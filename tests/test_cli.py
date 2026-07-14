@@ -43,6 +43,18 @@ def test_run_dry_run_is_secret_free_and_does_not_create_state(
     assert not state.exists()
 
 
+def test_run_help_identifies_team_and_writable_project_mounts(capsys) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        main(["run", "--help"])
+
+    assert stopped.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "definition at /team (read-only by default)" in help_text
+    assert "project source at /workspace (writable by default)" in help_text
+    assert "--project-read-only" in help_text
+    assert "default: writable" in help_text
+
+
 def test_task_reuses_agentws_queue(
     tmp_path: Path,
     monkeypatch,

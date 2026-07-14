@@ -13,6 +13,8 @@ test("dashboard assets are self-contained and expose accessible live regions", a
   assert.match(html, /aria-live="polite"/);
   assert.match(html, /<label class="search-field" for="search-input">/);
   assert.match(html, /<template id="instance-card-template">/);
+  assert.match(html, />Open AgentWS</);
+  assert.doesNotMatch(html, />Open workspace</);
   assert.match(html, /href="\/static\/styles\.css"/);
   assert.match(html, /src="\/static\/app\.js"/);
   assert.doesNotMatch(html, /(?:src|href)="https?:\/\//);

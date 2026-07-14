@@ -23,7 +23,7 @@ team + roles/*.md                           source being worked on
                                v
                     cyclo-runtime team container
                     filesystem tasks/jobs + agents
-                    read-only scoped model config
+                    writable scoped Pi runtime state
                                |
                         private Docker network
                                |
@@ -447,8 +447,9 @@ The team container receives:
 - its team repository;
 - its project mount;
 - writable task, job, agent, and transcript state;
-- a provider-and-model-scoped gateway capability in a read-only projected Pi
-  config.
+- writable per-instance Pi runtime state containing only its projected model
+  config and provider-and-model-scoped gateway capability. Pi needs this tree
+  for lock files and other local runtime metadata.
 
 It does **not** receive:
 
@@ -488,7 +489,7 @@ $XDG_STATE_HOME/cyclo/
     run.json                  # paths and lifecycle metadata; no provider keys
     runtime/                  # materialized, container-read-only filesystem loop
     agentws-state/            # writable tasks, jobs, agents, and transcripts
-    pi/agent/                 # read-only projected gateway config and scoped token
+    pi/agent/                 # writable projected config, scoped token, Pi state
 ```
 
 If `XDG_STATE_HOME` is unset, the root is `~/.local/state/cyclo`. Override it

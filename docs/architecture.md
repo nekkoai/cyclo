@@ -69,9 +69,11 @@ survive container replacement. Atomic publication, locking, bounded retries,
 and interrupted-write recovery are implemented by the bundled loop.
 
 Controller state contains paths, lifecycle metadata, scoped client records,
-and projected model configuration. It does not contain provider credentials.
-Stopping an instance removes its container and private network, revokes its
-capability, and preserves its queue history.
+and a writable per-instance Pi tree containing projected model configuration,
+the scoped gateway token, locks, and local runtime metadata. It does not contain
+host or provider credentials; those remain in the gateway store. Stopping an
+instance removes its container and private network, revokes its capability, and
+preserves its queue history.
 
 ## Networks and model traffic
 

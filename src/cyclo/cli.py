@@ -289,8 +289,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             raise
 
     print(f"started Cyclo instance: {instance.id}")
-    print(f"team: {team.root}")
-    print(f"project: {project}")
+    team_mode = "writable" if instance.team_write else "read-only"
+    project_mode = "read-only" if instance.project_read_only else "writable"
+    print(f"team definition (/team, {team_mode}): {team.root}")
+    print(f"project source (/workspace, {project_mode}): {project}")
     if instance.port is not None:
         print(f"AgentWS: http://127.0.0.1:{instance.port}")
     else:
@@ -639,13 +641,34 @@ def build_parser() -> argparse.ArgumentParser:
     templates = commands.add_parser("templates", help="list team templates bundled with Cyclo")
     templates.set_defaults(func=cmd_templates)
 
-    run = commands.add_parser("run", help="start a team against a project")
-    run.add_argument("team")
-    run.add_argument("project")
+    run = commands.add_parser(
+        "run",
+        help="start a team against a writable project workspace",
+        description=(
+            "Start a team with its definition at /team (read-only by default) "
+            "and project source at /workspace (writable by default)."
+        ),
+    )
+    run.add_argument(
+        "team",
+        help="team definition repository mounted at /team (read-only by default)",
+    )
+    run.add_argument(
+        "project",
+        help="project source directory mounted at /workspace (writable by default)",
+    )
     run.add_argument("--name", help="stable instance name (default: derived from team and project paths)")
     run.add_argument("--image", default=os.environ.get("CYCLO_RUNTIME_IMAGE", DEFAULT_RUNTIME_IMAGE))
-    run.add_argument("--team-write", action="store_true", help="allow the team to modify its own repository")
-    run.add_argument("--project-read-only", action="store_true", help="mount the project read-only")
+    run.add_argument(
+        "--team-write",
+        action="store_true",
+        help="mount the team definition at /team writable",
+    )
+    run.add_argument(
+        "--project-read-only",
+        action="store_true",
+        help="mount project source at /workspace read-only (default: writable)",
+    )
     run.add_argument("--offline", action="store_true", help="block direct outbound network access; the model proxy remains reachable")
     run.add_argument("--port", type=int, default=0, help="host AgentWS port; 0 chooses a free Docker port")
     run.add_argument("--verbose", action="store_true", help="mirror AgentWS agent transcripts to container logs")

@@ -154,7 +154,10 @@ def container_command(spec: ContainerSpec) -> list[str]:
         "--mount",
         mount(spec.agents_dir, CONTAINER_AGENTWS / "agents"),
         "--mount",
-        mount(spec.pi_root, CONTAINER_PI, "ro"),
+        # Pi creates lock files and mutable runtime metadata beside its projected
+        # configuration. This per-instance tree contains only a provider/model-
+        # scoped gateway capability; host credentials remain inside the gateway.
+        mount(spec.pi_root, CONTAINER_PI),
         "--mount",
         mount(spec.team.root, CONTAINER_TEAM, "rw" if instance.team_write else "ro"),
         "--mount",

@@ -11,7 +11,9 @@ from cyclo.state import Instance
 from cyclo.team import load_team
 
 
-def instance(team: Path, project: Path) -> Instance:
+def instance(
+    team: Path, project: Path, *, project_read_only: bool = False
+) -> Instance:
     return Instance(
         id="review-team-123",
         team_name="review-team",
@@ -24,7 +26,7 @@ def instance(team: Path, project: Path) -> Instance:
         network_name="cyclo-review-team-123-net",
         image="cyclo-runtime:test",
         team_write=False,
-        project_read_only=True,
+        project_read_only=project_read_only,
         offline=True,
     )
 
@@ -69,9 +71,11 @@ def test_container_argv_has_only_scoped_runtime_mounts(
     assert "AGENTWS_TEAM_ROSTER=/team/team" in command
     assert "AGENTWS_WORKSPACE=/workspace" in command
     assert f"type=bind,src={team_repo},dst=/team,readonly" in command
-    assert f"type=bind,src={project_repo},dst=/workspace,readonly" in command
+    assert f"type=bind,src={project_repo},dst=/workspace" in command
+    assert f"type=bind,src={project_repo},dst=/workspace,readonly" not in command
     assert f"type=bind,src={run},dst=/agentws,readonly" in command
-    assert f"type=bind,src={pi},dst=/home/cyclo/.pi,readonly" in command
+    assert f"type=bind,src={pi},dst=/home/cyclo/.pi" in command
+    assert f"type=bind,src={pi},dst=/home/cyclo/.pi,readonly" not in command
     assert f"type=bind,src={queue / 'tasks'},dst=/agentws/tasks" in command
     assert "gateway-token" not in rendered
     assert "/var/run/docker.sock" not in rendered
@@ -80,6 +84,34 @@ def test_container_argv_has_only_scoped_runtime_mounts(
     for name, value in retry_values.items():
         assert f"{name}={value}" in command
     assert "AGENTWS_UNSAFE_UNDOCUMENTED" not in rendered
+
+
+def test_project_read_only_mount_is_explicit(
+    tmp_path: Path, team_repo: Path, project_repo: Path
+) -> None:
+    runtime = tmp_path / "agentws"
+    pi = tmp_path / "pi"
+    queue = tmp_path / "queue"
+    runtime.mkdir()
+    pi.mkdir()
+    for name in ("tasks", "jobs", "agents"):
+        (queue / name).mkdir(parents=True)
+    spec = ContainerSpec(
+        instance=instance(team_repo, project_repo, project_read_only=True),
+        team=load_team(team_repo),
+        project=project_repo,
+        runtime_root=runtime,
+        tasks_dir=queue / "tasks",
+        jobs_dir=queue / "jobs",
+        agents_dir=queue / "agents",
+        pi_root=pi,
+        gateway_container="cyclo-gateway-test",
+        port=0,
+    )
+
+    command = container_command(spec)
+
+    assert f"type=bind,src={project_repo},dst=/workspace,readonly" in command
 
 
 def test_team_and_project_must_not_overlap(tmp_path: Path) -> None:
