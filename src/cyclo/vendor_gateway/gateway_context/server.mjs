@@ -20,6 +20,10 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { getOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import { getBuiltinModels, getBuiltinProviders } from "./pi-registry.mjs";
+import {
+  forwardedRequestHeaders,
+  prepareRequestBody,
+} from "./request-body.mjs";
 import { readJson, withFileLock, writeJsonAtomic } from "./store.mjs";
 import {
   MAX_USAGE_CAPTURE_BYTES,
@@ -108,28 +112,6 @@ const OAUTH_DECORATORS = {
   },
 };
 const DEFAULT_OAUTH_DECORATOR = (h, cred) => (h["authorization"] = `Bearer ${cred.access}`);
-
-// Request headers forwarded upstream. Everything else (including the client's
-// Authorization / x-api-key) is dropped and replaced.
-const FORWARDED_REQUEST_HEADERS = new Set([
-  "accept",
-  "content-type",
-  "anthropic-version",
-  "anthropic-beta",
-  "anthropic-dangerous-direct-browser-access",
-  "x-app",
-  "openai-beta",
-  "session_id",
-  "x-client-request-id",
-  "user-agent",
-  // github-copilot editor identity + per-request hints (pi sets these)
-  "copilot-integration-id",
-  "editor-version",
-  "editor-plugin-version",
-  "x-initiator",
-  "openai-intent",
-  "copilot-vision-request",
-]);
 
 // Response headers never relayed back. content-encoding/content-length are
 // dropped because fetch() transparently decompresses; node re-chunks.
@@ -459,12 +441,7 @@ export function copilotBaseUrl(token) {
 // Build the upstream request: forwarded headers + injected credential, and the
 // effective base URL (which a provider may override from its credential).
 async function resolveUpstream(req, name, provider) {
-  const headers = { "accept-encoding": "identity" };
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (FORWARDED_REQUEST_HEADERS.has(key.toLowerCase()) && typeof value === "string") {
-      headers[key] = value;
-    }
-  }
+  const headers = forwardedRequestHeaders(req.headers);
   // Per-provider HTTP quirks key off the provider TYPE, not the account name,
   // so an account like "claude-work" still gets the anthropic decorator.
   const providerType = provider.provider ?? name;
@@ -527,7 +504,21 @@ async function handleProxy(req, res, principal, name, restPath, search) {
     return;
   }
   const requestBytes = body?.length ?? 0;
-  const model = modelFromInferenceRequest(restPath, body);
+  let policyBody;
+  let upstreamBody;
+  try {
+    ({ policyBody, upstreamBody } = await prepareRequestBody(
+      body,
+      req.headers["content-encoding"],
+      MAX_REQUEST_BODY,
+    ));
+  } catch (exc) {
+    const status = Number.isInteger(exc?.statusCode) ? exc.statusCode : 400;
+    sendPlain(res, status, `${exc.message}\n`);
+    auditProxy(principal, name, "unknown", status, started, requestBytes, 0);
+    return;
+  }
+  const model = modelFromInferenceRequest(restPath, policyBody);
   if (!model) {
     sendPlain(res, 400, "inference request does not identify a model\n");
     auditProxy(principal, name, "unknown", 400, started, requestBytes, 0);
@@ -554,7 +545,7 @@ async function handleProxy(req, res, principal, name, restPath, search) {
     upstream = await fetch(url, {
       method: req.method,
       headers,
-      body,
+      body: upstreamBody,
       redirect: "manual",
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
