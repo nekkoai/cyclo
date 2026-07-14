@@ -1,4 +1,5 @@
-import { appendFile, readFile } from "node:fs/promises";
+import { appendFile, open } from "node:fs/promises";
+import { createInterface } from "node:readline";
 
 export const MAX_USAGE_CAPTURE_BYTES = 1024 * 1024;
 
@@ -173,21 +174,34 @@ function addGroup(groups, name, record) {
 }
 
 export function aggregateUsageRecords(records) {
-  const totals = counters();
-  const clients = new Map();
-  const teams = new Map();
-  const generations = new Map();
-  const providers = new Map();
-  const models = new Map();
-  for (const record of records) {
-    if (!record || typeof record !== "object") continue;
-    addRecord(totals, record);
-    addGroup(clients, record.client_id, record);
-    addGroup(teams, record.team_id, record);
-    addGroup(generations, record.binding_generation, record);
-    addGroup(providers, record.provider, record);
-    addGroup(models, record.model, record);
-  }
+  const accumulator = usageAccumulator();
+  for (const record of records) addUsageRecord(accumulator, record);
+  return finishUsageAccumulator(accumulator);
+}
+
+function usageAccumulator() {
+  return {
+    totals: counters(),
+    clients: new Map(),
+    teams: new Map(),
+    generations: new Map(),
+    providers: new Map(),
+    models: new Map(),
+  };
+}
+
+function addUsageRecord(accumulator, record) {
+  if (!record || typeof record !== "object") return;
+  addRecord(accumulator.totals, record);
+  addGroup(accumulator.clients, record.client_id, record);
+  addGroup(accumulator.teams, record.team_id, record);
+  addGroup(accumulator.generations, record.binding_generation, record);
+  addGroup(accumulator.providers, record.provider, record);
+  addGroup(accumulator.models, record.model, record);
+}
+
+function finishUsageAccumulator(accumulator) {
+  const { totals, clients, teams, generations, providers, models } = accumulator;
   return {
     version: 1,
     totals,
@@ -200,21 +214,30 @@ export function aggregateUsageRecords(records) {
 }
 
 export async function aggregateUsageFile(path) {
-  let text;
+  let file;
   try {
-    text = await readFile(path, "utf8");
+    file = await open(path, "r");
   } catch (exc) {
     if (exc?.code === "ENOENT") return aggregateUsageRecords([]);
     throw exc;
   }
-  const records = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    try {
-      records.push(JSON.parse(line));
-    } catch {
-      // Ignore one torn/corrupt line while retaining all other audit records.
+
+  const accumulator = usageAccumulator();
+  const input = file.createReadStream({ encoding: "utf8", autoClose: false });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        addUsageRecord(accumulator, JSON.parse(line));
+      } catch {
+        // Ignore one torn/corrupt line while retaining all other audit records.
+      }
     }
+  } finally {
+    lines.close();
+    input.destroy();
+    await file.close();
   }
-  return aggregateUsageRecords(records);
+  return finishUsageAccumulator(accumulator);
 }

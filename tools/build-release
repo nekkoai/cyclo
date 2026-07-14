@@ -1,0 +1,162 @@
+#!/bin/sh
+# Build and verify a complete Cyclo release without touching a Git remote.
+set -eu
+
+fail() {
+    printf '%s\n' "build release: $*" >&2
+    exit 1
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+python=${PYTHON:-python3}
+
+command -v git >/dev/null 2>&1 || fail "Git is required"
+command -v "$python" >/dev/null 2>&1 || fail "Python not found: $python"
+command -v node >/dev/null 2>&1 || fail "Node.js is required"
+command -v npm >/dev/null 2>&1 || fail "npm is required"
+command -v docker >/dev/null 2>&1 || fail "Docker is required"
+docker info >/dev/null 2>&1 || fail "the Docker daemon is unavailable"
+
+cd "$repo_root"
+[ -z "$(git status --porcelain --untracked-files=normal)" ] \
+    || fail "the release must be built from a clean committed tree"
+
+version=$(PYTHONPATH=src "$python" -c 'import cyclo; print(cyclo.__version__)')
+commit=$(git rev-parse HEAD)
+short_commit=$(git rev-parse --short=12 HEAD)
+source_date_epoch=$(git log -1 --format=%ct)
+output=${1:-"$repo_root/release/cyclo-agent-$version"}
+case $output in
+    /*) ;;
+    *) output=$repo_root/$output ;;
+esac
+[ ! -e "$output" ] || fail "output already exists: $output"
+
+work_root=$(mktemp -d "${TMPDIR:-/tmp}/cyclo-build-release.XXXXXX")
+cleanup() {
+    status=$?
+    trap - 0
+    rm -rf -- "$work_root"
+    exit "$status"
+}
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+source_tree=$work_root/source
+venv=$work_root/venv
+dist=$work_root/dist
+home=$work_root/home
+mkdir -p "$source_tree" "$dist" "$home"
+
+git archive --format=tar HEAD | tar -xf - -C "$source_tree"
+"$python" -m venv "$venv"
+"$venv/bin/python" -m pip install \
+    --disable-pip-version-check \
+    --require-hashes \
+    --requirement "$repo_root/requirements/release.txt"
+
+printf '%s\n' '==> source tests'
+(
+    cd "$source_tree"
+    "$venv/bin/python" -m pytest -q
+    node --test tests/*.mjs
+    find . -type f -exec sh -c '
+        for script do
+            first=
+            IFS= read -r first < "$script" || :
+            [ "$first" = "#!/bin/sh" ] && sh -n "$script"
+        done
+    ' sh {} +
+)
+
+printf '%s\n' '==> dependency audits'
+npm audit --package-lock-only --omit=dev --audit-level=high \
+    --prefix "$source_tree/src/cyclo/vendor_gateway/gateway_context"
+npm audit --package-lock-only --omit=dev --audit-level=high \
+    --prefix "$source_tree/src/cyclo/vendor_gateway/runtime_context"
+
+printf '%s\n' '==> wheel-only acceptance'
+CYCLO_RELEASE_BUILD_PYTHON="$venv/bin/python" \
+    PYTHON="$venv/bin/python" \
+    SOURCE_DATE_EPOCH=$source_date_epoch \
+    "$repo_root/tools/release-acceptance"
+
+printf '%s\n' '==> distributions and release metadata'
+(
+    cd "$source_tree"
+    SOURCE_DATE_EPOCH=$source_date_epoch "$venv/bin/python" -m build \
+        --no-isolation \
+        --outdir "$dist"
+)
+SOURCE_DATE_EPOCH=$source_date_epoch \
+    "$venv/bin/python" "$repo_root/tools/normalize-distributions" "$dist"
+"$venv/bin/python" -m twine check "$dist"/*
+SOURCE_DATE_EPOCH=$source_date_epoch CYCLO_RELEASE_COMMIT=$commit \
+    "$venv/bin/python" "$repo_root/tools/release-manifest" "$dist"
+"$venv/bin/python" "$repo_root/tools/secret-scan" "$dist"
+
+wheel=$dist/cyclo_agent-$version-py3-none-any.whl
+[ -f "$wheel" ] || fail "expected wheel was not built: $wheel"
+"$venv/bin/python" -m pip install \
+    --disable-pip-version-check --no-deps --force-reinstall "$wheel"
+
+printf '%s\n' '==> packaged example teams'
+for template in adversarial-audit plan-execute-verify test-driven-repair; do
+    team=$work_root/team-$template
+    project=$work_root/project-$template
+    state=$work_root/state-$template
+    mkdir -p "$project"
+    HOME=$home XDG_STATE_HOME=$home/.local/state \
+        "$venv/bin/cyclo" init "$team" \
+        --template "$template" \
+        --model openai-codex/release-verification
+    HOME=$home XDG_STATE_HOME=$home/.local/state \
+        "$venv/bin/cyclo" validate "$team"
+    HOME=$home XDG_STATE_HOME=$home/.local/state \
+        "$venv/bin/cyclo" --state-root "$state" run \
+        --name "release-$template" --dry-run "$team" "$project" >/dev/null
+done
+
+printf '%s\n' '==> credential-free Docker images'
+docker build --pull \
+    --tag "cyclo-runtime:release-$short_commit" \
+    --file "$source_tree/src/cyclo/vendor_gateway/runtime_context/Dockerfile" \
+    "$source_tree/src/cyclo/vendor_gateway/runtime_context"
+docker build --pull \
+    --tag "cyclo-gateway:release-$short_commit" \
+    --file "$source_tree/src/cyclo/vendor_gateway/gateway_context/Dockerfile" \
+    "$source_tree/src/cyclo/vendor_gateway/gateway_context"
+docker run --rm --network none \
+    --env CYCLO_HOST_UID=1000 \
+    --env CYCLO_HOST_GID=1000 \
+    "cyclo-runtime:release-$short_commit" sh -ceu '
+        python3 --version
+        node --version
+        npm --version
+        pi --version
+        command -v pi-lens-analyze
+        command -v pi-lens-mcp
+        test "$(npm root -g)" = /opt/cyclo-agent-tools/lib/node_modules
+        mkdir -p "$HOME/.pi/agent"
+        printf "%s\n" \
+          "{\"packages\":[\"npm:pi-web-access\",\"npm:pi-lens\",\"npm:pi-simplify\"]}" \
+          > "$HOME/.pi/agent/settings.json"
+        PI_OFFLINE=1 pi list > /tmp/pi-packages
+        grep -F "npm:pi-web-access" /tmp/pi-packages
+        grep -F "npm:pi-lens" /tmp/pi-packages
+        grep -F "npm:pi-simplify" /tmp/pi-packages
+        pi --offline --help > /tmp/pi-help
+        grep -F "Extension CLI Flags" /tmp/pi-help
+    '
+docker run --rm --network none \
+    "cyclo-gateway:release-$short_commit" providers.mjs >/dev/null
+
+[ -z "$(git status --porcelain --untracked-files=normal)" ] \
+    || fail "release verification modified the committed tree"
+mkdir -p "$(dirname -- "$output")"
+mv "$dist" "$output"
+printf '%s\n' "build release: PASS"
+printf '%s\n' "artifacts: $output"

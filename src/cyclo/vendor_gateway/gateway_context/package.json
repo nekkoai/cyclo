@@ -4,6 +4,6 @@
   "type": "module",
   "description": "Credential-injecting LLM gateway for Cyclo agent containers, built on pi-ai.",
   "dependencies": {
-    "@earendil-works/pi-ai": "0.75.5"
+    "@earendil-works/pi-ai": "0.80.6"
   }
 }

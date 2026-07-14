@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Create deterministic checksums, release metadata, and an SPDX SBOM."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tarfile
+import zipfile
+from datetime import datetime, timezone
+from email.parser import BytesParser
+from pathlib import Path, PurePosixPath
+from urllib.parse import quote
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(f"release manifest: {message}")
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git(*args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def require_local_commit(commit: str) -> None:
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        fail("release commit must be a full lowercase Git object ID")
+    result = subprocess.run(
+        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+        cwd=ROOT,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode:
+        fail(f"release commit does not exist in the local repository: {commit}")
+    head = git("rev-parse", "HEAD")
+    if commit != head:
+        fail(f"release commit {commit} does not match the checked-out source {head}")
+
+
+def wheel_metadata(wheel: Path) -> dict[str, str]:
+    with zipfile.ZipFile(wheel) as archive:
+        matches = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+        if len(matches) != 1:
+            fail(f"expected one METADATA file in {wheel.name}")
+        message = BytesParser().parsebytes(archive.read(matches[0]))
+    required = ("Name", "Version", "Requires-Python")
+    values = {key: message.get(key, "") for key in required}
+    if not all(values.values()):
+        fail(f"incomplete wheel metadata in {wheel.name}")
+    return values
+
+
+def sdist_metadata(sdist: Path, version: str) -> dict[str, str]:
+    expected = PurePosixPath(f"cyclo_agent-{version}") / "PKG-INFO"
+    try:
+        with tarfile.open(sdist, mode="r:gz") as archive:
+            matches = [
+                member
+                for member in archive.getmembers()
+                if member.isfile() and PurePosixPath(member.name) == expected
+            ]
+            if len(matches) != 1:
+                fail(f"expected one top-level PKG-INFO file in {sdist.name}")
+            if matches[0].size > 1024 * 1024:
+                fail(f"unreasonably large PKG-INFO file in {sdist.name}")
+            handle = archive.extractfile(matches[0])
+            if handle is None:
+                fail(f"cannot read PKG-INFO from {sdist.name}")
+            with handle:
+                message = BytesParser().parsebytes(handle.read(1024 * 1024 + 1))
+    except (OSError, tarfile.TarError) as exc:
+        fail(f"cannot read source distribution {sdist.name}: {exc}")
+
+    required = ("Name", "Version", "Requires-Python")
+    values = {key: message.get(key, "") for key in required}
+    if not all(values.values()):
+        fail(f"incomplete source distribution metadata in {sdist.name}")
+    return values
+
+
+def created_time() -> tuple[int, str]:
+    raw = os.environ.get("SOURCE_DATE_EPOCH")
+    if raw is None:
+        raw = git("log", "-1", "--format=%ct")
+    try:
+        epoch = int(raw)
+    except ValueError:
+        fail("SOURCE_DATE_EPOCH must be an integer")
+    created = datetime.fromtimestamp(epoch, tz=timezone.utc).replace(microsecond=0)
+    return epoch, created.isoformat().replace("+00:00", "Z")
+
+
+def spdx_id(kind: str, name: str, version: str, index: int) -> str:
+    token = re.sub(r"[^A-Za-z0-9.-]+", "-", f"{kind}-{name}-{version}").strip("-")
+    return f"SPDXRef-{token}-{index}"
+
+
+def npm_purl(name: str, version: str) -> str:
+    if name.startswith("@") and "/" in name:
+        scope, package = name.split("/", 1)
+        encoded_name = f"{quote(scope, safe='')}/{quote(package, safe='')}"
+    else:
+        encoded_name = quote(name, safe="")
+    return f"pkg:npm/{encoded_name}@{quote(version, safe='')}"
+
+
+def locked_node_packages() -> list[dict[str, object]]:
+    packages: list[dict[str, object]] = []
+    lock_paths = sorted((ROOT / "src" / "cyclo" / "vendor_gateway").glob("*_context/package-lock.json"))
+    for lock_path in lock_paths:
+        context = lock_path.parent.name
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        for package_path, entry in sorted(lock.get("packages", {}).items()):
+            if not package_path or "node_modules/" not in package_path:
+                continue
+            name = entry.get("name")
+            if not name:
+                name = package_path.rsplit("node_modules/", 1)[1]
+            version = entry.get("version")
+            if not isinstance(name, str) or not isinstance(version, str):
+                continue
+            packages.append(
+                {
+                    "context": context,
+                    "name": name,
+                    "version": version,
+                    "license": entry.get("license", "NOASSERTION"),
+                    "resolved": entry.get("resolved", "NOASSERTION"),
+                    "integrity": entry.get("integrity"),
+                }
+            )
+    return packages
+
+
+def make_spdx(
+    *,
+    version: str,
+    commit: str,
+    created: str,
+    wheel_hash: str,
+) -> dict[str, object]:
+    root_id = "SPDXRef-Package-cyclo-agent"
+    packages: list[dict[str, object]] = [
+        {
+            "SPDXID": root_id,
+            "name": "cyclo-agent",
+            "versionInfo": version,
+            "downloadLocation": "NOASSERTION",
+            "filesAnalyzed": False,
+            "licenseConcluded": "NOASSERTION",
+            "licenseDeclared": "MIT",
+            "copyrightText": "NOASSERTION",
+            "checksums": [{"algorithm": "SHA256", "checksumValue": wheel_hash}],
+            "externalRefs": [
+                {
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": f"pkg:pypi/cyclo-agent@{version}",
+                }
+            ],
+        }
+    ]
+    relationships: list[dict[str, str]] = [
+        {
+            "spdxElementId": "SPDXRef-DOCUMENT",
+            "relationshipType": "DESCRIBES",
+            "relatedSpdxElement": root_id,
+        }
+    ]
+    for index, dependency in enumerate(locked_node_packages(), start=1):
+        dep_id = spdx_id("npm", str(dependency["name"]), str(dependency["version"]), index)
+        package: dict[str, object] = {
+            "SPDXID": dep_id,
+            "name": dependency["name"],
+            "versionInfo": dependency["version"],
+            "downloadLocation": dependency["resolved"],
+            "filesAnalyzed": False,
+            "licenseConcluded": "NOASSERTION",
+            "licenseDeclared": dependency["license"],
+            "copyrightText": "NOASSERTION",
+            "primaryPackagePurpose": "LIBRARY",
+            "comment": f"Locked dependency in {dependency['context']}",
+            "externalRefs": [
+                {
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": npm_purl(
+                        str(dependency["name"]), str(dependency["version"])
+                    ),
+                }
+            ],
+        }
+        integrity = dependency.get("integrity")
+        if isinstance(integrity, str) and integrity.startswith("sha512-"):
+            try:
+                package["checksums"] = [
+                    {
+                        "algorithm": "SHA512",
+                        "checksumValue": base64.b64decode(integrity[7:]).hex(),
+                    }
+                ]
+            except ValueError:
+                pass
+        packages.append(package)
+        relationships.append(
+            {
+                "spdxElementId": root_id,
+                "relationshipType": "DEPENDS_ON",
+                "relatedSpdxElement": dep_id,
+            }
+        )
+
+    return {
+        "spdxVersion": "SPDX-2.3",
+        "dataLicense": "CC0-1.0",
+        "SPDXID": "SPDXRef-DOCUMENT",
+        "name": f"cyclo-agent-{version}",
+        "documentNamespace": f"https://spdx.org/spdxdocs/cyclo-agent-{version}-{commit}",
+        "creationInfo": {
+            "created": created,
+            "creators": ["Tool: cyclo-release-manifest/1"],
+            "licenseListVersion": "3.25",
+        },
+        "documentDescribes": [root_id],
+        "packages": packages,
+        "relationships": relationships,
+    }
+
+
+def main() -> int:
+    if len(sys.argv) > 2:
+        fail("usage: tools/release-manifest [DIST_DIR]")
+    dist = Path(sys.argv[1] if len(sys.argv) == 2 else "dist").resolve()
+    if not dist.is_dir():
+        fail(f"not a directory: {dist}")
+
+    wheels = sorted(dist.glob("cyclo_agent-*.whl"))
+    sdists = sorted(dist.glob("cyclo_agent-*.tar.gz"))
+    if len(wheels) != 1 or len(sdists) != 1:
+        fail("expected exactly one cyclo_agent wheel and one source distribution")
+
+    metadata = wheel_metadata(wheels[0])
+    if metadata["Name"] != "cyclo-agent":
+        fail(f"unexpected distribution name: {metadata['Name']}")
+    version = metadata["Version"]
+    expected_wheel = f"cyclo_agent-{version}-py3-none-any.whl"
+    expected_sdist = f"cyclo_agent-{version}.tar.gz"
+    if wheels[0].name != expected_wheel:
+        fail(f"unexpected wheel filename: {wheels[0].name}; expected {expected_wheel}")
+    if sdists[0].name != expected_sdist:
+        fail(
+            f"unexpected source distribution filename: {sdists[0].name}; "
+            f"expected {expected_sdist}"
+        )
+    source_metadata = sdist_metadata(sdists[0], version)
+    if source_metadata != metadata:
+        fail("source distribution metadata does not match wheel metadata")
+
+    commit = os.environ.get("CYCLO_RELEASE_COMMIT") or git("rev-parse", "HEAD")
+    require_local_commit(commit)
+    epoch, created = created_time()
+    artifacts = []
+    for path in sorted((wheels[0], sdists[0]), key=lambda item: item.name):
+        artifacts.append(
+            {"name": path.name, "sha256": sha256(path), "size": path.stat().st_size}
+        )
+
+    checksums = dist / "SHA256SUMS"
+    checksums.write_text(
+        "".join(f"{item['sha256']}  {item['name']}\n" for item in artifacts),
+        encoding="utf-8",
+    )
+    manifest = {
+        "schema_version": 1,
+        "project": "Cyclo",
+        "distribution": metadata["Name"],
+        "version": version,
+        "requires_python": metadata["Requires-Python"],
+        "console_command": "cyclo",
+        "git_commit": commit,
+        "source_date_epoch": epoch,
+        "created": created,
+        "artifacts": artifacts,
+    }
+    (dist / "release-manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    spdx = make_spdx(
+        version=version,
+        commit=commit,
+        created=created,
+        wheel_hash=next(item["sha256"] for item in artifacts if item["name"].endswith(".whl")),
+    )
+    (dist / f"cyclo-agent-{version}.spdx.json").write_text(
+        json.dumps(spdx, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(f"release manifest: wrote checksums, manifest, and SPDX SBOM for {version}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

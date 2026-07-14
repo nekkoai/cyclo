@@ -264,7 +264,10 @@ def test_gateway_destroy_store_uses_selected_volume(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("arguments", "expected"),
     [
-        (["gateway", "--help"], "manage Cyclo's isolated credential gateway store"),
+        (
+            ["gateway", "--help"],
+            "credentials, subscriptions, and retained usage history",
+        ),
         (["gateway", "login", "--help"], "--api-key-stdin"),
         (["gateway", "status", "--help"], "--store-volume"),
         (["gateway", "destroy-store", "--help"], "--confirm VOLUME"),
@@ -278,7 +281,8 @@ def test_gateway_help_comes_from_native_gateway_parser(
 
     assert stopped.value.code == 0
     output = capsys.readouterr().out
-    assert expected in output
+    normalized = " ".join(output.split())
+    assert expected in normalized
     assert "\n  arguments\n" not in output
 
 
@@ -287,7 +291,9 @@ def test_gateway_summary_and_missing_action_cover_store_management(capsys) -> No
         main(["--help"])
 
     assert stopped.value.code == 0
-    assert "manage Cyclo's isolated credential" in capsys.readouterr().out
+    help_text = capsys.readouterr().out
+    assert "manage Cyclo's isolated gateway store" in help_text
+    assert "retained usage history" in help_text
 
     assert main(["gateway"]) == 1
     assert "requires login, status, or destroy-store" in capsys.readouterr().err

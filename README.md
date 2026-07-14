@@ -11,6 +11,10 @@ example teams, and dashboard that it needs. It does **not** install, import,
 discover, or require another project, and it never expects sibling checkouts
 under the user's home directory.
 
+Version 0.1.0 is Cyclo's first stable release. The Python distribution is named
+`cyclo-agent`; the installed command, Python package, repository, and product
+name remain `cyclo` and Cyclo.
+
 ```text
 team Git repository                         project directory
 team + roles/*.md                           source being worked on
@@ -28,7 +32,8 @@ team + roles/*.md                           source being worked on
                     upstream proxy + usage records
                                |
                     cyclo-gateway-store volume
-                    credentials and subscriptions
+                    credentials, subscriptions,
+                    and retained usage history
 ```
 
 ## Requirements and installation
@@ -40,6 +45,11 @@ Cyclo requires:
 - Python 3.10 or newer, with `venv`/`ensurepip` support;
 - Git;
 - Docker with a running daemon that the current user can access.
+
+Node.js and npm are not host runtime requirements. The JavaScript Pi agent and
+provider libraries are installed and run inside Cyclo's Docker images. They are
+needed on the host only by maintainers running the complete source and release
+test suites.
 
 On a fresh machine, clone Cyclo into its own virtual environment and run the
 environment check:
@@ -55,10 +65,18 @@ cyclo doctor
 
 If the source tree is already present, the `git clone` step is unnecessary.
 
-Or install a release wheel directly:
+After the stable release has been published to a configured Python package
+index, install it by distribution name:
 
 ```sh
-python3 -m pip install ./cyclo-0.1.0-py3-none-any.whl
+python3 -m pip install cyclo-agent==0.1.0
+cyclo doctor
+```
+
+Release wheels use the normalized distribution filename:
+
+```sh
+python3 -m pip install ./cyclo_agent-0.1.0-py3-none-any.whl
 cyclo doctor
 ```
 
@@ -72,7 +90,7 @@ The source tree or wheel is the complete application. No external agent-runtime
 package, executable, environment variable, checkout, or network fetch is part
 of Cyclo's Python runtime dependency chain.
 
-## Images and the credential volume
+## Images and the gateway data volume
 
 Cyclo does not claim that prebuilt images are published. Version 0.1 builds its
 two images from Docker contexts carried inside the installed Cyclo package:
@@ -81,7 +99,7 @@ two images from Docker contexts carried inside the installed Cyclo package:
 |---|---|---|
 | Team runtime image | `cyclo-runtime:0.1.0` | Pi, local tools, and the per-team loop |
 | Credential gateway image | `cyclo-gateway:0.1.0` | Login, proxying, model projection, and usage |
-| Credential volume | `cyclo-gateway-store` | Provider API keys and subscription credentials |
+| Gateway data volume | `cyclo-gateway-store` | Provider credentials, subscriptions, and retained usage history |
 | Team container | `cyclo-<instance>` | One isolated running team/project binding |
 | Team network | `cyclo-<instance>-net` | One private network per binding |
 
@@ -141,7 +159,8 @@ cyclo gateway login openai --api-key-env OPENAI_API_KEY
 The provisioning command starts a one-shot gateway container and writes the
 result directly into `cyclo-gateway-store`. The long-running gateway mounts the
 same volume. Cyclo does not copy those credentials into its host state, team
-repositories, projects, or team containers.
+repositories, projects, or team containers. The volume also contains the
+append-only usage ledger used for experiment accounting.
 
 `cyclo gateway status` lists provisioned accounts. `cyclo models` starts or
 reuses the gateway and prints the exact `provider/model` values accepted in a
@@ -300,6 +319,19 @@ bound to loopback. Each online instance links to its detailed read-only queue
 viewer; stopped and offline instances remain visible from persistent host
 state.
 
+`cyclo usage` prints an aggregate JSON snapshot of the retained gateway ledger.
+Records contain attribution and provider-reported accounting metadata; Cyclo
+does not record request prompts or model responses in that ledger. The ledger
+is append-only in 0.1.0 and has no automatic retention limit. Long-running,
+high-volume installations should monitor the `cyclo-gateway-store` volume. Save
+an aggregate snapshot before destroying the store:
+
+```sh
+cyclo usage > cyclo-usage-before-destroy.json
+```
+
+This is an aggregate report, not a raw-ledger backup.
+
 After a Docker daemon restart, the gateway has its own restart policy. If a
 gateway or network was changed manually, `cyclo repair` reconciles it,
 reattaches active private networks, revokes stale capabilities, and removes
@@ -440,27 +472,34 @@ $XDG_STATE_HOME/cyclo/
 If `XDG_STATE_HOME` is unset, the root is `~/.local/state/cyclo`. Override it
 with `CYCLO_STATE_ROOT` or the global `--state-root` option.
 
-Provider credentials are outside that tree in the Docker-managed
-`cyclo-gateway-store` volume. Stopping teams or deleting ordinary instance
-state does not delete the credential volume. Credential destruction should be
-an explicit administrator action. After stopping all teams, destroy the default
-store with its name repeated as confirmation:
+Provider credentials, subscriptions, and retained token-usage history are
+outside that tree in the Docker-managed `cyclo-gateway-store` volume. Stopping
+teams or deleting ordinary instance state does not delete this volume. Gateway
+data destruction is an explicit administrator action. Export any usage report
+you need, then stop all teams and destroy the default store with its name
+repeated as confirmation:
 
 ```sh
 cyclo --store-volume cyclo-gateway-store \
   gateway destroy-store --confirm cyclo-gateway-store
 ```
 
-This irreversible command affects every Cyclo state root sharing that exact
-volume. It stops and removes every verified Cyclo gateway container that mounts
-the store, using immutable container IDs, and then removes the volume. It
-refuses instead of guessing if a foreign, unverified, or in-progress
-provisioning container also mounts the volume. Repeating the exact volume name
-is the authorization to delete the volume itself; Docker volumes created by
-Cyclo do not carry separate ownership metadata. If a new container mounts the
-store after preflight, Docker's final in-use check preserves the credentials
-and reports an error. Any gateways already stopped in that race are recreated
-by the next run or by `cyclo repair`.
+This irreversible command deletes **all credentials, subscriptions, and usage
+history** in that volume and affects every Cyclo state root sharing it. It stops
+and removes every verified Cyclo gateway container that mounts the store, using
+immutable container IDs, and then removes the volume. It refuses instead of
+guessing if a foreign, unverified, or in-progress provisioning container also
+mounts the volume. Repeating the exact volume name is the authorization to
+delete the volume itself; Docker volumes created by Cyclo do not carry separate
+ownership metadata. If a new container mounts the store after preflight,
+Docker's final in-use check preserves the data and reports an error. Any
+gateways already stopped in that race are recreated by the next run or by
+`cyclo repair`.
+
+For a component map and explicit trust boundaries, see
+[`docs/architecture.md`](docs/architecture.md). The local release build and
+verification procedure is in [`docs/releasing.md`](docs/releasing.md), and
+vulnerability reporting is in [`SECURITY.md`](SECURITY.md).
 
 ## Development
 
@@ -479,10 +518,10 @@ Before publishing a release, run the standalone wheel acceptance check:
 tools/release-acceptance
 ```
 
-This `/bin/sh` script targets Cyclo's supported Linux hosts. It builds with
-`pip wheel`, so it does not require the Python `build` module. It does not claim
-utility-level portability to non-Linux POSIX systems. It builds one wheel,
-installs it into a temporary virtual environment, switches to an empty `HOME`,
+This `/bin/sh` script targets Cyclo's supported Linux hosts. It installs the
+hash-locked release toolchain into a temporary build environment, invokes
+`pip wheel --no-build-isolation`, and installs the resulting wheel into a
+separate temporary virtual environment. It then switches to an empty `HOME`,
 removes user-local executables from `PATH`, and exercises the installed `cyclo`
 command. It checks packaged templates, team initialization and validation,
 `run --dry-run`, the packaged job-loop ABI, and the credential-gateway import.
@@ -491,5 +530,6 @@ installed and reachable, `cyclo doctor` must pass completely; otherwise only
 the Docker probe is skipped and all wheel checks must still pass. The temporary
 environment is removed on success, failure, or interruption. Running the check
 requires the standard-library `venv`/`ensurepip` support and package-index
-access for the isolated wheel build. It probes Docker but does not build images,
-provision credentials, or start a team.
+access to install the hash-locked build tools. PEP 517 build isolation is
+disabled, so the backend is not downloaded a second time. It probes Docker but
+does not build images, provision credentials, or start a team.

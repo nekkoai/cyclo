@@ -24,6 +24,12 @@ PROVIDER_ENV_VARS = {
     "huggingface": "HF_TOKEN",
 }
 
+STORE_CONTENTS = "credentials, subscriptions, and retained usage history"
+STORE_VOLUME_HELP = (
+    f"Docker volume containing gateway {STORE_CONTENTS}; "
+    "destroy-store deletes all three irreversibly"
+)
+
 GATEWAY_CONTAINER_HARDENING = [
     "--security-opt",
     "no-new-privileges",
@@ -168,7 +174,8 @@ def cmd_destroy_store(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="cyclo gateway", description="manage Cyclo's isolated credential gateway store"
+        prog="cyclo gateway",
+        description=f"manage Cyclo's isolated gateway store for {STORE_CONTENTS}",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -177,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--store-volume",
         default=gateway.DEFAULT_STORE_VOLUME,
-        help="Docker volume containing gateway credentials",
+        help=STORE_VOLUME_HELP,
     )
     common.add_argument("--build", action="store_true", help="rebuild the gateway image first")
 
@@ -213,7 +220,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     destroy = sub.add_parser(
         "destroy-store",
-        help="irreversibly delete every credential in the selected store volume",
+        help=f"irreversibly delete all {STORE_CONTENTS} in the selected volume",
+        description=(
+            f"Irreversibly delete all {STORE_CONTENTS} in the selected gateway "
+            "store volume. This operation cannot be undone."
+        ),
     )
     # The outer ``cyclo`` command injects its selected image alongside the
     # volume for every gateway action.  Accept it for composability, but keep
@@ -224,13 +235,13 @@ def build_parser() -> argparse.ArgumentParser:
     destroy.add_argument(
         "--store-volume",
         default=gateway.DEFAULT_STORE_VOLUME,
-        help="Docker volume containing gateway credentials",
+        help=STORE_VOLUME_HELP,
     )
     destroy.add_argument(
         "--confirm",
         required=True,
         metavar="VOLUME",
-        help="must exactly match --store-volume",
+        help="must exactly match --store-volume to authorize irreversible deletion",
     )
     destroy.set_defaults(func=cmd_destroy_store)
     return parser

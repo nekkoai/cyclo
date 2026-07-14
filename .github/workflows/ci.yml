@@ -18,6 +18,19 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
+  secret-scan:
+    name: Git history secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   python-tests:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
@@ -27,8 +40,10 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -42,12 +57,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
       - name: Run Node tests
         run: node --test tests/*.mjs
+      - name: Audit gateway Node dependencies
+        working-directory: src/cyclo/vendor_gateway/gateway_context
+        run: npm audit --omit=dev --package-lock-only --audit-level=high
+      - name: Audit runtime Node dependencies
+        working-directory: src/cyclo/vendor_gateway/runtime_context
+        run: npm audit --omit=dev --package-lock-only --audit-level=high
       - name: Check POSIX shell syntax
         shell: bash
         run: |
@@ -60,24 +83,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
           cache: pip
       - name: Install release dependencies
-        run: python -m pip install ".[dev]"
+        run: python -m pip install --require-hashes --requirement requirements/release.txt
       - name: Set reproducible build timestamp
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
       - name: Build and validate distributions
         run: |
-          python -m build
+          python -m build --no-isolation
+          python tools/normalize-distributions dist
           python -m twine check dist/*
       - name: Exercise a clean-copy wheel installation
         run: tools/release-acceptance
       - name: Confirm acceptance did not modify tracked files
         run: git diff --exit-code
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cyclo-distributions
           path: dist/*
@@ -86,11 +112,12 @@ jobs:
 
   docker-build:
     name: Credential-free Docker build smoke
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Build runtime image
         run: |
           docker build --pull \
@@ -108,5 +135,25 @@ jobs:
           docker run --rm --network none \
             --env CYCLO_HOST_UID=1000 \
             --env CYCLO_HOST_GID=1000 \
-            cyclo-runtime:ci python3 --version
+            cyclo-runtime:ci sh -ceu '
+              python3 --version
+              node --version
+              npm --version
+              pi --version
+              command -v pi
+              command -v pi-lens-analyze
+              command -v pi-lens-mcp
+              test "$(npm root -g)" = /opt/cyclo-agent-tools/lib/node_modules
+              npm ls --prefix /opt/cyclo-agent-tools/lib --depth=0
+              mkdir -p "$HOME/.pi/agent"
+              printf "%s\n" \
+                "{\"packages\":[\"npm:pi-web-access\",\"npm:pi-lens\",\"npm:pi-simplify\"]}" \
+                > "$HOME/.pi/agent/settings.json"
+              PI_OFFLINE=1 pi list > /tmp/pi-packages
+              grep -F "npm:pi-web-access" /tmp/pi-packages
+              grep -F "npm:pi-lens" /tmp/pi-packages
+              grep -F "npm:pi-simplify" /tmp/pi-packages
+              pi --offline --help > /tmp/pi-help
+              grep -F "Extension CLI Flags" /tmp/pi-help
+            '
           docker run --rm --network none cyclo-gateway:ci providers.mjs

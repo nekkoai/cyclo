@@ -19,8 +19,8 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
-import { getProviders } from "@earendil-works/pi-ai";
 import { getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
+import { getBuiltinProviders } from "./pi-registry.mjs";
 import { readJson, withFileLock, writeJsonAtomic } from "./store.mjs";
 
 const AUTH_JSON_PATH = process.env.CYCLO_GATEWAY_AUTH_JSON ?? "/var/lib/cyclo-gateway/auth.json";
@@ -129,7 +129,7 @@ async function loginOAuth(provider) {
     // No OAuth flow for this provider. If pi-ai knows it as a built-in (xai,
     // openai, mistral, ...) it's API-key based; tell the user how. Otherwise
     // it's unknown (or a custom provider that must be provisioned with a key).
-    if (getProviders().includes(provider)) {
+    if (getBuiltinProviders().includes(provider)) {
       throw new Error(
         `provider '${provider}' authenticates with an API key, not OAuth.\n` +
           `Provision it with:  login.mjs ${provider} --api-key <key>`,
@@ -167,7 +167,7 @@ async function loginOAuth(provider) {
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
   const key = await resolveApiKey(parsed);
-  if (key !== undefined && !getProviders().includes(parsed.provider)) {
+  if (key !== undefined && !getBuiltinProviders().includes(parsed.provider)) {
     // Not a built-in id: only served if the host pi defines a custom provider
     // of this exact name. A brand-name typo (grok -> xai) lands here.
     console.warn(

@@ -606,10 +606,15 @@ def add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--gateway-image",
         default=os.environ.get("CYCLO_GATEWAY_IMAGE", DEFAULT_GATEWAY_IMAGE),
+        help="credential gateway image",
     )
     parser.add_argument(
         "--store-volume",
         default=os.environ.get("CYCLO_GATEWAY_STORE", DEFAULT_STORE_VOLUME),
+        help=(
+            "Docker volume containing gateway credentials, subscriptions, "
+            "and retained usage history"
+        ),
     )
 
 
@@ -702,7 +707,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     gateway_parser = commands.add_parser(
         "gateway",
-        help="manage Cyclo's isolated credential gateway store",
+        help=(
+            "manage Cyclo's isolated gateway store for credentials, "
+            "subscriptions, and retained usage history"
+        ),
         add_help=False,
     )
     gateway_parser.add_argument(

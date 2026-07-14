@@ -1,0 +1,16 @@
+include CHANGELOG.md
+include LICENSE
+include README.md
+include SECURITY.md
+include pyproject.toml
+include tools/release-acceptance
+include tools/build-release
+include tools/normalize-distributions
+include tools/release-manifest
+include tools/secret-scan
+
+recursive-include .github *.yml
+recursive-include docs *.md
+recursive-include requirements *.in *.txt
+recursive-include template README.md team *.md
+recursive-include tests *.py *.mjs

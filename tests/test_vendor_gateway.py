@@ -719,6 +719,31 @@ def test_destroy_store_cli_requires_exact_confirmation(monkeypatch, capsys) -> N
     assert "must exactly match" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("command", ["login", "status", "destroy-store"])
+def test_gateway_store_help_discloses_every_irreversibly_deleted_kind(
+    command: str, capsys
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main([command, "--help"])
+
+    assert exc_info.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "credentials, subscriptions, and retained usage history" in help_text
+    assert "irreversibly" in help_text
+
+
+def test_destroy_store_confirmation_remains_fail_closed(monkeypatch) -> None:
+    destroyed: list[str] = []
+    monkeypatch.setattr(
+        gateway,
+        "destroy_store_volume",
+        lambda volume: destroyed.append(volume) or True,
+    )
+
+    assert cli.main(["destroy-store", "--confirm", "wrong-volume"]) == 1
+    assert destroyed == []
+
+
 def test_gateway_restarts_on_wrong_network_and_runs_by_verified_network_id(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -828,6 +853,7 @@ def test_packaged_contexts_are_the_only_build_inputs() -> None:
     assert source.dockerfile_path().parent == runtime_root
     assert source.gateway_dockerfile_path().parent == gateway_root
     assert (gateway_root / "package-lock.json").is_file()
+    assert (gateway_root / "pi-registry.mjs").is_file()
     assert (gateway_root / "server.mjs").is_file()
     assert (runtime_root / "entrypoint.sh").is_file()
 
@@ -841,9 +867,24 @@ def test_packaged_contexts_are_the_only_build_inputs() -> None:
 def test_gateway_javascript_uses_only_cyclo_runtime_names() -> None:
     context = source.gateway_context_root()
     server = (context / "server.mjs").read_text(encoding="utf-8")
+    login = (context / "login.mjs").read_text(encoding="utf-8")
+    providers = (context / "providers.mjs").read_text(encoding="utf-8")
+    registry = (context / "pi-registry.mjs").read_text(encoding="utf-8")
+    dockerfile = (context / "Dockerfile").read_text(encoding="utf-8")
     package = json.loads((context / "package.json").read_text(encoding="utf-8"))
     lock = json.loads((context / "package-lock.json").read_text(encoding="utf-8"))
     assert "CYCLO_GATEWAY_TOKEN" in server
     assert "MULTIAGENT_GATEWAY" not in server
+    assert 'from "./pi-registry.mjs"' in server
+    assert 'from "./pi-registry.mjs"' in login
+    assert 'from "./pi-registry.mjs"' in providers
+    assert 'from "@earendil-works/pi-ai/providers/all"' in registry
+    assert 'from "@earendil-works/pi-ai"' not in server
+    assert 'from "@earendil-works/pi-ai"' not in login
+    assert "checkBuiltinRegistry();" in providers
+    assert "pi-registry.mjs" in dockerfile
     assert package["name"] == "cyclo-gateway"
+    assert package["dependencies"] == {"@earendil-works/pi-ai": "0.80.6"}
     assert lock["packages"][""]["name"] == "cyclo-gateway"
+    assert lock["packages"][""]["dependencies"] == package["dependencies"]
+    assert lock["packages"]["node_modules/@earendil-works/pi-ai"]["version"] == "0.80.6"

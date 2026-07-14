@@ -18,8 +18,8 @@
 import { createServer } from "node:http";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { getModels, getProviders } from "@earendil-works/pi-ai";
 import { getOAuthProvider } from "@earendil-works/pi-ai/oauth";
+import { getBuiltinModels, getBuiltinProviders } from "./pi-registry.mjs";
 import { readJson, withFileLock, writeJsonAtomic } from "./store.mjs";
 import {
   MAX_USAGE_CAPTURE_BYTES,
@@ -192,7 +192,7 @@ function customBaseUrl(name, value) {
 function discoverProviders() {
   const auth = credentialStore();
   const custom = customProviderConfig();
-  const builtin = new Set(getProviders());
+  const builtin = new Set(getBuiltinProviders());
   const table = {};
   for (const [name, cred] of Object.entries(auth)) {
     // `name` is the ACCOUNT (store key); the provider TYPE is cred.provider,
@@ -215,7 +215,7 @@ function discoverProviders() {
       continue;
     }
     if (!builtin.has(providerType)) continue;
-    const models = getModels(providerType);
+    const models = getBuiltinModels(providerType);
     if (!models.length || typeof models[0].baseUrl !== "string") continue;
     table[name] = { provider: providerType, baseUrl: models[0].baseUrl, api: models[0].api, credType: cred.type, models };
   }

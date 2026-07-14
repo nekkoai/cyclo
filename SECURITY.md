@@ -2,20 +2,21 @@
 
 ## Supported versions
 
-Until the first public release, `main` is pre-release software. After release,
-security fixes will target the latest published version. Older releases may be
-asked to upgrade rather than receive a backport.
+Version 0.1.0 and later stable releases are supported until superseded by a
+newer stable release. Security fixes target the latest stable version;
+older releases may be asked to upgrade rather than receive a backport.
 
 ## Reporting a vulnerability
 
 Please do not disclose a suspected vulnerability in a public issue, discussion,
-or pull request. Use GitHub's private vulnerability reporting form:
+or pull request. When available for the published repository, use its private
+vulnerability reporting form:
 
 <https://github.com/glguida/cyclo/security/advisories/new>
 
-Private vulnerability reporting must be enabled in the repository settings
-before the first public release. If the form is temporarily unavailable,
-contact the maintainer through the GitHub profile without including exploit or
+Cyclo's local release tooling never reads or changes remote repository
+settings. If the private form is unavailable, contact the maintainer through a
+private channel listed on the publication profile without including exploit or
 credential details in a public message.
 
 Include, when possible:

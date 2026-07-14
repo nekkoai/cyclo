@@ -10,6 +10,7 @@ fail() {
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 python=${PYTHON:-python3}
+build_python=${CYCLO_RELEASE_BUILD_PYTHON:-}
 
 command -v "$python" >/dev/null 2>&1 || fail "Python not found: $python"
 command -v git >/dev/null 2>&1 || fail "Git is required"
@@ -33,6 +34,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 venv=$work_root/venv
+build_venv=$work_root/build-venv
 dist=$work_root/dist
 source_tree=$work_root/source
 empty_home=$work_root/home
@@ -62,14 +64,49 @@ unset PYTHONHOME PYTHONPATH \
     AGENTWS_RETRY_INITIAL_SECONDS AGENTWS_RETRY_MAX_SECONDS
 "$python" -m venv "$venv"
 
+if [ -z "$build_python" ]; then
+    printf '%s\n' '==> installing hash-locked build backend'
+    "$python" -m venv "$build_venv"
+    "$build_venv/bin/python" -m pip install \
+        --disable-pip-version-check \
+        --require-hashes \
+        --requirement "$repo_root/requirements/release.txt"
+    build_python=$build_venv/bin/python
+fi
+command -v "$build_python" >/dev/null 2>&1 \
+    || fail "build Python not found: $build_python"
+"$build_python" - "$repo_root/pyproject.toml" <<'PY'
+from importlib.metadata import version
+from pathlib import Path
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+with Path(sys.argv[1]).open("rb") as stream:
+    requirements = tomllib.load(stream)["build-system"]["requires"]
+expected = {}
+for requirement in requirements:
+    name, separator, expected_version = requirement.partition("==")
+    if not separator or not name or not expected_version:
+        raise SystemExit(f"release build backend is not exactly pinned: {requirement}")
+    expected[name] = expected_version
+actual = {name: version(name) for name in expected}
+if actual != expected:
+    raise SystemExit(f"release build backend mismatch: expected {expected}, found {actual}")
+PY
+
 printf '%s\n' '==> building release wheel'
-"$venv/bin/python" -m pip wheel \
+"$build_python" -m pip wheel \
     --disable-pip-version-check \
+    --no-build-isolation \
     --no-deps \
     --wheel-dir "$dist" \
     "$source_tree"
 
-set -- "$dist"/cyclo-*.whl
+set -- "$dist"/cyclo_agent-*.whl
 [ "$#" -eq 1 ] && [ -f "$1" ] || fail "expected exactly one Cyclo wheel in $dist"
 wheel=$1
 
@@ -88,14 +125,17 @@ forbidden_names = {
     "cyclo/vendor_gateway/ORIGIN.md",
     "cyclo/vendor_gateway/UPSTREAM.json",
 }
+upstream_https = b"github" + b".com/glguida/"
+upstream_ssh = b"git@" + b"github.com:glguida/"
+private_home = b"/home/" + b"glguida"
 forbidden_content = (
-    b"github.com/glguida/agentws",
-    b"github.com/glguida/multiagent",
-    b"git@github.com:glguida/agentws",
-    b"git@github.com:glguida/multiagent",
-    b"/home/glguida",
-    b"source_repository",
-    b"source_commit",
+    upstream_https + b"agentws",
+    upstream_https + b"multiagent",
+    upstream_ssh + b"agentws",
+    upstream_ssh + b"multiagent",
+    private_home,
+    b"source_" + b"repository",
+    b"source_" + b"commit",
 )
 
 problems = []
@@ -137,17 +177,34 @@ case $installed_root in
 esac
 
 printf '%s\n' '==> checking wheel-only commands and package resources'
-"$cyclo" --version
+[ "$("$cyclo" --version)" = "cyclo 0.1.0" ] \
+    || fail "installed command reports an unexpected release version"
+"$venv/bin/python" -c '
+from importlib.metadata import distribution
+dist = distribution("cyclo-agent")
+assert dist.metadata["Name"] == "cyclo-agent"
+assert dist.version == "0.1.0"
+import cyclo
+assert cyclo.__version__ == dist.version
+'
 
-gateway_help=$("$cyclo" gateway --help)
+gateway_help=$("$cyclo" gateway --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
 case $gateway_help in
     *destroy-store*) ;;
     *) fail "installed gateway help is incomplete" ;;
 esac
-destroy_help=$("$cyclo" gateway destroy-store --help)
+case $gateway_help in
+    *"credentials, subscriptions, and retained usage history"*) ;;
+    *) fail "installed gateway help does not disclose all retained store data" ;;
+esac
+destroy_help=$("$cyclo" gateway destroy-store --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
 case $destroy_help in
     *"--confirm VOLUME"*) ;;
-    *) fail "installed credential-destruction help is incomplete" ;;
+    *) fail "installed store-destruction confirmation help is incomplete" ;;
+esac
+case $destroy_help in
+    *"credentials, subscriptions, and retained usage history"*irreversib*|*irreversib*"credentials, subscriptions, and retained usage history"*) ;;
+    *) fail "installed store-destruction help does not disclose irreversible data loss" ;;
 esac
 
 templates=$("$cyclo" templates)

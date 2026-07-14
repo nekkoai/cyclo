@@ -2,6 +2,9 @@
 // Used by `cyclo gateway status`.
 
 import { readJson } from "./store.mjs";
+import { checkBuiltinRegistry } from "./pi-registry.mjs";
+
+checkBuiltinRegistry();
 
 const path = process.env.CYCLO_GATEWAY_AUTH_JSON ?? "/var/lib/cyclo-gateway/auth.json";
 const store = readJson(path) ?? {};

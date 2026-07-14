@@ -1,9 +1,9 @@
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools==83.0.0", "wheel==0.47.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cyclo"
+name = "cyclo-agent"
 version = "0.1.0"
 description = "Run Git-defined agent teams through an isolated credential proxy"
 readme = "README.md"
@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Gianluca Guida" }]
 keywords = ["agents", "docker", "llm", "multi-agent", "orchestration"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "Operating System :: POSIX :: Linux",
@@ -33,6 +33,7 @@ dependencies = []
 dev = [
   "build>=1.2",
   "pytest>=8",
+  "tomli>=2; python_version < '3.11'",
   "twine>=5",
 ]
 
