@@ -62,8 +62,12 @@ git archive --format=tar HEAD | tar -xf - -C "$source_tree"
 printf '%s\n' '==> source tests'
 (
     cd "$source_tree"
+    "$venv/bin/python" -m pytest -q \
+        --ignore=tests/test_release_manifest.py \
+        --ignore=tests/test_secret_scan.py
     GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree \
-        "$venv/bin/python" -m pytest -q
+        "$venv/bin/python" -m pytest -q \
+        tests/test_release_manifest.py tests/test_secret_scan.py
     node --test tests/*.mjs
     find . -type f -exec sh -c '
         for script do
