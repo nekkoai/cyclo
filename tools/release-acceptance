@@ -1,0 +1,210 @@
+#!/bin/sh
+# Exercise Cyclo as a wheel-installed application in an otherwise empty home.
+set -eu
+
+fail() {
+    printf '%s\n' "release acceptance: $*" >&2
+    exit 1
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+python=${PYTHON:-python3}
+
+command -v "$python" >/dev/null 2>&1 || fail "Python not found: $python"
+command -v git >/dev/null 2>&1 || fail "Git is required"
+
+"$python" -c '
+import sys
+if sys.version_info < (3, 10):
+    raise SystemExit("Cyclo requires Python 3.10 or newer")
+'
+
+work_root=$(mktemp -d "${TMPDIR:-/tmp}/cyclo-release-acceptance.XXXXXX")
+cleanup() {
+    status=$?
+    trap - 0
+    rm -rf -- "$work_root"
+    exit "$status"
+}
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+venv=$work_root/venv
+dist=$work_root/dist
+source_tree=$work_root/source
+empty_home=$work_root/home
+state_root=$work_root/state
+team=$work_root/team
+project=$work_root/project
+doctor_log=$work_root/doctor.log
+
+mkdir -p "$dist" "$source_tree" "$empty_home" "$project"
+
+# Build from exactly the files that could enter a source publication. This
+# prevents setuptools from reusing ignored build/lib files deleted from source.
+(
+    cd "$repo_root"
+    git ls-files --cached --others --exclude-standard |
+        while IFS= read -r path; do
+            [ -e "$path" ] || continue
+            cp -a --parents -- "$path" "$source_tree"
+        done
+)
+export HOME=$empty_home
+export XDG_STATE_HOME=$empty_home/.local/state
+unset PYTHONHOME PYTHONPATH \
+    CYCLO_RUNTIME_IMAGE CYCLO_GATEWAY_IMAGE CYCLO_GATEWAY_STORE CYCLO_STATE_ROOT \
+    PI_CODING_AGENT_DIR \
+    AGENTWS_MAX_JOB_ATTEMPTS AGENTWS_MAX_CONSECUTIVE_FAILURES \
+    AGENTWS_RETRY_INITIAL_SECONDS AGENTWS_RETRY_MAX_SECONDS
+"$python" -m venv "$venv"
+
+printf '%s\n' '==> building release wheel'
+"$venv/bin/python" -m pip wheel \
+    --disable-pip-version-check \
+    --no-deps \
+    --wheel-dir "$dist" \
+    "$source_tree"
+
+set -- "$dist"/cyclo-*.whl
+[ "$#" -eq 1 ] && [ -f "$1" ] || fail "expected exactly one Cyclo wheel in $dist"
+wheel=$1
+
+printf '%s\n' '==> auditing wheel contents'
+"$venv/bin/python" - "$wheel" <<'PY'
+import sys
+import zipfile
+
+wheel = sys.argv[1]
+forbidden_names = {
+    "cyclo/provenance.py",
+    "cyclo/runtime.lock.json",
+    "cyclo/_agentws/LICENSE",
+    "cyclo/_agentws/UPSTREAM.json",
+    "cyclo/vendor_gateway/LICENSE",
+    "cyclo/vendor_gateway/ORIGIN.md",
+    "cyclo/vendor_gateway/UPSTREAM.json",
+}
+forbidden_content = (
+    b"github.com/glguida/agentws",
+    b"github.com/glguida/multiagent",
+    b"git@github.com:glguida/agentws",
+    b"git@github.com:glguida/multiagent",
+    b"/home/glguida",
+    b"source_repository",
+    b"source_commit",
+)
+
+problems = []
+with zipfile.ZipFile(wheel) as archive:
+    names = set(archive.namelist())
+    problems.extend(sorted(names & forbidden_names))
+    for name in sorted(names):
+        data = archive.read(name)
+        for marker in forbidden_content:
+            if marker in data:
+                problems.append(f"{name}: contains forbidden publication metadata")
+
+if problems:
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    raise SystemExit("release wheel contains stale or private source metadata")
+PY
+
+printf '%s\n' '==> installing wheel into isolated environment'
+"$venv/bin/python" -m pip install \
+    --disable-pip-version-check \
+    --no-deps \
+    --force-reinstall \
+    "$wheel"
+
+# From here on, neither the source checkout nor user-local executables are on
+# Python's or the shell's search path. Git and Docker remain available from
+# ordinary system locations.
+export PATH=$venv/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
+cd "$work_root"
+
+cyclo=$venv/bin/cyclo
+installed_root=$(
+    "$venv/bin/python" -c 'import pathlib, cyclo; print(pathlib.Path(cyclo.__file__).resolve().parent)'
+)
+case $installed_root in
+    "$venv"/*) ;;
+    *) fail "Cyclo imported outside the isolated environment: $installed_root" ;;
+esac
+
+printf '%s\n' '==> checking wheel-only commands and package resources'
+"$cyclo" --version
+
+templates=$("$cyclo" templates)
+expected_templates=$(printf '%s\n' \
+    adversarial-audit \
+    plan-execute-verify \
+    test-driven-repair)
+[ "$templates" = "$expected_templates" ] || {
+    printf '%s\n' "unexpected template list:" "$templates" >&2
+    fail "packaged templates are incomplete"
+}
+
+"$cyclo" init "$team" \
+    --template test-driven-repair \
+    --model openai-codex/release-acceptance
+"$cyclo" validate "$team"
+
+dry_run=$(
+    "$cyclo" --state-root "$state_root" run \
+        --name release-acceptance \
+        --dry-run \
+        "$team" \
+        "$project"
+)
+printf '%s\n' "$dry_run"
+case $dry_run in
+    *"cyclo-runtime:"*) ;;
+    *) fail "dry-run did not use the packaged Cyclo runtime image" ;;
+esac
+case $dry_run in
+    *"type=bind,src=$team,dst=/team"*) ;;
+    *) fail "dry-run did not isolate the team mount" ;;
+esac
+case $dry_run in
+    *"type=bind,src=$project,dst=/workspace"*) ;;
+    *) fail "dry-run did not isolate the project mount" ;;
+esac
+case $dry_run in
+    *multiagent*|*"$HOME/agentws"*|*"$HOME/multiagent"*)
+        fail "dry-run referenced an external upstream checkout"
+        ;;
+esac
+
+printf '%s\n' '==> checking installed runtime'
+doctor_status=0
+"$cyclo" --state-root "$state_root" doctor >"$doctor_log" 2>&1 || doctor_status=$?
+cat "$doctor_log"
+
+grep -F 'ok  bundled job-loop ABI:' "$doctor_log" >/dev/null \
+    || fail "doctor did not find the packaged job-loop runtime"
+grep -F 'ok  Cyclo credential gateway API:' "$doctor_log" >/dev/null \
+    || fail "doctor did not load Cyclo's packaged gateway"
+
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    [ "$doctor_status" -eq 0 ] || fail "doctor failed with an accessible Docker daemon"
+    grep -F 'ok  Docker daemon:' "$doctor_log" >/dev/null \
+        || fail "doctor did not accept the Docker daemon"
+else
+    [ "$doctor_status" -eq 1 ] \
+        || fail "doctor returned $doctor_status when Docker was unavailable"
+    if grep -F 'no  Docker daemon:' "$doctor_log" >/dev/null; then
+        :
+    elif grep -F 'error: Docker is not installed or not on PATH' "$doctor_log" >/dev/null; then
+        :
+    else
+        fail "doctor did not report the unavailable Docker dependency"
+    fi
+    printf '%s\n' 'SKIP: Docker daemon is unavailable; wheel integrity checks passed.'
+fi
+
+printf '%s\n' 'release acceptance: PASS'

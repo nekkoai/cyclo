@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    echo "Usage: task-list"
+    exit 1
+}
+
+[ "$#" -eq 0 ] || usage
+require_tasks_dir
+
+found=0
+for task_dir in "$TASKS_DIR"/*; do
+    [ -d "$task_dir" ] || continue
+    found=1
+    task_id="$(basename "$task_dir")"
+    state="$(cat "$task_dir/state" 2>/dev/null || printf 'open')"
+    printf '%s\t%s\n' "$task_id" "$state"
+done
+[ "$found" -eq 1 ] || true

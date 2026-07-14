@@ -1,0 +1,35 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+require_jobs_dir
+
+for job_dir in "$JOBS_DIR"/*; do
+    [ -d "$job_dir" ] || continue
+    [ -f "$job_dir/status" ] || continue
+
+    status="$(cat "$job_dir/status" 2>/dev/null || true)"
+    case "$status" in
+        claimed|running) ;;
+        *) continue ;;
+    esac
+
+    job_name="$(basename "$job_dir")"
+    if [ ! -f "$job_dir/agent-id" ]; then
+        echo "$job_name (missing agent-id, status: $status)"
+        continue
+    fi
+
+    agent_id="$(cat "$job_dir/agent-id" 2>/dev/null || true)"
+    if [ -z "$agent_id" ]; then
+        echo "$job_name (empty agent-id, status: $status)"
+        continue
+    fi
+
+    if [ ! -d "$AGENTWS_ROOT/agents/$agent_id" ]; then
+        echo "$job_name (agent '$agent_id' has no agents/$agent_id directory, status: $status)"
+    fi
+done

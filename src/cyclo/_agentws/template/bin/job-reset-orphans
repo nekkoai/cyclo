@@ -1,0 +1,53 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+require_jobs_dir
+
+count=0
+
+for job_dir in "$JOBS_DIR"/*; do
+    [ -d "$job_dir" ] || continue
+    [ -f "$job_dir/status" ] || continue
+
+    status="$(cat "$job_dir/status" 2>/dev/null || true)"
+    case "$status" in
+        claimed|running) ;;
+        *) continue ;;
+    esac
+
+    job_name="$(basename "$job_dir")"
+    reset_reason=""
+
+    if [ ! -f "$job_dir/agent-id" ]; then
+        reset_reason="missing agent-id"
+    else
+        agent_id="$(cat "$job_dir/agent-id" 2>/dev/null || true)"
+        if [ -z "$agent_id" ]; then
+            reset_reason="empty agent-id"
+        elif [ ! -d "$AGENTWS_ROOT/agents/$agent_id" ]; then
+            reset_reason="agent '$agent_id' has no agents/$agent_id directory"
+        fi
+    fi
+
+    [ -n "$reset_reason" ] || continue
+
+    echo "Resetting orphaned job: $job_name ($reset_reason)"
+    if [ -d "$job_dir/lock" ] && ! rmdir "$job_dir/lock" 2>/dev/null; then
+        echo "error: cannot reset orphaned job '$job_name': lock directory is not empty" >&2
+        continue
+    fi
+    rm -f "$job_dir/agent-id"
+    write_file_atomic "$job_dir/status" "pending"
+    append_log "$job_dir" "Reset by job-reset-orphans" "$reset_reason."
+    count=$((count + 1))
+done
+
+if [ "$count" -eq 0 ]; then
+    echo "No orphaned jobs found"
+else
+    echo "Reset $count orphaned jobs"
+fi

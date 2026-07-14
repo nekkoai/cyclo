@@ -1,0 +1,74 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+AGENTS_DIR="$AGENTWS_ROOT/agents"
+ROLES_DIR="${AGENTWS_TEAM_ROLES_DIR:-$AGENTWS_ROOT/roles}"
+
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    echo "Usage: agent-new <agent-id> <role>" >&2
+    exit 1
+}
+
+[ "$#" -eq 2 ] || usage
+
+AGENT_ID="$1"
+ROLE="$2"
+
+validate_agent_id "$AGENT_ID"
+validate_role "$ROLE"
+
+[ -f "$ROLES_DIR/$ROLE.md" ] || die "role file not found: $ROLES_DIR/$ROLE.md"
+
+mkdir -p "$AGENTS_DIR"
+
+AGENT_DIR="$AGENTS_DIR/$AGENT_ID"
+CURRENT_JOB_FILE="$AGENT_DIR/current-job"
+
+agent_has_active_job() {
+    [ -f "$CURRENT_JOB_FILE" ] || return 1
+    job_id="$(cat "$CURRENT_JOB_FILE" 2>/dev/null || true)"
+    [ -n "$job_id" ] || return 1
+    validate_job_id "$job_id"
+
+    job_dir="$JOBS_DIR/$job_id"
+    [ -d "$job_dir" ] || return 1
+    [ -f "$job_dir/status" ] || return 1
+    [ -f "$job_dir/agent-id" ] || return 1
+
+    owner="$(cat "$job_dir/agent-id" 2>/dev/null || true)"
+    [ "$owner" = "$AGENT_ID" ] || return 1
+
+    status="$(cat "$job_dir/status" 2>/dev/null || true)"
+    case "$status" in
+        claimed|running)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+if [ -d "$AGENT_DIR" ]; then
+    if [ -f "$AGENT_DIR/role" ]; then
+        existing_role="$(cat "$AGENT_DIR/role" 2>/dev/null || true)"
+        [ "$existing_role" = "$ROLE" ] || die "agent '$AGENT_ID' already exists with role '$existing_role'"
+    else
+        write_file_atomic "$AGENT_DIR/role" "$ROLE"
+    fi
+
+    if agent_has_active_job; then
+        die "agent '$AGENT_ID' is busy"
+    fi
+else
+    mkdir "$AGENT_DIR" 2>/dev/null || die "cannot create agent '$AGENT_ID'"
+    write_file_atomic "$AGENT_DIR/name" "$AGENT_ID"
+    write_file_atomic "$AGENT_DIR/role" "$ROLE"
+    write_file_atomic "$AGENT_DIR/created_at" "$(timestamp)"
+fi
+
+write_file_atomic "$AGENT_DIR/name" "$AGENT_ID"
+printf '%s\n' "$AGENT_DIR"

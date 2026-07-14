@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# AgentWS team file
+# Format: <name> <role> <agent> [model]
+# Agent is one of: pi, pi-interactive, codex, claude
+# The built-in console assistant is started by tools/agentws, not this file.
+
+planner-1 planner pi
+implementer-1 implementer pi
+reviewer-1 reviewer pi
+judge-1 judge pi
+committer-1 committer pi

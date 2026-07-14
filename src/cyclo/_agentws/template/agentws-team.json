@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "roster": "default.team",
+  "protocol": "AGENTS.md",
+  "roles_dir": "roles",
+  "console": {
+    "role": "console"
+  }
+}

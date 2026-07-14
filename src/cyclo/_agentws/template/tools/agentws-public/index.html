@@ -1,0 +1,77 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AgentWS Control Room</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="side-rail">
+        <div class="brand-mark" aria-label="AgentWS">
+          <span>AW</span>
+        </div>
+        <nav class="rail-nav" aria-label="Views">
+          <button class="rail-button active" data-view="chat" title="Chat" aria-label="Chat">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.5C5 3.57 6.57 2 8.5 2h7A3.5 3.5 0 0 1 19 5.5v5A3.5 3.5 0 0 1 15.5 14H12l-4.8 4.1A.75.75 0 0 1 6 17.53V14.3A3.5 3.5 0 0 1 3 10.85V8A2.5 2.5 0 0 1 5 5.55zm3.5-1.8A1.8 1.8 0 0 0 6.7 5.5v5A1.8 1.8 0 0 0 8.5 12.3h.2v2.75l2.67-2.3.2-.45h3.93a1.8 1.8 0 0 0 1.8-1.8v-5a1.8 1.8 0 0 0-1.8-1.8zm-3.2 4A.8.8 0 0 0 4.7 8.5v2.35c0 .68.42 1.26 1 1.5V7.7zm3.2-.45h7v1.5h-7zm0 3h4.9v1.5H8.5z"/></svg>
+          </button>
+          <button class="rail-button" data-view="board" title="Tasks" aria-label="Tasks">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h5v14H4zM10.5 5h9v6h-9zM10.5 13h9v6h-9z"/></svg>
+          </button>
+          <button class="rail-button" data-view="pipeline" title="Jobs" aria-label="Jobs">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7.5A2.5 2.5 0 0 1 7.5 5h2A2.5 2.5 0 0 1 12 7.5V8h4V6l4 3-4 3v-2h-4v.5A2.5 2.5 0 0 1 9.5 13h-2A2.5 2.5 0 0 1 5 10.5zm2.5-.8a.8.8 0 0 0-.8.8v3c0 .44.36.8.8.8h2c.44 0 .8-.36.8-.8v-3a.8.8 0 0 0-.8-.8zM5 17h14v2H5z"/></svg>
+          </button>
+          <button class="rail-button" data-view="agents" title="Agents" aria-label="Agents">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8m0 2c3.4 0 6 1.8 6 4.2V19H2v-1.8C2 14.8 4.6 13 8 13m8.5-2.2A3.3 3.3 0 1 1 18 4.4a3.3 3.3 0 0 1-1.5 6.4m.4 2.2c2.9 0 5.1 1.5 5.1 3.5V19h-5.7v-1.8c0-1.5-.7-2.9-1.9-4 .75-.14 1.6-.22 2.5-.22"/></svg>
+          </button>
+          <button class="rail-button" data-view="map" title="Map" aria-label="Map">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 5a2.5 2.5 0 1 1 2.24 3.61l2.32 3.48a2.5 2.5 0 0 1 1.88 0l2.32-3.48A2.5 2.5 0 1 1 17 9a2.6 2.6 0 0 1-.4-.03l-2.36 3.54a2.5 2.5 0 1 1-4.48 0L7.4 8.97A2.5 2.5 0 0 1 6.5 9a2.5 2.5 0 0 1 0-4m0 2.9a.4.4 0 1 0 0-.8.4.4 0 0 0 0 .8M17.5 7.9a.4.4 0 1 0 0-.8.4.4 0 0 0 0 .8M12 15.9a.4.4 0 1 0 0-.8.4.4 0 0 0 0 .8"/></svg>
+          </button>
+        </nav>
+        <div class="rail-status" id="railStatus"></div>
+      </aside>
+
+      <main class="main-stage">
+        <header class="top-bar">
+          <div class="title-stack">
+            <p class="eyebrow">AgentWS</p>
+            <h1>Control Room</h1>
+          </div>
+          <div class="toolbar">
+            <div class="root-field" title="AgentWS root" aria-label="AgentWS root">
+              <span>Root</span>
+              <code id="rootInput"></code>
+            </div>
+            <label class="search-field" title="Search">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 4a6.5 6.5 0 0 1 5.15 10.46l4.45 4.44-1.2 1.2-4.44-4.45A6.5 6.5 0 1 1 10.5 4m0 1.7a4.8 4.8 0 1 0 0 9.6 4.8 4.8 0 0 0 0-9.6"/></svg>
+              <input id="searchInput" type="search" placeholder="Search">
+            </label>
+            <button id="refreshButton" class="icon-button" title="Refresh" aria-label="Refresh">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.76-4.24L13 11h8V3z"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <section class="metric-grid" id="metrics"></section>
+
+        <section class="view-panel active" id="view-chat"></section>
+        <section class="view-panel" id="view-board"></section>
+        <section class="view-panel" id="view-pipeline"></section>
+        <section class="view-panel" id="view-agents"></section>
+        <section class="view-panel" id="view-map"></section>
+      </main>
+
+      <aside class="inspector" id="inspector">
+        <div class="inspector-empty">
+          <div class="empty-symbol">AW</div>
+          <h2>No Selection</h2>
+        </div>
+      </aside>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,48 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+require_jobs_dir
+
+usage() {
+    echo "Usage: job-mine --agent-id <agent-id>"
+    exit 1
+}
+
+AGENT_ID=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --agent-id)
+            [ "$#" -ge 2 ] || die "$1 requires an agent ID"
+            AGENT_ID="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            die "unexpected argument '$1'"
+            ;;
+    esac
+done
+
+[ -n "$AGENT_ID" ] || usage
+validate_agent_id "$AGENT_ID"
+
+for job_dir in "$JOBS_DIR"/*; do
+    [ -d "$job_dir" ] || continue
+    [ -f "$job_dir/agent-id" ] || continue
+
+    owner="$(cat "$job_dir/agent-id" 2>/dev/null || true)"
+    if [ "$owner" = "$AGENT_ID" ]; then
+        job_name="$(basename "$job_dir")"
+        status="$(cat "$job_dir/status" 2>/dev/null || echo "unknown")"
+        task_id="$(cat "$job_dir/task-id" 2>/dev/null || echo "-")"
+        role="$(cat "$job_dir/role" 2>/dev/null || echo "-")"
+        echo "$job_name ($status, task: $task_id, role: $role)"
+    fi
+done

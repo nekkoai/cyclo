@@ -1,0 +1,7 @@
+# <name> <role> <agent> <provider/model>
+planner-1        planner        pi openai-codex/gpt-5.4
+threat-modeler-1 threat-modeler pi openai-codex/gpt-5.5
+inspector-1      inspector      pi openai-codex/gpt-5.3-codex
+inspector-2      inspector      pi openai-codex/gpt-5.4-mini
+challenger-1     challenger     pi openai-codex/gpt-5.5
+synthesizer-1    synthesizer    pi openai-codex/gpt-5.4

@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyclo"
+version = "0.1.0"
+description = "Run Git-defined agent teams through an isolated credential proxy"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Gianluca Guida" }]
+keywords = ["agents", "docker", "llm", "multi-agent", "orchestration"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "pytest>=8",
+  "twine>=5",
+]
+
+[project.scripts]
+cyclo = "cyclo.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/glguida/cyclo"
+Repository = "https://github.com/glguida/cyclo"
+Issues = "https://github.com/glguida/cyclo/issues"
+Security = "https://github.com/glguida/cyclo/security/policy"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cyclo = [
+  "team_templates/*",
+  "team_templates/*/*",
+  "team_templates/*/roles/*",
+]
+"cyclo._agentws" = [
+  "template/*",
+  "template/bin/*",
+  "template/roles/*",
+  "template/tools/*",
+  "template/tools/agentws-public/*",
+]
+"cyclo.vendor_gateway" = [
+  "runtime_context/*",
+  "runtime_context/.dockerignore",
+  "gateway_context/*",
+  "gateway_context/.dockerignore",
+]
+"cyclo.dashboard_static" = ["*.html", "*.css", "*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

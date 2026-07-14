@@ -1,0 +1,49 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+FILTER="${1:-}"
+[ "$#" -le 1 ] || die "unexpected argument '$2'"
+
+if [ -n "$FILTER" ]; then
+    require_valid_status "$FILTER"
+fi
+
+if [ ! -d "$JOBS_DIR" ]; then
+    echo "No jobs directory found."
+    exit 0
+fi
+
+found=0
+for job_dir in "$JOBS_DIR"/*; do
+    [ -d "$job_dir" ] || continue
+    [ -f "$job_dir/status" ] || continue
+
+    job_id="$(basename "$job_dir")"
+    status="$(cat "$job_dir/status" 2>/dev/null || echo "unknown")"
+
+    if [ -n "$FILTER" ] && [ "$status" != "$FILTER" ]; then
+        continue
+    fi
+
+    task_id="$(cat "$job_dir/task-id" 2>/dev/null || echo "-")"
+    role="$(cat "$job_dir/role" 2>/dev/null || echo "-")"
+    agent=""
+    if [ -f "$job_dir/agent-id" ]; then
+        agent="  ($(cat "$job_dir/agent-id"))"
+    fi
+
+    printf '%-24s  %-18s  %-10s  %-14s%s\n' "$job_id" "$task_id" "$status" "$role" "$agent"
+    found=1
+done
+
+if [ "$found" -eq 0 ]; then
+    if [ -n "$FILTER" ]; then
+        echo "No jobs with status '$FILTER'."
+    else
+        echo "No jobs found."
+    fi
+fi

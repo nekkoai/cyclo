@@ -1,0 +1,5 @@
+# <name> <role> <agent> <provider/model>
+coordinator planner     pi openai-codex/gpt-5.4
+repairer    implementer pi openai-codex/gpt-5.3-codex
+verifier    judge       pi openai-codex/gpt-5.5
+integrator  committer   pi openai-codex/gpt-5.4-mini

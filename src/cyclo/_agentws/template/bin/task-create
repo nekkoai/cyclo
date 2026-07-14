@@ -1,0 +1,361 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    echo "Usage: task-create <task-id> <spec-file>"
+    echo ""
+    echo "Create a task and enqueue its initial planner job."
+    exit 1
+}
+
+path_exists() {
+    [ -e "$1" ] || [ -L "$1" ]
+}
+
+regular_file() {
+    [ -f "$1" ] && [ ! -L "$1" ]
+}
+
+regular_nonempty_file() {
+    regular_file "$1" && [ -s "$1" ]
+}
+
+real_directory() {
+    [ -d "$1" ] && [ ! -L "$1" ]
+}
+
+file_equals() {
+    regular_file "$1" && [ "$(cat "$1" 2>/dev/null || true)" = "$2" ]
+}
+
+mask_commit_signals() {
+    trap '' HUP INT TERM
+}
+
+catch_signals() {
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+remove_owned_stage() {
+    stage="$1"
+    marker="$2"
+    [ -n "$TRANSACTION_ID" ] || return 0
+    real_directory "$stage" || return 0
+    file_equals "$stage/$marker" "$TRANSACTION_ID" || return 0
+    rm -rf -- "$stage"
+}
+
+cleanup() {
+    status=$?
+    trap - 0 HUP INT TERM
+    set +e
+    if [ "$status" -ne 0 ] && [ "${COMMIT_STARTED:-0}" -eq 0 ]; then
+        [ "${OWN_TASK_STAGE:-0}" -eq 0 ] \
+            || remove_owned_stage "$TASK_STAGE" ".creating"
+        [ "${OWN_PLAN_STAGE:-0}" -eq 0 ] \
+            || remove_owned_stage "$PLAN_JOB_STAGE" ".task-create-transaction"
+    fi
+    exec 9>&-
+    exit "$status"
+}
+
+task_is_complete() {
+    directory="$1"
+    transaction="$2"
+    expected_state="${3:-any}"
+
+    real_directory "$directory" \
+        && file_equals "$directory/.creating" "$transaction" \
+        && regular_nonempty_file "$directory/spec.md" \
+        && regular_file "$directory/log.md" \
+        && regular_file "$directory/state" \
+        || return 1
+
+    state="$(cat "$directory/state" 2>/dev/null || true)"
+    if [ "$expected_state" = "open" ]; then
+        [ "$state" = "open" ]
+        return
+    fi
+    case "$state" in
+        open|done) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+planner_job_has_complete_base() {
+    directory="$1"
+    transaction="$2"
+
+    real_directory "$directory" \
+        && file_equals "$directory/.task-create-transaction" "$transaction" \
+        && real_directory "$directory/workspace" \
+        && regular_nonempty_file "$directory/spec.md" \
+        && file_equals "$directory/role" "planner" \
+        && file_equals "$directory/task-id" "$TASK_ID" \
+        && regular_file "$directory/log.md"
+}
+
+planner_job_is_staged() {
+    directory="$1"
+    transaction="$2"
+    planner_job_has_complete_base "$directory" "$transaction" \
+        && ! path_exists "$directory/status"
+}
+
+planner_job_is_complete() {
+    directory="$1"
+    transaction="$2"
+
+    planner_job_has_complete_base "$directory" "$transaction" \
+        && regular_file "$directory/status" \
+        || return 1
+
+    status="$(cat "$directory/status" 2>/dev/null || true)"
+    case "$status" in
+        pending|claimed|running|done|failed) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+planner_job_is_recoverable() {
+    directory="$1"
+    transaction="$2"
+    planner_job_has_complete_base "$directory" "$transaction" || return 1
+    if path_exists "$directory/status"; then
+        planner_job_is_complete "$directory" "$transaction"
+        return
+    fi
+    return 0
+}
+
+read_transaction() {
+    marker="$1"
+    regular_nonempty_file "$marker" || return 1
+    cat "$marker"
+}
+
+publish_noreplace() {
+    source="$1"
+    destination="$2"
+    label="$3"
+
+    if ! mv -nT -- "$source" "$destination"; then
+        die "failed to publish $label: $destination"
+    fi
+    if path_exists "$source"; then
+        die "cannot publish $label because the destination already exists: $destination"
+    fi
+    path_exists "$destination" || die "failed to publish $label: $destination"
+}
+
+finish_commit() {
+    publish_task="$1"
+    publish_job="$2"
+
+    # The two queue roots may be separate bind mounts, so the pair cannot be
+    # published with one rename. Ignore catchable signals across both
+    # no-clobber renames; the transaction markers handle SIGKILL recovery.
+    COMMIT_STARTED=1
+    mask_commit_signals
+    if [ "$publish_task" -eq 1 ]; then
+        publish_noreplace "$TASK_STAGE" "$TASK_DIR" "task"
+        OWN_TASK_STAGE=0
+    fi
+    if [ "$publish_job" -eq 1 ]; then
+        publish_noreplace "$PLAN_JOB_STAGE" "$PLAN_JOB_DIR" "initial planner job"
+        OWN_PLAN_STAGE=0
+    fi
+    task_is_complete "$TASK_DIR" "$TRANSACTION_ID" \
+        || die "published task '$TASK_ID' is incomplete"
+    planner_job_has_complete_base "$PLAN_JOB_DIR" "$TRANSACTION_ID" \
+        || die "published initial planner job '$PLAN_JOB_ID' is incomplete"
+    if ! path_exists "$PLAN_JOB_DIR/status"; then
+        write_file_atomic "$PLAN_JOB_DIR/status" "pending"
+    fi
+    planner_job_is_complete "$PLAN_JOB_DIR" "$TRANSACTION_ID" \
+        || die "published initial planner job '$PLAN_JOB_ID' is incomplete"
+    rm -f -- "$TASK_DIR/.creating" \
+        || die "cannot finalize task '$TASK_ID' creation"
+    COMMIT_STARTED=0
+    catch_signals
+}
+
+recover_interrupted_commit() {
+    final_task=0
+    final_job=0
+    staged_task=0
+    staged_job=0
+    path_exists "$TASK_DIR" && final_task=1
+    path_exists "$PLAN_JOB_DIR" && final_job=1
+    path_exists "$TASK_STAGE" && staged_task=1
+    path_exists "$PLAN_JOB_STAGE" && staged_job=1
+
+    if [ "$final_task" -eq 0 ] && [ "$final_job" -eq 0 ] \
+        && [ "$staged_task" -eq 0 ] && [ "$staged_job" -eq 0 ]; then
+        return 1
+    fi
+
+    # A task-side .creating token plus the same persistent token in the planner
+    # job is the only state accepted as an interrupted commit. Ordinary or
+    # malformed collisions are never removed or silently adopted.
+    if [ "$final_task" -eq 1 ] && [ "$final_job" -eq 1 ] \
+        && [ "$staged_task" -eq 0 ] && [ "$staged_job" -eq 0 ]; then
+        TRANSACTION_ID="$(read_transaction "$TASK_DIR/.creating" 2>/dev/null || true)"
+        [ -n "$TRANSACTION_ID" ] \
+            && task_is_complete "$TASK_DIR" "$TRANSACTION_ID" \
+            && planner_job_is_recoverable "$PLAN_JOB_DIR" "$TRANSACTION_ID" \
+            || die "task '$TASK_ID' collides with an existing or corrupt task/planner pair"
+        finish_commit 0 0
+        return 0
+    fi
+
+    if [ "$final_task" -eq 1 ] && [ "$final_job" -eq 0 ] \
+        && [ "$staged_task" -eq 0 ] && [ "$staged_job" -eq 1 ]; then
+        TRANSACTION_ID="$(read_transaction "$TASK_DIR/.creating" 2>/dev/null || true)"
+        [ -n "$TRANSACTION_ID" ] \
+            && task_is_complete "$TASK_DIR" "$TRANSACTION_ID" \
+            && planner_job_is_staged "$PLAN_JOB_STAGE" "$TRANSACTION_ID" \
+            || die "task '$TASK_ID' has an ambiguous or corrupt interrupted creation"
+        finish_commit 0 1
+        return 0
+    fi
+
+    if [ "$final_task" -eq 0 ] && [ "$final_job" -eq 0 ] \
+        && [ "$staged_task" -eq 1 ] && [ "$staged_job" -eq 1 ]; then
+        TRANSACTION_ID="$(read_transaction "$TASK_STAGE/.creating" 2>/dev/null || true)"
+        [ -n "$TRANSACTION_ID" ] \
+            && task_is_complete "$TASK_STAGE" "$TRANSACTION_ID" "open" \
+            && planner_job_is_staged "$PLAN_JOB_STAGE" "$TRANSACTION_ID" \
+            || die "task '$TASK_ID' has ambiguous or corrupt staged creation data"
+        finish_commit 1 1
+        return 0
+    fi
+
+    die "task '$TASK_ID' collides with ambiguous task or planner creation state"
+}
+
+create_task_stage() {
+    mask_commit_signals
+    mkdir -m 700 "$TASK_STAGE" 2>/dev/null \
+        || die "cannot stage task '$TASK_ID'"
+    printf '%s\n' "$TRANSACTION_ID" > "$TASK_STAGE/.creating" \
+        || die "cannot mark staged task '$TASK_ID'"
+    OWN_TASK_STAGE=1
+    catch_signals
+
+    cp -- "$SPEC_FILE" "$TASK_STAGE/spec.md"
+    : > "$TASK_STAGE/log.md"
+    write_file_atomic "$TASK_STAGE/state" "open"
+}
+
+create_planner_job_stage() {
+    mask_commit_signals
+    mkdir -m 700 "$PLAN_JOB_STAGE" 2>/dev/null \
+        || die "cannot stage initial planner job '$PLAN_JOB_ID'"
+    printf '%s\n' "$TRANSACTION_ID" > "$PLAN_JOB_STAGE/.task-create-transaction" \
+        || die "cannot mark staged initial planner job '$PLAN_JOB_ID'"
+    OWN_PLAN_STAGE=1
+    catch_signals
+
+    mkdir "$PLAN_JOB_STAGE/workspace"
+    cat > "$PLAN_JOB_STAGE/spec.md" <<EOF
+# Plan for task $TASK_ID
+
+## Task
+$TASK_ID
+
+## Objective
+Read the task with \`bin/task-show $TASK_ID\`, update task understanding with
+\`bin/task-comment $TASK_ID <message>\`, and create the first jobs needed to
+complete this task.
+
+## Acceptance Criteria
+The task has a clear initial plan, and any jobs needed next have been created
+with \`task-id=$TASK_ID\`.
+
+## When Done
+Create the required follow-up jobs for this task, then close this planner job.
+The task is complete only when a planner decides it is complete and records the
+result with \`bin/task-result $TASK_ID <result-file>\`.
+EOF
+    write_file_atomic "$PLAN_JOB_STAGE/role" "planner"
+    write_file_atomic "$PLAN_JOB_STAGE/task-id" "$TASK_ID"
+    : > "$PLAN_JOB_STAGE/log.md"
+}
+
+TASK_ID=""
+SPEC_FILE=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            usage
+            ;;
+        *)
+            if [ -z "$TASK_ID" ]; then
+                TASK_ID="$1"
+            elif [ -z "$SPEC_FILE" ]; then
+                SPEC_FILE="$1"
+            else
+                die "unexpected argument '$1'"
+            fi
+            shift
+            ;;
+    esac
+done
+
+[ -n "$TASK_ID" ] || usage
+[ -n "$SPEC_FILE" ] || die "spec file required"
+[ "$SPEC_FILE" = "-" ] && die "pass a spec file path, not stdin"
+[ -f "$SPEC_FILE" ] || die "spec file '$SPEC_FILE' does not exist"
+[ -s "$SPEC_FILE" ] || die "spec file '$SPEC_FILE' is empty"
+
+validate_task_id "$TASK_ID"
+[ "$TASK_ID" != "." ] && [ "$TASK_ID" != ".." ] \
+    || die "invalid task ID '$TASK_ID'"
+require_tasks_dir
+require_jobs_dir
+command -v flock >/dev/null 2>&1 || die "required command not found: flock"
+
+TASK_DIR="$TASKS_DIR/$TASK_ID"
+PLAN_JOB_ID="$TASK_ID-plan"
+PLAN_JOB_DIR="$JOBS_DIR/$PLAN_JOB_ID"
+TASK_STAGE="$TASKS_DIR/.$TASK_ID.task-create-stage"
+PLAN_JOB_STAGE="$JOBS_DIR/.$PLAN_JOB_ID.task-create-stage"
+TRANSACTION_ID=""
+OWN_TASK_STAGE=0
+OWN_PLAN_STAGE=0
+COMMIT_STARTED=0
+
+trap cleanup 0
+catch_signals
+
+LOCK_FILE="$TASKS_DIR/.task-create.lock"
+# Keep one inode in the persistent queue and hold its advisory lock for all
+# inspection, staging, recovery, and publication. Unlike PID locks, flock is
+# released by the kernel even after an uncatchable process death.
+exec 9>>"$LOCK_FILE"
+flock -x 9 || die "cannot acquire task creation lock"
+
+if recover_interrupted_commit; then
+    echo "recovered completed task creation: $TASK_DIR"
+else
+    TRANSACTION_ID="task-$TASK_ID-$$-$(date +%s)"
+    create_task_stage
+    create_planner_job_stage
+    task_is_complete "$TASK_STAGE" "$TRANSACTION_ID" "open" \
+        || die "staged task '$TASK_ID' is incomplete"
+    planner_job_is_staged "$PLAN_JOB_STAGE" "$TRANSACTION_ID" \
+        || die "staged initial planner job '$PLAN_JOB_ID' is incomplete"
+    finish_commit 1 1
+fi
+
+echo "created task: $TASKS_DIR/$TASK_ID"
+echo "task id: $TASK_ID"
+echo "initial planner job: $JOBS_DIR/$TASK_ID-plan"

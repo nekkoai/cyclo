@@ -1,0 +1,54 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    echo "Usage: job-start <job-id> --agent-id <agent-id>" >&2
+    exit 1
+}
+
+JOB_ID=""
+AGENT_ID=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --agent-id)
+            [ "$#" -ge 2 ] || die "$1 requires an agent ID"
+            AGENT_ID="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            if [ -z "$JOB_ID" ]; then
+                JOB_ID="$1"
+            else
+                die "unexpected argument '$1'"
+            fi
+            shift
+            ;;
+    esac
+done
+
+[ -n "$JOB_ID" ] || usage
+[ -n "$AGENT_ID" ] || die "--agent-id <agent-id> is required"
+validate_job_id "$JOB_ID"
+validate_agent_id "$AGENT_ID"
+require_jobs_dir
+JOB_DIR="$JOBS_DIR/$JOB_ID"
+
+[ -d "$JOB_DIR" ] || die "job '$JOB_ID' does not exist"
+
+current_status="$(read_status "$JOB_DIR")"
+[ "$current_status" = "claimed" ] || die "cannot start job '$JOB_ID' from status '$current_status' (expected: claimed)"
+[ -d "$JOB_DIR/lock" ] || die "cannot start job '$JOB_ID': missing lock directory"
+require_agent_owner "start" "$JOB_ID" "$JOB_DIR" "$AGENT_ID"
+
+append_log "$JOB_DIR" "Started" "Job started by agent $AGENT_ID."
+write_file_atomic "$JOB_DIR/status" "running"
+
+echo "$JOB_ID: claimed -> running"
