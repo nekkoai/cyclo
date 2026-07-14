@@ -26,6 +26,7 @@ version=$(PYTHONPATH=src "$python" -c 'import cyclo; print(cyclo.__version__)')
 commit=$(git rev-parse HEAD)
 short_commit=$(git rev-parse --short=12 HEAD)
 source_date_epoch=$(git log -1 --format=%ct)
+git_dir=$(git rev-parse --absolute-git-dir)
 output=${1:-"$repo_root/release/cyclo-agent-$version"}
 case $output in
     /*) ;;
@@ -61,7 +62,8 @@ git archive --format=tar HEAD | tar -xf - -C "$source_tree"
 printf '%s\n' '==> source tests'
 (
     cd "$source_tree"
-    "$venv/bin/python" -m pytest -q
+    GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree \
+        "$venv/bin/python" -m pytest -q
     node --test tests/*.mjs
     find . -type f -exec sh -c '
         for script do
