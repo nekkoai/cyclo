@@ -69,6 +69,7 @@ def test_release_documents_and_sdist_manifest_match_the_version() -> None:
         "include tools/normalize-distributions",
         "include tools/release-acceptance",
         "include tools/release-manifest",
+        "include tools/runtime-write-acceptance",
         "include tools/secret-scan",
         "recursive-include docs *.md",
         "recursive-include requirements *.in *.txt",

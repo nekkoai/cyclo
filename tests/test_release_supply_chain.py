@@ -93,6 +93,7 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert "GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree" in release
     assert 'sh -n "$script" || exit 1' in release
     assert "tools/release-acceptance" in release
+    assert "tools/runtime-write-acceptance" in release
     assert "docker build --pull" in release
     assert "gateway providers" in release
     assert "cyclo gateway providers" in acceptance

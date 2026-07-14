@@ -1,0 +1,199 @@
+#!/bin/sh
+# Prove the release runtime can edit project source without making the team writable.
+set -eu
+
+fail() {
+    if [ -n "${container:-}" ]; then
+        docker logs "$container" >&2 2>/dev/null || true
+    fi
+    printf '%s\n' "runtime write acceptance: $*" >&2
+    exit 1
+}
+
+image=${1:-${CYCLO_RUNTIME_IMAGE:-}}
+python=${PYTHON:-python3}
+timeout=${CYCLO_RUNTIME_ACCEPTANCE_TIMEOUT:-30}
+
+[ -n "$image" ] || fail "pass a Cyclo runtime image as the first argument"
+command -v docker >/dev/null 2>&1 || fail "Docker is required"
+command -v "$python" >/dev/null 2>&1 || fail "Python not found: $python"
+case $timeout in
+    ''|*[!0-9]*) fail "CYCLO_RUNTIME_ACCEPTANCE_TIMEOUT must be an integer" ;;
+esac
+[ "$timeout" -ge 1 ] && [ "$timeout" -le 120 ] \
+    || fail "CYCLO_RUNTIME_ACCEPTANCE_TIMEOUT must be from 1 to 120 seconds"
+docker image inspect "$image" >/dev/null 2>&1 \
+    || fail "runtime image not found: $image"
+
+work_root=$(mktemp -d "${TMPDIR:-/tmp}/cyclo-runtime-write.XXXXXX")
+container="cyclo-runtime-write-$$"
+cleanup() {
+    status=$?
+    trap - 0
+    docker rm --force "$container" >/dev/null 2>&1 || true
+    rm -rf -- "$work_root"
+    exit "$status"
+}
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+state_root=$work_root/state
+team=$work_root/team
+project=$work_root/project
+fake_bin=$work_root/fake-bin
+pi_root=$work_root/pi
+mkdir -p "$team/roles" "$project" "$fake_bin" "$pi_root/agent"
+
+# Use the AgentWS payload from the installed Cyclo package and the same atomic
+# materialization path used for a normal instance. This deliberately avoids any
+# external AgentWS checkout.
+"$python" - "$state_root" <<'PY'
+from pathlib import Path
+import sys
+
+from cyclo import container_runtime
+from cyclo.agentws_bundle import packaged_agentws_template
+from cyclo.state import StateStore
+
+store = StateStore(Path(sys.argv[1]))
+store.materialize_agentws(
+    "runtime-write",
+    packaged_agentws_template(),
+    Path(container_runtime.__file__),
+)
+PY
+
+runtime=$state_root/instances/runtime-write/runtime
+queue=$state_root/instances/runtime-write/agentws-state
+tasks=$queue/tasks
+jobs=$queue/jobs
+agents=$queue/agents
+
+cat > "$team/AGENTS.md" <<'EOF'
+# Runtime write acceptance
+
+Process the queued planner job against the project mounted at `/workspace`.
+EOF
+cat > "$team/roles/planner.md" <<'EOF'
+# Planner
+
+Complete the single queued acceptance job.
+EOF
+printf '%s\n' 'writer-1 planner pi local/acceptance' > "$team/roster.team"
+
+spec=$work_root/task-spec.md
+printf '%s\n' 'Write the runtime acceptance marker in the mounted project.' > "$spec"
+JOBS_DIR=$jobs TASKS_DIR=$tasks \
+    "$runtime/bin/task-create" runtime-write "$spec" >/dev/null
+
+# The real AgentWS wrapper launches this executable as Pi. It verifies the
+# wrapper's cwd and environment, performs the filesystem probes itself, and
+# settles the real queued task/job through AgentWS commands.
+cat > "$fake_bin/pi" <<'EOF'
+#!/bin/sh
+set -eu
+
+print_mode=0
+json_mode=0
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        -p) print_mode=1 ;;
+        --mode)
+            shift
+            [ "${1:-}" = json ] && json_mode=1
+            ;;
+    esac
+    shift
+done
+[ "$print_mode" -eq 1 ] || exit 31
+[ "$json_mode" -eq 1 ] || exit 32
+[ "$(pwd -P)" = /workspace ] || exit 33
+[ "${AGENTWS_WORKSPACE:-}" = /workspace ] || exit 34
+[ "${CYCLO_AGENTWS_RUNTIME:-}" = /agentws ] || exit 35
+[ "$(id -u)" = "${CYCLO_HOST_UID:-}" ] || exit 36
+
+runtime=$CYCLO_AGENTWS_RUNTIME
+agent_id=writer-1
+job_id=$(cat "$runtime/agents/$agent_id/current-job")
+[ "$job_id" = runtime-write-plan ] || exit 37
+"$runtime/bin/job-start" "$job_id" --agent-id "$agent_id" >/dev/null
+
+marker=/workspace/.cyclo-runtime-write-check
+printf '%s\n' 'workspace-write-ok' > "$marker"
+
+team_probe=/team/.cyclo-runtime-write-check
+if (: > "$team_probe") 2>/dev/null; then
+    rm -f -- "$team_probe"
+    printf '%s\n' 'team mount unexpectedly allowed a write' >&2
+    exit 38
+fi
+
+"$runtime/bin/task-result" runtime-write "$marker" >/dev/null
+"$runtime/bin/job-done" "$job_id" --agent-id "$agent_id" \
+    -m 'Runtime wrote /workspace and could not write /team.' >/dev/null
+printf '%s\n' '{"type":"message","message":{"role":"assistant","stopReason":"stop"}}'
+EOF
+chmod 0755 "$fake_bin/pi"
+
+host_uid=$(id -u)
+host_gid=$(id -g)
+container_path=/acceptance-bin:/opt/cyclo-agent-tools/lib/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+docker run --detach \
+    --name "$container" \
+    --network none \
+    --workdir /workspace \
+    --pids-limit 2048 \
+    --security-opt no-new-privileges \
+    --env "CYCLO_HOST_UID=$host_uid" \
+    --env "CYCLO_HOST_GID=$host_gid" \
+    --env "PATH=$container_path" \
+    --env PI_CODING_AGENT_DIR=/home/cyclo/.pi/agent \
+    --env CYCLO_AGENTWS_RUNTIME=/agentws \
+    --env CYCLO_VERBOSE=0 \
+    --env AGENTWS_TEAM_ROOT=/team \
+    --env AGENTWS_TEAM_ROSTER=/team/roster.team \
+    --env AGENTWS_TEAM_PROTOCOL=/team/AGENTS.md \
+    --env AGENTWS_TEAM_ROLES_DIR=/team/roles \
+    --env AGENTWS_WORKSPACE=/workspace \
+    --env AGENTWS_MAX_JOB_ATTEMPTS=1 \
+    --env AGENTWS_MAX_CONSECUTIVE_FAILURES=1 \
+    --env AGENTWS_RETRY_INITIAL_SECONDS=1 \
+    --env AGENTWS_RETRY_MAX_SECONDS=1 \
+    --mount "type=bind,src=$runtime,dst=/agentws,readonly" \
+    --mount "type=bind,src=$tasks,dst=/agentws/tasks" \
+    --mount "type=bind,src=$jobs,dst=/agentws/jobs" \
+    --mount "type=bind,src=$agents,dst=/agentws/agents" \
+    --mount "type=bind,src=$pi_root,dst=/home/cyclo/.pi" \
+    --mount "type=bind,src=$team,dst=/team,readonly" \
+    --mount "type=bind,src=$project,dst=/workspace" \
+    --mount "type=bind,src=$fake_bin,dst=/acceptance-bin,readonly" \
+    "$image" python3 /agentws/.cyclo-runtime.py >/dev/null
+
+elapsed=0
+while [ "$elapsed" -lt "$timeout" ]; do
+    if [ -f "$project/.cyclo-runtime-write-check" ] \
+        && [ "$(cat "$jobs/runtime-write-plan/status" 2>/dev/null || true)" = done ] \
+        && [ "$(cat "$tasks/runtime-write/state" 2>/dev/null || true)" = done ]; then
+        break
+    fi
+    running=$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)
+    [ "$running" = true ] || fail "runtime container exited before completing the probe"
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+[ "$(cat "$project/.cyclo-runtime-write-check" 2>/dev/null || true)" = workspace-write-ok ] \
+    || fail "agent did not write the project marker from /workspace"
+[ "$(cat "$jobs/runtime-write-plan/status" 2>/dev/null || true)" = done ] \
+    || fail "AgentWS job did not complete"
+[ "$(cat "$tasks/runtime-write/state" 2>/dev/null || true)" = done ] \
+    || fail "AgentWS task did not record a result"
+[ ! -e "$team/.cyclo-runtime-write-check" ] \
+    || fail "agent wrote through the read-only /team mount"
+[ "$(cat "$agents/writer-1/engine" 2>/dev/null || true)" = pi ] \
+    || fail "real AgentWS agent wrapper did not launch Pi"
+
+printf '%s\n' 'runtime write acceptance: PASS'

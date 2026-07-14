@@ -133,6 +133,9 @@ docker build --pull \
     --tag "cyclo-runtime:release-$short_commit" \
     --file "$source_tree/src/cyclo/vendor_gateway/runtime_context/Dockerfile" \
     "$source_tree/src/cyclo/vendor_gateway/runtime_context"
+PYTHON="$venv/bin/python" \
+    "$source_tree/tools/runtime-write-acceptance" \
+    "cyclo-runtime:release-$short_commit"
 docker build --pull \
     --tag "cyclo-gateway:release-$short_commit" \
     --file "$source_tree/src/cyclo/vendor_gateway/gateway_context/Dockerfile" \
