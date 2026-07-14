@@ -6,7 +6,13 @@ from types import SimpleNamespace
 import pytest
 
 from cyclo.agentws_bundle import packaged_agentws_template
-from cyclo.cli import _DashboardUsageReader, cmd_repair, main, stop_instance
+from cyclo.cli import (
+    DEFAULT_GATEWAY_IMAGE,
+    _DashboardUsageReader,
+    cmd_repair,
+    main,
+    stop_instance,
+)
 from cyclo.errors import CycloError
 from cyclo.state import Instance, StateStore
 
@@ -219,6 +225,110 @@ def test_gateway_command_uses_cyclo_native_cli(monkeypatch) -> None:
             "cyclo-gateway-store-test",
             "--build",
         ]
+    ]
+
+
+def test_gateway_destroy_store_uses_selected_volume(monkeypatch) -> None:
+    delegated: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "cyclo.cli.gateway_cli.main",
+        lambda arguments: delegated.append(arguments) or 0,
+    )
+
+    result = main(
+        [
+            "--store-volume",
+            "private-cyclo-store",
+            "gateway",
+            "destroy-store",
+            "--confirm",
+            "private-cyclo-store",
+        ]
+    )
+
+    assert result == 0
+    assert delegated == [
+        [
+            "destroy-store",
+            "--image",
+            DEFAULT_GATEWAY_IMAGE,
+            "--store-volume",
+            "private-cyclo-store",
+            "--confirm",
+            "private-cyclo-store",
+        ]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (["gateway", "--help"], "manage Cyclo's isolated credential gateway store"),
+        (["gateway", "login", "--help"], "--api-key-stdin"),
+        (["gateway", "status", "--help"], "--store-volume"),
+        (["gateway", "destroy-store", "--help"], "--confirm VOLUME"),
+    ],
+)
+def test_gateway_help_comes_from_native_gateway_parser(
+    arguments: list[str], expected: str, capsys
+) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        main(arguments)
+
+    assert stopped.value.code == 0
+    output = capsys.readouterr().out
+    assert expected in output
+    assert "\n  arguments\n" not in output
+
+
+def test_gateway_summary_and_missing_action_cover_store_management(capsys) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        main(["--help"])
+
+    assert stopped.value.code == 0
+    assert "manage Cyclo's isolated credential" in capsys.readouterr().out
+
+    assert main(["gateway"]) == 1
+    assert "requires login, status, or destroy-store" in capsys.readouterr().err
+
+
+def test_models_prints_copyable_provider_model_names(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    store = StateStore(tmp_path / "state")
+
+    class FakeDocker:
+        pass
+
+    class FakeProxy:
+        def catalog(self, instances, *, build=False):
+            assert instances == []
+            assert not build
+            return {
+                "openai-codex": {
+                    "models": [
+                        {"id": "gpt-test"},
+                        {"id": "org/gpt-nested"},
+                    ]
+                },
+                "malformed": {"models": "not-a-list"},
+                "anthropic": {"models": [{"id": "claude-test"}]},
+            }
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
+    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: FakeProxy())
+    monkeypatch.setattr(
+        "cyclo.cli.active_instances",
+        lambda _store, _docker, *, stale: [],
+    )
+
+    assert main(["models"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "anthropic/claude-test",
+        "openai-codex/gpt-test",
+        "openai-codex/org/gpt-nested",
     ]
 
 

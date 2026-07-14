@@ -139,6 +139,17 @@ esac
 printf '%s\n' '==> checking wheel-only commands and package resources'
 "$cyclo" --version
 
+gateway_help=$("$cyclo" gateway --help)
+case $gateway_help in
+    *destroy-store*) ;;
+    *) fail "installed gateway help is incomplete" ;;
+esac
+destroy_help=$("$cyclo" gateway destroy-store --help)
+case $destroy_help in
+    *"--confirm VOLUME"*) ;;
+    *) fail "installed credential-destruction help is incomplete" ;;
+esac
+
 templates=$("$cyclo" templates)
 expected_templates=$(printf '%s\n' \
     adversarial-audit \

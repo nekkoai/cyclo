@@ -152,6 +152,20 @@ def cmd_status(args: argparse.Namespace) -> int:
     return docker.run_command(status_command(args.image, args.store_volume))
 
 
+def cmd_destroy_store(args: argparse.Namespace) -> int:
+    if args.confirm != args.store_volume:
+        raise CycloError(
+            "--confirm must exactly match the selected gateway store volume "
+            f"({args.store_volume})"
+        )
+    removed = gateway.destroy_store_volume(args.store_volume)
+    if removed:
+        print(f"destroyed gateway store volume: {args.store_volume}")
+    else:
+        print(f"gateway store volume is already absent: {args.store_volume}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cyclo gateway", description="manage Cyclo's isolated credential gateway store"
@@ -196,6 +210,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", parents=[common], help="list provisioned accounts")
     status.set_defaults(func=cmd_status)
+
+    destroy = sub.add_parser(
+        "destroy-store",
+        help="irreversibly delete every credential in the selected store volume",
+    )
+    # The outer ``cyclo`` command injects its selected image alongside the
+    # volume for every gateway action.  Accept it for composability, but keep
+    # irrelevant image/build controls out of destructive-command help.
+    destroy.add_argument(
+        "--image", default=gateway.DEFAULT_GATEWAY_IMAGE, help=argparse.SUPPRESS
+    )
+    destroy.add_argument(
+        "--store-volume",
+        default=gateway.DEFAULT_STORE_VOLUME,
+        help="Docker volume containing gateway credentials",
+    )
+    destroy.add_argument(
+        "--confirm",
+        required=True,
+        metavar="VOLUME",
+        help="must exactly match --store-volume",
+    )
+    destroy.set_defaults(func=cmd_destroy_store)
     return parser
 
 

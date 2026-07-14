@@ -37,16 +37,23 @@ Cyclo requires:
 
 - a Linux host (Cyclo currently relies on Linux/POSIX state locking, UID/GID
   mapping, bind mounts, and container networking);
-- Python 3.10 or newer;
+- Python 3.10 or newer, with `venv`/`ensurepip` support;
 - Git;
 - Docker with a running daemon that the current user can access.
 
-Install directly from a Cyclo source tree:
+On a fresh machine, clone Cyclo into its own virtual environment and run the
+environment check:
 
 ```sh
-python3 -m pip install .
+git clone https://github.com/glguida/cyclo.git
+cd cyclo
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install .
 cyclo doctor
 ```
+
+If the source tree is already present, the `git clone` step is unnecessary.
 
 Or install a release wheel directly:
 
@@ -119,11 +126,12 @@ Provision credentials through Cyclo's own gateway command:
 cyclo gateway status
 cyclo gateway login openai-codex
 cyclo gateway login anthropic
+cyclo gateway login github-copilot
 cyclo models
 ```
 
-OAuth providers use an interactive device login. For an API-key provider,
-prefer standard input or an environment-variable handoff:
+Subscription providers use an interactive browser OAuth login. For an API-key
+provider, prefer standard input or an environment-variable handoff:
 
 ```sh
 cyclo gateway login openai --api-key-stdin
@@ -138,6 +146,20 @@ repositories, projects, or team containers.
 `cyclo gateway status` lists provisioned accounts. `cyclo models` starts or
 reuses the gateway and prints the exact `provider/model` values accepted in a
 team roster.
+
+### Supported authentication
+
+| Service | Cyclo provider | Authentication |
+|---|---|---|
+| Anthropic Claude | `anthropic` | Claude Pro/Max; interactive browser OAuth |
+| OpenAI Codex | `openai-codex` | ChatGPT Plus/Pro; interactive browser OAuth |
+| GitHub Copilot | `github-copilot` | Copilot subscription; interactive browser OAuth |
+| API-key convenience | `openai`, `google`, `xai`, `groq`, `mistral`, `deepseek`, `cerebras`, `openrouter`, `fireworks`, `zai`, `moonshotai`, `huggingface` | Conventional environment variable, standard input, or explicit key argument |
+
+The account's subscription and provider policy determine which models it can
+actually use. Other providers may appear in the underlying model catalogue but
+can require provider-specific configuration. On each installation, treat the
+live output of `cyclo models` as authoritative for roster model names.
 
 ## Team repository
 
@@ -154,7 +176,8 @@ my-team/
 ```
 
 `team` is a whitespace-delimited roster with an explicit proxy model for every
-agent:
+agent. Existing compatible repositories may call the roster `default.team`;
+new Cyclo repositories use `team`:
 
 ```text
 # <name> <role> <agent-engine> <provider/model>
@@ -169,7 +192,7 @@ catalogue. Each role must have a matching `roles/<role>.md` file.
 At least one agent must have the `planner` role because every submitted task
 starts with a planner job. Team-definition files must be regular UTF-8 files;
 Cyclo rejects definition-file and `roles/` directory symlinks before reading or
-hashing them on the host.
+hashing them on the host, and limits each definition file to 1 MiB.
 
 Cyclo records a team generation consisting of its Git commit and a digest of
 the live roster, role files, and optional protocol. Experiments therefore
@@ -211,7 +234,9 @@ Cyclo checks its bundled loop ABI, builds missing images, reconciles the gateway
 issues a provider-and-model-scoped capability for this instance, materializes a
 read-only queue runtime, and starts the team container. It prints the instance
 name, per-team viewer URL, and persistent queue-state path. The container runs
-detached by default. Use `--foreground` to follow it until Ctrl-C.
+detached by default. With `--foreground`, Ctrl-C stops and removes that team
+container and network, and revokes its scoped gateway capability; persistent
+queue history remains.
 
 Submit a task specification to the filesystem loop:
 
@@ -257,8 +282,12 @@ Cyclo does not execute container-writable queue files on the host.
 
 `cyclo dashboard` starts a read-only fleet view on a random loopback port and
 prints its URL. It combines lifecycle state, bounded queue summaries, recent
-task/job activity, and gateway token usage for every instance. It never starts
-or reconciles the gateway and never executes queue content:
+task/job activity, and gateway token usage for every instance. Queue scans are
+limited per refresh to 4,096 direct entries and 2 MiB of file data, with eight
+recent tasks and twelve recent activity records retained; truncation is
+reported. If the gateway is unavailable, fleet and queue data remain visible
+while usage is marked unavailable. The dashboard never starts or reconciles the
+gateway and never executes queue content:
 
 ```sh
 cyclo dashboard
@@ -414,11 +443,24 @@ with `CYCLO_STATE_ROOT` or the global `--state-root` option.
 Provider credentials are outside that tree in the Docker-managed
 `cyclo-gateway-store` volume. Stopping teams or deleting ordinary instance
 state does not delete the credential volume. Credential destruction should be
-an explicit administrator action, for example after all teams are stopped:
+an explicit administrator action. After stopping all teams, destroy the default
+store with its name repeated as confirmation:
 
 ```sh
-docker volume rm cyclo-gateway-store
+cyclo --store-volume cyclo-gateway-store \
+  gateway destroy-store --confirm cyclo-gateway-store
 ```
+
+This irreversible command affects every Cyclo state root sharing that exact
+volume. It stops and removes every verified Cyclo gateway container that mounts
+the store, using immutable container IDs, and then removes the volume. It
+refuses instead of guessing if a foreign, unverified, or in-progress
+provisioning container also mounts the volume. Repeating the exact volume name
+is the authorization to delete the volume itself; Docker volumes created by
+Cyclo do not carry separate ownership metadata. If a new container mounts the
+store after preflight, Docker's final in-use check preserves the credentials
+and reports an error. Any gateways already stopped in that race are recreated
+by the next run or by `cyclo repair`.
 
 ## Development
 
@@ -437,12 +479,14 @@ Before publishing a release, run the standalone wheel acceptance check:
 tools/release-acceptance
 ```
 
-The POSIX-shell script uses `pip wheel`, so it does not require the Python
-`build` module. It builds one wheel, installs it into a temporary virtual
-environment, switches to an empty `HOME` with user-local executables removed
-from `PATH`, and exercises the installed `cyclo` command. It checks packaged
-templates, team initialization and validation, `run --dry-run`,
-the packaged job-loop ABI, and the credential-gateway import. If Docker is
+This `/bin/sh` script targets Cyclo's supported Linux hosts. It builds with
+`pip wheel`, so it does not require the Python `build` module. It does not claim
+utility-level portability to non-Linux POSIX systems. It builds one wheel,
+installs it into a temporary virtual environment, switches to an empty `HOME`,
+removes user-local executables from `PATH`, and exercises the installed `cyclo`
+command. It checks packaged templates, team initialization and validation,
+`run --dry-run`, the packaged job-loop ABI, and the credential-gateway import.
+If Docker is
 installed and reachable, `cyclo doctor` must pass completely; otherwise only
 the Docker probe is skipped and all wheel checks must still pass. The temporary
 environment is removed on success, failure, or interruption. Running the check

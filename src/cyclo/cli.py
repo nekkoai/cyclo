@@ -497,20 +497,19 @@ def cmd_models(args: argparse.Namespace) -> int:
         attach_active_networks(docker, proxy, running)
         if rotation_errors:
             raise token_rotation_failure(rotation_errors)
-    rows: list[tuple[str, str]] = []
+    names: list[str] = []
     for provider, info in sorted(catalog.items()):
-        models = info.get("models") if isinstance(info, dict) else None
-        if not isinstance(models, list):
+        provider_models = info.get("models") if isinstance(info, dict) else None
+        if not isinstance(provider_models, list):
             continue
-        for model in models:
+        for model in provider_models:
             model_id = model.get("id") if isinstance(model, dict) else None
             if isinstance(model_id, str) and model_id:
-                rows.append((provider, model_id))
-    if not rows:
+                names.append(f"{provider}/{model_id}")
+    if not names:
         raise CycloError("gateway returned no models")
-    print("PROVIDER\tMODEL")
-    for provider, model in rows:
-        print(f"{provider}\t{model}")
+    for model in names:
+        print(model)
     return 0
 
 
@@ -553,11 +552,16 @@ def cmd_repair(args: argparse.Namespace) -> int:
 
 
 def cmd_gateway(args: argparse.Namespace) -> int:
+    if args.gateway_help:
+        return gateway_cli.main(["--help"])
     if not args.arguments:
-        raise CycloError("gateway requires a command, such as status or login")
+        raise CycloError("gateway requires login, status, or destroy-store")
     action, *rest = args.arguments
-    if action not in {"login", "status"}:
-        raise CycloError("cyclo gateway delegates only login and status; use cyclo models or cyclo usage")
+    if action not in {"login", "status", "destroy-store"}:
+        raise CycloError(
+            "cyclo gateway accepts login, status, or destroy-store; "
+            "use cyclo models or cyclo usage for gateway queries"
+        )
     return gateway_cli.main(
         [
             action,
@@ -696,7 +700,18 @@ def build_parser() -> argparse.ArgumentParser:
     repair.add_argument("--build-gateway", action="store_true")
     repair.set_defaults(func=cmd_repair)
 
-    gateway_parser = commands.add_parser("gateway", help="provision credentials in Cyclo's isolated gateway")
+    gateway_parser = commands.add_parser(
+        "gateway",
+        help="manage Cyclo's isolated credential gateway store",
+        add_help=False,
+    )
+    gateway_parser.add_argument(
+        "-h",
+        "--help",
+        dest="gateway_help",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     gateway_parser.add_argument("arguments", nargs=argparse.REMAINDER)
     gateway_parser.set_defaults(func=cmd_gateway)
 

@@ -396,6 +396,329 @@ def test_gateway_container_removal_targets_verified_resource_id(monkeypatch) -> 
     ]
 
 
+def _store_gateway_info(
+    resource_id: str,
+    name: str,
+    volume: str,
+    *,
+    labels: dict[str, str] | None = None,
+    destination: str = gateway.GATEWAY_STORE_PATH,
+) -> dict[str, object]:
+    return {
+        "Id": resource_id,
+        "Name": f"/{name}",
+        "Config": {
+            "Labels": labels
+            if labels is not None
+            else {
+                gateway.GATEWAY_OWNERSHIP_LABEL: gateway.GATEWAY_OWNERSHIP_VALUE,
+                gateway.GATEWAY_RESOURCE_LABEL: name,
+            }
+        },
+        "Mounts": [
+            {
+                "Type": "volume",
+                "Name": volume,
+                "Destination": destination,
+            }
+        ],
+    }
+
+
+def test_destroy_store_stops_every_verified_gateway_by_immutable_id(
+    monkeypatch,
+) -> None:
+    volume = "cyclo-store"
+    containers = {
+        "gateway-one-id": _store_gateway_info(
+            "gateway-one-id", "cyclo-gateway-state-one", volume
+        ),
+        "gateway-two-id": _store_gateway_info(
+            "gateway-two-id", "cyclo-gateway-state-two", volume
+        ),
+    }
+    docker_commands: list[list[str]] = []
+    removed_volumes: list[str] = []
+    monkeypatch.setattr(
+        gateway, "_inspect_gateway_volume", lambda _name: {"Name": volume}
+    )
+    monkeypatch.setattr(
+        gateway, "_container_ids_using_volume", lambda _name: list(containers)
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_inspect_gateway_container",
+        lambda identifier: containers.get(identifier),
+    )
+    monkeypatch.setattr(
+        gateway.runner_docker,
+        "docker_call_ignore_missing",
+        lambda command: docker_commands.append(command) or 0,
+    )
+    monkeypatch.setattr(
+        gateway, "_remove_store_volume", lambda name: removed_volumes.append(name)
+    )
+
+    assert gateway.destroy_store_volume(volume)
+
+    assert docker_commands == [
+        ["docker", "stop", "--timeout", "10", "gateway-one-id"],
+        ["docker", "rm", "gateway-one-id"],
+        ["docker", "stop", "--timeout", "10", "gateway-two-id"],
+        ["docker", "rm", "gateway-two-id"],
+    ]
+    assert removed_volumes == [volume]
+    assert all(
+        "cyclo-gateway-state" not in part
+        for command in docker_commands
+        for part in command
+    )
+
+
+@pytest.mark.parametrize(
+    ("labels", "destination"),
+    [
+        ({}, gateway.GATEWAY_STORE_PATH),
+        (
+            {
+                gateway.GATEWAY_OWNERSHIP_LABEL: gateway.GATEWAY_OWNERSHIP_VALUE,
+                gateway.GATEWAY_RESOURCE_LABEL: "different-container",
+            },
+            gateway.GATEWAY_STORE_PATH,
+        ),
+        (
+            {
+                gateway.GATEWAY_OWNERSHIP_LABEL: gateway.GATEWAY_OWNERSHIP_VALUE,
+                gateway.GATEWAY_RESOURCE_LABEL: "cyclo-gateway-state-two",
+            },
+            "/unexpected",
+        ),
+    ],
+)
+def test_destroy_store_preflights_every_user_before_mutating(
+    monkeypatch, labels: dict[str, str], destination: str
+) -> None:
+    volume = "cyclo-store"
+    containers = {
+        "owned-id": _store_gateway_info(
+            "owned-id", "cyclo-gateway-state-one", volume
+        ),
+        "blocked-id": _store_gateway_info(
+            "blocked-id",
+            "cyclo-gateway-state-two",
+            volume,
+            labels=labels,
+            destination=destination,
+        ),
+    }
+    docker_commands: list[list[str]] = []
+    removed_volumes: list[str] = []
+    monkeypatch.setattr(
+        gateway, "_inspect_gateway_volume", lambda _name: {"Name": volume}
+    )
+    monkeypatch.setattr(
+        gateway, "_container_ids_using_volume", lambda _name: list(containers)
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_inspect_gateway_container",
+        lambda identifier: containers.get(identifier),
+    )
+    monkeypatch.setattr(
+        gateway.runner_docker,
+        "docker_call_ignore_missing",
+        lambda command: docker_commands.append(command) or 0,
+    )
+    monkeypatch.setattr(
+        gateway, "_remove_store_volume", lambda name: removed_volumes.append(name)
+    )
+
+    with pytest.raises(CycloError, match="unverified Docker container"):
+        gateway.destroy_store_volume(volume)
+
+    assert docker_commands == []
+    assert removed_volumes == []
+
+
+def test_destroy_store_ignores_volume_filter_false_positive(monkeypatch) -> None:
+    volume = "cyclo-store"
+    false_positive = _store_gateway_info(
+        "other-id", "cyclo-gateway-other", "cyclo-store-similar"
+    )
+    docker_commands: list[list[str]] = []
+    removed_volumes: list[str] = []
+    monkeypatch.setattr(
+        gateway, "_inspect_gateway_volume", lambda _name: {"Name": volume}
+    )
+    monkeypatch.setattr(gateway, "_container_ids_using_volume", lambda _name: ["other-id"])
+    monkeypatch.setattr(
+        gateway, "_inspect_gateway_container", lambda _identifier: false_positive
+    )
+    monkeypatch.setattr(
+        gateway.runner_docker,
+        "docker_call_ignore_missing",
+        lambda command: docker_commands.append(command) or 0,
+    )
+    monkeypatch.setattr(
+        gateway, "_remove_store_volume", lambda name: removed_volumes.append(name)
+    )
+
+    assert gateway.destroy_store_volume(volume)
+    assert docker_commands == []
+    assert removed_volumes == [volume]
+
+
+def test_destroy_store_is_idempotent_when_volume_is_absent(monkeypatch) -> None:
+    listed = False
+
+    def unexpected_list(_volume: str) -> list[str]:
+        nonlocal listed
+        listed = True
+        return []
+
+    monkeypatch.setattr(gateway, "_inspect_gateway_volume", lambda _name: None)
+    monkeypatch.setattr(gateway, "_container_ids_using_volume", unexpected_list)
+
+    assert not gateway.destroy_store_volume("missing-store")
+    assert listed is False
+
+
+def test_destroy_store_revalidates_immutable_id_before_mutation(monkeypatch) -> None:
+    volume = "cyclo-store"
+    first = _store_gateway_info("gateway-id", "cyclo-gateway-state", volume)
+    changed = _store_gateway_info("gateway-id", "cyclo-gateway-state", "other-store")
+    inspections = iter([first, changed])
+    docker_commands: list[list[str]] = []
+    monkeypatch.setattr(
+        gateway, "_inspect_gateway_volume", lambda _name: {"Name": volume}
+    )
+    monkeypatch.setattr(gateway, "_container_ids_using_volume", lambda _name: ["gateway-id"])
+    monkeypatch.setattr(
+        gateway, "_inspect_gateway_container", lambda _identifier: next(inspections)
+    )
+    monkeypatch.setattr(
+        gateway.runner_docker,
+        "docker_call_ignore_missing",
+        lambda command: docker_commands.append(command) or 0,
+    )
+
+    with pytest.raises(CycloError, match="changed during credential destruction"):
+        gateway.destroy_store_volume(volume)
+
+    assert docker_commands == []
+
+
+def test_destroy_store_volume_removal_is_fail_closed_and_never_forced(
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def in_use(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr="Error response from daemon: volume is in use",
+        )
+
+    monkeypatch.setattr(gateway.subprocess, "run", in_use)
+
+    with pytest.raises(CycloError, match="volume is in use"):
+        gateway._remove_store_volume("cyclo-store")
+
+    assert commands == [["docker", "volume", "rm", "cyclo-store"]]
+    assert "--force" not in commands[0]
+
+
+def test_destroy_store_enumerates_running_and_stopped_volume_users(monkeypatch) -> None:
+    commands: list[list[str]] = []
+
+    def list_users(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="first-id\nsecond-id\nfirst-id\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(gateway.subprocess, "run", list_users)
+
+    assert gateway._container_ids_using_volume("cyclo-store") == [
+        "first-id",
+        "second-id",
+    ]
+    assert commands == [
+        [
+            "docker",
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            "volume=cyclo-store",
+        ]
+    ]
+
+
+def test_destroy_store_volume_removal_tolerates_concurrent_absence(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr="Error response from daemon: get cyclo-store: no such volume",
+        ),
+    )
+
+    gateway._remove_store_volume("cyclo-store")
+
+
+def test_destroy_store_cli_requires_exact_confirmation(monkeypatch, capsys) -> None:
+    destroyed: list[str] = []
+    monkeypatch.setattr(
+        gateway,
+        "destroy_store_volume",
+        lambda volume: destroyed.append(volume) or True,
+    )
+
+    assert (
+        cli.main(
+            [
+                "destroy-store",
+                "--image",
+                "cyclo-gateway:test",
+                "--store-volume",
+                "cyclo-store",
+                "--confirm",
+                "cyclo-store",
+            ]
+        )
+        == 0
+    )
+    assert destroyed == ["cyclo-store"]
+    assert "destroyed gateway store volume: cyclo-store" in capsys.readouterr().out
+
+    assert (
+        cli.main(
+            [
+                "destroy-store",
+                "--store-volume",
+                "cyclo-store",
+                "--confirm",
+                "different-store",
+            ]
+        )
+        == 1
+    )
+    assert destroyed == ["cyclo-store"]
+    assert "must exactly match" in capsys.readouterr().err
+
+
 def test_gateway_restarts_on_wrong_network_and_runs_by_verified_network_id(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -413,6 +413,15 @@ def _inspect_gateway_network(name: str) -> dict[str, object] | None:
     )
 
 
+def _inspect_gateway_volume(name: str) -> dict[str, object] | None:
+    return _inspect_docker_resource(
+        ["docker", "volume", "inspect", name],
+        kind="volume",
+        name=name,
+        missing_markers=("no such volume",),
+    )
+
+
 def _resource_id(info: Mapping[str, object], *, kind: str, name: str) -> str:
     resource_id = info.get("Id")
     if not isinstance(resource_id, str) or not resource_id:
@@ -724,6 +733,174 @@ def stop_gateway_container(container: str, *, best_effort: bool = False) -> bool
     if remove_rc != 0 and not best_effort:
         raise CycloError(f"failed to remove gateway container: {container}")
     return stop_rc == 0 and remove_rc == 0
+
+
+def _container_ids_using_volume(volume: str) -> list[str]:
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "container",
+                "ls",
+                "--all",
+                "--quiet",
+                "--no-trunc",
+                "--filter",
+                f"volume={volume}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise CycloError("required command not found: docker") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise CycloError(
+            f"cannot list Docker containers using gateway store volume {volume}: "
+            f"{detail or 'unknown Docker error'}"
+        )
+    return list(
+        dict.fromkeys(
+            line.strip() for line in proc.stdout.splitlines() if line.strip()
+        )
+    )
+
+
+def _container_name(info: Mapping[str, object], *, identifier: str) -> str:
+    name = info.get("Name")
+    if not isinstance(name, str) or not name.startswith("/") or len(name) == 1:
+        raise CycloError(f"cannot inspect Docker container name: {identifier}")
+    return name[1:]
+
+
+def _verified_store_gateway(
+    info: Mapping[str, object], *, volume: str, identifier: str
+) -> tuple[str, str] | None:
+    """Return the immutable ID/name for an owned gateway using ``volume``.
+
+    Docker's volume filter is only a candidate selector.  An exact mount check
+    is required before deciding that a container is relevant, and both Cyclo
+    ownership labels are required before a destructive action is allowed.
+    """
+
+    mounts = info.get("Mounts")
+    if not isinstance(mounts, list):
+        raise CycloError(f"cannot inspect Docker container mounts: {identifier}")
+    exact_mounts = [
+        mount
+        for mount in mounts
+        if isinstance(mount, Mapping)
+        and mount.get("Type") == "volume"
+        and mount.get("Name") == volume
+    ]
+    if not exact_mounts:
+        return None
+
+    name = _container_name(info, identifier=identifier)
+    resource_id = _resource_id(info, kind="container", name=name)
+    config = info.get("Config")
+    labels = config.get("Labels") if isinstance(config, Mapping) else None
+    owned = (
+        isinstance(labels, Mapping)
+        and labels.get(GATEWAY_OWNERSHIP_LABEL) == GATEWAY_OWNERSHIP_VALUE
+        and labels.get(GATEWAY_RESOURCE_LABEL) == name
+    )
+    expected_mount = (
+        len(exact_mounts) == 1
+        and exact_mounts[0].get("Destination") == GATEWAY_STORE_PATH
+    )
+    if not owned or not expected_mount:
+        raise CycloError(
+            "refusing to destroy gateway credentials while an unverified Docker "
+            f"container uses volume {volume}: {name}"
+        )
+    return resource_id, name
+
+
+def _stop_verified_store_gateway(resource_id: str, name: str, volume: str) -> None:
+    # Reinspect by immutable ID immediately before mutation.  A container name
+    # can be rebound, while an ID cannot be made to refer to a different object.
+    current = _inspect_gateway_container(resource_id)
+    if current is None:
+        return
+    verified = _verified_store_gateway(current, volume=volume, identifier=resource_id)
+    if verified is None or verified != (resource_id, name):
+        raise CycloError(
+            f"gateway container changed during credential destruction: {name}"
+        )
+    stop_rc = runner_docker.docker_call_ignore_missing(
+        ["docker", "stop", "--timeout", "10", resource_id]
+    )
+    if stop_rc != 0:
+        raise CycloError(f"failed to stop gateway container: {name}")
+    remove_rc = runner_docker.docker_call_ignore_missing(["docker", "rm", resource_id])
+    if remove_rc != 0:
+        raise CycloError(f"failed to remove gateway container: {name}")
+
+
+def _remove_store_volume(volume: str) -> None:
+    try:
+        proc = subprocess.run(
+            ["docker", "volume", "rm", volume],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise CycloError("required command not found: docker") from exc
+    if proc.returncode == 0:
+        return
+    detail = (proc.stderr or proc.stdout or "").strip()
+    if "no such volume" in detail.lower():
+        return
+    raise CycloError(
+        f"failed to remove gateway store volume {volume}: "
+        f"{detail or 'unknown Docker error'}"
+    )
+
+
+def destroy_store_volume(volume: str) -> bool:
+    """Irreversibly remove one credential volume and its verified gateways.
+
+    Every candidate is inspected and validated before any container is stopped.
+    This lets several state roots share a store without relying on discovery of
+    their host directories, while refusing to kill provisioning or foreign
+    containers.  Docker's final volume removal is the fail-closed race check: a
+    new or otherwise undiscovered user keeps the volume alive and makes this
+    operation fail.
+
+    Return ``True`` when an existing volume was removed and ``False`` when the
+    volume was already absent.
+    """
+
+    volume_info = _inspect_gateway_volume(volume)
+    if volume_info is None:
+        return False
+    actual_name = volume_info.get("Name")
+    if actual_name != volume:
+        raise CycloError(
+            f"Docker returned the wrong gateway store volume for {volume}"
+        )
+
+    verified: list[tuple[str, str]] = []
+    for identifier in _container_ids_using_volume(volume):
+        info = _inspect_gateway_container(identifier)
+        if info is None:
+            continue
+        candidate = _verified_store_gateway(
+            info, volume=volume, identifier=identifier
+        )
+        if candidate is not None:
+            verified.append(candidate)
+
+    # Mutation starts only after every current candidate passed validation.
+    for resource_id, name in verified:
+        _stop_verified_store_gateway(resource_id, name, volume)
+    _remove_store_volume(volume)
+    return True
 
 
 def stop_shared_gateway(registry_dir) -> None:
