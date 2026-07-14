@@ -46,6 +46,7 @@ docker build --pull -t cyclo-gateway:0.1.0 \
 docker run --rm --network none \
   -e CYCLO_HOST_UID=1000 -e CYCLO_HOST_GID=1000 \
   cyclo-runtime:0.1.0 python3 --version
+docker run --rm --network none cyclo-gateway:0.1.0 supported-providers.mjs
 docker run --rm --network none cyclo-gateway:0.1.0 providers.mjs
 ```
 
@@ -108,6 +109,7 @@ python -m pip install ./cyclo_agent-0.1.0-py3-none-any.whl
 cyclo --version
 cyclo doctor
 cyclo templates
+cyclo gateway providers
 ```
 
 Initialize one packaged team, run `cyclo validate`, and perform a `run

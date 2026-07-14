@@ -194,8 +194,22 @@ case $gateway_help in
     *) fail "installed gateway help is incomplete" ;;
 esac
 case $gateway_help in
+    *providers*) ;;
+    *) fail "installed gateway help omits pre-login provider discovery" ;;
+esac
+case $gateway_help in
     *"credentials, subscriptions, and retained usage history"*) ;;
     *) fail "installed gateway help does not disclose all retained store data" ;;
+esac
+providers_help=$("$cyclo" gateway providers --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
+case $providers_help in
+    *"Providers are upstream AI services"*"does not read or mount the gateway credential store"*) ;;
+    *) fail "installed provider-discovery help omits its credential-free guarantee" ;;
+esac
+models_help=$("$cyclo" models --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
+case $models_help in
+    *"cyclo gateway providers"*) ;;
+    *) fail "installed models help omits pre-login provider discovery" ;;
 esac
 destroy_help=$("$cyclo" gateway destroy-store --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
 case $destroy_help in

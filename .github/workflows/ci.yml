@@ -156,4 +156,19 @@ jobs:
               pi --offline --help > /tmp/pi-help
               grep -F "Extension CLI Flags" /tmp/pi-help
             '
+          docker run --rm --network none \
+            cyclo-gateway:ci supported-providers.mjs > /tmp/cyclo-providers
+          grep -F "$(printf 'PROVIDER\tDESCRIPTION\tAUTH\tLOGIN')" /tmp/cyclo-providers
+          grep -F "cyclo gateway login anthropic" /tmp/cyclo-providers
+          grep -F "cyclo gateway login openai --api-key-stdin" /tmp/cyclo-providers
           docker run --rm --network none cyclo-gateway:ci providers.mjs
+          if printf 'q\n' | docker run --rm --interactive \
+            --security-opt no-new-privileges --cap-drop ALL --pids-limit 256 \
+            --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+            --network none cyclo-gateway:ci login.mjs openai-codex \
+            > /tmp/cyclo-oauth-login 2>&1; then
+            echo "cancelled OAuth login unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -F "Select OpenAI Codex login method" /tmp/cyclo-oauth-login
+          grep -F "login failed: Login cancelled" /tmp/cyclo-oauth-login

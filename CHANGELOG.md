@@ -18,5 +18,9 @@ First stable release.
   locks and credential-free extension-loading smoke tests.
 - Provide lifecycle, inspection, repair, usage, model-discovery, and environment
   diagnostic commands through the `cyclo` executable.
+- Explain built-in gateway providers and list copyable login commands without
+  requiring a provider login or mounting the private gateway store.
+- Support Pi's interactive OAuth method selector and device-code callback for
+  subscription logins, including OpenAI Codex.
 - Build a locally verified release bundle containing checksums, provenance
   metadata, an SPDX SBOM, and secret-scan results without publishing it.

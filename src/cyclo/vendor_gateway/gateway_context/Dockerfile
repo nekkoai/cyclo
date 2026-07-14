@@ -3,7 +3,8 @@ FROM node:22-slim@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547c
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY store.mjs usage.mjs policy.mjs pi-registry.mjs server.mjs login.mjs providers.mjs ./
+COPY store.mjs usage.mjs policy.mjs pi-registry.mjs oauth-ui.mjs server.mjs login.mjs \
+  providers.mjs supported-providers.mjs ./
 
 # The gateway's own private credential store lives here (mount a volume).
 RUN mkdir -p /var/lib/cyclo-gateway && chown node:node /var/lib/cyclo-gateway

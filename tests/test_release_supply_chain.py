@@ -94,6 +94,8 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert 'sh -n "$script" || exit 1' in release
     assert "tools/release-acceptance" in release
     assert "docker build --pull" in release
+    assert "gateway providers" in release
+    assert "cyclo gateway providers" in acceptance
     assert not re.search(r"\bgh\s", release)
     assert "git push" not in release
     assert "api.github.com" not in release

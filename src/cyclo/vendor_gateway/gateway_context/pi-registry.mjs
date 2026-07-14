@@ -7,12 +7,16 @@ import {
   getBuiltinProviders as readBuiltinProviders,
 } from "@earendil-works/pi-ai/providers/all";
 
+const PROVIDER_ID = /^[a-z0-9][a-z0-9._-]*$/;
+
 function getBuiltinProviders() {
   const providers = readBuiltinProviders();
   if (
     !Array.isArray(providers) ||
     providers.length === 0 ||
-    providers.some((provider) => typeof provider !== "string" || !provider) ||
+    providers.some(
+      (provider) => typeof provider !== "string" || !PROVIDER_ID.test(provider),
+    ) ||
     new Set(providers).size !== providers.length
   ) {
     throw new Error("pi-ai returned an invalid built-in provider registry");

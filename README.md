@@ -141,12 +141,30 @@ The corresponding environment variables are `CYCLO_GATEWAY_IMAGE`,
 Provision credentials through Cyclo's own gateway command:
 
 ```sh
+cyclo gateway providers
 cyclo gateway status
 cyclo gateway login openai-codex
 cyclo gateway login anthropic
 cyclo gateway login github-copilot
 cyclo models
 ```
+
+`cyclo gateway providers` does not mount or read the gateway credential store,
+so it works before the first provider login. It prints `PROVIDER`,
+`DESCRIPTION`, `AUTH`, and `LOGIN` columns, including a plain-language
+explanation and a copyable login command for every provider in the gateway's
+built-in Pi registry. A provider is the upstream AI service or subscription
+account behind the `provider/model` name. `AUTH` is the default login route:
+OAuth entries use `cyclo gateway login PROVIDER`; API-key entries use `cyclo
+gateway login PROVIDER --api-key-stdin`.
+
+If the gateway image is absent, Cyclo builds its packaged image first. That
+build may need registry and package-index access, but Cyclo passes it no
+provider credentials.
+
+This command lists built-ins only. Custom providers depend on the host Pi
+`models.json`, so they cannot be discovered before that configuration is
+available; they can still be provisioned explicitly with an API key.
 
 Subscription providers use an interactive browser OAuth login. For an API-key
 provider, prefer standard input or an environment-variable handoff:
@@ -156,6 +174,9 @@ cyclo gateway login openai --api-key-stdin
 cyclo gateway login openai --api-key-env OPENAI_API_KEY
 ```
 
+OpenAI Codex asks whether to use browser login or a device code. Browser login
+is the default; choose device code for a headless or remote machine.
+
 The provisioning command starts a one-shot gateway container and writes the
 result directly into `cyclo-gateway-store`. The long-running gateway mounts the
 same volume. Cyclo does not copy those credentials into its host state, team
@@ -164,7 +185,8 @@ append-only usage ledger used for experiment accounting.
 
 `cyclo gateway status` lists provisioned accounts. `cyclo models` starts or
 reuses the gateway and prints the exact `provider/model` values accepted in a
-team roster.
+team roster. If no models are available, run `cyclo gateway providers` and then
+the listed `cyclo gateway login ...` command for the provider you want.
 
 ### Supported authentication
 

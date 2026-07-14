@@ -21,6 +21,7 @@ import { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { getBuiltinProviders } from "./pi-registry.mjs";
+import { createOAuthLoginCallbacks } from "./oauth-ui.mjs";
 import { readJson, withFileLock, writeJsonAtomic } from "./store.mjs";
 
 const AUTH_JSON_PATH = process.env.CYCLO_GATEWAY_AUTH_JSON ?? "/var/lib/cyclo-gateway/auth.json";
@@ -144,21 +145,12 @@ async function loginOAuth(provider) {
   }
   const rl = createInterface({ input: stdin, output: stdout });
   try {
-    const credentials = await oauth.login({
-      onAuth: (info) => {
-        console.log(`\nOpen this URL in your browser to authorize the gateway:\n  ${info.url}`);
-        if (info.instructions) console.log(info.instructions);
-        console.log(
-          "\nThe browser will redirect to a localhost URL when you finish. If that page\n" +
-            "fails to load (e.g. you authorized on a laptop while this runs over SSH),\n" +
-            "copy that whole failed URL from the address bar and paste it below.",
-        );
-      },
-      onProgress: (message) => console.log(message),
-      onPrompt: (prompt) => rl.question(`${prompt.message} `),
-      onManualCodeInput: () => rl.question("Paste the authorization code or the full redirect URL: "),
-    });
-    return { type: "oauth", ...credentials };
+    const credentials = await oauth.login(
+      createOAuthLoginCallbacks({
+        ask: (question) => rl.question(question),
+      }),
+    );
+    return { ...credentials, type: "oauth" };
   } finally {
     rl.close();
   }
@@ -179,8 +171,11 @@ async function main() {
   // several accounts of the same provider (e.g. two anthropic logins). The
   // credential records its provider TYPE so the gateway can resolve it.
   const account = parsed.account || parsed.provider;
-  const base = key !== undefined ? { type: "api_key", key } : await loginOAuth(parsed.provider);
-  await storeCredential(account, { provider: parsed.provider, ...base });
+  const base =
+    key !== undefined
+      ? { type: "api_key", key }
+      : await loginOAuth(parsed.provider);
+  await storeCredential(account, { ...base, provider: parsed.provider });
   return 0;
 }
 

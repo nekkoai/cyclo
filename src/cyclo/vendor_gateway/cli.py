@@ -101,6 +101,21 @@ def status_command(image: str, store_volume: str) -> list[str]:
     ]
 
 
+def providers_command(image: str) -> list[str]:
+    """Build provider discovery without access to the gateway store."""
+
+    return [
+        "docker",
+        "run",
+        "--rm",
+        *GATEWAY_CONTAINER_HARDENING,
+        "--network",
+        "none",
+        image,
+        "supported-providers.mjs",
+    ]
+
+
 def login_env_var(
     provider: str,
     *,
@@ -158,6 +173,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     return docker.run_command(status_command(args.image, args.store_volume))
 
 
+def cmd_providers(args: argparse.Namespace) -> int:
+    gateway.ensure_gateway_image(args.image, build=args.build)
+    return docker.run_command(providers_command(args.image))
+
+
 def cmd_destroy_store(args: argparse.Namespace) -> int:
     if args.confirm != args.store_volume:
         raise CycloError(
@@ -175,21 +195,43 @@ def cmd_destroy_store(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cyclo gateway",
-        description=f"manage Cyclo's isolated gateway store for {STORE_CONTENTS}",
+        description=(
+            "discover built-in providers and manage Cyclo's isolated gateway "
+            f"store for {STORE_CONTENTS}"
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--image", default=gateway.DEFAULT_GATEWAY_IMAGE)
-    common.add_argument(
+    image_common = argparse.ArgumentParser(add_help=False)
+    image_common.add_argument("--image", default=gateway.DEFAULT_GATEWAY_IMAGE)
+    image_common.add_argument(
+        "--build", action="store_true", help="rebuild the gateway image first"
+    )
+
+    store_common = argparse.ArgumentParser(add_help=False, parents=[image_common])
+    store_common.add_argument(
         "--store-volume",
         default=gateway.DEFAULT_STORE_VOLUME,
         help=STORE_VOLUME_HELP,
     )
-    common.add_argument("--build", action="store_true", help="rebuild the gateway image first")
 
-    login = sub.add_parser("login", parents=[common], help="provision one provider credential")
-    login.add_argument("provider")
+    providers = sub.add_parser(
+        "providers",
+        parents=[image_common],
+        help="explain built-in AI providers and show login commands",
+        description=(
+            "Providers are upstream AI services or subscription accounts used by "
+            "Cyclo's isolated gateway. This command explains each built-in "
+            "provider, shows its default authentication and login command, and "
+            "does not read or mount the gateway credential store."
+        ),
+    )
+    providers.set_defaults(func=cmd_providers)
+
+    login = sub.add_parser(
+        "login", parents=[store_common], help="provision one provider credential"
+    )
+    login.add_argument("provider", metavar="PROVIDER")
     login.add_argument(
         "--as",
         dest="account",
@@ -215,7 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     login.set_defaults(func=cmd_login)
 
-    status = sub.add_parser("status", parents=[common], help="list provisioned accounts")
+    status = sub.add_parser("status", parents=[store_common], help="list provisioned accounts")
     status.set_defaults(func=cmd_status)
 
     destroy = sub.add_parser(

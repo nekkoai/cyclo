@@ -834,6 +834,25 @@ def test_login_env_forwards_name_not_secret() -> None:
     assert "--read-only" in command
 
 
+def test_oauth_login_is_interactive_hardened_and_uses_a_writable_store() -> None:
+    command = cli.login_command(
+        "cyclo-gateway:test",
+        "cyclo-store",
+        "openai-codex",
+    )
+
+    assert "-i" in command
+    assert "-t" in command
+    assert "--network" not in command
+    assert "--env" not in command
+    assert "-e" not in command
+    assert "no-new-privileges" in command
+    assert "--read-only" in command
+    mount = f"type=volume,src=cyclo-store,dst={gateway.GATEWAY_STORE_PATH}"
+    assert mount in command
+    assert f"{mount},readonly" not in command
+
+
 def test_status_container_is_hardened_and_credential_volume_is_read_only() -> None:
     command = cli.status_command("cyclo-gateway:test", "cyclo-store")
 
@@ -853,7 +872,9 @@ def test_packaged_contexts_are_the_only_build_inputs() -> None:
     assert source.dockerfile_path().parent == runtime_root
     assert source.gateway_dockerfile_path().parent == gateway_root
     assert (gateway_root / "package-lock.json").is_file()
+    assert (gateway_root / "oauth-ui.mjs").is_file()
     assert (gateway_root / "pi-registry.mjs").is_file()
+    assert (gateway_root / "supported-providers.mjs").is_file()
     assert (gateway_root / "server.mjs").is_file()
     assert (runtime_root / "entrypoint.sh").is_file()
 
@@ -868,7 +889,11 @@ def test_gateway_javascript_uses_only_cyclo_runtime_names() -> None:
     context = source.gateway_context_root()
     server = (context / "server.mjs").read_text(encoding="utf-8")
     login = (context / "login.mjs").read_text(encoding="utf-8")
+    oauth_ui = (context / "oauth-ui.mjs").read_text(encoding="utf-8")
     providers = (context / "providers.mjs").read_text(encoding="utf-8")
+    supported_providers = (context / "supported-providers.mjs").read_text(
+        encoding="utf-8"
+    )
     registry = (context / "pi-registry.mjs").read_text(encoding="utf-8")
     dockerfile = (context / "Dockerfile").read_text(encoding="utf-8")
     package = json.loads((context / "package.json").read_text(encoding="utf-8"))
@@ -877,12 +902,20 @@ def test_gateway_javascript_uses_only_cyclo_runtime_names() -> None:
     assert "MULTIAGENT_GATEWAY" not in server
     assert 'from "./pi-registry.mjs"' in server
     assert 'from "./pi-registry.mjs"' in login
+    assert 'from "./oauth-ui.mjs"' in login
+    assert "createOAuthLoginCallbacks" in login
+    assert "store.mjs" not in oauth_ui
     assert 'from "./pi-registry.mjs"' in providers
+    assert 'import("./pi-registry.mjs")' in supported_providers
+    assert "store.mjs" not in supported_providers
     assert 'from "@earendil-works/pi-ai/providers/all"' in registry
     assert 'from "@earendil-works/pi-ai"' not in server
     assert 'from "@earendil-works/pi-ai"' not in login
     assert "checkBuiltinRegistry();" in providers
+    assert "checkBuiltinRegistry();" in supported_providers
     assert "pi-registry.mjs" in dockerfile
+    assert "oauth-ui.mjs" in dockerfile
+    assert "supported-providers.mjs" in dockerfile
     assert package["name"] == "cyclo-gateway"
     assert package["dependencies"] == {"@earendil-works/pi-ai": "0.80.6"}
     assert lock["packages"][""]["name"] == "cyclo-gateway"

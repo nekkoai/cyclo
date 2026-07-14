@@ -507,7 +507,11 @@ def cmd_models(args: argparse.Namespace) -> int:
             if isinstance(model_id, str) and model_id:
                 names.append(f"{provider}/{model_id}")
     if not names:
-        raise CycloError("gateway returned no models")
+        raise CycloError(
+            "gateway returned no models; run `cyclo gateway providers` to list "
+            "login choices, then use the listed "
+            "`cyclo gateway login PROVIDER` command"
+        )
     for model in names:
         print(model)
     return 0
@@ -555,23 +559,17 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     if args.gateway_help:
         return gateway_cli.main(["--help"])
     if not args.arguments:
-        raise CycloError("gateway requires login, status, or destroy-store")
+        raise CycloError("gateway requires providers, login, status, or destroy-store")
     action, *rest = args.arguments
-    if action not in {"login", "status", "destroy-store"}:
+    if action not in {"providers", "login", "status", "destroy-store"}:
         raise CycloError(
-            "cyclo gateway accepts login, status, or destroy-store; "
+            "cyclo gateway accepts providers, login, status, or destroy-store; "
             "use cyclo models or cyclo usage for gateway queries"
         )
-    return gateway_cli.main(
-        [
-            action,
-            "--image",
-            args.gateway_image,
-            "--store-volume",
-            args.store_volume,
-            *rest,
-        ]
-    )
+    delegated = [action, "--image", args.gateway_image]
+    if action != "providers":
+        delegated.extend(["--store-volume", args.store_volume])
+    return gateway_cli.main([*delegated, *rest])
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -694,7 +692,19 @@ def build_parser() -> argparse.ArgumentParser:
     usage = commands.add_parser("usage", help="show proxy token usage by team, generation, provider, and model")
     usage.set_defaults(func=cmd_usage)
 
-    models = commands.add_parser("models", help="list gateway provider/model names accepted in a team roster")
+    models = commands.add_parser(
+        "models",
+        help="list gateway provider/model names accepted in a team roster",
+        description=(
+            "List provider/model names available from logged-in gateway accounts. "
+            "A provider is the upstream AI service or subscription account before "
+            "the slash."
+        ),
+        epilog=(
+            "Before the first login, run `cyclo gateway providers` to list provider "
+            "names and authentication methods."
+        ),
+    )
     models.add_argument("--build-gateway", action="store_true")
     models.set_defaults(func=cmd_models)
 
@@ -708,8 +718,8 @@ def build_parser() -> argparse.ArgumentParser:
     gateway_parser = commands.add_parser(
         "gateway",
         help=(
-            "manage Cyclo's isolated gateway store for credentials, "
-            "subscriptions, and retained usage history"
+            "discover providers and manage Cyclo's isolated gateway store for "
+            "credentials, subscriptions, and retained usage history"
         ),
         add_help=False,
     )

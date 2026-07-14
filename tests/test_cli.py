@@ -269,6 +269,10 @@ def test_gateway_destroy_store_uses_selected_volume(monkeypatch) -> None:
             "credentials, subscriptions, and retained usage history",
         ),
         (["gateway", "login", "--help"], "--api-key-stdin"),
+        (
+            ["gateway", "providers", "--help"],
+            "Providers are upstream AI services",
+        ),
         (["gateway", "status", "--help"], "--store-volume"),
         (["gateway", "destroy-store", "--help"], "--confirm VOLUME"),
     ],
@@ -292,11 +296,12 @@ def test_gateway_summary_and_missing_action_cover_store_management(capsys) -> No
 
     assert stopped.value.code == 0
     help_text = capsys.readouterr().out
-    assert "manage Cyclo's isolated gateway store" in help_text
+    assert "discover providers" in help_text
+    assert "isolated gateway" in help_text
     assert "retained usage history" in help_text
 
     assert main(["gateway"]) == 1
-    assert "requires login, status, or destroy-store" in capsys.readouterr().err
+    assert "requires providers, login, status, or destroy-store" in capsys.readouterr().err
 
 
 def test_models_prints_copyable_provider_model_names(

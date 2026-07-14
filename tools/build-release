@@ -159,8 +159,28 @@ docker run --rm --network none \
         pi --offline --help > /tmp/pi-help
         grep -F "Extension CLI Flags" /tmp/pi-help
     '
+providers_output=$work_root/gateway-providers
+HOME=$home XDG_STATE_HOME=$home/.local/state \
+    "$venv/bin/cyclo" \
+    --gateway-image "cyclo-gateway:release-$short_commit" \
+    gateway providers > "$providers_output"
+grep -F "$(printf 'PROVIDER\tDESCRIPTION\tAUTH\tLOGIN')" \
+    "$providers_output" >/dev/null
+grep -F "cyclo gateway login anthropic" "$providers_output" >/dev/null
+grep -F "cyclo gateway login openai --api-key-stdin" \
+    "$providers_output" >/dev/null
 docker run --rm --network none \
     "cyclo-gateway:release-$short_commit" providers.mjs >/dev/null
+oauth_output=$work_root/oauth-login
+if printf 'q\n' | docker run --rm --interactive \
+    --security-opt no-new-privileges --cap-drop ALL --pids-limit 256 \
+    --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+    --network none "cyclo-gateway:release-$short_commit" \
+    login.mjs openai-codex > "$oauth_output" 2>&1; then
+    fail "cancelled OAuth login unexpectedly succeeded"
+fi
+grep -F "Select OpenAI Codex login method" "$oauth_output" >/dev/null
+grep -F "login failed: Login cancelled" "$oauth_output" >/dev/null
 
 [ -z "$(git status --porcelain --untracked-files=normal)" ] \
     || fail "release verification modified the committed tree"

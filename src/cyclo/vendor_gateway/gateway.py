@@ -697,8 +697,8 @@ def start_gateway(config: GatewayConfig, token: str, build: bool = False) -> dic
     catalog = fetch_provider_catalog(port, token)
     if not catalog:
         raise CycloError(
-            "gateway has no provisioned providers; run "
-            "`cyclo gateway login <provider>` (or `--api-key`) first"
+            "gateway has no provisioned providers; run `cyclo gateway providers` "
+            "to list login choices, then use the listed login command"
         )
     return catalog
 
