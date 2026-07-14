@@ -73,7 +73,9 @@ printf '%s\n' '==> source tests'
         for script do
             first=
             IFS= read -r first < "$script" || :
-            [ "$first" = "#!/bin/sh" ] && sh -n "$script"
+            if [ "$first" = "#!/bin/sh" ]; then
+                sh -n "$script" || exit 1
+            fi
         done
     ' sh {} +
 )

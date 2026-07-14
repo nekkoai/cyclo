@@ -91,6 +91,7 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert "tools/secret-scan" in release
     assert "git archive --format=tar HEAD" in release
     assert "GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree" in release
+    assert 'sh -n "$script" || exit 1' in release
     assert "tools/release-acceptance" in release
     assert "docker build --pull" in release
     assert not re.search(r"\bgh\s", release)
