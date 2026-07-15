@@ -9,6 +9,7 @@ from cyclo.agentws_bundle import packaged_agentws_template
 from cyclo.cli import (
     DEFAULT_GATEWAY_IMAGE,
     _DashboardUsageReader,
+    build_parser,
     cmd_repair,
     main,
     stop_instance,
@@ -528,9 +529,10 @@ def test_dashboard_command_prints_url_and_closes_server(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     events: list[str] = []
+    server_args: dict[str, object] = {}
 
     class FakeServer:
-        server_address = ("127.0.0.1", 43123)
+        server_address = ("0.0.0.0", 43123)
 
         def serve_forever(self, *, poll_interval):
             assert poll_interval == 0.5
@@ -543,7 +545,7 @@ def test_dashboard_command_prints_url_and_closes_server(
     monkeypatch.setattr("cyclo.cli.packaged_dashboard_assets", lambda: {"/": "ok"})
     monkeypatch.setattr(
         "cyclo.cli.make_dashboard_server",
-        lambda *_args, **_kwargs: FakeServer(),
+        lambda *_args, **kwargs: server_args.update(kwargs) or FakeServer(),
     )
 
     result = main(
@@ -551,6 +553,8 @@ def test_dashboard_command_prints_url_and_closes_server(
             "--state-root",
             str(tmp_path / "state"),
             "dashboard",
+            "--host",
+            "0.0.0.0",
             "--port",
             "0",
         ]
@@ -558,4 +562,26 @@ def test_dashboard_command_prints_url_and_closes_server(
 
     assert result == 0
     assert events == ["serve", "close"]
-    assert "http://127.0.0.1:43123/" in capsys.readouterr().out
+    assert server_args["host"] == "0.0.0.0"
+    output = capsys.readouterr().out
+    assert "http://0.0.0.0:43123/" in output
+    assert "WARNING" in output
+    assert "no authentication" in output
+
+
+def test_dashboard_help_warns_about_non_loopback_exposure(capsys) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        main(["dashboard", "--help"])
+
+    assert stopped.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--host" in help_text
+    assert "default: 127.0.0.1" in help_text
+    assert "0.0.0.0" in help_text
+    assert "no authentication" in help_text
+
+
+def test_dashboard_defaults_to_loopback() -> None:
+    args = build_parser().parse_args(["dashboard"])
+
+    assert args.host == "127.0.0.1"

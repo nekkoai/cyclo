@@ -321,25 +321,27 @@ cyclo stop plan-execute-verify
 Queue mutations, such as task creation, are sent into the running container;
 Cyclo does not execute container-writable queue files on the host.
 
-`cyclo dashboard` starts a read-only fleet view on a random loopback port and
-prints its URL. It combines lifecycle state, bounded queue summaries, recent
-task/job activity, and gateway token usage for every instance. Queue scans are
-limited per refresh to 4,096 direct entries and 2 MiB of file data, with eight
-recent tasks and twelve recent activity records retained; truncation is
-reported. If the gateway is unavailable, fleet and queue data remain visible
-while usage is marked unavailable. The dashboard never starts or reconciles the
-gateway and never executes queue content:
+`cyclo dashboard` starts a read-only fleet view on a random loopback port by
+default and prints its URL. It combines lifecycle state, bounded queue
+summaries, recent task/job activity, and gateway token usage for every instance.
+Queue scans are limited per refresh to 4,096 direct entries and 2 MiB of file
+data, with eight recent tasks and twelve recent activity records retained;
+truncation is reported. If the gateway is unavailable, fleet and queue data
+remain visible while usage is marked unavailable. The dashboard never starts
+or reconciles the gateway and never executes queue content:
 
 ```sh
 cyclo dashboard
 # Cyclo dashboard: http://127.0.0.1:49152/
 ```
 
-Use `cyclo dashboard --port 4173` for a stable port. It runs in the foreground
-until Ctrl-C. Version 0.1 has no application authentication, so it is strictly
-bound to loopback. Each online instance links to its detailed read-only queue
-viewer; stopped and offline instances remain visible from persistent host
-state.
+Use `cyclo dashboard --port 4173` for a stable port. To expose it deliberately
+on every IPv4 interface, run `cyclo dashboard --host 0.0.0.0`; Cyclo prints a
+warning when the selected address is not loopback. It runs in the foreground
+until Ctrl-C. Version 0.1 has no application authentication, so only use a
+non-loopback bind on a trusted network with appropriate firewall controls. Each
+online instance links to its detailed read-only queue viewer; stopped and
+offline instances remain visible from persistent host state.
 
 `cyclo usage` prints an aggregate JSON snapshot of the retained gateway ledger.
 Records contain attribution and provider-reported accounting metadata; Cyclo

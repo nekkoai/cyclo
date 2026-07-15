@@ -10,7 +10,13 @@ from pathlib import Path
 
 from . import __version__
 from .agentws_bundle import packaged_agentws_root
-from .dashboard import DashboardSnapshot, make_dashboard_server, packaged_dashboard_assets
+from .dashboard import (
+    DEFAULT_DASHBOARD_HOST,
+    DashboardSnapshot,
+    dashboard_host_is_loopback,
+    make_dashboard_server,
+    packaged_dashboard_assets,
+)
 from .docker import ContainerSpec, Docker, container_command, validate_mount_boundaries
 from .errors import CycloError
 from .gateway import CredentialGateway
@@ -420,11 +426,20 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     )
     server = make_dashboard_server(
         snapshot.build,
+        host=args.host,
         port=args.port,
         static_assets=packaged_dashboard_assets(),
     )
+    host = str(server.server_address[0])
     port = int(server.server_address[1])
-    print(f"Cyclo dashboard: http://127.0.0.1:{port}/", flush=True)
+    print(f"Cyclo dashboard: http://{host}:{port}/", flush=True)
+    if not dashboard_host_is_loopback(host):
+        print(
+            "WARNING: dashboard has no authentication and is exposed on a "
+            "non-loopback address; anyone who can reach this host can view "
+            "team activity.",
+            flush=True,
+        )
     print("Press Ctrl-C to stop.", flush=True)
     try:
         server.serve_forever(poll_interval=0.5)
@@ -688,12 +703,24 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard = commands.add_parser(
         "dashboard",
         help="serve the local read-only dashboard for all Cyclo instances",
+        description=(
+            "Serve the read-only dashboard. It has no authentication; binding "
+            "a non-loopback host exposes team activity to reachable clients."
+        ),
+    )
+    dashboard.add_argument(
+        "--host",
+        default=DEFAULT_DASHBOARD_HOST,
+        help=(
+            "listen address (default: 127.0.0.1); non-loopback addresses such "
+            "as 0.0.0.0 expose the unauthenticated dashboard"
+        ),
     )
     dashboard.add_argument(
         "--port",
         type=int,
         default=0,
-        help="loopback port; 0 chooses a free port",
+        help="host port; 0 chooses a free port",
     )
     dashboard.set_defaults(func=cmd_dashboard)
 

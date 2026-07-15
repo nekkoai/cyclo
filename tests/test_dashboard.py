@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -13,10 +14,11 @@ import pytest
 from cyclo.dashboard import (
     DashboardSnapshot,
     QueueLimits,
+    dashboard_host_is_loopback,
     make_dashboard_server,
     packaged_dashboard_assets,
     scan_agentws_queue,
-    validate_loopback_host,
+    validate_dashboard_host,
 )
 from cyclo.errors import CycloError
 from cyclo.state import Instance, StateStore
@@ -334,7 +336,21 @@ def test_packaged_dashboard_assets_use_fixed_browser_routes() -> None:
     assert b'/api/snapshot' in assets["/static/app.js"][1]
 
 
-def test_dashboard_rejects_non_loopback_hosts() -> None:
-    validate_loopback_host("127.0.0.1")
-    with pytest.raises(CycloError, match="loopback"):
-        validate_loopback_host("0.0.0.0")
+def test_dashboard_accepts_explicit_non_loopback_hosts() -> None:
+    validate_dashboard_host("127.0.0.1")
+    validate_dashboard_host("0.0.0.0")
+
+    assert dashboard_host_is_loopback("127.0.0.1") is True
+    assert dashboard_host_is_loopback("0.0.0.0") is False
+
+
+def test_dashboard_rejects_invalid_hosts(monkeypatch) -> None:
+    with pytest.raises(CycloError, match="non-empty"):
+        validate_dashboard_host("")
+
+    def unresolved(*_args, **_kwargs):
+        raise socket.gaierror("test lookup failed")
+
+    monkeypatch.setattr("cyclo.dashboard.socket.getaddrinfo", unresolved)
+    with pytest.raises(CycloError, match="cannot resolve"):
+        validate_dashboard_host("not-a-real-cyclo-host.invalid")

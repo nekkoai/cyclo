@@ -608,16 +608,37 @@ def _normalize_assets(assets: Mapping[str, StaticAsset] | None) -> dict[str, tup
     return result
 
 
-def validate_loopback_host(host: str) -> None:
+def _dashboard_host_addresses(host: str) -> set[str]:
+    if not isinstance(host, str) or not host or host != host.strip():
+        raise CycloError("dashboard host must be a non-empty address or hostname")
     try:
         addresses = {
             item[4][0].split("%", 1)[0]
-            for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            for item in socket.getaddrinfo(
+                host,
+                None,
+                family=socket.AF_INET,
+                type=socket.SOCK_STREAM,
+            )
         }
     except socket.gaierror as exc:
         raise CycloError(f"cannot resolve dashboard host {host!r}: {exc}") from exc
-    if not addresses or not all(ipaddress.ip_address(value).is_loopback for value in addresses):
-        raise CycloError("Cyclo dashboard may listen only on a loopback address")
+    if not addresses:
+        raise CycloError(f"cannot resolve dashboard host {host!r}")
+    return addresses
+
+
+def validate_dashboard_host(host: str) -> None:
+    """Require a bindable IPv4 host; callers decide whether exposure is safe."""
+
+    _dashboard_host_addresses(host)
+
+
+def dashboard_host_is_loopback(host: str) -> bool:
+    return all(
+        ipaddress.ip_address(value).is_loopback
+        for value in _dashboard_host_addresses(host)
+    )
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -723,7 +744,7 @@ def make_dashboard_server(
     port: int = DEFAULT_DASHBOARD_PORT,
     static_assets: Mapping[str, StaticAsset] | None = None,
 ) -> DashboardHTTPServer:
-    validate_loopback_host(host)
+    validate_dashboard_host(host)
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
         raise CycloError("dashboard port must be between 0 and 65535")
     try:
