@@ -25,6 +25,10 @@ task paths from there, and report changes with project-relative paths.
 
 Do not mistake `/team`, `/agentws`, or a job workspace for the project.
 
+All `bin/`, `tasks/`, `jobs/`, and `agents/` paths below are relative to
+`$CYCLO_AGENTWS_RUNTIME` (`/agentws`). Run queue commands from that directory;
+run project commands from `$AGENTWS_WORKSPACE`.
+
 The launcher has already selected your role, claimed one job for that role, and
 recorded that job in your agent directory. Discover your assignment from files,
 not from hidden state.
