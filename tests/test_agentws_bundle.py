@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
+import runpy
 import shutil
 import stat
 import subprocess
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
+
+import pytest
 
 from cyclo.agentws_bundle import (
     packaged_agentws_root,
@@ -95,3 +102,48 @@ def test_packaged_agentws_initializes_a_team_without_a_checkout(tmp_path: Path) 
     assert {agent.model for agent in team.agents} == {"openai-codex/test-model"}
     assert (destination / "AGENTS.md").is_file()
     assert (destination / "roles" / "planner.md").is_file()
+
+
+def test_packaged_agentws_viewer_is_observation_only(tmp_path: Path) -> None:
+    runtime = packaged_agentws_template()
+    namespace = runpy.run_path(str(runtime / "tools" / "agentws"))
+    queue = tmp_path / "queue"
+    for directory in ("tasks", "jobs", "agents"):
+        (queue / directory).mkdir(parents=True)
+
+    config = namespace["Config"](
+        root=queue,
+        host="127.0.0.1",
+        port=0,
+        pin_root=True,
+    )
+    namespace["ViewerHandler"].config = config
+    server = namespace["bind_server"](config)
+    assert server is not None
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        with urllib.request.urlopen(f"{url}/") as response:
+            html = response.read()
+            assert b'class="brand-name">cyclo<' in html
+            assert b"view-chat" not in html
+        with urllib.request.urlopen(f"{url}/api/snapshot") as response:
+            snapshot = json.loads(response.read())
+            assert snapshot["root"] == str(queue)
+            assert snapshot["metrics"]["tasksTotal"] == 0
+            assert "capabilities" not in snapshot
+
+        request = urllib.request.Request(
+            f"{url}/api/snapshot",
+            data=b"{}",
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request)
+        assert rejected.value.code == 405
+        assert json.loads(rejected.value.read())["error"] == "AgentWS viewer is observation-only"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

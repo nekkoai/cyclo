@@ -206,8 +206,13 @@ svg {
 .connection-dot {
   width: 7px;
   height: 7px;
-  background: var(--green);
+  background: var(--amber);
   border-radius: 50%;
+  box-shadow: 0 0 0 4px var(--amber-soft);
+}
+
+.connection.live .connection-dot {
+  background: var(--green);
   box-shadow: 0 0 0 4px var(--green-soft);
 }
 

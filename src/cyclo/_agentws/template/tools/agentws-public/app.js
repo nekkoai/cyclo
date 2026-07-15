@@ -78,11 +78,13 @@ async function loadSnapshot(options = {}) {
     state.root = payload.root;
     setRootDisplay(payload.root);
     els.railStatus.classList.remove("error");
+    els.railStatus.classList.add("live");
     els.connectionLabel.textContent = "Live";
     els.snapshotTime.textContent = formatDateTime(payload.generatedAt);
     render();
     if (!silent) toast("Snapshot loaded");
   } catch (error) {
+    els.railStatus.classList.remove("live");
     els.railStatus.classList.add("error");
     els.connectionLabel.textContent = "Unavailable";
     toast(error.message);
