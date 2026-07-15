@@ -12,6 +12,7 @@ include tools/secret-scan
 
 recursive-include .github *.yml
 recursive-include docs *.md
+include docs/assets/cyclo-hero.jpg
 recursive-include requirements *.in *.txt
 recursive-include template README.md team *.md
 recursive-include tests *.py *.mjs
