@@ -7,7 +7,6 @@ import json
 import mimetypes
 import os
 import re
-import select
 import signal
 import stat
 import subprocess
@@ -26,7 +25,6 @@ PUBLIC_DIR = Path(__file__).resolve().parent / "agentws-public"
 DEFAULT_PORT = 4137
 PROCESS_CHECK_INTERVAL = 1.0
 PROCESS_RESTART_DELAY = 1.0
-FIFO_WRITE_TIMEOUT = 2.0
 VALID_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 VALID_TEAM_ENGINES = {"pi", "pi-interactive", "codex", "claude"}
 ALLOWED_FILES = {
@@ -50,7 +48,6 @@ class Config:
     host: str
     port: int
     pin_root: bool = False
-    read_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -496,23 +493,6 @@ class ConfinedQueueReader:
             os.close(parent_fd)
 
 
-def write_all_nonblocking(fd: int, payload: bytes, timeout: float = FIFO_WRITE_TIMEOUT) -> None:
-    deadline = time.monotonic() + timeout
-    offset = 0
-    while offset < len(payload):
-        try:
-            written = os.write(fd, payload[offset:])
-        except BlockingIOError:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("interactive input timed out")
-            select.select([], [fd], [], min(remaining, 0.1))
-            continue
-        if written <= 0:
-            raise BrokenPipeError("interactive input pipe closed")
-        offset += written
-
-
 def first_markdown_title(markdown, fallback):
     match = re.search(r"^#\s+(.+)$", markdown, re.MULTILINE)
     return match.group(1).strip() if match else titleize(fallback)
@@ -693,13 +673,6 @@ def read_agents(queue: ConfinedQueueReader, jobs_by_agent):
     return sorted(agents, key=lambda agent: (agent["role"], agent["id"]))
 
 
-def is_fifo(path: Path):
-    try:
-        return stat.S_ISFIFO(path.stat().st_mode)
-    except OSError:
-        return False
-
-
 def enrich_tasks(tasks, jobs):
     by_task = {}
     for job in jobs:
@@ -876,11 +849,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self.serve_static(parsed.path)
 
     def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path.startswith("/api/"):
-            self.handle_api_post(parsed)
-        else:
-            self.send_json(404, {"error": "unknown route"})
+        self.send_json(405, {"error": "AgentWS viewer is observation-only"})
 
     def handle_api(self, parsed):
         query = parse_qs(parsed.query)
@@ -888,24 +857,9 @@ class ViewerHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/snapshot":
                 snapshot = build_snapshot(root)
-                snapshot["capabilities"] = {"agentInput": not self.config.read_only}
                 self.send_json(200, snapshot)
             elif parsed.path == "/api/file":
                 self.handle_file(root, query)
-            else:
-                self.send_json(404, {"error": "unknown api route"})
-        except Exception as exc:
-            self.send_json(400, {"error": str(exc)})
-
-    def handle_api_post(self, parsed):
-        query = parse_qs(parsed.query)
-        root = self.resolve_api_root(query)
-        try:
-            if parsed.path == "/api/agent-input":
-                if self.config.read_only:
-                    self.send_json(403, {"error": "viewer is read-only"})
-                else:
-                    self.handle_agent_input(root, query)
             else:
                 self.send_json(404, {"error": "unknown api route"})
         except Exception as exc:
@@ -953,50 +907,6 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 "text": text,
             },
         )
-
-    def handle_agent_input(self, root: Path, query):
-        agent_id = query.get("id", [""])[0]
-        if not VALID_ID.match(agent_id):
-            raise ValueError("invalid agent id")
-
-        length = min(int(self.headers.get("Content-Length", "0") or "0"), 64 * 1024)
-        payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-        message = str(payload.get("message") or "").strip()
-        mode = str(payload.get("mode") or "follow_up")
-        if not message:
-            raise ValueError("message is required")
-        if mode not in {"follow_up", "steer", "prompt"}:
-            raise ValueError("invalid mode")
-
-        agent_dir = root.resolve() / "agents" / agent_id
-        if not (agent_dir / "interactive").is_file():
-            self.send_json(409, {"error": "agent is not interactive"})
-            return
-        input_fifo = agent_dir / "input.fifo"
-        if not is_fifo(input_fifo):
-            self.send_json(409, {"error": "interactive input is not ready"})
-            return
-
-        line = json.dumps({"message": message, "mode": mode}) + "\n"
-        try:
-            fd = os.open(input_fifo, os.O_WRONLY | os.O_NONBLOCK)
-        except OSError as exc:
-            if exc.errno == errno.ENXIO:
-                self.send_json(409, {"error": "interactive agent is not listening; restart AgentWS or wait for the console to finish starting"})
-                return
-            self.send_json(409, {"error": f"interactive input is not available: {exc.strerror}"})
-            return
-        try:
-            write_all_nonblocking(fd, line.encode("utf-8"))
-        except TimeoutError as exc:
-            self.send_json(409, {"error": str(exc)})
-            return
-        except OSError as exc:
-            self.send_json(409, {"error": f"interactive input write failed: {exc.strerror or exc}"})
-            return
-        finally:
-            os.close(fd)
-        self.send_json(200, {"ok": True})
 
     def serve_static(self, raw_path):
         relative = unquote(raw_path.lstrip("/")) or "index.html"
@@ -1204,7 +1114,7 @@ def main():
     parser.add_argument(
         "--read-only",
         action="store_true",
-        help="disable interactive agent input through the web interface",
+        help="deprecated compatibility flag; the web interface is always observation-only",
     )
     parser.add_argument(
         "--team-manifest",
@@ -1219,7 +1129,6 @@ def main():
         host=args.host,
         port=args.port,
         pin_root=args.pin_root,
-        read_only=args.read_only,
     )
     workspace = Path(args.workspace).expanduser().resolve() if args.workspace else config.root
     if not workspace.is_dir():

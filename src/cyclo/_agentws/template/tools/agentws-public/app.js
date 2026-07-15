@@ -2,12 +2,6 @@
 
 const DEFAULT_ROOT = "";
 const LIVE_REFRESH_MS = 750;
-const CHAT_REFRESH_MS = 1000;
-const CHAT_STATE_REFRESH_MS = 3000;
-const CHAT_TRANSCRIPT_MAX_BYTES = 512 * 1024;
-const CHAT_MAX_MESSAGES = 80;
-const CHAT_RENDER_TEXT_LIMIT = 180 * 1024;
-const TRANSCRIPT_SECTION_TITLES = new Set(["User", "Assistant", "Thinking", "Reasoning", "Tool Call"]);
 
 const state = {
   snapshot: null,
@@ -15,25 +9,16 @@ const state = {
   activeFile: null,
   live: false,
   liveTimer: null,
-  chatTimer: null,
-  chatDraft: "",
-  chatAutofocused: false,
-  chatWasBusy: false,
-  chatPinned: true,
-  chatMessageKeys: [],
-  chatTranscriptInFlight: false,
-  chatStateInFlight: false,
-  chatStateLastRefresh: 0,
   view: initialView(),
   query: "",
   root: DEFAULT_ROOT
 };
 
 const columns = [
-  ["intake", "Intake"],
-  ["pending", "Pending"],
-  ["active", "Active"],
+  ["active", "In progress"],
   ["blocked", "Blocked"],
+  ["pending", "Queued"],
+  ["intake", "Intake"],
   ["closed", "Done"]
 ];
 
@@ -42,21 +27,25 @@ const els = {
   searchInput: document.querySelector("#searchInput"),
   refreshButton: document.querySelector("#refreshButton"),
   railStatus: document.querySelector("#railStatus"),
+  connectionLabel: document.querySelector("#connectionLabel"),
+  snapshotTime: document.querySelector("#snapshotTime"),
+  resultCount: document.querySelector("#resultCount"),
   metrics: document.querySelector("#metrics"),
-  chat: document.querySelector("#view-chat"),
   board: document.querySelector("#view-board"),
   pipeline: document.querySelector("#view-pipeline"),
   agents: document.querySelector("#view-agents"),
   map: document.querySelector("#view-map"),
   inspector: document.querySelector("#inspector"),
+  inspectorBackdrop: document.querySelector("#inspectorBackdrop"),
   toast: document.querySelector("#toast")
 };
 
 setRootDisplay(state.root);
 
-document.querySelectorAll(".rail-button").forEach((button) => {
+document.querySelectorAll(".view-tab").forEach((button) => {
   button.addEventListener("click", () => setView(button.dataset.view));
 });
+els.inspectorBackdrop.addEventListener("click", clearSelection);
 
 els.refreshButton.addEventListener("click", () => loadSnapshot());
 els.searchInput.addEventListener("input", () => {
@@ -66,8 +55,7 @@ els.searchInput.addEventListener("input", () => {
 
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") clearSelection();
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-    if (state.view === "chat") return;
+  if (event.key === "/" && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "")) {
     event.preventDefault();
     els.searchInput.focus();
   }
@@ -90,14 +78,13 @@ async function loadSnapshot(options = {}) {
     state.root = payload.root;
     setRootDisplay(payload.root);
     els.railStatus.classList.remove("error");
-    if (silent && state.view === "chat") {
-      updateChatAgentState(consoleAgent());
-    } else {
-      render();
-    }
+    els.connectionLabel.textContent = "Live";
+    els.snapshotTime.textContent = formatDateTime(payload.generatedAt);
+    render();
     if (!silent) toast("Snapshot loaded");
   } catch (error) {
     els.railStatus.classList.add("error");
+    els.connectionLabel.textContent = "Unavailable";
     toast(error.message);
   } finally {
     setBusy(false);
@@ -116,17 +103,13 @@ function setRootDisplay(root) {
 
 function setView(view, options = {}) {
   const { updateHash = true } = options;
-  const previousView = state.view;
   state.view = view;
-  if (view === "chat" && previousView !== "chat") {
-    state.chatAutofocused = false;
-    state.chatPinned = true;
-  }
   if (updateHash && location.hash.slice(1) !== view) {
     history.replaceState(null, "", `#${view}`);
   }
-  document.querySelectorAll(".rail-button").forEach((button) => {
+  document.querySelectorAll(".view-tab").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === view);
+    button.setAttribute("aria-current", button.dataset.view === view ? "page" : "false");
   });
   document.querySelectorAll(".view-panel").forEach((panel) => {
     panel.classList.toggle("active", panel.id === `view-${view}`);
@@ -136,12 +119,13 @@ function setView(view, options = {}) {
 }
 
 function updateToolbarForView() {
-  els.searchInput.closest(".search-field").hidden = state.view === "chat";
+  const labels = { board: "tasks", pipeline: "jobs", agents: "agents", map: "flow" };
+  els.searchInput.placeholder = `Search ${labels[state.view] || "activity"}…`;
 }
 
 function initialView() {
   const view = location.hash.replace("#", "");
-  return ["chat", "board", "pipeline", "agents", "map"].includes(view) ? view : "chat";
+  return ["board", "pipeline", "agents", "map"].includes(view) ? view : "board";
 }
 
 function render() {
@@ -150,10 +134,7 @@ function render() {
     return;
   }
 
-  els.metrics.hidden = state.view === "chat";
-  if (state.view !== "chat") renderMetrics();
-  if (state.view !== "chat") stopChatTimer();
-  if (state.view === "chat") renderChat();
+  renderMetrics();
   if (state.view === "board") renderBoard();
   if (state.view === "pipeline") renderPipeline();
   if (state.view === "agents") renderAgents();
@@ -167,18 +148,17 @@ function render() {
       state.selected = null;
     }
   }
+  updateResultCount();
   renderInspector();
 }
 
 function renderEmptyChooser() {
-  els.metrics.hidden = false;
   els.metrics.innerHTML = metricSkeleton();
   const message = `
     <div class="empty-note">
       Run <strong>tools/agentws</strong> and load the printed local URL.
     </div>
   `;
-  els.chat.innerHTML = message;
   els.board.innerHTML = message;
   els.pipeline.innerHTML = message;
   els.agents.innerHTML = message;
@@ -189,16 +169,16 @@ function renderMetrics() {
   const { metrics, generatedAt } = state.snapshot;
   const activeJobs = (metrics.jobsByStatus.running || 0) + (metrics.jobsByStatus.claimed || 0);
   els.metrics.innerHTML = [
-    metric(metrics.tasksTotal, "Tasks tracked", `${metrics.tasksByFlow.closed || 0} complete`),
-    metric(activeJobs, "Active jobs", `${metrics.jobsByStatus.pending || 0} pending`),
-    metric(metrics.activeAgents, "Agents working", `${metrics.agentsTotal} registered`),
-    metric(metrics.failedJobs + metrics.attentionTasks, "Need attention", `Updated ${formatTime(generatedAt)}`)
+    metric(metrics.tasksTotal, "Tasks tracked", `${metrics.tasksByFlow.closed || 0} complete`, "primary"),
+    metric(activeJobs, "Active jobs", `${metrics.jobsByStatus.pending || 0} pending`, "active"),
+    metric(metrics.activeAgents, "Agents working", `${metrics.agentsTotal} registered`, "agents"),
+    metric(metrics.failedJobs + metrics.attentionTasks, "Need attention", `Updated ${formatTime(generatedAt)}`, "attention")
   ].join("");
 }
 
-function metric(value, label, sublabel) {
+function metric(value, label, sublabel, tone = "") {
   return `
-    <article class="metric">
+    <article class="metric ${tone ? `metric--${tone}` : ""}">
       <strong>${escapeHtml(value)}</strong>
       <span>${escapeHtml(label)}</span>
       <span>${escapeHtml(sublabel)}</span>
@@ -210,15 +190,30 @@ function metricSkeleton() {
   return [0, 1, 2, 3].map(() => metric("...", "Loading", "")).join("");
 }
 
+function updateResultCount() {
+  if (!state.snapshot) return;
+  const counts = {
+    board: filteredTasks().length,
+    pipeline: filteredJobs().length,
+    agents: filteredAgents().length,
+    map: filteredTasks().length
+  };
+  const labels = { board: "tasks", pipeline: "jobs", agents: "agents", map: "tasks mapped" };
+  els.resultCount.textContent = `${counts[state.view] || 0} ${labels[state.view] || "items"}`;
+}
+
 function renderBoard() {
   const tasks = filteredTasks();
   const activity = filteredActivity();
   const byColumn = groupBy(tasks, (task) => task.flowState);
+  const populatedColumns = columns.filter(([key]) => (byColumn.get(key) || []).length);
 
   els.board.innerHTML = `
     <div class="board-layout">
       <div class="board-statuses">
-        ${columns.map(([key, label]) => renderColumn(key, label, byColumn.get(key) || [])).join("")}
+        ${populatedColumns.length
+          ? populatedColumns.map(([key, label]) => renderColumn(key, label, byColumn.get(key) || [])).join("")
+          : `<div class="empty-note">No matching tasks</div>`}
       </div>
       <aside class="feed-panel">
         <div class="section-head">
@@ -252,7 +247,7 @@ function renderTaskCard(task) {
   const tone = toneFor(task.flowState);
   const selected = isSelected("task", task.id) ? "selected" : "";
   return `
-    <button class="task-card ${selected}" data-select-type="task" data-select-id="${escapeAttr(task.id)}">
+    <button class="task-card status-${escapeAttr(task.flowState)} ${selected}" data-select-type="task" data-select-id="${escapeAttr(task.id)}">
       <div class="card-meta">
         <span class="status-pill status-${escapeAttr(task.flowState)} ${tone}">
           <span class="status-dot"></span>${escapeHtml(task.flowState)}
@@ -359,7 +354,7 @@ function renderAgents() {
 function renderAgentCard(agent) {
   const selected = isSelected("agent", agent.id) ? "selected" : "";
   return `
-    <button class="agent-card ${selected}" data-select-type="agent" data-select-id="${escapeAttr(agent.id)}">
+    <button class="agent-card ${agent.active ? "agent-card--active" : ""} ${selected}" data-select-type="agent" data-select-id="${escapeAttr(agent.id)}">
       <div class="agent-top">
         <div class="avatar">${escapeHtml(initials(agent.name))}</div>
         <div>
@@ -378,495 +373,6 @@ function renderAgentCard(agent) {
       </div>
     </button>
   `;
-}
-
-function renderChat() {
-  const agent = consoleAgent();
-  const inputAllowed = agentInputAllowed();
-  const inputReady = Boolean(inputAllowed && agent?.interactive && agent?.inputReady);
-  const isBusy = Boolean(agent?.busy);
-  const statusLabel = agent ? (!inputAllowed ? "observing" : isBusy ? "busy" : inputReady ? "ready" : "starting") : "offline";
-  const statusTone = !inputAllowed ? "" : isBusy ? "tone-blue" : inputReady ? "tone-green" : "tone-amber";
-  const placeholder = inputReady ? "Message console" : "Console agent is not ready";
-  const existingInput = document.querySelector("#chatInput");
-  if (existingInput) state.chatDraft = existingInput.value;
-  const actionDisabled = !inputReady || !state.chatDraft.trim();
-  const steerHidden = isBusy ? "" : "hidden";
-  const steerDisabled = inputReady ? "" : "disabled";
-
-  els.chat.innerHTML = `
-    <section class="chat-shell" aria-label="Console chat">
-      <div class="chat-heading">
-        <div>
-          <p class="eyebrow">Console</p>
-          <h2>Assistant</h2>
-        </div>
-        <span class="status-pill ${statusTone}" id="chatStatus"><span class="status-dot"></span>${escapeHtml(statusLabel)}</span>
-      </div>
-      <div class="chat-thread" id="chatThread" aria-live="polite">
-        <div class="empty-note">Loading chat</div>
-        <div class="chat-bottom-sentinel" id="chatBottomSentinel" aria-hidden="true"></div>
-      </div>
-      ${inputAllowed ? `<form class="chat-composer" id="chatComposer">
-        <textarea id="chatInput" rows="1" placeholder="${escapeAttr(placeholder)}" ${inputReady ? "" : "disabled"}>${escapeHtml(state.chatDraft)}</textarea>
-        <div class="chat-actions">
-          <button class="chat-action-button send" type="submit" id="chatActionButton" ${actionDisabled ? "disabled" : ""}>Send</button>
-          <button class="chat-steer-button" type="button" id="chatSteerButton" title="Steer now" aria-label="Steer now" ${steerHidden} ${steerDisabled}>
-            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-              <path d="M8 3h8l5 5v8l-5 5H8l-5-5V8zM9.2 8.7v6.6h5.6V8.7z"/>
-            </svg>
-          </button>
-        </div>
-        <div class="chat-input-hint">Enter to send, Shift+Enter for new line</div>
-      </form>` : observationOnlyNotice()}
-    </section>
-  `;
-
-  bindChatComposer(agent);
-  bindChatThread();
-  state.chatWasBusy = isBusy;
-  startChatTimer();
-  refreshChatTranscript({ scroll: true });
-
-  const input = document.querySelector("#chatInput");
-  autoSizeChatInput(input);
-  if (inputReady && input && !state.chatAutofocused) {
-    input.focus({ preventScroll: true });
-    state.chatAutofocused = true;
-  }
-}
-
-function bindChatComposer(agent) {
-  const form = document.querySelector("#chatComposer");
-  const input = document.querySelector("#chatInput");
-  const steerButton = document.querySelector("#chatSteerButton");
-  if (!form || !input) return;
-
-  input.addEventListener("input", () => {
-    state.chatDraft = input.value;
-    autoSizeChatInput(input);
-    syncChatAction(consoleAgent() || agent);
-  });
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      submitChatAction(consoleAgent() || agent, input);
-    }
-  });
-  form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    submitChatAction(consoleAgent() || agent, input);
-  });
-  steerButton?.addEventListener("click", () => sendChatSteer(consoleAgent() || agent, input));
-  syncChatAction(agent);
-}
-
-function bindChatThread() {
-  const thread = document.querySelector("#chatThread");
-  if (!thread) return;
-  thread.addEventListener("scroll", () => {
-    state.chatPinned = isNearThreadBottom(thread);
-  }, { passive: true });
-}
-
-function syncChatAction(agent) {
-  const input = document.querySelector("#chatInput");
-  const actionButton = document.querySelector("#chatActionButton");
-  const steerButton = document.querySelector("#chatSteerButton");
-  if (!input || !actionButton) return;
-  if (!agentInputAllowed()) {
-    input.disabled = true;
-    actionButton.disabled = true;
-    if (steerButton) steerButton.hidden = true;
-    return;
-  }
-  const isBusy = Boolean(agent?.busy);
-  actionButton.textContent = "Send";
-  actionButton.classList.add("send");
-  actionButton.classList.remove("stop");
-  actionButton.disabled = !input.value.trim() || !agent?.inputReady;
-  if (steerButton) {
-    steerButton.hidden = !isBusy;
-    steerButton.disabled = !agent?.inputReady || !isBusy;
-  }
-}
-
-function submitChatAction(agent, input) {
-  sendChatPrompt(agent, input);
-}
-
-function sendChatSteer(agent, input) {
-  if (!agent?.inputReady) {
-    toast("Console input is not ready");
-    return;
-  }
-  const customMessage = input?.value.trim() || "";
-  const message = customMessage || "Stop.";
-  const hasCustomMessage = Boolean(customMessage);
-  sendAgentInput(agent.id, message, "steer", {
-    input,
-    clearInput: hasCustomMessage,
-    refreshInspector: false,
-    refreshChat: true,
-    successMessage: hasCustomMessage ? "Steer sent" : "Stop sent"
-  }).then((sent) => {
-    if (sent && hasCustomMessage) {
-      state.chatDraft = "";
-      autoSizeChatInput(input);
-    }
-  });
-}
-
-function sendChatPrompt(agent, input) {
-  if (!agent?.inputReady) {
-    toast("Console input is not ready");
-    return;
-  }
-  const mode = agent?.busy ? "follow_up" : "prompt";
-  sendAgentInput(agent.id, input.value, mode, {
-    input,
-    clearInput: true,
-    refreshInspector: false,
-    refreshChat: true,
-    successMessage: agent?.busy ? "Follow-up queued" : "Message sent"
-  }).then((sent) => {
-    if (sent) {
-      state.chatDraft = "";
-      autoSizeChatInput(input);
-      agent.busy = true;
-      state.chatPinned = true;
-      updateChatAgentState(agent);
-    }
-  });
-}
-
-async function refreshChatTranscript(options = {}) {
-  const { scroll = false } = options;
-  const thread = document.querySelector("#chatThread");
-  if (!thread || state.view !== "chat") return;
-  if (state.chatTranscriptInFlight) return;
-
-  const agent = consoleAgent();
-  if (!agent) {
-    thread.innerHTML = `<div class="empty-note">Console agent is not running</div>`;
-    return;
-  }
-
-  state.chatTranscriptInFlight = true;
-  try {
-    const response = await fetch(`/api/file?type=agent&id=${encodeURIComponent(agent.id)}&file=transcript.log&tail=1&maxBytes=${CHAT_TRANSCRIPT_MAX_BYTES}`);
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "transcript load failed");
-    const renderKey = `${payload.size || 0}:${payload.text?.length || 0}`;
-    const isNewContent = thread.dataset.renderKey !== renderKey;
-    const stickToBottom = scroll || state.chatPinned || isNearThreadBottom(thread);
-    if (isNewContent) {
-      const messages = visibleChatMessages(parseTranscriptMessages(payload.text || ""));
-      updateChatMessages(thread, messages);
-      thread.dataset.renderKey = renderKey;
-    }
-    if (stickToBottom) scrollChatToBottom(thread);
-  } catch (error) {
-    updateChatError(thread, error.message);
-  } finally {
-    state.chatTranscriptInFlight = false;
-  }
-}
-
-async function refreshChatState() {
-  if (state.view !== "chat") return;
-  if (state.chatStateInFlight) return;
-  state.chatStateInFlight = true;
-  try {
-    const response = await fetch("/api/snapshot");
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "snapshot failed");
-    const previousDraft = document.querySelector("#chatInput")?.value ?? state.chatDraft;
-    state.snapshot = payload;
-    state.root = payload.root;
-    setRootDisplay(payload.root);
-    const agent = consoleAgent();
-    state.chatDraft = previousDraft;
-    updateChatAgentState(agent);
-    state.chatStateLastRefresh = Date.now();
-  } catch (error) {
-    els.railStatus.classList.add("error");
-  } finally {
-    state.chatStateInFlight = false;
-  }
-}
-
-function parseTranscriptMessages(text) {
-  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
-  const messages = [];
-  let current = null;
-  const fallback = [];
-
-  const flush = () => {
-    if (!current) return;
-    const body = current.lines.join("\n").trim();
-    if (body) messages.push({ role: current.role, title: current.title, text: body });
-    current = null;
-  };
-
-  for (const line of lines) {
-    const title = transcriptSectionTitle(line);
-    if (title) {
-      flush();
-      current = { role: chatRoleFor(title), title, lines: [] };
-      continue;
-    }
-    if (!current) {
-      if (line.trim() && !line.includes("earlier content truncated")) fallback.push(line);
-      continue;
-    }
-    if (/^\[\d{4}-\d{2}-\d{2}T/.test(line)) {
-      flush();
-      continue;
-    }
-    current.lines.push(line);
-  }
-  flush();
-  if (!messages.length) {
-    const tail = fallback.join("\n").trim();
-    if (tail) messages.push({ role: "tail", title: "Transcript Tail", text: tail });
-  }
-  return messages;
-}
-
-function transcriptSectionTitle(line) {
-  const heading = line.match(/^###\s+(.+?)\s*$/);
-  if (!heading) return "";
-  const title = heading[1].trim();
-  return TRANSCRIPT_SECTION_TITLES.has(title) ? title : "";
-}
-
-function chatRoleFor(title) {
-  const key = title.toLowerCase();
-  if (key === "user") return "user";
-  if (key === "assistant") return "assistant";
-  return "trace";
-}
-
-function renderChatMessages(messages) {
-  if (!messages.length) return `<div class="empty-note">No console messages yet</div>`;
-  return messages.map((message, index) => renderChatMessage(message, chatMessageKey(message, index))).join("");
-}
-
-function visibleChatMessages(messages) {
-  return messages.slice(-CHAT_MAX_MESSAGES);
-}
-
-function updateChatMessages(thread, messages) {
-  if (!messages.length) {
-    if (!thread.querySelector(".empty-note") || thread.querySelector("[data-chat-key]")) {
-      thread.innerHTML = `<div class="empty-note">No console messages yet</div>${chatBottomSentinelHtml()}`;
-    } else {
-      ensureChatBottomSentinel(thread);
-    }
-    state.chatMessageKeys = [];
-    return;
-  }
-
-  const keys = messages.map(chatMessageKey);
-  const signatures = messages.map(chatMessageSignature);
-  ensureChatBottomSentinel(thread);
-  thread.querySelectorAll(".empty-note").forEach((node) => node.remove());
-
-  const nodes = Array.from(thread.querySelectorAll("[data-chat-key]"));
-  const commonLength = Math.min(nodes.length, keys.length);
-  const prefixMatches = nodes.slice(0, commonLength).every((node, index) => node.dataset.chatKey === keys[index]);
-
-  if (!prefixMatches) {
-    thread.innerHTML = `${renderChatMessages(messages)}${chatBottomSentinelHtml()}`;
-    state.chatMessageKeys = keys;
-    return;
-  }
-
-  messages.slice(0, commonLength).forEach((message, index) => {
-    const node = nodes[index];
-    if (node.dataset.chatSig === signatures[index]) return;
-    const replacement = htmlToElement(renderChatMessage(message, keys[index], signatures[index]));
-    node.replaceWith(replacement);
-  });
-
-  nodes.slice(keys.length).forEach((node) => node.remove());
-
-  const sentinel = ensureChatBottomSentinel(thread);
-  messages.slice(nodes.length).forEach((message, offset) => {
-    const index = nodes.length + offset;
-    sentinel.insertAdjacentElement("beforebegin", htmlToElement(renderChatMessage(message, keys[index], signatures[index])));
-  });
-
-  state.chatMessageKeys = keys;
-}
-
-function updateChatError(thread, message) {
-  thread.innerHTML = `<div class="empty-note">${escapeHtml(message)}</div>${chatBottomSentinelHtml()}`;
-  state.chatMessageKeys = [];
-}
-
-function renderChatMessage(message, key = chatMessageKey(message, 0), signature = chatMessageSignature(message)) {
-  const attrs = `data-chat-key="${escapeAttr(key)}" data-chat-sig="${escapeAttr(signature)}"`;
-  const renderText = chatRenderableText(message.text);
-  const truncation = renderText.truncated
-    ? `<p class="chat-truncation">Showing the latest part of a very large message.</p>`
-    : "";
-  if (message.role === "tail") {
-    return `
-      <article class="chat-message assistant chat-tail" ${attrs}>
-        <div class="chat-bubble">
-          ${truncation || `<p class="chat-truncation">Showing recent transcript tail.</p>`}
-          <pre><code>${escapeHtml(renderText.text)}</code></pre>
-        </div>
-      </article>
-    `;
-  }
-  if (message.role === "trace") {
-    const traceBody = renderText.truncated
-      ? `<pre><code>${escapeHtml(renderText.text)}</code></pre>`
-      : markdownToHtml(renderText.text);
-    return `
-      <details class="chat-trace" ${attrs}>
-        <summary>${escapeHtml(message.title)}</summary>
-        <div>${truncation}${traceBody}</div>
-      </details>
-    `;
-  }
-
-  const isUser = message.role === "user";
-  const body = isUser
-    ? plainTextToHtml(renderText.text)
-    : renderText.truncated
-      ? `<pre><code>${escapeHtml(renderText.text)}</code></pre>`
-      : markdownToHtml(renderText.text);
-  return `
-    <article class="chat-message ${isUser ? "user" : "assistant"}" ${attrs}>
-      <div class="chat-bubble">
-        ${truncation}${body}
-      </div>
-    </article>
-  `;
-}
-
-function chatMessageKey(message, index) {
-  return `${index}:${message.role}:${message.title}`;
-}
-
-function chatMessageSignature(message) {
-  const text = String(message.text || "");
-  return `${text.length}:${hashString(text)}`;
-}
-
-function chatRenderableText(text) {
-  const value = String(text || "");
-  if (value.length <= CHAT_RENDER_TEXT_LIMIT) return { text: value, truncated: false };
-  return {
-    text: value.slice(-CHAT_RENDER_TEXT_LIMIT),
-    truncated: true
-  };
-}
-
-function hashString(value) {
-  let hash = 2166136261;
-  const text = String(value || "");
-  for (let index = 0; index < text.length; index += 1) {
-    hash ^= text.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(36);
-}
-
-function htmlToElement(html) {
-  const template = document.createElement("template");
-  template.innerHTML = html.trim();
-  return template.content.firstElementChild;
-}
-
-function chatBottomSentinelHtml() {
-  return `<div class="chat-bottom-sentinel" id="chatBottomSentinel" aria-hidden="true"></div>`;
-}
-
-function ensureChatBottomSentinel(thread) {
-  let sentinel = thread.querySelector("#chatBottomSentinel");
-  if (!sentinel) {
-    thread.insertAdjacentHTML("beforeend", chatBottomSentinelHtml());
-    sentinel = thread.querySelector("#chatBottomSentinel");
-  }
-  return sentinel;
-}
-
-function scrollChatToBottom(thread) {
-  ensureChatBottomSentinel(thread);
-  thread.scrollLeft = 0;
-  thread.scrollTop = thread.scrollHeight;
-  state.chatPinned = true;
-}
-
-function updateChatAgentState(agent) {
-  const inputAllowed = agentInputAllowed();
-  const inputReady = Boolean(inputAllowed && agent?.interactive && agent?.inputReady);
-  const isBusy = Boolean(agent?.busy);
-  const status = document.querySelector("#chatStatus");
-  const input = document.querySelector("#chatInput");
-
-  if (status) {
-    const label = agent ? (!inputAllowed ? "observing" : isBusy ? "busy" : inputReady ? "ready" : "starting") : "offline";
-    const tone = !inputAllowed ? "" : isBusy ? "tone-blue" : inputReady ? "tone-green" : "tone-amber";
-    status.className = `status-pill ${tone}`;
-    status.innerHTML = `<span class="status-dot"></span>${escapeHtml(label)}`;
-  }
-
-  if (input) {
-    input.disabled = !inputReady;
-    input.placeholder = inputReady ? "Message console" : "Console agent is not ready";
-  }
-
-  state.chatWasBusy = isBusy;
-  syncChatAction(agent);
-}
-
-function isNearThreadBottom(thread) {
-  return thread.scrollHeight - thread.scrollTop - thread.clientHeight < 96;
-}
-
-function startChatTimer() {
-  stopChatTimer();
-  state.chatTimer = setInterval(() => {
-    refreshChatTranscript();
-    if (Date.now() - state.chatStateLastRefresh >= CHAT_STATE_REFRESH_MS) {
-      refreshChatState();
-    }
-  }, CHAT_REFRESH_MS);
-}
-
-function stopChatTimer() {
-  if (state.chatTimer) {
-    clearInterval(state.chatTimer);
-    state.chatTimer = null;
-  }
-}
-
-function autoSizeChatInput(input) {
-  if (!input) return;
-  input.style.height = "auto";
-  input.style.height = `${Math.min(input.scrollHeight, 172)}px`;
-}
-
-function consoleAgent() {
-  return (
-    state.snapshot?.agents.find((agent) => agent.id === "console") ||
-    state.snapshot?.agents.find((agent) => agent.role === "console" && agent.interactive) ||
-    null
-  );
-}
-
-function agentInputAllowed(snapshot = state.snapshot) {
-  return snapshot?.capabilities?.agentInput !== false;
-}
-
-function observationOnlyNotice() {
-  return `<div class="empty-note" role="status">Observation-only viewer. Sending and steering are disabled.</div>`;
 }
 
 function renderMap() {
@@ -986,16 +492,15 @@ function renderGraphNode(node) {
 function renderInspector() {
   if (!state.selected) {
     els.inspector.classList.remove("open");
-    els.inspector.innerHTML = `
-      <div class="inspector-empty">
-        <div class="empty-symbol">AW</div>
-        <h2>No Selection</h2>
-      </div>
-    `;
+    els.inspector.setAttribute("aria-hidden", "true");
+    els.inspectorBackdrop.hidden = true;
+    els.inspector.innerHTML = "";
     return;
   }
 
   els.inspector.classList.add("open");
+  els.inspector.setAttribute("aria-hidden", "false");
+  els.inspectorBackdrop.hidden = false;
   const { type, item } = state.selected;
   if (type === "task") renderTaskInspector(item);
   if (type === "job") renderJobInspector(item);
@@ -1093,24 +598,9 @@ function renderAgentInspector(agent) {
       <button class="tab-button live-button ${state.live ? "active" : ""}" id="liveFileButton" title="Refresh current file every 2 seconds">Live</button>
     </div>
     <div id="filePane" class="markdown-render">${markdownToHtml(agent.promptPreview || "Select a file to load.")}</div>
-    ${agent.interactive ? renderInteractiveComposer(agent) : ""}
   `;
   bindInspector();
-  bindInteractiveComposer(agent);
   loadFile(currentFile.active.type, currentFile.active.id, currentFile.active.file, currentFile.active.tail);
-}
-
-function renderInteractiveComposer(agent, inputAllowed = agentInputAllowed()) {
-  if (!inputAllowed) return observationOnlyNotice();
-  return `
-    <form class="agent-composer" id="agentComposer" data-agent-id="${escapeAttr(agent.id)}">
-      <textarea id="agentMessageInput" rows="3" placeholder="Message ${escapeAttr(agent.name)}" ${agent.inputReady ? "" : "disabled"}></textarea>
-      <div class="composer-actions">
-        <button class="tab-button" type="button" id="agentSteerButton" ${agent.inputReady ? "" : "disabled"}>Steer</button>
-        <button class="tab-button active" type="submit" ${agent.inputReady ? "" : "disabled"}>Send</button>
-      </div>
-    </form>
-  `;
 }
 
 function activeFileFor(options) {
@@ -1164,61 +654,6 @@ function bindInspector() {
   });
 }
 
-function bindInteractiveComposer(agent) {
-  const form = document.querySelector("#agentComposer");
-  const input = document.querySelector("#agentMessageInput");
-  const steerButton = document.querySelector("#agentSteerButton");
-  if (!form || !input || !agent?.interactive || !agentInputAllowed()) return;
-
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      sendAgentInput(agent.id, input.value, "prompt");
-    }
-  });
-  form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    sendAgentInput(agent.id, input.value, "prompt");
-  });
-  steerButton?.addEventListener("click", () => sendAgentInput(agent.id, input.value, "steer"));
-}
-
-async function sendAgentInput(agentId, value, mode, options = {}) {
-  const {
-    input = document.querySelector("#agentMessageInput"),
-    clearInput = true,
-    refreshInspector = true,
-    refreshChat = state.view === "chat",
-    successMessage = mode === "steer" ? "Steer sent" : "Message sent"
-  } = options;
-  if (!agentInputAllowed()) {
-    toast("Observation-only viewer; agent input is disabled");
-    return false;
-  }
-  const message = String(value || "").trim();
-  if (!message) return false;
-  try {
-    const response = await fetch(`/api/agent-input?id=${encodeURIComponent(agentId)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, mode })
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "send failed");
-    if (clearInput && input) input.value = "";
-    toast(successMessage);
-    if (refreshInspector) {
-      const transcript = { type: "agent", id: agentId, file: "transcript.log", tail: true };
-      loadFile(transcript.type, transcript.id, transcript.file, transcript.tail, { silent: true });
-      if (!state.live) setLive(true);
-    }
-    if (refreshChat) refreshChatTranscript({ scroll: true });
-    return true;
-  } catch (error) {
-    toast(error.message);
-    return false;
-  }
-}
 
 async function loadFile(type, id, file, tail = false, options = {}) {
   const { silent = false } = options;
@@ -1380,10 +815,6 @@ function markdownToHtml(markdown) {
   }
 
   return html.join("");
-}
-
-function plainTextToHtml(text) {
-  return escapeHtml(text).replace(/\n/g, "<br>");
 }
 
 function inlineMarkdown(value) {

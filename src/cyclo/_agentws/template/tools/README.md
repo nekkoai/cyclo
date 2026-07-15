@@ -10,10 +10,10 @@ only.
 
 ## `agentws`
 
-`agentws` is the top-level way to run AgentWS. It starts the built-in `console`
-assistant, the configured team, and the local web interface for the installed
-AgentWS directory. It serves the installed root by default, so from the target
-project root:
+`agentws` is the top-level way to run AgentWS. It starts the configured
+processes and a local, observation-only web interface for the installed AgentWS
+directory. It serves the installed root by default, so from the target project
+root:
 
 ```sh
 agentws/tools/agentws
@@ -37,6 +37,8 @@ Options:
 - `--no-team`: serve the web interface without starting agents.
 - `--no-console`: do not start the built-in console assistant.
 - `--console-model <model>`: pass a model to the built-in console assistant.
+- `--read-only`: deprecated compatibility flag; the web interface is always
+  observation-only.
 - `[team-file]`: team file to run. Defaults to `agentws/default.team`.
 
 ## `run_agentws`
@@ -81,15 +83,15 @@ team entry and in jobs. The runner and web pipeline do not require roles to be
 registered in code.
 
 Use `pi-interactive` for a Pi agent that keeps the normal AgentWS role and job
-protocol while accepting live messages from the web interface:
+protocol while exposing Pi's RPC input FIFO to external tooling:
 
 ```text
 planner-1 planner pi-interactive
 ```
 
-The built-in `console` assistant is different: `agentws/tools/agentws` starts it
-automatically as agent `console` with role `console`. It is not listed in the
-team file and has no queued job.
+The built-in `console` assistant is different: `agentws/tools/agentws` can start
+it as agent `console` with role `console`. It is not listed in the team file and
+has no queued job. Cyclo starts its AgentWS viewer with `--no-console`.
 
 ## `agent`
 
@@ -132,14 +134,9 @@ The agent name is mandatory. `agent` calls `bin/agent-new`, `bin/job-wait`, and
 `agent-pi-interactive` is launched by `run_agentws` for team entries that use
 `pi-interactive`, and by `agentws` itself for the built-in console assistant.
 It starts `pi --mode rpc`, writes the rendered transcript to
-`agents/<agent-name>/transcript.log`, and listens for web input on the agent's
-local `input.fifo`.
-
-Humans normally talk to the built-in console from the `Chat` tab in
-`agentws/tools/agentws`. Return sends the message; Shift+Return inserts a
-newline; `Stop` sends an interrupting steer message. Agent inspectors still
-provide the lower-level transcript view with explicit `Send` and `Steer`
-controls.
+`agents/<agent-name>/transcript.log`, and exposes a local `input.fifo` for
+external RPC tooling. The AgentWS web viewer displays transcripts and errors
+but never sends or steers agent input.
 
 ## Task Commands
 
