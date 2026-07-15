@@ -287,6 +287,11 @@ cyclo task plan-execute-verify change-001 /tmp/change-001.md
 cyclo logs -f plan-execute-verify
 ```
 
+A task specification describes work relative to the project passed to
+`cyclo run`; it never needs to mention Cyclo's internal `/workspace` mount.
+After creating a task, Cyclo prints the actual host project root so generated
+artifacts are easy to locate.
+
 A task is the durable objective. Agents claim role-matching jobs, record their
 work and evidence in ordinary files, and create follow-up jobs for the next
 role. The per-agent wrapper continues waiting for later work. Tasks, jobs,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import runpy
 import shutil
 import signal
 import subprocess
@@ -11,6 +12,29 @@ from cyclo.agentws_bundle import packaged_agentws_template
 
 
 RETRYABLE_AGENT_EXIT = 75
+
+
+def test_agent_prompt_treats_workspace_as_an_internal_project_root() -> None:
+    agent_script = packaged_agentws_template() / "tools" / "agent"
+    build_initial_prompt = runpy.run_path(str(agent_script))["build_initial_prompt"]
+
+    prompt = build_initial_prompt(
+        "builder-1",
+        "builder",
+        Path("/agentws"),
+        Path("/workspace"),
+        Path("/team/AGENTS.md"),
+        Path("/team/roles/builder.md"),
+        "Protocol.",
+        "Role.",
+    )
+
+    normalized = " ".join(prompt.split())
+    assert "Project root (current working directory): /workspace" in normalized
+    assert "Interpret relative paths in user tasks from" in normalized
+    assert "container mount name is an internal runtime detail" in normalized
+    assert "do not require the task author to name it" in normalized
+    assert "Agent workspace:" not in normalized
 
 
 def write_executable(path: Path, text: str) -> None:

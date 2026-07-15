@@ -481,6 +481,11 @@ def cmd_task(args: argparse.Namespace) -> int:
             check=False,
             user="0:0",
         )
+    print(f"project root: {instance.project_path}")
+    print(
+        "task paths are relative to this project root; no container mount path "
+        "is required"
+    )
     return 0
 
 

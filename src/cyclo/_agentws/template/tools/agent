@@ -99,13 +99,16 @@ to inspect and manage tasks, jobs, and agents, and dispatch work when asked.
     return f"""You are agent {agent_name} with role {role}.
 
 AgentWS runtime root: {runtime_root}
-Agent workspace: {workspace}
+Project root (current working directory): {workspace}
 Team protocol source: {protocol_file}
 Role instruction source: {role_file}
 {mode_text}
 Run AgentWS queue and state commands from the runtime root above. Use the agent
-workspace as the default location for project inspection and work unless the
-task or job names a more specific worktree.
+project root as the default location for inspection and work unless the task or
+job names a more specific worktree. Interpret relative paths in user tasks from
+that project root. The container mount name is an internal runtime detail: do
+not require the task author to name it, and report changed artifacts with
+repository-relative paths whenever possible.
 
 The complete protocol and role instructions are included below. Treat this
 included content as authoritative; you do not need cwd-based prompt discovery.

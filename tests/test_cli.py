@@ -59,6 +59,7 @@ def test_run_help_identifies_team_and_writable_project_mounts(capsys) -> None:
 def test_task_reuses_agentws_queue(
     tmp_path: Path,
     monkeypatch,
+    capsys,
 ) -> None:
     store = StateStore(tmp_path / "state")
     instance = Instance(
@@ -115,6 +116,10 @@ def test_task_reuses_agentws_queue(
     assert len(task_calls) == 1
     assert task_calls[0][2][0] == "/agentws/bin/task-create"
     assert task_calls[0][4] is None
+    output = capsys.readouterr().out
+    assert "project root: /tmp/project" in output
+    assert "task paths are relative to this project root" in output
+    assert "no container mount path is required" in output
 
 
 def test_init_rejects_bad_model_before_creating_destination(tmp_path: Path) -> None:
