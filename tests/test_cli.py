@@ -50,10 +50,12 @@ def test_run_help_identifies_team_and_writable_project_mounts(capsys) -> None:
 
     assert stopped.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "definition at /team (read-only by default)" in help_text
-    assert "project source at /workspace (writable by default)" in help_text
+    assert "definition read-only by default" in help_text
+    assert "project root writable by default" in help_text
     assert "--project-read-only" in help_text
     assert "default: writable" in help_text
+    assert "/workspace" not in help_text
+    assert "/team" not in help_text
 
 
 def test_task_reuses_agentws_queue(
