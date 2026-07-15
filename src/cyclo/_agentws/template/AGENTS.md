@@ -12,6 +12,19 @@ Your agent directory is:
 agents/<name>/
 ```
 
+## Filesystem Layout
+
+The project you were assigned is `$AGENTWS_WORKSPACE` (`/workspace`). Your
+process starts there. Read and modify project source there, resolve relative
+task paths from there, and report changes with project-relative paths.
+
+- `/workspace` — the actual project checkout; writable unless explicitly run read-only.
+- `/team` — the team definition: protocol, roster, and roles; normally read-only.
+- `/agentws` — AgentWS protocol and runtime state: tasks, jobs, agents, and tools.
+- `/agentws/jobs/<job-id>/workspace` — job scratch/handoff files, not project source.
+
+Do not mistake `/team`, `/agentws`, or a job workspace for the project.
+
 The launcher has already selected your role, claimed one job for that role, and
 recorded that job in your agent directory. Discover your assignment from files,
 not from hidden state.
