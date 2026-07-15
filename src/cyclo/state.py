@@ -16,6 +16,7 @@ from .errors import CycloError
 
 
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+DEFAULT_AGENTWS_HOST = "127.0.0.1"
 
 
 def utc_now() -> str:
@@ -65,6 +66,7 @@ class Instance:
     team_write: bool
     project_read_only: bool
     offline: bool
+    agentws_host: str = DEFAULT_AGENTWS_HOST
     active: bool = False
     port: int | None = None
     created_at: str = ""

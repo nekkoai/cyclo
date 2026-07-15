@@ -104,9 +104,9 @@ or lets Docker's final in-use check preserve the volume.
 
 ## Observation boundary
 
-The fleet dashboard and per-team viewer are read-only. The fleet dashboard
-binds to loopback by default and has no application authentication in 0.1.0.
-An operator can explicitly select a non-loopback host, in which case Cyclo
+The fleet dashboard and per-team viewer are read-only. Both bind to loopback by
+default and have no application authentication in 0.1.0. An operator can
+explicitly select a non-loopback host for either interface, in which case Cyclo
 prints an exposure warning. Queue scans are bounded, queue content is treated
 as data, and the dashboard never starts the gateway or executes queue files. A
 team cannot read another team's private queue through Cyclo; cross-team

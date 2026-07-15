@@ -41,7 +41,33 @@ def test_run_dry_run_is_secret_free_and_does_not_create_state(
     assert "docker run --detach" in output
     assert "gateway-token" not in output
     assert "sk-ant" not in output
+    assert "--publish 127.0.0.1::4137" in output
     assert not state.exists()
+
+
+def test_run_can_publish_agentws_on_an_explicit_host(
+    tmp_path: Path,
+    team_repo: Path,
+    project_repo: Path,
+    capsys,
+) -> None:
+    result = main(
+        [
+            "--state-root",
+            str(tmp_path / "state"),
+            "run",
+            "--dry-run",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "43123",
+            str(team_repo),
+            str(project_repo),
+        ]
+    )
+
+    assert result == 0
+    assert "--publish 0.0.0.0:43123:4137" in capsys.readouterr().out
 
 
 def test_run_help_identifies_team_and_writable_project_mounts(capsys) -> None:
@@ -53,9 +79,18 @@ def test_run_help_identifies_team_and_writable_project_mounts(capsys) -> None:
     assert "definition read-only by default" in help_text
     assert "project root writable by default" in help_text
     assert "--project-read-only" in help_text
+    assert "--host" in help_text
+    assert "default: 127.0.0.1" in help_text
+    assert "0.0.0.0" in help_text
     assert "default: writable" in help_text
     assert "/workspace" not in help_text
     assert "/team" not in help_text
+
+
+def test_run_defaults_agentws_to_loopback() -> None:
+    args = build_parser().parse_args(["run", "team", "project"])
+
+    assert args.host == "127.0.0.1"
 
 
 def test_task_reuses_agentws_queue(

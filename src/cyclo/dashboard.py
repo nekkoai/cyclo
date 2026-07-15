@@ -19,11 +19,11 @@ from urllib.parse import urlsplit
 
 from .docker import Docker
 from .errors import CycloError
-from .state import Instance, StateStore, utc_now
+from .state import DEFAULT_AGENTWS_HOST, Instance, StateStore, utc_now
 
 
 API_VERSION = 1
-DEFAULT_DASHBOARD_HOST = "127.0.0.1"
+DEFAULT_DASHBOARD_HOST = DEFAULT_AGENTWS_HOST
 DEFAULT_DASHBOARD_PORT = 0
 SAFE_QUEUE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 KNOWN_JOB_STATUSES = ("pending", "claimed", "running", "done", "failed")
@@ -497,7 +497,7 @@ class DashboardSnapshot:
             usage = _usage_counters(by_client.get(instance.id))
             agentws_url = None
             if running and not instance.offline and instance.port:
-                agentws_url = f"http://127.0.0.1:{instance.port}/"
+                agentws_url = f"http://{instance.agentws_host}:{instance.port}/"
             rows.append(
                 {
                     "id": instance.id,

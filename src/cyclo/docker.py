@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .errors import CycloError
-from .state import Instance
+from .state import DEFAULT_AGENTWS_HOST, Instance
 from .team import Team
 
 
@@ -111,7 +111,11 @@ def container_command(spec: ContainerSpec) -> list[str]:
         instance.network_name,
     ]
     if not instance.offline:
-        published = f"127.0.0.1:{spec.port}:4137" if spec.port else "127.0.0.1::4137"
+        published = (
+            f"{instance.agentws_host}:{spec.port}:4137"
+            if spec.port
+            else f"{instance.agentws_host}::4137"
+        )
         command.extend(["--publish", published])
     command.extend(
         [
@@ -377,9 +381,17 @@ class Docker:
         except (IndexError, ValueError) as exc:
             raise CycloError(f"unexpected Docker port output for {container}: {line!r}") from exc
 
-    def wait_ready(self, container: str, port: int | None, timeout: float = 15.0) -> None:
+    def wait_ready(
+        self,
+        container: str,
+        port: int | None,
+        *,
+        host: str = DEFAULT_AGENTWS_HOST,
+        timeout: float = 15.0,
+    ) -> None:
         deadline = time.monotonic() + timeout
-        url = f"http://127.0.0.1:{port}/" if port is not None else "http://127.0.0.1:4137/"
+        probe_host = DEFAULT_AGENTWS_HOST if host == "0.0.0.0" else host
+        url = f"http://{probe_host}:{port}/" if port is not None else "http://127.0.0.1:4137/"
         while time.monotonic() < deadline:
             if not self.container_running(container):
                 logs = self._run(

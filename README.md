@@ -398,6 +398,16 @@ These controls are independent:
 | `--project-read-only` | unchanged | read-only | unchanged |
 | `--offline` | unchanged | unchanged | model gateway only; no per-team host viewer |
 
+The per-team viewer binds to `127.0.0.1` by default. To expose a team's
+read-only viewer deliberately on every IPv4 interface, pass `--host 0.0.0.0`:
+
+```sh
+cyclo run --host 0.0.0.0 ~/teams/reviewer ~/src/project
+```
+
+AgentWS has no application authentication in 0.1.0, so use a non-loopback
+bind only on a trusted network with appropriate firewall controls.
+
 The default protects the team definition while allowing it to work on the
 project. Allow a team to edit its own roles or roster explicitly:
 

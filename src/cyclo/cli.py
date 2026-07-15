@@ -74,6 +74,7 @@ def new_instance(args: argparse.Namespace, team, project: Path) -> Instance:
         team_write=args.team_write,
         project_read_only=args.project_read_only,
         offline=args.offline,
+        agentws_host=args.host,
         active=True,
     )
 
@@ -206,6 +207,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise CycloError("port must be 0 or an integer from 1 to 65535")
     if args.offline and args.port:
         raise CycloError("--port cannot be used with --offline because no host UI is published")
+    agentws_host_is_loopback = dashboard_host_is_loopback(args.host)
     instance = new_instance(args, team, project)
     runtime = store.runtime_root(instance.id)
     pi_root = store.pi_root(instance.id)
@@ -263,7 +265,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             if rotation_errors:
                 raise token_rotation_failure(rotation_errors)
             instance.port = docker.start(spec)
-            docker.wait_ready(instance.container_name, instance.port)
+            docker.wait_ready(
+                instance.container_name,
+                instance.port,
+                host=instance.agentws_host,
+            )
             store.save(instance)
         except Exception:
             instance.active = False
@@ -300,7 +306,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"team definition ({team_mode}): {team.root}")
     print(f"project root ({project_mode}): {project}")
     if instance.port is not None:
-        print(f"AgentWS: http://127.0.0.1:{instance.port}")
+        print(f"AgentWS: http://{instance.agentws_host}:{instance.port}")
+        if not agentws_host_is_loopback:
+            print(
+                "WARNING: AgentWS has no authentication and is exposed on a "
+                "non-loopback address; anyone who can reach this host can view "
+                "team activity."
+            )
     else:
         print("AgentWS UI: not published in --offline mode")
     print(f"state: {store.queue_root(instance.id)}")
@@ -690,6 +702,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="make the project root read-only (default: writable)",
     )
     run.add_argument("--offline", action="store_true", help="block direct outbound network access; the model proxy remains reachable")
+    run.add_argument(
+        "--host",
+        default=DEFAULT_DASHBOARD_HOST,
+        help=(
+            "host address for the AgentWS viewer (default: 127.0.0.1); "
+            "0.0.0.0 exposes the unauthenticated viewer"
+        ),
+    )
     run.add_argument("--port", type=int, default=0, help="host AgentWS port; 0 chooses a free Docker port")
     run.add_argument("--verbose", action="store_true", help="mirror AgentWS agent transcripts to container logs")
     run.add_argument("--foreground", action="store_true", help="follow logs and stop on Ctrl-C")
