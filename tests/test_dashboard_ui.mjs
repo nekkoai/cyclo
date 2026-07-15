@@ -29,6 +29,30 @@ test("dashboard application parses and keeps API data out of HTML sinks", async 
   assert.match(javascript, /jobs\.unknown/);
   assert.match(javascript, /textContent/);
   assert.doesNotMatch(javascript, /\.innerHTML\s*=/);
+  assert.doesNotMatch(javascript, /workspaceLink\.href = raw\./);
+});
+
+test("AgentWS links use the client-facing dashboard host and change only the port", async () => {
+  const javascript = await readFile(asset("app.js"), "utf8");
+  const instrumented = javascript.replace(
+    /\n  init\(\);\n\}\)\(\);\s*$/,
+    "\n  globalThis.__dashboardTest = { agentwsUrlForCurrentHost };\n})();",
+  );
+  assert.notEqual(instrumented, javascript, "dashboard test hook was not installed");
+
+  const context = {
+    document: { querySelector: () => null },
+    window: {
+      location: new URL("https://dashboard.example.test:4173/fleet?view=all#running"),
+    },
+    URL,
+  };
+  vm.runInNewContext(instrumented, context);
+
+  const helpers = context.__dashboardTest;
+  assert.equal(helpers.agentwsUrlForCurrentHost(32853), "https://dashboard.example.test:32853/");
+  assert.equal(helpers.agentwsUrlForCurrentHost(32854), "https://dashboard.example.test:32854/");
+  assert.equal(helpers.agentwsUrlForCurrentHost(0), "");
 });
 
 test("dashboard styles include keyboard, motion, and responsive affordances", async () => {

@@ -495,9 +495,9 @@ class DashboardSnapshot:
             if isinstance(queue_errors, list):
                 errors.extend(str(item) for item in queue_errors)
             usage = _usage_counters(by_client.get(instance.id))
-            agentws_url = None
+            agentws_port = None
             if running and not instance.offline and instance.port:
-                agentws_url = f"http://{instance.agentws_host}:{instance.port}/"
+                agentws_port = instance.port
             rows.append(
                 {
                     "id": instance.id,
@@ -510,7 +510,7 @@ class DashboardSnapshot:
                         "project_read_only": instance.project_read_only,
                     },
                     "generation": instance.generation,
-                    "agentws_url": agentws_url,
+                    "agentws_port": agentws_port,
                     "counts": queue["counts"],
                     "usage": usage,
                     "recent_tasks": queue["recent_tasks"],

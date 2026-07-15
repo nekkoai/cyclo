@@ -217,7 +217,8 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     running, stopped = result["instances"]
     assert running["id"] == "alpha"
     assert running["state"] == "running"
-    assert running["agentws_url"] == "http://127.0.0.1:4100/"
+    assert running["agentws_port"] == 4100
+    assert "agentws_url" not in running
     assert running["usage"] == {
         "input_tokens": 100,
         "output_tokens": 25,
@@ -225,7 +226,7 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
         "requests": 3,
     }
     assert stopped["state"] == "stopped"
-    assert stopped["agentws_url"] is None
+    assert stopped["agentws_port"] is None
 
 
 def test_snapshot_counts_queue_errors_as_attention(tmp_path: Path) -> None:

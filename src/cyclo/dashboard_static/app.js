@@ -236,7 +236,7 @@
         projectReadOnly: Boolean(mode.project_read_only),
       },
       generation: firstString([raw.generation, raw.team_generation], "—"),
-      agentwsUrl: safeWorkspaceUrl(firstString([raw.agentws_url, raw.ui_url])),
+      agentwsUrl: agentwsUrlForCurrentHost(raw.agentws_port),
       tasks,
       jobs,
       agents,
@@ -333,11 +333,18 @@
     return summary;
   }
 
-  function safeWorkspaceUrl(value) {
-    if (!value) return "";
+  function validPort(value) {
+    const port = Number(value);
+    return Number.isInteger(port) && port >= 1 && port <= 65_535 ? port : 0;
+  }
+
+  function agentwsUrlForCurrentHost(portValue) {
+    const port = validPort(portValue);
+    if (!port) return "";
     try {
-      const url = new URL(value, window.location.origin);
+      const url = new URL("/", window.location.href);
       if (!["http:", "https:"].includes(url.protocol)) return "";
+      url.port = String(port);
       return url.href;
     } catch (_error) {
       return "";
