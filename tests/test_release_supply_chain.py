@@ -4,6 +4,11 @@ import json
 import re
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
+    import tomli as tomllib
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "src" / "cyclo" / "vendor_gateway" / "runtime_context"
@@ -74,6 +79,27 @@ def test_workflow_actions_are_pinned_to_full_commits() -> None:
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "python -m build --no-isolation" in ci
     assert "python tools/normalize-distributions dist" in ci
+
+
+def test_build_backend_dependencies_are_available_in_test_and_release_envs() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    build_requirements = set(project["build-system"]["requires"])
+    dev_requirements = set(project["project"]["optional-dependencies"]["dev"])
+    release_inputs = {
+        line
+        for raw_line in (ROOT / "requirements" / "release.in")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if (line := raw_line.split("#", 1)[0].strip())
+    }
+    release_lock = (ROOT / "requirements" / "release.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert build_requirements <= dev_requirements
+    assert build_requirements <= release_inputs
+    for requirement in build_requirements:
+        assert re.search(rf"(?m)^{re.escape(requirement)}\s+\\$", release_lock)
 
 
 def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:

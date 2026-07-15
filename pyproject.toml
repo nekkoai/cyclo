@@ -33,8 +33,10 @@ dependencies = []
 dev = [
   "build>=1.2",
   "pytest>=8",
+  "setuptools==83.0.0",
   "tomli>=2; python_version < '3.11'",
   "twine>=5",
+  "wheel==0.47.0",
 ]
 
 [project.scripts]
