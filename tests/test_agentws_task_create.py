@@ -385,7 +385,7 @@ def test_foreign_job_collision_at_commit_boundary_is_never_deleted(
     result = invoke_task_create(runtime, state, environment=environment)
 
     assert result.returncode != 0
-    assert "destination already exists" in result.stderr
+    assert "publish initial planner job" in result.stderr
     assert sentinel.read_text(encoding="utf-8") == "foreign\n"
     assert (state / "tasks" / "change-1" / ".creating").is_file()
     staged_job = state / "jobs" / ".change-1-plan.task-create-stage"
