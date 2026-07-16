@@ -30,8 +30,8 @@ from .team import (
     verify_agentws_abi,
 )
 from .team_templates import bundled_team_template_names
-from .vendor_gateway import cli as gateway_cli
-from .vendor_gateway import source as gateway_source
+from .credential_gateway import cli as gateway_cli
+from .credential_gateway import source as gateway_source
 
 
 DEFAULT_RUNTIME_IMAGE = f"cyclo-runtime:{__version__}"

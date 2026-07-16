@@ -70,10 +70,10 @@ jobs:
       - name: Run Node tests
         run: node --test tests/*.mjs
       - name: Audit gateway Node dependencies
-        working-directory: src/cyclo/vendor_gateway/gateway_context
+        working-directory: src/cyclo/credential_gateway/gateway_context
         run: npm audit --omit=dev --package-lock-only --audit-level=high
       - name: Audit runtime Node dependencies
-        working-directory: src/cyclo/vendor_gateway/runtime_context
+        working-directory: src/cyclo/credential_gateway/runtime_context
         run: npm audit --omit=dev --package-lock-only --audit-level=high
       - name: Check POSIX shell syntax
         shell: bash
@@ -126,14 +126,14 @@ jobs:
         run: |
           docker build --pull \
             --tag cyclo-runtime:ci \
-            --file src/cyclo/vendor_gateway/runtime_context/Dockerfile \
-            src/cyclo/vendor_gateway/runtime_context
+            --file src/cyclo/credential_gateway/runtime_context/Dockerfile \
+            src/cyclo/credential_gateway/runtime_context
       - name: Build gateway image
         run: |
           docker build --pull \
             --tag cyclo-gateway:ci \
-            --file src/cyclo/vendor_gateway/gateway_context/Dockerfile \
-            src/cyclo/vendor_gateway/gateway_context
+            --file src/cyclo/credential_gateway/gateway_context/Dockerfile \
+            src/cyclo/credential_gateway/gateway_context
       - name: Smoke-test images without credentials
         run: |
           docker run --rm --network none \
@@ -176,3 +176,9 @@ jobs:
           fi
           grep -F "Select OpenAI Codex login method" /tmp/cyclo-oauth-login
           grep -F "login failed: Login cancelled" /tmp/cyclo-oauth-login
+          docker run --rm --network none \
+            --env CYCLO_GATEWAY_TOKEN=image-smoke-token \
+            --env CYCLO_GATEWAY_AUTH_JSON=/tmp/cyclo-auth.json \
+            --env CYCLO_GATEWAY_MODELS_JSON=/tmp/cyclo-models.json \
+            --volume "$PWD/tests/fixtures/credential_gateway_image_smoke.mjs:/tmp/smoke.mjs:ro" \
+            cyclo-gateway:ci /tmp/smoke.mjs

@@ -121,10 +121,18 @@ forbidden_names = {
     "cyclo/runtime.lock.json",
     "cyclo/_agentws/LICENSE",
     "cyclo/_agentws/UPSTREAM.json",
-    "cyclo/vendor_gateway/LICENSE",
-    "cyclo/vendor_gateway/ORIGIN.md",
-    "cyclo/vendor_gateway/UPSTREAM.json",
+    "cyclo/credential_gateway/LICENSE",
+    "cyclo/credential_gateway/ORIGIN.md",
+    "cyclo/credential_gateway/UPSTREAM.json",
 }
+required_names = {
+    "cyclo/credential_gateway/gateway_context/Dockerfile",
+    "cyclo/credential_gateway/gateway_context/model-metadata.mjs",
+    "cyclo/credential_gateway/gateway_context/safe-model-fields.json",
+    "cyclo/credential_gateway/gateway_context/safe-model-fields.mjs",
+    "cyclo/credential_gateway/runtime_context/Dockerfile",
+}
+legacy_package_prefix = "cyclo/" + "vendor" + "_gateway/"
 upstream_https = b"github" + b".com/glguida/"
 upstream_ssh = b"git@" + b"github.com:glguida/"
 private_home = b"/home/" + b"glguida"
@@ -142,6 +150,15 @@ problems = []
 with zipfile.ZipFile(wheel) as archive:
     names = set(archive.namelist())
     problems.extend(sorted(names & forbidden_names))
+    problems.extend(
+        f"missing required wheel resource: {name}"
+        for name in sorted(required_names - names)
+    )
+    problems.extend(
+        f"legacy package path remains: {name}"
+        for name in sorted(names)
+        if name.startswith(legacy_package_prefix)
+    )
     for name in sorted(names):
         data = archive.read(name)
         for marker in forbidden_content:
@@ -151,7 +168,7 @@ with zipfile.ZipFile(wheel) as archive:
 if problems:
     for problem in problems:
         print(problem, file=sys.stderr)
-    raise SystemExit("release wheel contains stale or private source metadata")
+    raise SystemExit("release wheel content audit failed")
 PY
 
 printf '%s\n' '==> installing wheel into isolated environment'

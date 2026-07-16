@@ -7,6 +7,8 @@ import os
 import secrets
 from pathlib import Path
 
+from .safe_model_fields import SAFE_MODEL_FIELDS
+
 
 PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR"
 PI_PACKAGES = ["npm:pi-web-access", "npm:pi-lens", "npm:pi-simplify"]
@@ -16,34 +18,13 @@ GATEWAY_PORT = 8787
 # Pi model records are provider metadata, not a general extension mechanism.
 # This allowlist is the boundary that prevents host-side URLs, headers, and
 # credentials from being projected into a team container.
-SAFE_COST_FIELDS = {"input", "output", "cacheRead", "cacheWrite"}
-SAFE_INPUT_TYPES = {"text", "image"}
-SAFE_COMPAT_BOOLEAN_FIELDS = {
-    "requiresAssistantAfterToolResult",
-    "requiresReasoningContentOnAssistantMessages",
-    "requiresThinkingAsText",
-    "requiresToolResultName",
-    "sendSessionAffinityHeaders",
-    "sendSessionIdHeader",
-    "supportsDeveloperRole",
-    "supportsEagerToolInputStreaming",
-    "supportsLongCacheRetention",
-    "supportsReasoningEffort",
-    "supportsStore",
-    "supportsStrictMode",
-    "supportsUsageInStreaming",
-    "zaiToolStream",
-}
-SAFE_MAX_TOKENS_FIELDS = {"max_completion_tokens", "max_tokens"}
-SAFE_THINKING_FORMATS = {
-    "openai",
-    "openrouter",
-    "deepseek",
-    "zai",
-    "qwen",
-    "qwen-chat-template",
-}
-SAFE_THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh"}
+SAFE_COST_FIELDS = SAFE_MODEL_FIELDS.cost_fields
+SAFE_INPUT_TYPES = SAFE_MODEL_FIELDS.input_types
+SAFE_COMPAT_BOOLEAN_FIELDS = SAFE_MODEL_FIELDS.compat_boolean_fields
+SAFE_MAX_TOKENS_FIELDS = SAFE_MODEL_FIELDS.max_tokens_fields
+SAFE_THINKING_FORMATS = SAFE_MODEL_FIELDS.thinking_formats
+SAFE_THINKING_LEVELS = SAFE_MODEL_FIELDS.thinking_levels
+SAFE_CACHE_CONTROL_FORMATS = SAFE_MODEL_FIELDS.cache_control_formats
 
 
 def expand_pi_agent_dir(value: str, home: Path) -> Path:
@@ -132,8 +113,12 @@ def sanitize_model(model: object) -> dict[str, object] | None:
         thinking_format = compat.get("thinkingFormat")
         if isinstance(thinking_format, str) and thinking_format in SAFE_THINKING_FORMATS:
             safe_compat["thinkingFormat"] = thinking_format
-        if compat.get("cacheControlFormat") == "anthropic":
-            safe_compat["cacheControlFormat"] = "anthropic"
+        cache_control_format = compat.get("cacheControlFormat")
+        if (
+            isinstance(cache_control_format, str)
+            and cache_control_format in SAFE_CACHE_CONTROL_FORMATS
+        ):
+            safe_compat["cacheControlFormat"] = cache_control_format
         if safe_compat:
             clean["compat"] = safe_compat
     thinking_levels = model.get("thinkingLevelMap")

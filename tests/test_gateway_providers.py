@@ -4,7 +4,7 @@ from pathlib import Path
 
 from cyclo.cli import main as cyclo_main
 from cyclo.state import StateStore
-from cyclo.vendor_gateway import cli, gateway, source
+from cyclo.credential_gateway import cli, gateway, source
 
 
 def test_supported_providers_command_is_hardened_and_credential_free() -> None:

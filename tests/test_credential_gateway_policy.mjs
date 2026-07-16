@@ -8,7 +8,7 @@ import {
   modelFromGooglePath,
   modelFromInferenceRequest,
   principalAllowsModel,
-} from "../src/cyclo/vendor_gateway/gateway_context/policy.mjs";
+} from "../src/cyclo/credential_gateway/gateway_context/policy.mjs";
 
 test("only current Pi inference POST endpoints are accepted", () => {
   for (const path of [

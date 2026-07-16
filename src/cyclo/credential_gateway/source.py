@@ -5,7 +5,7 @@ from importlib import resources
 from pathlib import Path
 
 
-PACKAGE = "cyclo.vendor_gateway"
+PACKAGE = "cyclo.credential_gateway"
 
 
 def package_root() -> Path:

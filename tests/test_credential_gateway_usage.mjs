@@ -9,7 +9,7 @@ import {
   aggregateUsageRecords,
   modelFromRequest,
   usageFromCapture,
-} from "../src/cyclo/vendor_gateway/gateway_context/usage.mjs";
+} from "../src/cyclo/credential_gateway/gateway_context/usage.mjs";
 
 test("usage parsing never retains request bodies", () => {
   const body = Buffer.from(JSON.stringify({ model: "gpt-test", messages: [{ content: "secret" }] }));
