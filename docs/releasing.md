@@ -38,11 +38,11 @@ Build and smoke-test both credential-free image contexts:
 
 ```sh
 docker build --pull -t cyclo-runtime:0.1.0 \
-  -f src/cyclo/vendor_gateway/runtime_context/Dockerfile \
-  src/cyclo/vendor_gateway/runtime_context
+  -f src/cyclo/credential_gateway/runtime_context/Dockerfile \
+  src/cyclo/credential_gateway/runtime_context
 docker build --pull -t cyclo-gateway:0.1.0 \
-  -f src/cyclo/vendor_gateway/gateway_context/Dockerfile \
-  src/cyclo/vendor_gateway/gateway_context
+  -f src/cyclo/credential_gateway/gateway_context/Dockerfile \
+  src/cyclo/credential_gateway/gateway_context
 docker run --rm --network none \
   -e CYCLO_HOST_UID=1000 -e CYCLO_HOST_GID=1000 \
   cyclo-runtime:0.1.0 python3 --version

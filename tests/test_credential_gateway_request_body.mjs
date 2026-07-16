@@ -5,11 +5,11 @@ import { zstdCompressSync } from "node:zlib";
 import {
   forwardedRequestHeaders,
   prepareRequestBody,
-} from "../src/cyclo/vendor_gateway/gateway_context/request-body.mjs";
+} from "../src/cyclo/credential_gateway/gateway_context/request-body.mjs";
 import {
   modelFromInferenceRequest,
   principalAllowsModel,
-} from "../src/cyclo/vendor_gateway/gateway_context/policy.mjs";
+} from "../src/cyclo/credential_gateway/gateway_context/policy.mjs";
 
 
 function isRequestError(statusCode, message) {

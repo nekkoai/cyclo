@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   formatSupportedProviders,
-} from "../src/cyclo/vendor_gateway/gateway_context/supported-providers.mjs";
+} from "../src/cyclo/credential_gateway/gateway_context/supported-providers.mjs";
 
 
 test("supported provider table gives copyable login commands", () => {

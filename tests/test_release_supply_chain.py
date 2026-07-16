@@ -11,8 +11,8 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME = ROOT / "src" / "cyclo" / "vendor_gateway" / "runtime_context"
-GATEWAY = ROOT / "src" / "cyclo" / "vendor_gateway" / "gateway_context"
+RUNTIME = ROOT / "src" / "cyclo" / "credential_gateway" / "runtime_context"
+GATEWAY = ROOT / "src" / "cyclo" / "credential_gateway" / "gateway_context"
 
 
 def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() -> None:

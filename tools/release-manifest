@@ -131,7 +131,7 @@ def npm_purl(name: str, version: str) -> str:
 
 def locked_node_packages() -> list[dict[str, object]]:
     packages: list[dict[str, object]] = []
-    lock_paths = sorted((ROOT / "src" / "cyclo" / "vendor_gateway").glob("*_context/package-lock.json"))
+    lock_paths = sorted((ROOT / "src" / "cyclo" / "credential_gateway").glob("*_context/package-lock.json"))
     for lock_path in lock_paths:
         context = lock_path.parent.name
         lock = json.loads(lock_path.read_text(encoding="utf-8"))

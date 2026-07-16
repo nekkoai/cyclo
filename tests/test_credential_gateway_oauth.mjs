@@ -5,7 +5,7 @@ import {
   createOAuthLoginCallbacks,
   selectOAuthOption,
   showOAuthDeviceCode,
-} from "../src/cyclo/vendor_gateway/gateway_context/oauth-ui.mjs";
+} from "../src/cyclo/credential_gateway/gateway_context/oauth-ui.mjs";
 
 
 const LOGIN_METHODS = {

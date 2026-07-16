@@ -67,7 +67,7 @@ cyclo = [
   "template/tools/*",
   "template/tools/agentws-public/*",
 ]
-"cyclo.vendor_gateway" = [
+"cyclo.credential_gateway" = [
   "runtime_context/*",
   "runtime_context/.dockerignore",
   "gateway_context/*",

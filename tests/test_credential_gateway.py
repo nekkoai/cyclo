@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import stat
@@ -10,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from cyclo.errors import CycloError
-from cyclo.vendor_gateway import auth, cli, commands, gateway, source
+from cyclo.credential_gateway import auth, cli, commands, gateway, safe_model_fields, source
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,122 @@ def test_projection_drops_secret_and_extension_fields() -> None:
     assert model["compat"] == {"supportsStore": False, "thinkingFormat": "qwen"}
     assert not ({"apiKey", "headers", "authorization"} & model.keys())
     assert "secret" not in json.dumps(projected)
+
+
+def test_python_projection_consumes_the_canonical_safe_field_manifest() -> None:
+    policy = safe_model_fields.SAFE_MODEL_FIELDS
+    document = json.loads(
+        safe_model_fields.MANIFEST_PATH.read_text(encoding="utf-8")
+    )
+
+    assert policy.schema_version == document["schemaVersion"] == 1
+    assert policy.cost_fields == frozenset(document["costFields"])
+    assert policy.input_types == frozenset(document["inputTypes"])
+    assert policy.compat_boolean_fields == frozenset(document["compatBooleanFields"])
+    assert policy.max_tokens_fields == frozenset(document["maxTokensFields"])
+    assert policy.thinking_formats == frozenset(document["thinkingFormats"])
+    assert policy.thinking_levels == frozenset(document["thinkingLevels"])
+    assert policy.cache_control_formats == frozenset(document["cacheControlFormats"])
+    assert auth.SAFE_COST_FIELDS is policy.cost_fields
+    assert auth.SAFE_INPUT_TYPES is policy.input_types
+    assert auth.SAFE_COMPAT_BOOLEAN_FIELDS is policy.compat_boolean_fields
+    assert auth.SAFE_MAX_TOKENS_FIELDS is policy.max_tokens_fields
+    assert auth.SAFE_THINKING_FORMATS is policy.thinking_formats
+    assert auth.SAFE_THINKING_LEVELS is policy.thinking_levels
+    assert auth.SAFE_CACHE_CONTROL_FORMATS is policy.cache_control_formats
+
+
+def test_safe_field_manifest_schema_fails_closed(tmp_path: Path) -> None:
+    valid = json.loads(
+        safe_model_fields.MANIFEST_PATH.read_text(encoding="utf-8")
+    )
+    missing = copy.deepcopy(valid)
+    missing.pop("costFields")
+    duplicate = copy.deepcopy(valid)
+    duplicate["inputTypes"] = ["text", "text"]
+    cases = [
+        ([], "must be a JSON object"),
+        ({**valid, "schemaVersion": 2}, "requires schemaVersion 1"),
+        (missing, "invalid keys"),
+        ({**valid, "unknownFields": ["unsafe"]}, "invalid keys"),
+        ({**valid, "inputTypes": "text"}, "must be a non-empty array"),
+        ({**valid, "inputTypes": []}, "must be a non-empty array"),
+        ({**valid, "inputTypes": ["text", ""]}, "only non-empty strings"),
+        (duplicate, "must not contain duplicates"),
+    ]
+    manifest = tmp_path / "safe-model-fields.json"
+    for document, error in cases:
+        manifest.write_text(json.dumps(document), encoding="utf-8")
+        with pytest.raises(RuntimeError, match=error):
+            safe_model_fields.load_safe_model_fields(manifest)
+
+    manifest.write_text("{", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="cannot load safe model fields manifest"):
+        safe_model_fields.load_safe_model_fields(manifest)
+
+    with pytest.raises(RuntimeError, match="cannot load safe model fields manifest"):
+        safe_model_fields.load_safe_model_fields(tmp_path / "missing.json")
+
+
+def test_python_projection_uses_every_canonical_allowlist() -> None:
+    policy = safe_model_fields.SAFE_MODEL_FIELDS
+    cost = {field: index for index, field in enumerate(policy.cost_fields)}
+    cost["authorization"] = "secret"
+    compat: dict[str, object] = {
+        field: True for field in policy.compat_boolean_fields
+    }
+    compat.update(
+        {
+            "maxTokensField": next(iter(policy.max_tokens_fields)),
+            "thinkingFormat": next(iter(policy.thinking_formats)),
+            "cacheControlFormat": next(iter(policy.cache_control_formats)),
+            "headers": {"authorization": "secret"},
+        }
+    )
+    thinking_levels = {
+        field: f"mapped-{field}" for field in policy.thinking_levels
+    }
+    thinking_levels["unsafe"] = "secret"
+
+    projected = auth.sanitize_model(
+        {
+            "id": "model",
+            "input": [*policy.input_types, "audio", {"apiKey": "secret"}],
+            "cost": cost,
+            "compat": compat,
+            "thinkingLevelMap": thinking_levels,
+            "apiKey": "secret",
+            "baseUrl": "https://provider.invalid",
+            "headers": {"authorization": "secret"},
+        }
+    )
+
+    assert projected is not None
+    assert set(projected["input"]) == policy.input_types
+    assert set(projected["cost"]) == policy.cost_fields
+    assert set(projected["compat"]) == {
+        *policy.compat_boolean_fields,
+        "maxTokensField",
+        "thinkingFormat",
+        "cacheControlFormat",
+    }
+    assert set(projected["thinkingLevelMap"]) == policy.thinking_levels
+    assert "secret" not in json.dumps(projected)
+
+    enum_fields = {
+        "maxTokensField": policy.max_tokens_fields,
+        "thinkingFormat": policy.thinking_formats,
+        "cacheControlFormat": policy.cache_control_formats,
+    }
+    for compat_field, allowed_values in enum_fields.items():
+        for allowed_value in allowed_values:
+            projected = auth.sanitize_model(
+                {"id": "model", "compat": {compat_field: allowed_value}}
+            )
+            assert projected == {
+                "id": "model",
+                "compat": {compat_field: allowed_value},
+            }
 
 
 def test_gateway_run_command_mounts_only_gateway_owned_inputs(tmp_path: Path) -> None:
@@ -874,6 +991,9 @@ def test_packaged_contexts_are_the_only_build_inputs() -> None:
     assert (gateway_root / "package-lock.json").is_file()
     assert (gateway_root / "oauth-ui.mjs").is_file()
     assert (gateway_root / "pi-registry.mjs").is_file()
+    assert (gateway_root / "safe-model-fields.json").is_file()
+    assert (gateway_root / "safe-model-fields.mjs").is_file()
+    assert (gateway_root / "model-metadata.mjs").is_file()
     assert (gateway_root / "supported-providers.mjs").is_file()
     assert (gateway_root / "server.mjs").is_file()
     assert (runtime_root / "entrypoint.sh").is_file()
@@ -901,6 +1021,8 @@ def test_gateway_javascript_uses_only_cyclo_runtime_names() -> None:
     assert "CYCLO_GATEWAY_TOKEN" in server
     assert "MULTIAGENT_GATEWAY" not in server
     assert 'from "./pi-registry.mjs"' in server
+    assert 'from "./model-metadata.mjs"' in server
+    assert "SAFE_COMPAT_BOOLEAN_FIELDS" not in server
     assert 'from "./pi-registry.mjs"' in login
     assert 'from "./oauth-ui.mjs"' in login
     assert "createOAuthLoginCallbacks" in login
@@ -914,6 +1036,9 @@ def test_gateway_javascript_uses_only_cyclo_runtime_names() -> None:
     assert "checkBuiltinRegistry();" in providers
     assert "checkBuiltinRegistry();" in supported_providers
     assert "pi-registry.mjs" in dockerfile
+    assert "safe-model-fields.json" in dockerfile
+    assert "safe-model-fields.mjs" in dockerfile
+    assert "model-metadata.mjs" in dockerfile
     assert "oauth-ui.mjs" in dockerfile
     assert "supported-providers.mjs" in dockerfile
     assert package["name"] == "cyclo-gateway"

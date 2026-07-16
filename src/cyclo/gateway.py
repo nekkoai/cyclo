@@ -9,11 +9,11 @@ from typing import Iterable
 from .errors import CycloError
 from .state import Instance, StateStore
 from .team import Team
-from .vendor_gateway import auth as gateway_auth
-from .vendor_gateway import commands as gateway_commands
-from .vendor_gateway import docker as gateway_docker
-from .vendor_gateway import gateway as gateway_runtime
-from .vendor_gateway import source as gateway_source
+from .credential_gateway import auth as gateway_auth
+from .credential_gateway import commands as gateway_commands
+from .credential_gateway import docker as gateway_docker
+from .credential_gateway import gateway as gateway_runtime
+from .credential_gateway import source as gateway_source
 
 
 @dataclass(frozen=True)

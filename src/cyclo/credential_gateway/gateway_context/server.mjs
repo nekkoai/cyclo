@@ -20,6 +20,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { getOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import { getBuiltinModels, getBuiltinProviders } from "./pi-registry.mjs";
+import { sanitizeModel } from "./model-metadata.mjs";
 import {
   forwardedRequestHeaders,
   prepareRequestBody,
@@ -51,35 +52,6 @@ const USAGE_JSONL_PATH = process.env.CYCLO_GATEWAY_USAGE_JSONL ?? "/var/lib/cycl
 const UPSTREAM_TIMEOUT_MS = 600_000;
 const MAX_REQUEST_BODY = 64 * 1024 * 1024;
 const OAUTH_REFRESH_SKEW_MS = 60_000;
-
-const SAFE_COST_FIELDS = new Set(["input", "output", "cacheRead", "cacheWrite"]);
-const SAFE_INPUT_TYPES = new Set(["text", "image"]);
-const SAFE_COMPAT_BOOLEAN_FIELDS = new Set([
-  "requiresAssistantAfterToolResult",
-  "requiresReasoningContentOnAssistantMessages",
-  "requiresThinkingAsText",
-  "requiresToolResultName",
-  "sendSessionAffinityHeaders",
-  "sendSessionIdHeader",
-  "supportsDeveloperRole",
-  "supportsEagerToolInputStreaming",
-  "supportsLongCacheRetention",
-  "supportsReasoningEffort",
-  "supportsStore",
-  "supportsStrictMode",
-  "supportsUsageInStreaming",
-  "zaiToolStream",
-]);
-const SAFE_MAX_TOKENS_FIELDS = new Set(["max_completion_tokens", "max_tokens"]);
-const SAFE_THINKING_FORMATS = new Set([
-  "openai",
-  "openrouter",
-  "deepseek",
-  "zai",
-  "qwen",
-  "qwen-chat-template",
-]);
-const SAFE_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 // How an api_key credential is presented upstream, per pi-ai api dialect.
 const AUTH_HEADER_BY_API = {
@@ -202,55 +174,6 @@ function discoverProviders() {
     table[name] = { provider: providerType, baseUrl: models[0].baseUrl, api: models[0].api, credType: cred.type, models };
   }
   return table;
-}
-
-function sanitizeModel(model) {
-  if (!model || typeof model !== "object" || typeof model.id !== "string" || !model.id) return null;
-  const clean = { id: model.id };
-  for (const key of ["name", "provider", "api"]) {
-    if (typeof model[key] === "string" && model[key]) clean[key] = model[key];
-  }
-  if (typeof model.reasoning === "boolean") clean.reasoning = model.reasoning;
-  if (Array.isArray(model.input)) {
-    clean.input = model.input.filter((value) => typeof value === "string" && SAFE_INPUT_TYPES.has(value));
-  }
-  for (const key of ["contextWindow", "maxTokens"]) {
-    if (Number.isSafeInteger(model[key]) && model[key] > 0) clean[key] = model[key];
-  }
-  if (model.cost && typeof model.cost === "object") {
-    const cost = {};
-    for (const key of SAFE_COST_FIELDS) {
-      if (typeof model.cost[key] === "number" && Number.isFinite(model.cost[key]) && model.cost[key] >= 0) {
-        cost[key] = model.cost[key];
-      }
-    }
-    if (Object.keys(cost).length) clean.cost = cost;
-  }
-  if (model.compat && typeof model.compat === "object") {
-    const compat = {};
-    for (const key of SAFE_COMPAT_BOOLEAN_FIELDS) {
-      if (typeof model.compat[key] === "boolean") compat[key] = model.compat[key];
-    }
-    if (SAFE_MAX_TOKENS_FIELDS.has(model.compat.maxTokensField)) {
-      compat.maxTokensField = model.compat.maxTokensField;
-    }
-    if (SAFE_THINKING_FORMATS.has(model.compat.thinkingFormat)) {
-      compat.thinkingFormat = model.compat.thinkingFormat;
-    }
-    if (model.compat.cacheControlFormat === "anthropic") compat.cacheControlFormat = "anthropic";
-    if (Object.keys(compat).length) clean.compat = compat;
-  }
-  if (model.thinkingLevelMap && typeof model.thinkingLevelMap === "object") {
-    const thinkingLevelMap = {};
-    for (const key of SAFE_THINKING_LEVELS) {
-      const value = model.thinkingLevelMap[key];
-      if (typeof value === "string" || value === null) {
-        thinkingLevelMap[key] = value;
-      }
-    }
-    if (Object.keys(thinkingLevelMap).length) clean.thinkingLevelMap = thinkingLevelMap;
-  }
-  return clean;
 }
 
 // The provider catalog the runner needs to build each agent container's
