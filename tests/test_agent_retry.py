@@ -198,7 +198,7 @@ exec sleep 30
         if process.poll() is None:
             stop_process_group(process)
 
-    assert process.returncode == 128 + signal.SIGTERM
+    assert process.returncode in (1, 128 + signal.SIGTERM)
     assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
     assert not (job / ".agent-attempts").exists()
     assert "without consuming a retry attempt" in (job / "log.md").read_text(

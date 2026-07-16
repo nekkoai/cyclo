@@ -206,12 +206,12 @@ while IFS= read -r line || [ -n "$line" ]; do
 
             consecutive_failures=$((consecutive_failures + 1))
             if [ "$consecutive_failures" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
+                echo "agent $name suspended after $consecutive_failures consecutive failures; restart the Cyclo container after correcting the cause" >&2
                 {
                     printf 'failures=%s\n' "$consecutive_failures"
                     printf 'last_status=%s\n' "$rc"
                     printf 'suspended_at=%s\n' "$(timestamp)"
                 } > "$suspended_file"
-                echo "agent $name suspended after $consecutive_failures consecutive failures; restart the Cyclo container after correcting the cause" >&2
                 # Keep the team supervisor alive so Docker's restart policy cannot
                 # reset this in-memory circuit breaker into another crash loop.
                 while :; do
