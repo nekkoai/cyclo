@@ -85,10 +85,29 @@ class StateStore:
         self.root = (root or default_state_root()).expanduser().resolve()
         self.instances_dir = self.root / "instances"
         self.gateway_registry = self.root / "gateway"
+        self.provider_runtime_root = self.root / "provider-runtime"
         self.lock_path = self.root / "control.lock"
 
     def ensure(self) -> None:
-        for path in (self.root, self.instances_dir, self.gateway_registry):
+        if self.provider_runtime_root.is_symlink():
+            raise CycloError(
+                "refusing symlinked provider-runtime state root: "
+                f"{self.provider_runtime_root}"
+            )
+        if (
+            self.provider_runtime_root.exists()
+            and not self.provider_runtime_root.is_dir()
+        ):
+            raise CycloError(
+                "provider-runtime state root is not a directory: "
+                f"{self.provider_runtime_root}"
+            )
+        for path in (
+            self.root,
+            self.instances_dir,
+            self.gateway_registry,
+            self.provider_runtime_root,
+        ):
             path.mkdir(parents=True, mode=0o700, exist_ok=True)
             os.chmod(path, 0o700)
 

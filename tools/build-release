@@ -62,6 +62,10 @@ git archive --format=tar HEAD | tar -xf - -C "$source_tree"
 printf '%s\n' '==> source tests'
 (
     cd "$source_tree"
+    npm ci --ignore-scripts \
+        --prefix src/cyclo/credential_gateway/gateway_context
+    npm ci --ignore-scripts \
+        --prefix src/cyclo/provider_runtime_context
     "$venv/bin/python" -m pytest -q \
         --ignore=tests/test_release_manifest.py \
         --ignore=tests/test_secret_scan.py
@@ -84,7 +88,9 @@ printf '%s\n' '==> dependency audits'
 npm audit --package-lock-only --omit=dev --audit-level=high \
     --prefix "$source_tree/src/cyclo/credential_gateway/gateway_context"
 npm audit --package-lock-only --omit=dev --audit-level=high \
-    --prefix "$source_tree/src/cyclo/credential_gateway/runtime_context"
+    --prefix "$source_tree/src/cyclo/team_runtime_context"
+npm audit --package-lock-only --omit=dev --audit-level=high \
+    --prefix "$source_tree/src/cyclo/provider_runtime_context"
 
 printf '%s\n' '==> wheel-only acceptance'
 CYCLO_RELEASE_BUILD_PYTHON="$venv/bin/python" \
@@ -131,8 +137,8 @@ done
 printf '%s\n' '==> credential-free Docker images'
 docker build --pull \
     --tag "cyclo-runtime:release-$short_commit" \
-    --file "$source_tree/src/cyclo/credential_gateway/runtime_context/Dockerfile" \
-    "$source_tree/src/cyclo/credential_gateway/runtime_context"
+    --file "$source_tree/src/cyclo/team_runtime_context/Dockerfile" \
+    "$source_tree/src/cyclo/team_runtime_context"
 PYTHON="$venv/bin/python" \
     "$source_tree/tools/runtime-write-acceptance" \
     "cyclo-runtime:release-$short_commit"
@@ -140,6 +146,12 @@ docker build --pull \
     --tag "cyclo-gateway:release-$short_commit" \
     --file "$source_tree/src/cyclo/credential_gateway/gateway_context/Dockerfile" \
     "$source_tree/src/cyclo/credential_gateway/gateway_context"
+docker build --pull \
+    --tag "cyclo-provider-runtime:release-$short_commit" \
+    --file "$source_tree/src/cyclo/provider_runtime_context/Dockerfile" \
+    "$source_tree/src/cyclo/provider_runtime_context"
+docker run --rm --network none --entrypoint node \
+    "cyclo-provider-runtime:release-$short_commit" --check /app/server.mjs
 docker run --rm --network none \
     --env CYCLO_HOST_UID=1000 \
     --env CYCLO_HOST_GID=1000 \

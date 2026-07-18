@@ -12,14 +12,6 @@ def package_root() -> Path:
     return Path(str(resources.files(PACKAGE))).resolve()
 
 
-def runtime_context_root() -> Path:
-    return package_root() / "runtime_context"
-
-
-def dockerfile_path() -> Path:
-    return runtime_context_root() / "Dockerfile"
-
-
 def gateway_context_root() -> Path:
     return package_root() / "gateway_context"
 
@@ -40,10 +32,10 @@ def filesystem_source_files(root: Path) -> tuple[Path, ...]:
     return tuple(sorted(result, key=lambda item: item.as_posix()))
 
 
-def source_fingerprint(root: Path | None = None) -> str:
+def source_fingerprint(root: Path) -> str:
     """Hash the exact packaged build context, independent of a Git checkout."""
 
-    selected = (runtime_context_root() if root is None else root).resolve()
+    selected = Path(root).resolve()
     digest = hashlib.sha256()
     for rel in filesystem_source_files(selected):
         path = selected / rel

@@ -1,0 +1,7 @@
+{
+  "name": "cyclo-provider-runtime",
+  "private": true,
+  "type": "module",
+  "description": "Cyclo virtual-provider routing runtime",
+  "dependencies": {}
+}

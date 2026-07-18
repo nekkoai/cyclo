@@ -8,7 +8,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
+from urllib.parse import unquote, urlsplit
 
 from .errors import CycloError
 from .state import DEFAULT_AGENTWS_HOST, Instance
@@ -20,6 +21,12 @@ CONTAINER_AGENTWS = Path("/agentws")
 CONTAINER_TEAM = Path("/team")
 CONTAINER_WORKSPACE = Path("/workspace")
 CONTAINER_PI = Path("/home/cyclo/.pi")
+HOST_PSEUDO_FILESYSTEMS = (
+    (Path("/proc"), "host process filesystem"),
+    (Path("/sys"), "host system filesystem"),
+    (Path("/dev"), "host device filesystem"),
+    (Path("/run"), "host runtime filesystem"),
+)
 AGENTWS_RETRY_ENVIRONMENT = (
     "AGENTWS_MAX_JOB_ATTEMPTS",
     "AGENTWS_MAX_CONSECUTIVE_FAILURES",
@@ -34,6 +41,48 @@ def overlaps(left: Path, right: Path) -> bool:
     return left == right or left.is_relative_to(right) or right.is_relative_to(left)
 
 
+def overlaps_lexically(left: Path, right: Path) -> bool:
+    """Compare mount names without following a final symlink.
+
+    The resolved comparison protects a trusted target; this second comparison
+    also protects the host-owned path name when it is missing or is itself a
+    symlink inside an agent-writable tree.
+    """
+
+    left = Path(os.path.abspath(left.expanduser()))
+    right = Path(os.path.abspath(right.expanduser()))
+    return left == right or left.is_relative_to(right) or right.is_relative_to(left)
+
+
+def docker_socket_paths(
+    environment: Mapping[str, str] | None = None,
+) -> tuple[Path, ...]:
+    """Return system and rootless Unix Docker sockets worth protecting."""
+
+    env = os.environ if environment is None else environment
+    candidates = [
+        Path("/var/run/docker.sock"),
+        Path(f"/run/user/{os.getuid()}/docker.sock"),
+        Path.home() / ".docker" / "run" / "docker.sock",
+    ]
+    runtime = env.get("XDG_RUNTIME_DIR")
+    if runtime:
+        candidates.append(Path(runtime).expanduser() / "docker.sock")
+    configured = env.get("DOCKER_HOST")
+    if configured:
+        parsed = urlsplit(configured)
+        if parsed.scheme == "unix" and parsed.path:
+            candidates.append(Path(unquote(parsed.path)).expanduser())
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(resolved)
+    return tuple(result)
+
+
 def validate_mount_boundaries(
     team: Path,
     project: Path,
@@ -43,15 +92,16 @@ def validate_mount_boundaries(
 ) -> None:
     if overlaps(team, project):
         raise CycloError(f"team and project must be separate filesystem trees: {team} and {project}")
-    protected = [
+    protected: list[tuple[Path, str]] = [
         (state_root, "Cyclo state"),
         (host_pi_agent_dir, "host Pi credential/configuration directory"),
-        (Path("/var/run/docker.sock"), "Docker socket"),
     ]
+    protected.extend(HOST_PSEUDO_FILESYSTEMS)
+    protected.extend((path, "Docker socket") for path in docker_socket_paths())
     protected.extend(trusted_roots)
     for source, label in protected:
         for mounted, mounted_label in ((team, "team"), (project, "project")):
-            if overlaps(mounted, source):
+            if overlaps(mounted, source) or overlaps_lexically(mounted, source):
                 raise CycloError(f"{mounted_label} mount overlaps {label}: {mounted} and {source}")
 
 
@@ -74,7 +124,6 @@ class ContainerSpec:
     jobs_dir: Path
     agents_dir: Path
     pi_root: Path
-    gateway_container: str
     port: int
     verbose: bool = False
 
@@ -107,6 +156,11 @@ def container_command(spec: ContainerSpec) -> list[str]:
         "2048",
         "--security-opt",
         "no-new-privileges",
+        # The runtime binds team capabilities to its destination interface.
+        # Removing raw-packet authority prevents a root/custom team image from
+        # forging traffic for another private-network interface.
+        "--cap-drop",
+        "NET_RAW",
         "--network",
         instance.network_name,
     ]
@@ -159,8 +213,9 @@ def container_command(spec: ContainerSpec) -> list[str]:
         mount(spec.agents_dir, CONTAINER_AGENTWS / "agents"),
         "--mount",
         # Pi creates lock files and mutable runtime metadata beside its projected
-        # configuration. This per-instance tree contains only a provider/model-
-        # scoped gateway capability; host credentials remain inside the gateway.
+        # configuration. This per-instance tree contains only a provider-runtime
+        # capability scoped to provider/model names; host credentials remain
+        # inside the gateway.
         mount(spec.pi_root, CONTAINER_PI),
         "--mount",
         mount(spec.team.root, CONTAINER_TEAM, "rw" if instance.team_write else "ro"),
@@ -324,19 +379,19 @@ class Docker:
                 result[container_id] = value["Name"]
         return result
 
-    def connect_gateway(
+    def connect_runtime(
         self,
         network_id: str,
-        gateway_container_id: str,
-        gateway_alias: str,
+        runtime_container_id: str,
+        runtime_alias: str,
     ) -> None:
         info = self._inspect_network(network_id)
         if info is None:
             raise CycloError(f"Docker network disappeared before connection: {network_id}")
         labels = info.get("Labels") or {}
         if not isinstance(labels, dict) or not isinstance(labels.get(CYCLO_LABEL), str):
-            raise CycloError(f"refusing to connect gateway to non-Cyclo network: {network_id}")
-        if gateway_container_id in self._network_members(info):
+            raise CycloError(f"refusing to connect runtime to non-Cyclo network: {network_id}")
+        if runtime_container_id in self._network_members(info):
             return
         self._run(
             [
@@ -344,9 +399,9 @@ class Docker:
                 "network",
                 "connect",
                 "--alias",
-                gateway_alias,
+                runtime_alias,
                 network_id,
-                gateway_container_id,
+                runtime_container_id,
             ]
         )
 
@@ -443,7 +498,7 @@ class Docker:
             self._run(["docker", "stop", "--timeout", "30", resource_id])
         self._run(["docker", "rm", resource_id])
 
-    def remove_network(self, name: str, gateway_container: str) -> None:
+    def remove_network(self, name: str, runtime_container: str) -> None:
         info = self._inspect_network(name)
         if info is None:
             return
@@ -454,7 +509,7 @@ class Docker:
             raise CycloError(f"refusing to remove non-Cyclo network: {name}")
         network_id = self._resource_id(info, kind="network", name=name)
         for container_id, container_name in self._network_members(info).items():
-            if container_name == gateway_container:
+            if container_name == runtime_container:
                 self._run(
                     ["docker", "network", "disconnect", network_id, container_id],
                     check=False,

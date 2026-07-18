@@ -25,6 +25,8 @@ import { createOAuthLoginCallbacks } from "./oauth-ui.mjs";
 import { readJson, withFileLock, writeJsonAtomic } from "./store.mjs";
 
 const AUTH_JSON_PATH = process.env.CYCLO_GATEWAY_AUTH_JSON ?? "/var/lib/cyclo-gateway/auth.json";
+const ROUTE_NAME = /^[a-z0-9_-]+$/u;
+const RESERVED_ROUTE_NAMES = new Set(["__proto__", "constructor", "gateway", "prototype"]);
 
 // Common brand names that don't match pi-ai's provider id. Used only to make
 // error/warning messages helpful; never silently rewrites the provider.
@@ -43,15 +45,25 @@ function requireValue(argv, i, flag) {
   return value;
 }
 
+function routeName(value, label) {
+  if (typeof value !== "string" || !ROUTE_NAME.test(value) || RESERVED_ROUTE_NAMES.has(value)) {
+    throw new Error(
+      `${label} must use lowercase letters, numbers, underscore, or hyphen`,
+    );
+  }
+  return value;
+}
+
 function parseArgs(argv) {
-  const provider = argv[0];
-  if (!provider || provider.startsWith("-")) {
+  const rawProvider = argv[0];
+  if (!rawProvider || rawProvider.startsWith("-")) {
     throw new Error("usage: login.mjs <provider> [--as ACCOUNT] [--api-key KEY | --api-key-env VAR | --api-key-stdin]");
   }
+  const provider = routeName(rawProvider, "provider name");
   const parsed = { provider, account: undefined, apiKey: undefined, apiKeyEnv: undefined, apiKeyStdin: false };
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--as") parsed.account = requireValue(argv, ++i, arg);
+    if (arg === "--as") parsed.account = routeName(requireValue(argv, ++i, arg), "account name");
     else if (arg === "--api-key") parsed.apiKey = requireValue(argv, ++i, arg);
     else if (arg === "--api-key-env") parsed.apiKeyEnv = requireValue(argv, ++i, arg);
     else if (arg === "--api-key-stdin") parsed.apiKeyStdin = true;
@@ -115,6 +127,7 @@ async function resolveApiKey({ apiKey, apiKeyEnv, apiKeyStdin }) {
 }
 
 async function storeCredential(account, credential) {
+  routeName(account, "account name");
   await withFileLock(AUTH_JSON_PATH, () => {
     const store = readJson(AUTH_JSON_PATH) ?? {};
     store[account] = credential;
@@ -190,4 +203,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   );
 }
 
-export { parseArgs, resolveApiKey, storeCredential };
+export { parseArgs, resolveApiKey, routeName, storeCredential };

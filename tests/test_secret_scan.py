@@ -29,6 +29,11 @@ def test_secret_scan_accepts_repository_history_and_worktree() -> None:
     assert "secret scan: PASS" in result.stdout
 
 
+def test_worktree_scan_ignores_a_tracked_path_deleted_from_disk(tmp_path: Path) -> None:
+    missing = tmp_path / "deleted-tracked-file"
+    assert SCANNER_API["scan_paths"]([missing]) == []
+
+
 def test_secret_scan_rejects_a_private_key_in_an_artifact(tmp_path: Path) -> None:
     artifact = tmp_path / "leaked.txt"
     marker = "-----BEGIN " + "PRIVATE KEY-----"

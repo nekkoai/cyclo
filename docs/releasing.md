@@ -1,6 +1,6 @@
 # Releasing Cyclo
 
-Cyclo uses stable semantic versions. `0.1.0` is a stable release; version
+Cyclo uses stable semantic versions. `0.2.0` is a stable release; version
 numbers below `1.0.0` do not imply an alpha or preview build. The Python
 distribution is `cyclo-agent`, while the command, import package, repository,
 and Docker images retain the `cyclo` name.
@@ -34,20 +34,25 @@ tools/release-manifest dist
 git status --short
 ```
 
-Build and smoke-test both credential-free image contexts:
+Build and smoke-test all three credential-free image contexts:
 
 ```sh
-docker build --pull -t cyclo-runtime:0.1.0 \
-  -f src/cyclo/credential_gateway/runtime_context/Dockerfile \
-  src/cyclo/credential_gateway/runtime_context
-docker build --pull -t cyclo-gateway:0.1.0 \
+docker build --pull -t cyclo-runtime:0.2.0 \
+  -f src/cyclo/team_runtime_context/Dockerfile \
+  src/cyclo/team_runtime_context
+docker build --pull -t cyclo-gateway:0.2.0 \
   -f src/cyclo/credential_gateway/gateway_context/Dockerfile \
   src/cyclo/credential_gateway/gateway_context
+docker build --pull -t cyclo-provider-runtime:0.2.0 \
+  -f src/cyclo/provider_runtime_context/Dockerfile \
+  src/cyclo/provider_runtime_context
 docker run --rm --network none \
   -e CYCLO_HOST_UID=1000 -e CYCLO_HOST_GID=1000 \
-  cyclo-runtime:0.1.0 python3 --version
-docker run --rm --network none cyclo-gateway:0.1.0 supported-providers.mjs
-docker run --rm --network none cyclo-gateway:0.1.0 providers.mjs
+  cyclo-runtime:0.2.0 python3 --version
+docker run --rm --network none cyclo-gateway:0.2.0 supported-providers.mjs
+docker run --rm --network none cyclo-gateway:0.2.0 providers.mjs
+docker run --rm --network none --entrypoint node \
+  cyclo-provider-runtime:0.2.0 --check /app/server.mjs
 ```
 
 The worktree must be clean and tests must pass on the exact commit before a
@@ -72,16 +77,16 @@ The script refuses a dirty tree, archives the exact local commit, installs the
 hash-locked release tools into a temporary environment, and disables PEP 517
 build isolation so the backend cannot be replaced by an implicit download. It
 runs the Python, Node, shell, dependency, clean-wheel, and three-template
-acceptance suites, builds and smoke-tests both credential-free Docker images,
-and writes this bundle:
+acceptance suites, builds and smoke-tests all three credential-free Docker
+images, and writes this bundle:
 
 ```text
-release/cyclo-agent-0.1.0/
-  cyclo_agent-0.1.0-py3-none-any.whl
-  cyclo_agent-0.1.0.tar.gz
+release/cyclo-agent-0.2.0/
+  cyclo_agent-0.2.0-py3-none-any.whl
+  cyclo_agent-0.2.0.tar.gz
   SHA256SUMS
   release-manifest.json
-  cyclo-agent-0.1.0.spdx.json
+  cyclo-agent-0.2.0.spdx.json
 ```
 
 The wheel and source archive are normalized before their checksums and SBOM are
@@ -90,6 +95,9 @@ toolchain, and commit-derived `SOURCE_DATE_EPOCH` produces byte-identical
 distribution files. Docker base images and npm tarballs are pinned, but the
 runtime image also installs packages from the live Debian index and is not
 claimed to be byte-identical across rebuild dates.
+
+The SPDX SBOM enumerates locked Node dependencies from the team runtime,
+credential gateway, and provider runtime package locks.
 
 `tools/build-release` does not inspect, contact, mutate, tag, push to, or
 publish through any Git remote or hosting service. Publication is deliberately
@@ -100,17 +108,41 @@ instead.
 ## Verify from a clean machine
 
 On a disposable Linux host with Git, Python 3.10 or newer, and Docker, copy the
-wheel from the release bundle and run:
+wheel from the release bundle and first verify its passive commands:
 
 ```sh
 python3 -m venv /tmp/cyclo-release
 . /tmp/cyclo-release/bin/activate
-python -m pip install ./cyclo_agent-0.1.0-py3-none-any.whl
+python -m pip install ./cyclo_agent-0.2.0-py3-none-any.whl
 cyclo --version
-cyclo doctor
 cyclo templates
 cyclo gateway providers
+cyclo runtime status
 ```
+
+At this point the provider runtime is deliberately absent. `cyclo doctor` is a
+diagnostic and must not build or start it, so a nonzero result that explicitly
+reports the absent runtime is expected. `tools/release-acceptance` exercises
+that clean installed-wheel state while checking the packaged runtime resources
+and Docker daemon independently.
+
+For a complete operational check, provision a disposable provider account and
+operate shared services in dependency order:
+
+```sh
+sudo install -d -m 0755 /etc/cyclo
+cyclo gateway login PROVIDER
+cyclo gateway restart
+cyclo runtime start --build
+cyclo provider build --all   # when /etc/cyclo/host.conf defines providers
+cyclo provider start --all   # when /etc/cyclo/host.conf defines providers
+cyclo doctor
+cyclo models
+```
+
+The order is intentional: credential gateway, provider runtime, configured
+provider components, then `doctor`. None of `doctor`, `models`, or `run` starts
+or rebuilds these shared services.
 
 Initialize one packaged team, run `cyclo validate`, and perform a `run
 --dry-run` against a disposable project. Compare the copied wheel against

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Callable
 
 from ..errors import CycloError
 from . import docker, gateway
@@ -43,6 +44,22 @@ GATEWAY_CONTAINER_HARDENING = [
 ]
 
 
+def validate_route_name(value: object, *, label: str) -> str:
+    """Validate a provider/account name accepted by gateway HTTP routes."""
+
+    if (
+        not isinstance(value, str)
+        or value.startswith("-")
+        or not gateway.PROVIDER_RE.fullmatch(value)
+        or value in gateway.RESERVED_PROVIDER_NAMES
+    ):
+        raise CycloError(
+            f"invalid gateway {label} {value!r}; use lowercase letters, numbers, "
+            "underscore, or hyphen"
+        )
+    return value
+
+
 def login_command(
     image: str,
     store_volume: str,
@@ -56,6 +73,9 @@ def login_command(
 ) -> list[str]:
     """Build the isolated one-shot credential provisioning command."""
 
+    provider = validate_route_name(provider, label="provider name")
+    if account is not None:
+        account = validate_route_name(account, label="account name")
     oauth = api_key is None and api_key_env is None and not api_key_stdin
     command = ["docker", "run", "--rm", *GATEWAY_CONTAINER_HARDENING]
     if oauth:
@@ -145,25 +165,32 @@ def login_env_var(
 
 
 def cmd_login(args: argparse.Namespace) -> int:
-    gateway.ensure_gateway_image(args.image, build=args.build)
+    provider = validate_route_name(args.provider, label="provider name")
+    account = (
+        validate_route_name(args.account, label="account name")
+        if args.account is not None
+        else None
+    )
     env_var = login_env_var(
-        args.provider,
+        provider,
         api_key=args.api_key,
         api_key_env=args.api_key_env,
         api_key_stdin=args.api_key_stdin,
         environ=os.environ,
     )
+    command = login_command(
+        args.image,
+        args.store_volume,
+        provider,
+        account=account,
+        api_key=args.api_key,
+        api_key_env=env_var,
+        api_key_stdin=args.api_key_stdin,
+        stdin_is_tty=sys.stdin.isatty(),
+    )
+    gateway.ensure_gateway_image(args.image, build=args.build)
     return docker.run_command(
-        login_command(
-            args.image,
-            args.store_volume,
-            args.provider,
-            account=args.account,
-            api_key=args.api_key,
-            api_key_env=env_var,
-            api_key_stdin=args.api_key_stdin,
-            stdin_is_tty=sys.stdin.isatty(),
-        )
+        command
     )
 
 
@@ -192,7 +219,9 @@ def cmd_destroy_store(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(
+    restart_handler: Callable[[argparse.Namespace], int] | None = None,
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cyclo gateway",
         description=(
@@ -229,14 +258,25 @@ def build_parser() -> argparse.ArgumentParser:
     providers.set_defaults(func=cmd_providers)
 
     login = sub.add_parser(
-        "login", parents=[store_common], help="provision one provider credential"
+        "login",
+        parents=[store_common],
+        help="provision one provider credential",
+        description=(
+            "Provision one provider credential with a short-lived login container; "
+            "this does not start the long-running gateway. On success, the top-level "
+            "Cyclo command refreshes a running provider runtime. The credential may "
+            "already be committed if that follow-up refresh reports an error."
+        ),
     )
     login.add_argument("provider", metavar="PROVIDER")
     login.add_argument(
         "--as",
         dest="account",
         metavar="ACCOUNT",
-        help="store the credential under this account alias",
+        help=(
+            "catalogue provider/account name (default: PROVIDER); use lowercase "
+            "letters, numbers, underscore, or hyphen"
+        ),
     )
     key_source = login.add_mutually_exclusive_group()
     key_source.add_argument(
@@ -259,6 +299,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", parents=[store_common], help="list provisioned accounts")
     status.set_defaults(func=cmd_status)
+
+    if restart_handler is not None:
+        restart = sub.add_parser(
+            "restart",
+            parents=[store_common],
+            help="recreate only the credential gateway and preserve its store",
+            description=(
+                "Recreate Cyclo's credential gateway container without deleting "
+                "its credential store. The separate provider runtime reconnects "
+                "through the gateway's stable private network name. On success, "
+                "the top-level Cyclo command refreshes a running provider runtime; "
+                "the gateway replacement may already be committed if that follow-up "
+                "refresh reports an error."
+            ),
+        )
+        restart.set_defaults(func=restart_handler)
 
     destroy = sub.add_parser(
         "destroy-store",
@@ -289,8 +345,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+def main(
+    argv: list[str] | None = None,
+    *,
+    restart_handler: Callable[[argparse.Namespace], int] | None = None,
+) -> int:
+    args = build_parser(restart_handler).parse_args(
+        sys.argv[1:] if argv is None else argv
+    )
     try:
         return int(args.func(args))
     except CycloError as exc:

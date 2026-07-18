@@ -1,121 +1,305 @@
 # Cyclo architecture
 
-Cyclo separates four things that often get mixed together in agent runners:
-the team definition, the project being changed, the filesystem work queue, and
-provider credentials. Each has an independent owner and lifecycle.
+Cyclo keeps four lifecycles separate: Git-defined teams, project workspaces,
+model composition, and credentials. The credential gateway is deliberately not
+the provider orchestrator.
 
 ## Components
 
 ```text
-team Git repository                 project Git repository
-team + roles/*.md                   source and tests
-        | read-only by default             | writable by default
-        +-------------------+---------------+
-                            v
-                 cyclo-runtime container
-             bundled queue + agent processes
-                            |
-                 scoped private capability
-                            |
-                            v
-                 cyclo-gateway container
-            model catalogue + policy + proxy
-                            |
-                 cyclo-gateway-store volume
-       credentials + subscriptions + usage ledger
+team repository              project directory
+team + roles/*.md            source + tests
+       | read-only                  | writable
+       +--------------+-------------+
+                      v
+             team runtime container
+          agents + filesystem job loop
+                      |
+          scoped per-instance bearer
+                      | TCP on team network
+                      v
+             provider runtime container
+      catalogue + composition routes + policy
+          | UDS                         | private Docker network
+          v                             v
+ provider component containers   credential gateway container
+ network=none                    credentials + concrete proxy + usage
+                                        |
+                                        v
+                               concrete model services
 ```
 
-The host-side `cyclo` command validates definitions and mount boundaries,
-builds packaged Docker contexts, creates isolated instance state, reconciles
-Docker resources, and issues a capability scoped to the providers and models
-declared by that team generation.
+The host-side `cyclo` controller is Python. It validates definitions and mount
+boundaries, manages explicitly requested Docker lifecycle operations, and
+publishes scoped client records. The Pi agent engine, provider runtime, and
+credential gateway execute inside packaged images; Node.js is a maintainer
+requirement, not a normal host runtime requirement.
 
-The host controller is Python. The reused Pi agent engine and `pi-ai` provider
-and subscription support are JavaScript, but they are installed and executed
-inside the runtime and gateway images. Running Cyclo therefore does not require
-Node.js or npm on the host; those tools are host prerequisites only for the
-complete maintainer test and release workflow.
+The three long-running runtime roles are distinct:
 
-The runtime image contains Cyclo's owned filesystem loop, Pi agent engines, and
-supporting command-line tools. It receives the team, project, and per-instance
-queue state as explicit mounts. It never receives the Docker socket, gateway
-administrator token, credential store, host home directory, or another team's
-state.
+- A **team runtime** owns one team/project binding, its agents, viewer, and
+  durable filesystem queue.
+- The shared **provider runtime** owns the merged model catalogue, host-provider
+  policy, virtual routes, short-lived request contexts, and provider-component
+  registration. It contains no physical provider credential.
+- The **credential gateway** owns API keys and subscription sessions, exposes
+  only concrete account/model routes, substitutes real credentials, talks to
+  concrete upstream services, and records concrete usage. It does not read
+  `host.conf`, launch components, or implement composition.
 
-The gateway image is the only component that mounts `cyclo-gateway-store`.
-Interactive subscription logins and API-key provisioning run inside that
-image. The long-running proxy projects only allowed models to each runtime and
-records provider-reported token accounting by instance and team generation.
+Only the gateway mounts `cyclo-gateway-store`. A provider component and a team
+container never receive that volume, a real provider key, or a subscription
+session.
 
-## Definitions and generations
+## Host provider configuration
 
-A team is an ordinary Git repository containing a `team` roster and role files.
-The roster binds every named agent to a role, engine, and proxy model. Cyclo
-identifies a generation with the repository commit plus a digest of the live
-roster, roles, and optional protocol, so experiments remain attributable even
-when the team has uncommitted edits.
+Optional installation-wide composition is a small line-oriented file,
+`/etc/cyclo/host.conf`:
 
-The default team mount is read-only. `--team-write` deliberately permits a team
-to modify its own definition; those changes are ordinary Git working-tree
-changes and apply on the next run. Project writability is controlled
-independently with `--project-read-only`.
+```text
+# provider PREFIX PATH INPUT_MODEL... [KEY=VALUE ...]
+provider fusion ./providers/fusion codex-work/MODEL_ID mode=balanced
+```
 
-## Queue and controller state
+`PREFIX` is the component's output namespace. `PATH` is a local build context
+containing a `Dockerfile`; relative paths resolve from the directory containing
+`host.conf`, never from the caller's working directory. Inputs are exact
+`provider/model` names and must precede component-owned `key=value` arguments.
+Lines are dependency order, so an input may refer to a concrete gateway account
+or an output from an earlier line. Forward references, cycles, unknown inputs,
+duplicate prefixes, and collisions with concrete accounts fail closed.
 
-Each instance has durable host state below the selected Cyclo state root. The
-runtime sees a materialized, read-only copy of the bundled queue implementation
-and a writable instance queue. Tasks, jobs, comments, transcripts, and results
-survive container replacement. Atomic publication, locking, bounded retries,
-and interrupted-write recovery are implemented by the bundled loop.
+The provider runtime receives exactly the canonical `host.conf` file as a
+read-only bind at `/etc/cyclo/host.conf`; no sibling host files are exposed.
+The runtime parses it once at startup. Every edit—including an in-place write,
+creation or removal, symlink retarget, or inode replacement—requires an explicit
+runtime restart before it takes effect. Run `cyclo runtime restart` for that
+operation; configuration changes never require an image rebuild.
 
-Controller state contains paths, lifecycle metadata, scoped client records,
-and a writable per-instance Pi tree containing projected model configuration,
-the scoped gateway token, locks, and local runtime metadata. It does not contain
-host or provider credentials; those remain in the gateway store. Stopping an
-instance removes its container and private network, revokes its capability, and
-preserves its queue history.
+A missing or empty file is a valid configuration: the provider runtime exposes
+the gateway's concrete catalogue unchanged. At startup the runtime combines its
+parsed configuration, concrete gateway catalogue, expected provider state, and
+validated persisted registrations into one immutable in-memory snapshot.
+Normal catalogue and inference requests use that snapshot directly: they do not
+reread files, refetch the whole catalogue, or health-probe every component.
 
-## Networks and model traffic
+A successful component registration validates the startup configuration and
+expected launch state, probes that component, sanitizes and durably records its
+registration for restart recovery, and atomically publishes a replacement
+snapshot. On runtime restart, a persisted registration is
+recovered only after it still matches the new configuration and expected state
+and its component passes the health probe. The active route table itself exists
+only in process memory. Removing a `host.conf` line therefore hides the route
+after the required runtime restart without silently deleting its container.
+Changing a provider path or argument also changes its configuration identity,
+so the old component cannot be recovered under the edited definition; restart
+that provider explicitly to publish a matching generation.
 
-Each instance receives a private Docker network. In normal mode the runtime can
-also use direct outbound networking. `--offline` makes its network internal;
-the gateway is attached to that network, so allowed model calls still work but
-direct web egress and the per-team viewer do not.
+The provider runtime's expected-provider registry, sanitized registration
+recovery records, component capabilities, socket directories, and client
+records live in a writable bind below Cyclo's host state root. They are separate
+from both `host.conf` and the gateway credential volume.
 
-The scoped gateway capability is provider-and-model authorization plus usage
-attribution. It is not a confidentiality boundary between the mounted project
-and an allowed model provider: an agent can send readable project content in a
-model request. Use read-only mounts and offline mode to reduce privileges, and
-use separate Git worktrees for concurrent writers.
+Expected-provider and client registries are dynamic security authority. The
+controller normally replaces them atomically and requests an authenticated
+reload for a synchronous `204` acknowledgement. The runtime also compares only
+their file identities every 500 ms and runs that same reload transaction after
+a replacement. This is a crash backstop: if the controller is killed after the
+durable revocation but before its control call, cached authority is still
+revoked within a bounded interval. A changed malformed registry revokes all
+dynamic clients and component routes until a valid replacement appears.
+`host.conf` is deliberately excluded from this watcher and remains
+restart-only.
 
-## Persistent gateway data
+## Explicit lifecycle
 
-`cyclo-gateway-store` contains credentials, subscription sessions, and an
-append-only JSONL usage ledger. Usage records contain accounting and
-attribution metadata, not prompts or responses. `cyclo usage` aggregates the
-retained ledger for experiments. Version 0.1.0 does not impose automatic
-retention; operators should monitor the Docker volume.
+Shared services and provider components are operated explicitly:
 
-`cyclo gateway destroy-store` is intentionally fail-closed and confirmation
-gated. It deletes the entire volume, including credentials, subscriptions, and
-usage history, only after verifying every mounting Cyclo container by immutable
-identity. A foreign, unverifiable, racing, or still-running mount causes refusal
-or lets Docker's final in-use check preserve the volume.
+```sh
+cyclo gateway restart [--build]
 
-## Observation boundary
+cyclo runtime start [--build]
+cyclo runtime restart [--build]
+cyclo runtime stop
+cyclo runtime status
 
-The fleet dashboard and per-team viewer are read-only. Both bind to loopback by
-default and have no application authentication in 0.1.0. An operator can
-explicitly select a non-loopback host for either interface, in which case Cyclo
-prints an exposure warning. Queue scans are bounded, queue content is treated
-as data, and the dashboard never starts the gateway or executes queue files. A
-team cannot read another team's private queue through Cyclo; cross-team
-supervision requires a future explicit, read-only observation interface.
+cyclo provider build PREFIX          # or: cyclo provider build --all
+cyclo provider start PREFIX          # or: cyclo provider start --all
+cyclo provider restart PREFIX        # or --all; add --build when wanted
+cyclo provider stop PREFIX           # or: cyclo provider stop --all
+cyclo provider status PREFIX         # or: cyclo provider status --all
+```
 
-## Docker-host trust
+The initial runtime start normally uses `cyclo runtime start --build`; later
+starts require the already-built image. `provider start` requires a current
+image and never builds one. `provider restart --build` is the explicit combined
+operation. No command stops a configured-but-omitted provider as a side effect.
+Runtime start validates, but never repairs, the credential boundary: the
+gateway must be current and attached only to its owned private network. A
+legacy gateway still attached to a team network is rejected with an explicit
+`cyclo gateway restart` instruction.
 
-Cyclo treats team containers and writable Git trees as untrusted, but trusts
-the host kernel, Docker daemon, Cyclo installation, gateway image, and
-administrator account. Compromise of the Docker host or access to the Docker
-socket is outside the isolation guarantee. The detailed reporting and support
-policy is in [`../SECURITY.md`](../SECURITY.md).
+`cyclo models` asks the running provider runtime to refresh its concrete
+gateway catalogue, then queries it. `cyclo run` requires that runtime to be
+running. Neither command starts, rebuilds, replaces, or stops the gateway,
+provider runtime, or provider components. A team run may still build its own
+per-team runtime image when needed.
+
+`cyclo gateway restart` replaces only the credential gateway and preserves its
+credential volume. `cyclo runtime restart` replaces only the provider runtime
+and preserves its host-bound recovery state; use it after every `host.conf`
+update. The restarted runtime revalidates and probes persisted registrations
+before admitting them to its new in-memory snapshot. Image rebuilds are tied to
+changed program code or an explicit `--build`, not to `host.conf` contents.
+Gateway login and restart refresh the concrete catalogue of a running runtime
+through a separate authenticated control operation. That operation never
+reloads `host.conf`.
+
+`cyclo provider restart PREFIX` first publishes and acknowledges removal of
+that prefix's expected state and upstream capability, then stops the old
+component. Only afterward does it publish replacement authority and launch the
+new process, with fresh ingress and upstream tokens. This revocation boundary
+also removes the old recovery record, so
+a same-generation replacement cannot be mistaken for an idempotent
+registration through Unix-socket inode reuse.
+
+## Model request path
+
+A team calls `POST /p/PREFIX/<native-path>` on the provider runtime over its
+private team network. The runtime validates the team's exact public
+provider/model scope. Authentication binds the team's capability hash to the
+runtime's local address on that specific team network; possessing another
+team's bearer is therefore insufficient to replay it from the caller's own
+network.
+
+The shared listener admits at most 32 TCP connections on any one team-facing
+runtime interface, 256 TCP connections globally, eight active requests per
+project/provider principal, and 24 untrusted root requests globally. Nested
+calls use a separate pool charged to the originating project: 16 per origin and
+32 globally. At most 12 root bodies and 24 nested bodies are retained globally.
+Bodies remain capped at 16 MiB and must finish within 30 seconds; active
+admission is held through the complete upstream response, while body admission
+is released after upstream response headers. Host-admin control uses its
+separate Unix listener, so a team filling network or workload budgets cannot
+block revocation. Each provider Unix listener is separately capped at 64, and
+requests on it use a 200/s prefix-local token bucket. Team-facing TCP requests
+use a 500/s token bucket per private-network interface. Authenticated
+registration attempts are additionally serialized and rate-limited per prefix.
+
+For a concrete route, the runtime forwards the same opaque team bearer to the
+gateway over the runtime/gateway private network. The gateway resolves that
+bearer against its transitive concrete scope, swaps it for the selected real
+credential, calls the upstream service, and attributes usage to the original
+team/project generation.
+
+For a virtual route, the runtime calls the component over its private Unix
+socket with a route-local ingress token and an opaque
+`X-Cyclo-Request-Context`. The component calls declared inputs back through the
+runtime's Unix socket using a separate upstream token plus that context. The
+runtime recovers the original team bearer from in-memory request state and
+uses it for any concrete gateway call. Consequently:
+
+- the gateway retains physical usage attribution to the original team;
+- a component never sees the team bearer or a real credential;
+- a component can call only the inputs declared on its own `host.conf` line;
+- nested composition does not create a provider-to-provider transport.
+
+The provider runtime may use a separate gateway-wide capability to read the
+concrete catalogue. That capability is mounted only into the trusted provider
+runtime and is never sent to a team or component.
+
+## Networks and sockets
+
+Every team instance has a private Docker network. Its team runtime and the
+shared provider runtime join that network; the credential gateway does not.
+The provider runtime and gateway share a different private network. The host
+controller publishes network ports only on loopback; provider-runtime control
+uses a separate mode-`0600` host Unix socket. Cyclo reads the runtime's address
+on each attached team network when publishing client capabilities. Missing
+attachment produces an unusable binding rather than a token-only fallback.
+
+Provider components run with `--network none`, a read-only root, reduced
+privileges, bounded resources, and no Docker socket. HTTP/1.1 uses two
+host-managed Unix-socket directions:
+
+- every component can reach one prefix-specific provider-runtime socket through
+  its own read-only directory mount;
+- the provider runtime can reach each component's socket through that
+  component's separate read-only directory mount.
+
+Components cannot mount or scan one another's socket directories, nor can they
+mount the sibling host-admin socket. One provider exhausting its own UDS
+connection cap therefore cannot occupy another provider's or the controller's
+listener. The filesystem topology provides reachability; bearer capabilities
+provide authorization. HTTP retains streaming, backpressure, cancellation,
+and language-neutral framing. The normative contract is
+[provider protocol v1](provider-protocol.md).
+
+Team containers are launched without `CAP_NET_RAW`. This makes the per-team
+runtime-interface capability binding hold even for a custom image or a Cyclo
+invocation running as root: the team cannot forge raw traffic addressed to the
+runtime's interface on a different private network.
+
+Normal team mode may also have direct outbound networking. `--offline` makes
+the team network internal while preserving its route to the provider runtime.
+It does not make readable project data confidential from an allowed model: an
+agent can still include that data in a model request.
+
+## Teams, projects, and durable work
+
+A team is an ordinary Git repository containing a `team` roster, role prompts,
+and optionally `AGENTS.md`. The roster binds each agent to a role, engine, and
+exact provider/model. A generation combines the repository commit with a
+digest of the live definition, so runs remain attributable with uncommitted
+edits.
+
+The team mount is read-only by default; `--team-write` permits deliberate
+self-modification. The separate project mount is writable by default;
+`--project-read-only` removes that write access.
+
+Tasks, jobs, comments, transcripts, and results live below the selected Cyclo
+state root and survive container replacement. The runtime sees a materialized,
+read-only copy of the bundled queue implementation and writable per-instance
+queue and Pi state. Stopping an instance removes its container and private
+network, revokes its model capability, and preserves its queue history.
+
+## Persistent state
+
+By default, controller and provider-runtime state is below
+`$XDG_STATE_HOME/cyclo` (or `~/.local/state/cyclo`):
+
+```text
+cyclo/
+  gateway/                       # gateway/runtime client records and host capabilities
+  provider-runtime/              # registry, tokens, registration recovery, sockets
+  instances/<instance>/
+    run.json
+    runtime/                     # bundled filesystem loop copy
+    agentws-state/               # tasks, jobs, comments, results, transcripts
+    pi/agent/                    # projected model config and scoped runtime bearer
+```
+
+Physical credentials, subscription sessions, and the append-only concrete
+usage ledger are not in that tree. They live in the Docker-managed
+`cyclo-gateway-store` volume. `cyclo gateway restart`, team stop, and ordinary
+state cleanup do not delete it. `cyclo gateway destroy-store` is the separate,
+explicit destructive operation.
+
+## Observation and host trust
+
+The per-team AgentWS viewer and fleet dashboard are read-only and bind to
+loopback by default. They have no application authentication in 0.2.0; a
+non-loopback bind should be protected by the host network policy. Dashboard
+queue reads are bounded and never execute queue content.
+
+Cyclo assumes the host kernel, Docker daemon, Cyclo installation, provider
+runtime, and credential-gateway images are trusted. Docker administrators can
+inspect containers and volumes. Installed provider source is privileged build
+input and must be reviewed before `cyclo provider build`; runtime isolation
+does not make a malicious Dockerfile safe to build.
+
+Team and project trees are untrusted agent-controlled data. Cyclo does not mount
+the Docker socket, host home, gateway volume, another team's queue, or another
+team's project into a team container. Writable Git trees may contain hostile
+hooks or configuration and should be treated accordingly by later host-side
+commands.

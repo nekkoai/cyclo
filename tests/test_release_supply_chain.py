@@ -11,8 +11,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME = ROOT / "src" / "cyclo" / "credential_gateway" / "runtime_context"
+RUNTIME = ROOT / "src" / "cyclo" / "team_runtime_context"
 GATEWAY = ROOT / "src" / "cyclo" / "credential_gateway" / "gateway_context"
+PROVIDER_RUNTIME = ROOT / "src" / "cyclo" / "provider_runtime_context"
 
 
 def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() -> None:
@@ -60,6 +61,28 @@ def test_gateway_node_install_is_locked_to_the_runtime_pi_generation() -> None:
         if resolved:
             assert resolved.startswith("https://registry.npmjs.org/")
             assert dependency.get("integrity")
+
+
+def test_provider_runtime_is_locked_and_shares_the_safe_metadata_contract() -> None:
+    dockerfile = (PROVIDER_RUNTIME / "Dockerfile").read_text(encoding="utf-8")
+    package = json.loads(
+        (PROVIDER_RUNTIME / "package.json").read_text(encoding="utf-8")
+    )
+    lock = json.loads(
+        (PROVIDER_RUNTIME / "package-lock.json").read_text(encoding="utf-8")
+    )
+
+    assert "npm ci --omit=dev" in dockerfile
+    assert re.search(r"^FROM node:22-[^@\s]+@sha256:[0-9a-f]{64}", dockerfile)
+    assert package["private"] is True
+    assert package["dependencies"] == {}
+    assert lock["lockfileVersion"] == 3
+    assert lock["packages"][""].get("dependencies", {}) == {}
+    assert json.loads(
+        (PROVIDER_RUNTIME / "safe-model-fields.json").read_text(encoding="utf-8")
+    ) == json.loads(
+        (GATEWAY / "safe-model-fields.json").read_text(encoding="utf-8")
+    )
 
 
 def test_workflow_actions_are_pinned_to_full_commits() -> None:
@@ -121,8 +144,11 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert "tools/release-acceptance" in release
     assert "tools/runtime-write-acceptance" in release
     assert "docker build --pull" in release
+    assert "src/cyclo/provider_runtime_context" in release
     assert "gateway providers" in release
     assert "cyclo gateway providers" in acceptance
+    assert "CYCLO_PROVIDER_RUNTIME_IMAGE" in acceptance
+    assert "intentionally absent provider runtime" in acceptance
     assert not re.search(r"\bgh\s", release)
     assert "git push" not in release
     assert "api.github.com" not in release

@@ -17,6 +17,7 @@ from .team_templates import packaged_team_template
 
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 PROVIDER_RE = re.compile(r"^[a-z0-9_-]+$")
+RESERVED_PROVIDER_NAMES = {"__proto__", "constructor", "gateway", "prototype"}
 SUPPORTED_ENGINES = {"pi", "pi-interactive"}
 ROSTER_NAMES = ("team", "default.team")
 MAX_TEAM_FILE_BYTES = 1024 * 1024
@@ -94,7 +95,11 @@ def validate_proxy_model(model: str) -> tuple[str, str]:
     if any(char.isspace() for char in model) or model.count("/") < 1:
         raise CycloError("model must be a proxy name such as provider/model")
     provider, model_id = model.split("/", 1)
-    if not PROVIDER_RE.fullmatch(provider) or not model_id:
+    if (
+        not PROVIDER_RE.fullmatch(provider)
+        or provider in RESERVED_PROVIDER_NAMES
+        or not model_id
+    ):
         raise CycloError(f"invalid proxy model {model!r}")
     return provider, model_id
 

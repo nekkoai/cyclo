@@ -54,10 +54,15 @@ def test_controller_has_no_external_agent_runtime_discovery() -> None:
     assert failures == []
 
 
-def test_runtime_and_gateway_images_use_cyclo_identity() -> None:
-    from cyclo.cli import DEFAULT_GATEWAY_IMAGE, DEFAULT_RUNTIME_IMAGE
+def test_owned_images_use_cyclo_identity() -> None:
+    from cyclo.cli import (
+        DEFAULT_GATEWAY_IMAGE,
+        DEFAULT_PROVIDER_RUNTIME_IMAGE,
+        DEFAULT_RUNTIME_IMAGE,
+    )
     from cyclo.docker import CONTAINER_PI
 
     assert DEFAULT_RUNTIME_IMAGE.startswith("cyclo-runtime:")
     assert DEFAULT_GATEWAY_IMAGE.startswith("cyclo-gateway:")
+    assert DEFAULT_PROVIDER_RUNTIME_IMAGE.startswith("cyclo-provider-runtime:")
     assert CONTAINER_PI == Path("/home/cyclo/.pi")

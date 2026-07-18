@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cyclo-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Run Git-defined agent teams through an isolated credential proxy"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -59,6 +59,10 @@ cyclo = [
   "team_templates/*",
   "team_templates/*/*",
   "team_templates/*/roles/*",
+  "provider_runtime_context/*",
+  "provider_runtime_context/.dockerignore",
+  "team_runtime_context/*",
+  "team_runtime_context/.dockerignore",
 ]
 "cyclo._agentws" = [
   "template/*",
@@ -68,8 +72,6 @@ cyclo = [
   "template/tools/agentws-public/*",
 ]
 "cyclo.credential_gateway" = [
-  "runtime_context/*",
-  "runtime_context/.dockerignore",
   "gateway_context/*",
   "gateway_context/.dockerignore",
 ]
