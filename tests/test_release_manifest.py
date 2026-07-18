@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,61 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tools" / "release-manifest"
+
+
+def test_release_manifest_scans_every_owned_node_lockfile(tmp_path: Path) -> None:
+    namespace = runpy.run_path(str(MANIFEST), run_name="cyclo_release_manifest_test")
+    release_root = tmp_path / "release-root"
+    expected_lockfiles = {
+        "src/cyclo/credential_gateway/gateway_context/package-lock.json",
+        "src/cyclo/team_runtime_context/package-lock.json",
+        "src/cyclo/provider_runtime_context/package-lock.json",
+    }
+    assert {
+        path.as_posix() for path in namespace["NODE_LOCK_PATHS"]
+    } == expected_lockfiles
+
+    for relative in namespace["NODE_LOCK_PATHS"]:
+        lock_path = release_root / relative
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        dependency_name = f"@cyclo-test/{lock_path.parent.name}"
+        lock_path.write_text(
+            json.dumps(
+                {
+                    "lockfileVersion": 3,
+                    "packages": {
+                        "": {},
+                        f"node_modules/{dependency_name}": {
+                            "name": dependency_name,
+                            "version": "1.0.0",
+                            "license": "MIT",
+                            "resolved": "https://registry.npmjs.org/example/-/example-1.0.0.tgz",
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    locked_node_packages = namespace["locked_node_packages"]
+    locked_node_packages.__globals__["ROOT"] = release_root
+    packages = locked_node_packages()
+    assert {package["lockfile"] for package in packages} == expected_lockfiles
+
+    sbom = namespace["make_spdx"](
+        version="0.2.0",
+        commit="0" * 40,
+        created="2023-11-14T22:13:20Z",
+        wheel_hash="0" * 64,
+    )
+    dependency_comments = {
+        package["comment"]
+        for package in sbom["packages"]
+        if package["name"] != "cyclo-agent"
+    }
+    assert dependency_comments == {
+        f"Locked dependency in {lockfile}" for lockfile in expected_lockfiles
+    }
 
 
 @pytest.fixture(scope="module")
@@ -83,7 +139,7 @@ def test_release_manifest_for_built_distributions(
 
     manifest = json.loads((tmp_path / "release-manifest.json").read_text())
     assert manifest["distribution"] == "cyclo-agent"
-    assert manifest["version"] == "0.1.0"
+    assert manifest["version"] == "0.2.0"
     assert manifest["source_date_epoch"] == 1700000000
     assert [artifact["name"] for artifact in manifest["artifacts"]] == sorted(
         artifact["name"] for artifact in manifest["artifacts"]
@@ -91,7 +147,7 @@ def test_release_manifest_for_built_distributions(
     checksums = (tmp_path / "SHA256SUMS").read_text()
     assert all(artifact["sha256"] in checksums for artifact in manifest["artifacts"])
 
-    sbom = json.loads((tmp_path / "cyclo-agent-0.1.0.spdx.json").read_text())
+    sbom = json.loads((tmp_path / "cyclo-agent-0.2.0.spdx.json").read_text())
     assert sbom["spdxVersion"] == "SPDX-2.3"
     assert sbom["documentDescribes"] == ["SPDXRef-Package-cyclo-agent"]
     root_package = next(
@@ -99,7 +155,7 @@ def test_release_manifest_for_built_distributions(
     )
     assert root_package["downloadLocation"] == "NOASSERTION"
     assert any(
-        reference["referenceLocator"] == "pkg:pypi/cyclo-agent@0.1.0"
+        reference["referenceLocator"] == "pkg:pypi/cyclo-agent@0.2.0"
         for reference in root_package["externalRefs"]
     )
     assert sbom["dataLicense"] == "CC0-1.0"
@@ -124,12 +180,12 @@ def test_release_manifest_for_built_distributions(
     [
         (
             "cyclo_agent-*.whl",
-            "cyclo_agent-0.1.0-malicious-py3-none-any.whl",
+            "cyclo_agent-0.2.0-malicious-py3-none-any.whl",
             "unexpected wheel filename",
         ),
         (
             "cyclo_agent-*.tar.gz",
-            "cyclo_agent-0.1.0-malicious.tar.gz",
+            "cyclo_agent-0.2.0-malicious.tar.gz",
             "unexpected source distribution filename",
         ),
     ],
@@ -163,7 +219,7 @@ def test_release_manifest_cross_checks_sdist_metadata(
         b"Requires-Python: >=3.10\n\n"
     )
     with tarfile.open(sdist, mode="w:gz") as archive:
-        member = tarfile.TarInfo("cyclo_agent-0.1.0/PKG-INFO")
+        member = tarfile.TarInfo("cyclo_agent-0.2.0/PKG-INFO")
         member.size = len(metadata)
         archive.addfile(member, io.BytesIO(metadata))
 

@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from cyclo.docker import Docker, ContainerSpec, container_command, validate_mount_boundaries
+from cyclo.docker import (
+    Docker,
+    ContainerSpec,
+    container_command,
+    docker_socket_paths,
+    validate_mount_boundaries,
+)
 from cyclo.errors import CycloError
 from cyclo.state import Instance
 from cyclo.team import load_team
@@ -59,7 +65,6 @@ def test_container_argv_has_only_scoped_runtime_mounts(
         jobs_dir=queue / "jobs",
         agents_dir=queue / "agents",
         pi_root=pi,
-        gateway_container="cyclo-gateway-test",
         port=0,
     )
 
@@ -81,6 +86,7 @@ def test_container_argv_has_only_scoped_runtime_mounts(
     assert "/var/run/docker.sock" not in rendered
     assert str(Path.home() / ".pi" / "agent") not in rendered
     assert "--security-opt" in command
+    assert command[command.index("--cap-drop") + 1] == "NET_RAW"
     for name, value in retry_values.items():
         assert f"{name}={value}" in command
     assert "AGENTWS_UNSAFE_UNDOCUMENTED" not in rendered
@@ -105,7 +111,6 @@ def test_project_read_only_mount_is_explicit(
         jobs_dir=queue / "jobs",
         agents_dir=queue / "agents",
         pi_root=pi,
-        gateway_container="cyclo-gateway-test",
         port=0,
     )
 
@@ -132,6 +137,42 @@ def test_mounts_must_not_cover_host_credentials(tmp_path: Path) -> None:
 
     with pytest.raises(CycloError, match="credential"):
         validate_mount_boundaries(team, project, tmp_path / "state", credentials)
+
+
+def test_rootless_and_configured_docker_sockets_are_protected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    team = tmp_path / "team"
+    project = tmp_path / "project"
+    team.mkdir()
+    project.mkdir()
+    socket = project / "runtime" / "docker.sock"
+    monkeypatch.setenv("DOCKER_HOST", f"unix://{socket}")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "xdg-runtime"))
+
+    assert socket.resolve() in docker_socket_paths()
+    assert (tmp_path / "xdg-runtime" / "docker.sock").resolve() in docker_socket_paths()
+    with pytest.raises(CycloError, match="Docker socket"):
+        validate_mount_boundaries(
+            team,
+            project,
+            tmp_path / "state",
+            tmp_path / "host-pi",
+        )
+
+
+@pytest.mark.parametrize("source", [Path("/proc/self"), Path("/sys"), Path("/dev"), Path("/run")])
+def test_host_pseudo_filesystems_cannot_be_mounted(source: Path, tmp_path: Path) -> None:
+    team = tmp_path / "team"
+    team.mkdir()
+
+    with pytest.raises(CycloError, match="host .* filesystem"):
+        validate_mount_boundaries(
+            team,
+            source,
+            tmp_path / "state",
+            tmp_path / "host-pi",
+        )
 
 
 def test_lowercase_missing_object_is_not_a_docker_failure(monkeypatch) -> None:
@@ -238,7 +279,7 @@ def test_network_removal_uses_inspected_network_and_member_ids(monkeypatch) -> N
     ]
 
 
-def test_gateway_connection_uses_verified_resource_ids(monkeypatch) -> None:
+def test_runtime_connection_uses_verified_resource_ids(monkeypatch) -> None:
     docker = Docker()
     commands: list[list[str]] = []
     monkeypatch.setattr(
@@ -257,8 +298,8 @@ def test_gateway_connection_uses_verified_resource_ids(monkeypatch) -> None:
         or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
     )
 
-    docker.connect_gateway(
-        "verified-network-id", "verified-gateway-id", "cyclo-gateway-test"
+    docker.connect_runtime(
+        "verified-network-id", "verified-runtime-id", "cyclo-provider-runtime-test"
     )
 
     assert commands == [
@@ -267,8 +308,8 @@ def test_gateway_connection_uses_verified_resource_ids(monkeypatch) -> None:
             "network",
             "connect",
             "--alias",
-            "cyclo-gateway-test",
+            "cyclo-provider-runtime-test",
             "verified-network-id",
-            "verified-gateway-id",
+            "verified-runtime-id",
         ]
     ]

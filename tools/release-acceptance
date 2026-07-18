@@ -58,7 +58,8 @@ mkdir -p "$dist" "$source_tree" "$empty_home" "$project"
 export HOME=$empty_home
 export XDG_STATE_HOME=$empty_home/.local/state
 unset PYTHONHOME PYTHONPATH \
-    CYCLO_RUNTIME_IMAGE CYCLO_GATEWAY_IMAGE CYCLO_GATEWAY_STORE CYCLO_STATE_ROOT \
+    CYCLO_RUNTIME_IMAGE CYCLO_GATEWAY_IMAGE CYCLO_PROVIDER_RUNTIME_IMAGE \
+    CYCLO_GATEWAY_STORE CYCLO_STATE_ROOT \
     PI_CODING_AGENT_DIR \
     AGENTWS_MAX_JOB_ATTEMPTS AGENTWS_MAX_CONSECUTIVE_FAILURES \
     AGENTWS_RETRY_INITIAL_SECONDS AGENTWS_RETRY_MAX_SECONDS
@@ -126,11 +127,28 @@ forbidden_names = {
     "cyclo/credential_gateway/UPSTREAM.json",
 }
 required_names = {
+    "cyclo/host_config.py",
+    "cyclo/host_providers.py",
+    "cyclo/provider_runtime.py",
+    "cyclo/provider_service.py",
     "cyclo/credential_gateway/gateway_context/Dockerfile",
     "cyclo/credential_gateway/gateway_context/model-metadata.mjs",
+    "cyclo/credential_gateway/gateway_context/response-redaction.mjs",
     "cyclo/credential_gateway/gateway_context/safe-model-fields.json",
     "cyclo/credential_gateway/gateway_context/safe-model-fields.mjs",
-    "cyclo/credential_gateway/runtime_context/Dockerfile",
+    "cyclo/team_runtime_context/.dockerignore",
+    "cyclo/team_runtime_context/Dockerfile",
+    "cyclo/team_runtime_context/entrypoint.sh",
+    "cyclo/team_runtime_context/package-lock.json",
+    "cyclo/team_runtime_context/package.json",
+    "cyclo/provider_runtime_context/.dockerignore",
+    "cyclo/provider_runtime_context/Dockerfile",
+    "cyclo/provider_runtime_context/metadata.mjs",
+    "cyclo/provider_runtime_context/package-lock.json",
+    "cyclo/provider_runtime_context/package.json",
+    "cyclo/provider_runtime_context/protocol.mjs",
+    "cyclo/provider_runtime_context/safe-model-fields.json",
+    "cyclo/provider_runtime_context/server.mjs",
 }
 legacy_package_prefix = "cyclo/" + "vendor" + "_gateway/"
 upstream_https = b"github" + b".com/glguida/"
@@ -194,13 +212,13 @@ case $installed_root in
 esac
 
 printf '%s\n' '==> checking wheel-only commands and package resources'
-[ "$("$cyclo" --version)" = "cyclo 0.1.0" ] \
+[ "$("$cyclo" --version)" = "cyclo 0.2.0" ] \
     || fail "installed command reports an unexpected release version"
 "$venv/bin/python" -c '
 from importlib.metadata import distribution
 dist = distribution("cyclo-agent")
 assert dist.metadata["Name"] == "cyclo-agent"
-assert dist.version == "0.1.0"
+assert dist.version == "0.2.0"
 import cyclo
 assert cyclo.__version__ == dist.version
 '
@@ -215,6 +233,10 @@ case $gateway_help in
     *) fail "installed gateway help omits pre-login provider discovery" ;;
 esac
 case $gateway_help in
+    *restart*) ;;
+    *) fail "installed gateway help omits gateway restart" ;;
+esac
+case $gateway_help in
     *"credentials, subscriptions, and retained usage history"*) ;;
     *) fail "installed gateway help does not disclose all retained store data" ;;
 esac
@@ -222,6 +244,11 @@ providers_help=$("$cyclo" gateway providers --help | tr '\n' ' ' | sed 's/[[:spa
 case $providers_help in
     *"Providers are upstream AI services"*"does not read or mount the gateway credential store"*) ;;
     *) fail "installed provider-discovery help omits its credential-free guarantee" ;;
+esac
+login_help=$("$cyclo" gateway login --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
+case $login_help in
+    *"catalogue provider/account name"*"default: PROVIDER"*) ;;
+    *) fail "installed gateway login help does not explain account naming" ;;
 esac
 models_help=$("$cyclo" models --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
 case $models_help in
@@ -290,9 +317,13 @@ grep -F 'ok  Cyclo credential gateway API:' "$doctor_log" >/dev/null \
     || fail "doctor did not load Cyclo's packaged gateway"
 
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    [ "$doctor_status" -eq 0 ] || fail "doctor failed with an accessible Docker daemon"
+    [ "$doctor_status" -eq 1 ] \
+        || fail "doctor returned $doctor_status with an intentionally absent provider runtime"
     grep -F 'ok  Docker daemon:' "$doctor_log" >/dev/null \
         || fail "doctor did not accept the Docker daemon"
+    grep -F 'no  provider runtime: provider runtime is not running; run `cyclo runtime start`' \
+        "$doctor_log" >/dev/null \
+        || fail "doctor did not diagnose the intentionally absent provider runtime"
 else
     [ "$doctor_status" -eq 1 ] \
         || fail "doctor returned $doctor_status when Docker was unavailable"

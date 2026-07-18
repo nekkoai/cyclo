@@ -19,6 +19,14 @@ const GOOGLE_INTERNAL_PATHS = new Set(
     `/v1internal/${action}`,
   ]),
 );
+const GOOGLE_MODEL_PATH = new RegExp(
+  `^/(?:v1/|v1beta/)?models/([^/]+):(${GOOGLE_INFERENCE_ACTIONS.join("|")})$`,
+  "u",
+);
+const GOOGLE_VERTEX_MODEL_PATH = new RegExp(
+  `^/v1/projects/[^/]+/locations/[^/]+/publishers/google/models/([^/]+):(${GOOGLE_INFERENCE_ACTIONS.join("|")})$`,
+  "u",
+);
 
 function normalizedPath(path) {
   if (typeof path !== "string" || !path.startsWith("/")) return null;
@@ -28,22 +36,19 @@ function normalizedPath(path) {
 export function modelFromGooglePath(path) {
   const normalized = normalizedPath(path);
   if (!normalized) return null;
-  const marker = "/models/";
-  const markerIndex = normalized.lastIndexOf(marker);
-  if (markerIndex < 0) return null;
-  for (const action of GOOGLE_INFERENCE_ACTIONS) {
-    const suffix = `:${action}`;
-    if (!normalized.endsWith(suffix)) continue;
-    const encoded = normalized.slice(markerIndex + marker.length, -suffix.length);
-    if (!encoded) return null;
-    try {
-      const model = decodeURIComponent(encoded);
-      return model && !/[\u0000-\u001f\u007f]/u.test(model) ? model : null;
-    } catch {
-      return null;
-    }
+  const match = normalized.match(GOOGLE_MODEL_PATH)
+    ?? normalized.match(GOOGLE_VERTEX_MODEL_PATH);
+  if (!match) return null;
+  try {
+    const model = decodeURIComponent(match[1]);
+    return model
+      && !/[\\\s\u0000-\u001f\u007f]/u.test(model)
+      && !model.split("/").some((segment) => segment === "." || segment === "..")
+      ? model
+      : null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 export function isKnownInferenceEndpoint(method, path) {
@@ -57,13 +62,89 @@ export function isKnownInferenceEndpoint(method, path) {
   );
 }
 
+function topLevelObjectKeys(text) {
+  const keys = [];
+  let offset = 0;
+  const whitespace = /\s/u;
+  const skipWhitespace = () => {
+    while (offset < text.length && whitespace.test(text[offset])) offset += 1;
+  };
+  skipWhitespace();
+  if (text[offset] !== "{") return null;
+  offset += 1;
+  skipWhitespace();
+  if (text[offset] === "}") return keys;
+
+  while (offset < text.length) {
+    skipWhitespace();
+    if (text[offset] !== '"') return null;
+    const keyStart = offset;
+    offset += 1;
+    let escaped = false;
+    while (offset < text.length) {
+      const character = text[offset];
+      offset += 1;
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        break;
+      }
+    }
+    keys.push(JSON.parse(text.slice(keyStart, offset)));
+    skipWhitespace();
+    if (text[offset] !== ":") return null;
+    offset += 1;
+
+    let depth = 0;
+    let inString = false;
+    escaped = false;
+    for (; offset < text.length; offset += 1) {
+      const character = text[offset];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') inString = false;
+        continue;
+      }
+      if (character === '"') inString = true;
+      else if (character === "{" || character === "[") depth += 1;
+      else if (character === "}" || character === "]") {
+        if (depth > 0) depth -= 1;
+        else break;
+      } else if (character === "," && depth === 0) {
+        break;
+      }
+    }
+    if (text[offset] === ",") {
+      offset += 1;
+      continue;
+    }
+    if (text[offset] === "}") return keys;
+    return null;
+  }
+  return null;
+}
+
 export function modelFromInferenceRequest(path, body) {
   const pathModel = modelFromGooglePath(path);
   if (pathModel) return pathModel;
   if (!body || body.length === 0) return null;
   try {
-    const parsed = JSON.parse(Buffer.from(body).toString("utf8"));
-    return typeof parsed?.model === "string" && parsed.model ? parsed.model : null;
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(body));
+    const parsed = JSON.parse(text);
+    const keys = topLevelObjectKeys(text);
+    if (
+      !parsed
+      || typeof parsed !== "object"
+      || Array.isArray(parsed)
+      || !keys
+      || keys.filter((key) => key === "model").length !== 1
+    ) {
+      return null;
+    }
+    return typeof parsed.model === "string" && parsed.model ? parsed.model : null;
   } catch {
     return null;
   }

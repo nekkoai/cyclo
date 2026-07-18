@@ -19,8 +19,8 @@ EPOCH = 1700000000
 
 def write_sdist(path: Path, *, mtime: int, reverse: bool) -> None:
     members = [
-        ("cyclo_agent-0.1.0/cyclo/runner.py", b"print('cyclo')\n", 0o755),
-        ("cyclo_agent-0.1.0/README.md", b"# Cyclo\n", 0o644),
+        ("cyclo_agent-0.2.0/cyclo/runner.py", b"print('cyclo')\n", 0o755),
+        ("cyclo_agent-0.2.0/README.md", b"# Cyclo\n", 0o644),
     ]
     if reverse:
         members.reverse()
@@ -54,8 +54,8 @@ def write_wheel(
     members = [
         ("cyclo/runner.py", b"print('cyclo')\n", 0o755),
         (
-            "cyclo_agent-0.1.0.dist-info/METADATA",
-            b"Name: cyclo-agent\nVersion: 0.1.0\n",
+            "cyclo_agent-0.2.0.dist-info/METADATA",
+            b"Name: cyclo-agent\nVersion: 0.2.0\n",
             0o644,
         ),
     ]
@@ -74,8 +74,8 @@ def test_normalizer_makes_archives_byte_reproducible(tmp_path: Path) -> None:
     second = tmp_path / "second"
     first.mkdir()
     second.mkdir()
-    wheel_name = "cyclo_agent-0.1.0-py3-none-any.whl"
-    sdist_name = "cyclo_agent-0.1.0.tar.gz"
+    wheel_name = "cyclo_agent-0.2.0-py3-none-any.whl"
+    sdist_name = "cyclo_agent-0.2.0.tar.gz"
 
     write_wheel(first / wheel_name, timestamp=(2025, 1, 2, 3, 4, 6), reverse=False)
     write_wheel(second / wheel_name, timestamp=(2026, 7, 8, 9, 10, 12), reverse=True)
@@ -131,5 +131,5 @@ def test_normalizer_makes_archives_byte_reproducible(tmp_path: Path) -> None:
             (member.uid, member.gid, member.uname, member.gname) == (0, 0, "", "")
             for member in members
         )
-        runner = archive.getmember("cyclo_agent-0.1.0/cyclo/runner.py")
+        runner = archive.getmember("cyclo_agent-0.2.0/cyclo/runner.py")
         assert runner.mode == 0o755

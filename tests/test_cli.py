@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,9 @@ from cyclo.cli import (
     DEFAULT_GATEWAY_IMAGE,
     _DashboardUsageReader,
     build_parser,
+    cmd_provider,
     cmd_repair,
+    cmd_runtime,
     main,
     stop_instance,
 )
@@ -91,6 +94,31 @@ def test_run_defaults_agentws_to_loopback() -> None:
     args = build_parser().parse_args(["run", "team", "project"])
 
     assert args.host == "127.0.0.1"
+
+
+def test_run_rejects_host_configuration_inside_writable_project(
+    tmp_path: Path,
+    team_repo: Path,
+    project_repo: Path,
+    capsys,
+) -> None:
+    host_config = project_repo / "host.conf"
+
+    result = main(
+        [
+            "--state-root",
+            str(tmp_path / "state"),
+            "--host-config",
+            str(host_config),
+            "run",
+            "--dry-run",
+            str(team_repo),
+            str(project_repo),
+        ]
+    )
+
+    assert result == 1
+    assert "project mount overlaps host provider configuration" in capsys.readouterr().err
 
 
 def test_task_reuses_agentws_queue(
@@ -329,6 +357,10 @@ def test_gateway_destroy_store_uses_selected_volume(monkeypatch) -> None:
             "Providers are upstream AI services",
         ),
         (["gateway", "status", "--help"], "--store-volume"),
+        (
+            ["gateway", "restart", "--help"],
+            "Recreate Cyclo's credential gateway",
+        ),
         (["gateway", "destroy-store", "--help"], "--confirm VOLUME"),
     ],
 )
@@ -356,78 +388,49 @@ def test_gateway_summary_and_missing_action_cover_store_management(capsys) -> No
     assert "retained usage history" in help_text
 
     assert main(["gateway"]) == 1
-    assert "requires providers, login, status, or destroy-store" in capsys.readouterr().err
-
-
-def test_models_prints_copyable_provider_model_names(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    store = StateStore(tmp_path / "state")
-
-    class FakeDocker:
-        pass
-
-    class FakeProxy:
-        def catalog(self, instances, *, build=False):
-            assert instances == []
-            assert not build
-            return {
-                "openai-codex": {
-                    "models": [
-                        {"id": "gpt-test"},
-                        {"id": "org/gpt-nested"},
-                    ]
-                },
-                "malformed": {"models": "not-a-list"},
-                "anthropic": {"models": [{"id": "claude-test"}]},
-            }
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: FakeProxy())
-    monkeypatch.setattr(
-        "cyclo.cli.active_instances",
-        lambda _store, _docker, *, stale: [],
+    assert (
+        "requires providers, login, status, restart, or destroy-store"
+        in capsys.readouterr().err
     )
 
-    assert main(["models"]) == 0
-    assert capsys.readouterr().out.splitlines() == [
-        "anthropic/claude-test",
-        "openai-codex/gpt-test",
-        "openai-codex/org/gpt-nested",
-    ]
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (["runtime", "--help"], "start the current runtime image"),
+        (["runtime", "restart", "--help"], "explicitly replace the runtime container"),
+        (["provider", "--help"], "wait for readiness"),
+        (["provider", "build", "--help"], "without launching them"),
+        (["models", "--help"], "Refresh the running provider runtime"),
+    ],
+)
+def test_runtime_provider_and_models_help_describes_explicit_boundaries(
+    arguments: list[str], expected: str, capsys
+) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        main(arguments)
+
+    assert stopped.value.code == 0
+    assert expected in " ".join(capsys.readouterr().out.split())
 
 
-def test_stop_repairs_other_networks_even_if_token_file_rotation_fails(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize("network_failure", [False, True])
+def test_stop_repairs_network_before_publishing_team_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    network_failure: bool,
 ) -> None:
     store = StateStore(tmp_path / "state")
     target = Instance(
-        id="alpha",
-        team_name="alpha-team",
-        team_path="/tmp/alpha-team",
-        project_path="/tmp/alpha-project",
-        generation="one",
-        providers=["openai-codex"],
-        models=["openai-codex/gpt-test"],
-        container_name="cyclo-alpha",
-        network_name="cyclo-alpha-net",
-        image="cyclo-runtime:test",
-        team_write=False,
-        project_read_only=False,
-        offline=False,
-        active=True,
-    )
-    remaining = Instance(
-        id="beta",
-        team_name="beta-team",
-        team_path="/tmp/beta-team",
-        project_path="/tmp/beta-project",
-        generation="two",
-        providers=["anthropic"],
-        models=["anthropic/claude-test"],
-        container_name="cyclo-beta",
-        network_name="cyclo-beta-net",
+        id="target",
+        team_name="target-team",
+        team_path="/team/target",
+        project_path="/project/target",
+        generation="target-generation",
+        providers=["account"],
+        models=["account/model"],
+        container_name="cyclo-target",
+        network_name="cyclo-target-net",
         image="cyclo-runtime:test",
         team_write=False,
         project_read_only=False,
@@ -435,112 +438,821 @@ def test_stop_repairs_other_networks_even_if_token_file_rotation_fails(
         active=True,
     )
     store.save(target)
-    store.save(remaining)
-    events: list[tuple] = []
+    remaining = SimpleNamespace(id="remaining")
+    events: list[object] = []
+
+    class FakeRuntime:
+        container_name = "cyclo-provider-runtime-test"
+
+        @staticmethod
+        def update_clients(instances):
+            events.append(("publish", tuple(item.id for item in instances)))
+
+        @staticmethod
+        def rotate_client_token(identifier):
+            events.append(("rotate", identifier))
 
     class FakeDocker:
-        def container_running(self, name):
-            events.append(("running", name))
-            return name == "cyclo-beta"
+        @staticmethod
+        def stop_remove(container, identifier):
+            events.append(("stop", container, identifier))
 
-        def ensure_network(self, name, *, offline):
-            events.append(("ensure", name, offline))
-            return f"{name}-id"
-
-        def connect_gateway(self, network_id, container_id, alias):
-            events.append(("connect", network_id, container_id, alias))
-
-        def stop_remove(self, container, expected):
-            events.append(("remove", container, expected))
-
-        def remove_network(self, network, gateway_container):
-            events.append(("remove-network", network, gateway_container))
-
-    class FakeProxy:
-        container_name = "gateway"
-        container_id = "gateway-id"
-
-        def reconcile(self, instances):
-            events.append(("reconcile", tuple(item.id for item in instances)))
-
-        def rotate_client_token(self, identifier):
-            events.append(("rotate", identifier))
-            raise CycloError("injected unlink failure")
+        @staticmethod
+        def remove_network(network, runtime):
+            events.append(("remove-network", network, runtime))
 
     monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: FakeProxy())
-
-    args = SimpleNamespace(gateway_image="gateway", store_volume="store")
-    with pytest.raises(CycloError, match="obsolete local capability files"):
-        stop_instance(args, store, "alpha")
-
-    assert ("reconcile", ("beta",)) in events
-    assert (
-        "connect",
-        "cyclo-beta-net-id",
-        "gateway-id",
-        "gateway",
-    ) in events
-    assert ("remove", "cyclo-alpha", "alpha") in events
-    assert events.index(("rotate", "alpha")) < events.index(
-        ("connect", "cyclo-beta-net-id", "gateway-id", "gateway")
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeRuntime()
     )
+    monkeypatch.setattr(
+        "cyclo.cli.active_instances",
+        lambda _store, _docker, *, stale: [remaining],
+    )
+    def attach(_docker, _runtime, instances):
+        events.append(("attach", tuple(item.id for item in instances)))
+        if network_failure:
+            raise CycloError("injected network drift")
+
+    monkeypatch.setattr("cyclo.cli.attach_active_networks", attach)
+
+    if network_failure:
+        with pytest.raises(CycloError, match="network repair failed"):
+            stop_instance(SimpleNamespace(), store, "target")
+    else:
+        stop_instance(SimpleNamespace(), store, "target")
+
+    assert events == [
+        ("attach", ("remaining",)),
+        ("publish", ("remaining",)),
+        ("rotate", "target"),
+        ("stop", "cyclo-target", "target"),
+        ("remove-network", "cyclo-target-net", "cyclo-provider-runtime-test"),
+    ]
+    assert store.load("target").active is False
 
 
-def test_repair_removes_container_left_by_interrupted_stop(
-    tmp_path: Path, monkeypatch, capsys
+def test_runtime_start_seeds_clients_without_reloading_old_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    orphan = Instance(
-        id="alpha",
-        team_name="alpha-team",
-        team_path="/tmp/alpha-team",
-        project_path="/tmp/alpha-project",
-        generation="one",
-        providers=["openai-codex"],
-        models=["openai-codex/gpt-test"],
-        container_name="cyclo-alpha",
-        network_name="cyclo-alpha-net",
-        image="cyclo-runtime:test",
-        team_write=False,
-        project_read_only=False,
-        offline=True,
-        active=False,
-    )
-    store.save(orphan)
-    events: list[tuple] = []
+    events: list[object] = []
 
-    class FakeDocker:
-        def container_exists(self, name):
-            events.append(("exists", name))
+    class FakeRuntime:
+        container_name = "cyclo-provider-runtime-test"
+
+        @staticmethod
+        def status():
+            return SimpleNamespace(exists=False, running=False, current=False)
+
+        @staticmethod
+        def update_clients(instances, *, apply_runtime):
+            events.append(("seed", tuple(instances), apply_runtime))
+
+        @staticmethod
+        def start(*, build):
+            events.append(("start", build))
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeRuntime()
+    )
+    monkeypatch.setattr("cyclo.cli.Docker", lambda: SimpleNamespace())
+    monkeypatch.setattr("cyclo.cli.active_instances", lambda _store, _docker: [])
+    monkeypatch.setattr(
+        "cyclo.cli.attach_active_networks",
+        lambda _docker, _runtime, instances: events.append(
+            ("attach", tuple(instances))
+        ),
+    )
+
+    assert cmd_runtime(SimpleNamespace(runtime_action="start", build=False)) == 0
+
+    assert events == [("seed", (), False), ("start", False), ("attach", ())]
+    assert "started provider runtime" in capsys.readouterr().out
+
+
+def test_runtime_start_applies_clients_when_current_process_is_retained(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    events: list[object] = []
+
+    class FakeRuntime:
+        container_name = "cyclo-provider-runtime-test"
+
+        @staticmethod
+        def status():
+            return SimpleNamespace(exists=True, running=True, current=True)
+
+        @staticmethod
+        def update_clients(instances):
+            events.append(("apply", tuple(instances)))
+
+        @staticmethod
+        def start(*, build):
+            events.append(("start", build))
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeRuntime()
+    )
+    monkeypatch.setattr("cyclo.cli.Docker", lambda: SimpleNamespace())
+    monkeypatch.setattr("cyclo.cli.active_instances", lambda _store, _docker: [])
+    monkeypatch.setattr("cyclo.cli.attach_active_networks", lambda *_args: None)
+
+    assert cmd_runtime(SimpleNamespace(runtime_action="start", build=False)) == 0
+
+    assert events == [("apply", ()), ("start", False)]
+
+
+def test_runtime_start_rejects_stale_process_before_registry_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state")
+
+    class FakeRuntime:
+        container_name = "cyclo-provider-runtime-test"
+
+        @staticmethod
+        def status():
+            return SimpleNamespace(exists=True, running=True, current=False)
+
+        @staticmethod
+        def update_clients(*_args, **_kwargs):
+            raise AssertionError("stale runtime registries must not be mutated")
+
+        @staticmethod
+        def start(*, build):
+            assert build is False
+            raise CycloError("run `cyclo runtime restart`")
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeRuntime()
+    )
+    monkeypatch.setattr("cyclo.cli.Docker", lambda: SimpleNamespace())
+    monkeypatch.setattr("cyclo.cli.active_instances", lambda _store, _docker: [])
+
+    with pytest.raises(CycloError, match="runtime restart"):
+        cmd_runtime(SimpleNamespace(runtime_action="start", build=False))
+
+
+@pytest.mark.parametrize(
+    ("build", "expected"),
+    [
+        (False, ["stop", "seed", ("start", False)]),
+        (True, ["build", "stop", "seed", ("start", False)]),
+    ],
+)
+def test_runtime_restart_removes_old_authority_before_seeding_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    build: bool,
+    expected: list[object],
+) -> None:
+    store = StateStore(tmp_path / "state")
+    events: list[object] = []
+
+    class FakeRuntime:
+        container_name = "cyclo-provider-runtime-test"
+
+        @staticmethod
+        def build():
+            events.append("build")
+
+        @staticmethod
+        def stop():
+            events.append("stop")
+
+        @staticmethod
+        def update_clients(instances, *, apply_runtime):
+            assert tuple(instances) == ()
+            assert apply_runtime is False
+            events.append("seed")
+
+        @staticmethod
+        def start(*, build):
+            events.append(("start", build))
+
+        @staticmethod
+        def restart(*, build):
+            raise AssertionError(f"unsafe in-place restart called: {build}")
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeRuntime()
+    )
+    monkeypatch.setattr("cyclo.cli.Docker", lambda: SimpleNamespace())
+    monkeypatch.setattr("cyclo.cli.active_instances", lambda _store, _docker: [])
+    monkeypatch.setattr("cyclo.cli.attach_active_networks", lambda *_args: None)
+
+    assert cmd_runtime(SimpleNamespace(runtime_action="restart", build=build)) == 0
+
+    assert events == expected
+
+
+@pytest.mark.parametrize(
+    ("launched", "expected_marker", "verb"),
+    [(True, 1234.567, "started"), (False, None, "running")],
+)
+def test_provider_start_requires_matching_registration_and_freshness_for_launches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    launched: bool,
+    expected_marker: float | None,
+    verb: str,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    definition = SimpleNamespace(prefix="local")
+    identity = SimpleNamespace(prefix="local")
+    item = SimpleNamespace(
+        definition=definition,
+        identity=identity,
+        generation="expected-generation",
+    )
+    wait_call: dict[str, object] = {}
+
+    class FakeComponentRuntime:
+        def require_startable(self, _spec):
+            return None
+
+        def start(self, _spec):
+            return SimpleNamespace(
+                container_restarted=launched,
+                generation="expected-generation",
+            )
+
+    component_runtime = FakeComponentRuntime()
+
+    class FakeHost:
+        def __init__(self, _state_root):
+            self.runtime = component_runtime
+
+        def prepare(self, definitions, *, selected_prefixes):
+            assert tuple(definitions) == (definition,)
+            assert selected_prefixes == {"local"}
+            return (item,)
+
+        def spec(self, selected):
+            assert selected is item
+            return SimpleNamespace()
+
+        def published_expectations(self):
+            return []
+
+        def upsert_expectations(self, _expectations):
+            return None
+
+        def expectation(self, selected):
+            assert selected is item
+            return {"prefix": "local"}
+
+        def client_record(self, selected):
+            assert selected is item
+            return {"client_id": "provider-local"}
+
+    class FakeService:
+        def require_running(self):
+            return 8788
+
+        def provider_clients(self):
+            return ()
+
+        def merged_provider_clients(self, records):
+            return tuple(records)
+
+        def update_clients(self, instances, *, provider_clients):
+            assert instances == []
+            assert provider_clients == ({"client_id": "provider-local"},)
+            return {}
+
+        def wait_provider(self, prefix, generation, **kwargs):
+            wait_call.update(
+                prefix=prefix,
+                generation=generation,
+                **kwargs,
+            )
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.HostProviders", FakeHost)
+    monkeypatch.setattr("cyclo.cli.provider_service", lambda _args, _store: FakeService())
+    monkeypatch.setattr(
+        "cyclo.cli.host_configuration",
+        lambda _args: SimpleNamespace(load=lambda: (definition,)),
+    )
+    monkeypatch.setattr("cyclo.cli.Docker", lambda: SimpleNamespace())
+    monkeypatch.setattr("cyclo.cli.active_instances", lambda _store, _docker: [])
+    monkeypatch.setattr("cyclo.cli.time.time_ns", lambda: 1_234_567_890_000)
+    args = SimpleNamespace(
+        provider_action="start",
+        all_providers=False,
+        provider_prefix="local",
+        build=False,
+    )
+
+    assert cmd_provider(args) == 0
+    assert wait_call == {
+        "prefix": "local",
+        "generation": "expected-generation",
+        "runtime": component_runtime,
+        "identity": identity,
+        "registered_after": expected_marker,
+    }
+    assert capsys.readouterr().out == f"{verb} provider: local\n"
+
+
+def test_provider_restart_stops_old_process_before_publishing_new_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    definition = SimpleNamespace(prefix="local")
+    identity = SimpleNamespace(prefix="local")
+    item = SimpleNamespace(
+        definition=definition,
+        identity=identity,
+        generation="new-generation",
+    )
+    events: list[object] = []
+
+    class FakeComponentRuntime:
+        @staticmethod
+        def require_current_image(_spec):
+            events.append("image-current")
+
+        @staticmethod
+        def stop(selected):
+            assert selected is identity
+            events.append("stop-old")
             return True
 
-        def stop_remove(self, container, expected):
-            events.append(("remove", container, expected))
+        @staticmethod
+        def start(_spec):
+            events.append("start-new")
+            return SimpleNamespace(
+                container_restarted=True,
+                generation="new-generation",
+            )
 
-        def remove_network(self, network, gateway_container):
-            events.append(("remove-network", network, gateway_container))
+    component_runtime = FakeComponentRuntime()
 
-    class FakeProxy:
-        container_name = "gateway"
+    class FakeHost:
+        def __init__(self, _state_root):
+            self.runtime = component_runtime
 
-        def reconcile(self, instances, *, build=False):
-            events.append(("reconcile", tuple(item.id for item in instances), build))
+        @staticmethod
+        def prepare(definitions, *, selected_prefixes):
+            assert tuple(definitions) == (definition,)
+            assert selected_prefixes == {"local"}
+            return (item,)
 
-        def rotate_client_token(self, identifier):
-            events.append(("rotate", identifier))
+        @staticmethod
+        def spec(_item):
+            return SimpleNamespace()
 
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: FakeProxy())
+        @staticmethod
+        def published_expectations():
+            return []
+
+        @staticmethod
+        def remove_expectations(prefixes):
+            assert tuple(prefixes) == ("local",)
+            events.append("revoke-expectation")
+
+        @staticmethod
+        def rotate_capabilities(selected):
+            assert selected is item
+            events.append("rotate-capabilities")
+
+        @staticmethod
+        def expectation(_item):
+            return {"prefix": "local", "generation": "new-generation"}
+
+        @staticmethod
+        def upsert_expectations(_records):
+            events.append("publish-expectation")
+
+        @staticmethod
+        def client_record(_item):
+            return {"client_id": "provider-local"}
+
+    class FakeService:
+        @staticmethod
+        def capability_update_guard():
+            return nullcontext()
+
+        @staticmethod
+        def reload_control(*, require_current):
+            assert require_current is False
+            events.append("reload-expectation")
+
+        @staticmethod
+        def require_running():
+            return 8788
+
+        @staticmethod
+        def provider_clients():
+            return (
+                {"client_id": "provider-local-old", "provider_prefix": "local"},
+                {"client_id": "provider-other", "provider_prefix": "other"},
+            )
+
+        @staticmethod
+        def merged_provider_clients(records):
+            return tuple(records)
+
+        @staticmethod
+        def update_clients(_instances, *, provider_clients):
+            if provider_clients == (
+                {"client_id": "provider-other", "provider_prefix": "other"},
+            ):
+                events.append("publish-revocation")
+            else:
+                assert provider_clients == ({"client_id": "provider-local"},)
+                events.append("publish-client")
+            return {}
+
+        @staticmethod
+        def wait_provider(*_args, **_kwargs):
+            events.append("ready")
+
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.HostProviders", FakeHost)
+    monkeypatch.setattr("cyclo.cli.provider_service", lambda _args, _store: FakeService())
+    monkeypatch.setattr(
+        "cyclo.cli.host_configuration",
+        lambda _args: SimpleNamespace(load=lambda: (definition,)),
+    )
+    monkeypatch.setattr("cyclo.cli.Docker", lambda: SimpleNamespace())
+    monkeypatch.setattr("cyclo.cli.active_instances", lambda _store, _docker: [])
 
-    result = cmd_repair(SimpleNamespace(build_gateway=False))
+    assert cmd_provider(
+        SimpleNamespace(
+            provider_action="restart",
+            all_providers=False,
+            provider_prefix="local",
+            build=False,
+        )
+    ) == 0
 
-    assert result == 0
-    assert ("reconcile", (), False) in events
-    assert ("rotate", "alpha") in events
-    assert ("remove", "cyclo-alpha", "alpha") in events
-    assert "cleaned 1 orphaned container" in capsys.readouterr().out
+    assert events == [
+        "image-current",
+        "revoke-expectation",
+        "reload-expectation",
+        "publish-revocation",
+        "stop-old",
+        "rotate-capabilities",
+        "publish-expectation",
+        "publish-client",
+        "start-new",
+        "ready",
+    ]
+
+
+def test_provider_status_uses_definitions_and_lists_absent_and_unconfigured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    state = tmp_path / "state"
+    stale_source = tmp_path / "stale-source"
+    absent_source = tmp_path / "absent-source"
+    for source in (stale_source, absent_source):
+        source.mkdir()
+        (source / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    host_config = tmp_path / "host.conf"
+    host_config.write_text(
+        f"provider stale {stale_source} account/model mode=new\n"
+        f"provider absent {absent_source} account/model\n",
+        encoding="utf-8",
+    )
+    seen_specs: dict[str, object] = {}
+
+    class FakeProviderRuntime:
+        def __init__(self, _state_root):
+            pass
+
+        def identity(self, prefix):
+            return SimpleNamespace(prefix=prefix)
+
+        def owned_identities(self):
+            return (self.identity("orphan"), self.identity("stale"))
+
+        def status(self, identity, spec=None):
+            seen_specs[identity.prefix] = spec
+            if identity.prefix == "absent":
+                return SimpleNamespace(
+                    image_exists=False,
+                    image_current=False,
+                    container_exists=False,
+                    container_running=False,
+                    configuration_current=False,
+                )
+            if identity.prefix == "stale":
+                return SimpleNamespace(
+                    image_exists=True,
+                    image_current=True,
+                    container_exists=True,
+                    container_running=True,
+                    configuration_current=False,
+                )
+            return SimpleNamespace(
+                image_exists=True,
+                image_current=False,
+                container_exists=True,
+                container_running=True,
+                configuration_current=False,
+            )
+
+    monkeypatch.setattr("cyclo.cli.ProviderRuntime", FakeProviderRuntime)
+
+    assert main(
+        [
+            "--state-root",
+            str(state),
+            "--host-config",
+            str(host_config),
+            "provider",
+            "status",
+            "--all",
+        ]
+    ) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "absent\tabsent",
+        "orphan\trunning\tunconfigured",
+        "stale\trunning\tstale",
+    ]
+    assert seen_specs["absent"].arguments == ("account/model",)
+    assert seen_specs["stale"].arguments == ("account/model", "mode=new")
+    assert seen_specs["orphan"] is None
+
+    seen_specs.clear()
+    assert main(
+        [
+            "--state-root",
+            str(state),
+            "--host-config",
+            str(host_config),
+            "provider",
+            "status",
+            "stale",
+        ]
+    ) == 0
+    assert capsys.readouterr().out == "stale\trunning\tstale\n"
+    assert seen_specs["stale"].arguments == ("account/model", "mode=new")
+
+
+def test_doctor_reports_configured_provider_staleness_and_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    stale_source = tmp_path / "stale-source"
+    absent_source = tmp_path / "absent-source"
+    for source in (stale_source, absent_source):
+        source.mkdir()
+        (source / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    host_config = tmp_path / "host.conf"
+    host_config.write_text(
+        f"provider stale {stale_source} account/model mode=new\n"
+        f"provider absent {absent_source} account/model\n",
+        encoding="utf-8",
+    )
+    runtime_state = tmp_path / "state" / "provider-runtime"
+
+    class FakeDocker:
+        def available(self):
+            return True, "test daemon"
+
+    class FakeService:
+        state_root = runtime_state
+        container_name = "cyclo-provider-runtime-test"
+
+        def status(self):
+            return SimpleNamespace(running=True, current=True)
+
+        def catalog(self):
+            return {"stale": {}, "absent": {}}
+
+    class FakeComponentRuntime:
+        def __init__(self, state_root):
+            assert state_root == runtime_state
+
+        def status(self, identity, spec):
+            assert spec.identity == identity
+            if identity.prefix == "absent":
+                return SimpleNamespace(
+                    image_current=False,
+                    configuration_current=False,
+                    container_exists=False,
+                    container_running=False,
+                )
+            return SimpleNamespace(
+                image_current=True,
+                configuration_current=False,
+                container_exists=True,
+                container_running=True,
+            )
+
+    monkeypatch.setattr("cyclo.cli.agentws_root", lambda: tmp_path / "agentws")
+    monkeypatch.setattr(
+        "cyclo.cli.gateway",
+        lambda _args, _store: SimpleNamespace(
+            gateway=SimpleNamespace(__file__="credential-gateway.py")
+        ),
+    )
+    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeService()
+    )
+    monkeypatch.setattr("cyclo.cli.ProviderRuntime", FakeComponentRuntime)
+
+    assert main(
+        [
+            "--state-root",
+            str(tmp_path / "state"),
+            "--host-config",
+            str(host_config),
+            "doctor",
+        ]
+    ) == 1
+
+    output = capsys.readouterr().out
+    assert "no  configured provider stale: stale (configuration)" in output
+    assert "no  configured provider absent: absent" in output
+
+
+def test_gateway_restart_is_credential_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    store = StateStore(tmp_path / "state")
+    events: list[tuple] = []
+
+    class FakeGateway:
+        def restart(self, *, build=False):
+            events.append(("restart", build))
+
+    class FakeRuntime:
+        @staticmethod
+        def status():
+            events.append(("runtime-status",))
+            return SimpleNamespace(running=True)
+
+        @staticmethod
+        def refresh_catalog_control():
+            events.append(("runtime-reload",))
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: FakeGateway())
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeRuntime()
+    )
+    monkeypatch.setattr(
+        "cyclo.cli.Docker",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("gateway restart must not touch team networks")
+        ),
+    )
+
+    assert main(["gateway", "restart", "--build"]) == 0
+    assert events == [
+        ("restart", True),
+        ("runtime-status",),
+        ("runtime-reload",),
+    ]
+    assert capsys.readouterr().out == "restarted gateway\n"
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_successful_gateway_login_refreshes_runtime_only_when_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    running: bool,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    events: list[object] = []
+
+    class FakeRuntime:
+        @staticmethod
+        def status():
+            events.append("status")
+            return SimpleNamespace(running=running)
+
+        @staticmethod
+        def refresh_catalog_control():
+            events.append("reload")
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeRuntime()
+    )
+    monkeypatch.setattr(
+        "cyclo.cli.gateway_cli.main",
+        lambda arguments: events.append(tuple(arguments)) or 0,
+    )
+
+    assert main(["gateway", "login", "openai", "--api-key-stdin"]) == 0
+
+    assert isinstance(events[0], tuple)
+    assert events[1:] == (["status", "reload"] if running else ["status"])
+
+
+def test_models_is_a_pure_provider_runtime_query(tmp_path: Path, monkeypatch, capsys) -> None:
+    store = StateStore(tmp_path / "state")
+
+    class FakeRuntime:
+        @staticmethod
+        def catalog(*, refresh):
+            assert refresh is True
+            return {
+                "openai-codex": {"models": [{"id": "gpt-test"}]},
+                "anthropic": {"models": [{"id": "claude-test"}]},
+            }
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeRuntime()
+    )
+    monkeypatch.setattr(
+        "cyclo.cli.Docker",
+        lambda: (_ for _ in ()).throw(AssertionError("models must not use Docker")),
+    )
+
+    assert main(["models"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "anthropic/claude-test",
+        "openai-codex/gpt-test",
+    ]
+
+
+def test_provider_stop_revokes_capabilities_before_failed_container_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    events: list[tuple[str, tuple[str, ...] | str]] = []
+
+    class FakeRuntime:
+        @staticmethod
+        def identity(prefix):
+            return SimpleNamespace(prefix=prefix)
+
+        @staticmethod
+        def stop(identity):
+            events.append(("stop", identity.prefix))
+            raise CycloError("injected Docker stop failure")
+
+    class FakeHost:
+        def __init__(self, _root):
+            self.runtime = FakeRuntime()
+
+        @staticmethod
+        def remove_expectations(prefixes):
+            events.append(("revoke-expectations", tuple(prefixes)))
+
+    class FakeService:
+        @staticmethod
+        def capability_update_guard():
+            return nullcontext()
+
+        @staticmethod
+        def reload_control(*, require_current=True):
+            assert require_current is False
+            events.append(("apply-expectations", "runtime"))
+
+        @staticmethod
+        def remove_provider_clients(prefixes):
+            events.append(("revoke-upstream", tuple(prefixes)))
+            raise CycloError("injected registry write failure")
+
+    monkeypatch.setattr("cyclo.cli.HostProviders", FakeHost)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeService()
+    )
+
+    assert main(
+        [
+            "--state-root",
+            str(tmp_path / "state"),
+            "provider",
+            "stop",
+            "fusion",
+        ]
+    ) == 1
+    assert events == [
+        ("revoke-expectations", ("fusion",)),
+        ("apply-expectations", "runtime"),
+        ("revoke-upstream", ("fusion",)),
+        ("stop", "fusion"),
+    ]
+    error = capsys.readouterr().err
+    assert "injected registry write failure" in error
+    assert "injected Docker stop failure" in error
 
 
 def test_dashboard_usage_reader_never_provisions_gateway(

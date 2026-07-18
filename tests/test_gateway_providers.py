@@ -82,26 +82,20 @@ def test_models_empty_catalog_points_to_provider_discovery_then_login(
 ) -> None:
     store = StateStore(tmp_path / "state")
 
-    class FakeDocker:
-        pass
-
-    class FakeProxy:
-        def catalog(self, instances, *, build=False):
-            assert instances == []
-            assert not build
+    class FakeRuntime:
+        def catalog(self, *, refresh):
+            assert refresh is True
             return {}
 
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: FakeProxy())
     monkeypatch.setattr(
-        "cyclo.cli.active_instances",
-        lambda _store, _docker, *, stale: [],
+        "cyclo.cli.provider_service",
+        lambda _args, _store: FakeRuntime(),
     )
 
     assert cyclo_main(["models"]) == 1
     error = capsys.readouterr().err
-    assert "gateway returned no models" in error
+    assert "provider runtime returned no models" in error
     assert "cyclo gateway providers" in error
     assert "cyclo gateway login PROVIDER" in error
     assert error.index("cyclo gateway providers") < error.index(

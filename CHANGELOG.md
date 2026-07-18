@@ -2,6 +2,63 @@
 
 All notable changes to Cyclo are documented in this file.
 
+## [0.2.0] - 2026-07-18
+
+Provider composition and runtime-isolation release.
+
+- Separate the credential gateway from the provider runtime: the gateway owns
+  credentials, concrete upstream traffic, and usage, while the provider runtime
+  owns composition, policy, routing, and team capabilities.
+- Default gateway account names to the login provider ID and optionally choose
+  another with `cyclo gateway login PROVIDER --as NAME`.
+- Compose ordered host providers declared as
+  `provider PREFIX PATH INPUT_MODEL... [KEY=VALUE ...]` in
+  `/etc/cyclo/host.conf`. A separate provider runtime parses that exact
+  read-only file bind once at startup and serves normal requests from an
+  immutable in-memory snapshot. Every edit takes effect through
+  `cyclo runtime restart` without an image rebuild; a missing or empty file
+  passes the gateway's concrete catalogue through unchanged.
+- Keep normal runtime requests free of configuration reads, gateway-catalogue
+  fetches, and global component probes. Separate acknowledged capability reload
+  from gateway-catalogue refresh so revocation does not depend on the gateway.
+- Watch only dynamic client/provider authority outside the request path, closing
+  the controller-crash revocation gap on a 500 ms polling cadence and failing
+  closed on a malformed changed registry; `host.conf` remains restart-only.
+- Bound shared-runtime TCP/UDS connections, active work per principal and
+  globally, request bodies, and inbound-body time while reserving host control
+  admission.
+- Give every provider a distinct runtime UDS, give the host a separate private
+  admin UDS, and charge nested work to a separate pool keyed by the originating
+  project so composition cannot multiply one team's root quota.
+- Bind each team capability to the provider runtime's interface on that team's
+  private network and drop `CAP_NET_RAW` from team containers, preventing
+  cross-team bearer replay even from custom/root images.
+- Run each intermediate provider in a networkless container with private
+  HTTP/1.1 Unix-socket transport to the provider runtime, two scoped
+  capabilities, registration/recovery health verification, durable sanitized
+  recovery records, in-memory active routes, and per-dispatch socket-identity
+  checks. Provider components never register with or connect to the credential
+  gateway.
+- Bound registration metadata and durable rewrite frequency, make exact
+  re-registration a throttled disk-free lease barrier, rate-limit authenticated
+  attempts before reading their bodies, reject concrete/component prefix
+  collisions locally, and revoke an old provider before replacement authority
+  is published.
+- Preserve physical usage attribution by keeping the original team bearer in
+  provider-runtime request context and forwarding it to the credential gateway
+  for concrete calls; components see only ingress, upstream, and request-context
+  capabilities.
+- Make shared lifecycle explicit with `cyclo runtime start|stop|restart|status`
+  and `cyclo provider build|start|restart|stop|status PREFIX|--all`.
+  `provider start` never builds, while `cyclo models` and `cyclo run` never
+  start or build shared services or provider containers.
+- Recreate the shared gateway without deleting credentials or restarting teams
+  with `cyclo gateway restart`.
+- Scrub exact credential reflections from upstream response headers and
+  streaming bodies at the gateway boundary.
+- Split the owned team-runtime image from the credential-gateway package and
+  package the provider runtime and protocol as first-class Cyclo resources.
+
 ## [0.1.0] - 2026-07-14
 
 First stable release.

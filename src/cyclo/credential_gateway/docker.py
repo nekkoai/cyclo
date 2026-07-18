@@ -102,8 +102,6 @@ def run_command_capture(command: list[str]) -> tuple[int, str]:
         )
     except FileNotFoundError as exc:
         raise CycloError(f"required command not found: {command[0]}") from exc
-    if proc.stdout:
-        print(proc.stdout, end="")
     return proc.returncode, proc.stdout.strip()
 
 
@@ -125,8 +123,6 @@ def docker_call_ignore_missing(command: list[str]) -> int:
     )
     if proc.returncode != 0 and missing:
         return 0
-    if proc.stdout:
-        print(proc.stdout, end="")
     if proc.stderr:
         print(proc.stderr, end="", file=sys.stderr)
     return proc.returncode

@@ -27,6 +27,34 @@ def test_requires_explicit_proxy_model(team_repo: Path) -> None:
         load_team(team_repo)
 
 
+@pytest.mark.parametrize(
+    "provider",
+    ["OpenAI", "with.dot", "constructor", "gateway", "prototype"],
+)
+def test_rejects_provider_names_the_gateway_cannot_route(
+    team_repo: Path, provider: str
+) -> None:
+    (team_repo / "team").write_text(
+        f"planner-1 planner pi {provider}/model\n", encoding="utf-8"
+    )
+
+    with pytest.raises(CycloError, match="invalid proxy model"):
+        load_team(team_repo)
+
+
+@pytest.mark.parametrize("provider", ["_legacy", "-legacy"])
+def test_preserves_legacy_direct_provider_names(
+    team_repo: Path, provider: str
+) -> None:
+    (team_repo / "team").write_text(
+        f"planner-1 planner pi {provider}/model\n", encoding="utf-8"
+    )
+
+    team = load_team(team_repo)
+    assert team.providers == (provider,)
+    assert team.agents[0].model == f"{provider}/model"
+
+
 def test_rejects_non_pi_engine(team_repo: Path) -> None:
     (team_repo / "team").write_text(
         "planner-1 planner codex openai-codex/gpt-test\n", encoding="utf-8"

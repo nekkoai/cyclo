@@ -3,7 +3,7 @@
 
 import { pathToFileURL } from "node:url";
 
-const PROVIDER_ID = /^[a-z0-9][a-z0-9._-]*$/;
+const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]*$/;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
 
 // pi-ai exposes canonical IDs and model metadata, but not human descriptions
@@ -104,6 +104,10 @@ function formatSupportedProviders(
       `${provider}\t${providerDescription(provider, descriptions)}\t${auth}\t${login}`,
     );
   }
+  lines.push(
+    "",
+    "Account/catalogue names default to PROVIDER. Add --as NAME to choose one; NAME uses lowercase letters, numbers, underscore, or hyphen.",
+  );
   return lines.join("\n");
 }
 

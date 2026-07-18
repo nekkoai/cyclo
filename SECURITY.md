@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Version 0.1.0 and later stable releases are supported until superseded by a
+Version 0.2.0 and later stable releases are supported until superseded by a
 newer stable release. Security fixes target the latest stable version;
 older releases may be asked to upgrade rather than receive a backport.
 
@@ -37,9 +37,9 @@ provide an initial assessment within seven business days. Fix and disclosure
 timing will be coordinated with the reporter and will depend on severity,
 provider coordination, and release complexity.
 
-Reports about credential storage, scoped gateway capabilities, container or
-mount isolation, filesystem queue integrity, and unintended dashboard exposure
-are especially useful. Provider outages, social engineering, and attacks that
-require an already-compromised Docker host are normally outside Cyclo's own
-security boundary, but reports showing an unexpected amplification are still
-welcome.
+Reports about credential storage, scoped team-to-runtime capabilities,
+credential-gateway forwarding, container or mount isolation, filesystem queue
+integrity, and unintended dashboard exposure are especially useful. Provider
+outages, social engineering, and attacks that require an already-compromised
+Docker host are normally outside Cyclo's own security boundary, but reports
+showing an unexpected amplification are still welcome.

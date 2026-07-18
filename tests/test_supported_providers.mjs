@@ -21,6 +21,8 @@ test("supported provider table gives copyable login commands", () => {
       "google\tGoogle Gemini Developer API\tapi-key\tcyclo gateway login google --api-key-stdin",
       "openai\tOpenAI API for GPT and o-series models\tapi-key\tcyclo gateway login openai --api-key-stdin",
       "openai-codex\tOpenAI Codex through a ChatGPT Plus/Pro subscription\toauth\tcyclo gateway login openai-codex",
+      "",
+      "Account/catalogue names default to PROVIDER. Add --as NAME to choose one; NAME uses lowercase letters, numbers, underscore, or hyphen.",
     ].join("\n"),
   );
 });
@@ -30,6 +32,7 @@ test("supported provider formatter rejects unsafe or ambiguous registries", () =
   for (const providers of [
     [],
     ["openai", "openai"],
+    ["bad.provider"],
     ["bad\tprovider"],
     ["bad\nprovider"],
     ["\u001b[31mbad"],
@@ -79,6 +82,8 @@ test(
       "PROVIDER\tDESCRIPTION\tAUTH\tLOGIN",
       "openai\tOpenAI API for GPT and o-series models\tapi-key\tcyclo gateway login openai --api-key-stdin",
       "zai\tZ.AI international coding API for GLM models\tapi-key\tcyclo gateway login zai --api-key-stdin",
+      "",
+      "Account/catalogue names default to PROVIDER. Add --as NAME to choose one; NAME uses lowercase letters, numbers, underscore, or hyphen.",
       ].join("\n"),
     );
     assert.deepEqual(providers, ["zai", "openai"]);

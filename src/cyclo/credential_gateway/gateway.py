@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Iterable, Mapping, Protocol
@@ -32,7 +34,27 @@ GATEWAY_RUN_LABEL = "cyclo.gateway-run"
 SOURCE_FINGERPRINT_LABEL = "cyclo.source-fingerprint"
 GATEWAY_CONFIG_FINGERPRINT_LABEL = "cyclo.gateway-config-fingerprint"
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-PROVIDER_RE = CLIENT_ID_RE
+PROVIDER_RE = re.compile(r"^[a-z0-9_-]+$")
+RESERVED_PROVIDER_NAMES = {"__proto__", "constructor", "gateway", "prototype"}
+
+
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+_LOOPBACK_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _RejectRedirects(),
+)
+
+
+def _open_loopback(request: str | urllib.request.Request, *, timeout: float):
+    url = request.full_url if isinstance(request, urllib.request.Request) else request
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"}:
+        raise CycloError("gateway control request must use loopback HTTP")
+    return _LOOPBACK_OPENER.open(request, timeout=timeout)
 
 # One gateway per system (keyed by its registry dir), reused by every project in
 # that system instead of a container per run. The store volume was already
@@ -73,6 +95,54 @@ def host_client_registry_path(registry_dir: Path) -> Path:
     return host_client_registry_dir(registry_dir) / "clients.json"
 
 
+def ensure_client_registry_mount(directory: Path) -> Path:
+    """Create the gateway's empty hash-only live registry when absent.
+
+    Explicit gateway startup establishes this directory mount before the
+    provider runtime exists. Existing registry contents are never replaced.
+    """
+
+    selected = Path(directory)
+    selected.mkdir(parents=True, mode=0o755, exist_ok=True)
+    if selected.is_symlink() or not selected.is_dir():
+        raise CycloError(f"refusing unsafe gateway client registry: {selected}")
+    os.chmod(selected, 0o755)
+    path = selected / "clients.json"
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+        )
+    except FileExistsError:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise CycloError(
+                f"cannot inspect gateway client registry {path}: {exc}"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            raise CycloError(
+                f"gateway client registry is not a regular file: {path}"
+            )
+        os.chmod(path, 0o644, follow_symlinks=False)
+        return path
+    except OSError as exc:
+        raise CycloError(f"cannot create gateway client registry {path}: {exc}") from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write('{"clients":[],"version":1}\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def client_token_dir(registry_dir: Path) -> Path:
     return Path(registry_dir) / "runs" / "gateway" / "client-tokens"
 
@@ -92,17 +162,22 @@ def _private_dir(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
-def _write_private_atomic(path: Path, text: str) -> None:
-    _private_dir(path.parent)
+def _write_registry_atomic(path: Path, text: str) -> None:
+    # The container needs to read this bind mount under its fixed unprivileged
+    # UID, which may differ from the invoking host UID.  The document contains
+    # only token hashes and explicit scopes; raw capabilities remain in the
+    # separate 0700/0600 client-token tree.
+    path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
+    os.chmod(path.parent, 0o755)
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{os.urandom(6).hex()}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(text)
             stream.flush()
+            os.fchmod(stream.fileno(), 0o644)
             os.fsync(stream.fileno())
         os.replace(tmp, path)
-        os.chmod(path, 0o600)
     finally:
         try:
             tmp.unlink()
@@ -164,6 +239,7 @@ def prepare_client_registry(
         if not providers or any(
             not isinstance(provider, str)
             or not PROVIDER_RE.fullmatch(provider)
+            or provider in RESERVED_PROVIDER_NAMES
             for provider in providers
         ):
             raise CycloError(
@@ -181,6 +257,7 @@ def prepare_client_registry(
             if (
                 not separator
                 or not PROVIDER_RE.fullmatch(provider)
+                or provider in RESERVED_PROVIDER_NAMES
                 or not model_id
                 or provider not in providers
                 or any(
@@ -201,6 +278,7 @@ def prepare_client_registry(
         clients.append(
             {
                 "client_id": project.project_id,
+                "kind": "client",
                 "team_id": project.name,
                 "binding_generation": getattr(project, "generation", "") or None,
                 "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
@@ -212,7 +290,7 @@ def prepare_client_registry(
             }
         )
     data = {"version": CLIENT_REGISTRY_VERSION, "clients": clients}
-    _write_private_atomic(
+    _write_registry_atomic(
         host_client_registry_path(registry_dir),
         json.dumps(data, indent=2, sort_keys=True) + "\n",
     )
@@ -335,13 +413,6 @@ def gateway_config_fingerprint(config: GatewayConfig, token: str) -> str:
     except OSError:
         models_hash = ""
     client_registry = getattr(config, "client_registry_dir", None)
-    client_registry_path = (
-        Path(client_registry) / "clients.json" if client_registry is not None else None
-    )
-    try:
-        client_registry_hash = hashlib.sha256(client_registry_path.read_bytes()).hexdigest()
-    except (OSError, AttributeError):
-        client_registry_hash = ""
     data = {
         "image": config.gateway_image,
         "source": gateway_image_fingerprint(),
@@ -349,7 +420,13 @@ def gateway_config_fingerprint(config: GatewayConfig, token: str) -> str:
         "store_volume": config.store_volume,
         "host_models_json": str(config.host_models_json) if config.host_models_json.exists() else "",
         "host_models_hash": models_hash,
-        "client_registry_hash": client_registry_hash,
+        # The server rereads clients.json for every authentication.  Its
+        # contents are live state and must never turn into container lifecycle.
+        "client_registry_dir": (
+            str(client_registry)
+            if client_registry is not None and Path(client_registry).is_dir()
+            else ""
+        ),
         "token_hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
     }
     return hashlib.sha256(
@@ -503,6 +580,17 @@ def network_exists(name: str) -> bool:
     return _inspect_gateway_network(name) is not None
 
 
+def owned_network_id(name: str) -> str:
+    """Return an existing Cyclo-owned gateway network without creating it."""
+
+    info = _owned_gateway_network(name)
+    if info is None:
+        raise CycloError(
+            f"gateway network does not exist: {name}; restart the gateway first"
+        )
+    return _resource_id(info, kind="network", name=name)
+
+
 def ensure_network(name: str) -> str:
     info = _owned_gateway_network(name)
     if info is not None:
@@ -594,6 +682,66 @@ def gateway_container_id(container: str) -> str:
     return _resource_id(info, kind="container", name=container)
 
 
+def validate_running_gateway(
+    config: GatewayConfig, token: str
+) -> tuple[str, str, int]:
+    """Validate the credential boundary without creating or changing it.
+
+    Returns ``(container_id, network_id, published_port)`` only when the
+    running container is built from the current packaged gateway, has the
+    expected immutable configuration, and is attached solely to its owned
+    private gateway network.
+    """
+
+    source_fingerprint = gateway_image_fingerprint()
+    if not gateway_image_current(config.gateway_image, source_fingerprint):
+        raise CycloError(
+            "credential gateway image is missing or stale; run "
+            "`cyclo gateway restart --build`"
+        )
+    network_id = owned_network_id(config.gateway_network)
+    info = _owned_gateway_container(config.gateway_container)
+    if info is None:
+        raise CycloError(
+            "credential gateway is not running; run `cyclo gateway restart`"
+        )
+    running, labels = _container_state(info, name=config.gateway_container)
+    if not running:
+        raise CycloError(
+            "credential gateway is stopped; run `cyclo gateway restart`"
+        )
+    expected = gateway_config_fingerprint(config, token)
+    if labels.get(GATEWAY_CONFIG_FINGERPRINT_LABEL) != expected:
+        raise CycloError(
+            "credential gateway configuration is stale; run "
+            "`cyclo gateway restart` (add `--build` only for a stale image)"
+        )
+    settings = info.get("NetworkSettings")
+    networks = settings.get("Networks") if isinstance(settings, Mapping) else None
+    attached_ids = {
+        network.get("NetworkID")
+        for network in networks.values()
+        if isinstance(network, Mapping)
+        and isinstance(network.get("NetworkID"), str)
+        and network.get("NetworkID")
+    } if isinstance(networks, Mapping) else set()
+    if (
+        not isinstance(networks, Mapping)
+        or attached_ids != {network_id}
+        or len(networks) != 1
+    ):
+        raise CycloError(
+            "credential gateway has unsafe Docker network attachments; run "
+            "`cyclo gateway restart` before starting the provider runtime"
+        )
+    container_id = _resource_id(
+        info, kind="container", name=config.gateway_container
+    )
+    port = _published_port(info, name=config.gateway_container)
+    wait_healthy(port, timeout=5.0)
+    return container_id, network_id, port
+
+
 def _container_uses_network(
     info: Mapping[str, object], *, network_id: str
 ) -> bool:
@@ -612,7 +760,7 @@ def wait_healthy(port: int, timeout: float = 15.0) -> None:
     url = f"http://127.0.0.1:{port}/health"
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=2) as response:
+            with _open_loopback(url, timeout=2) as response:
                 if response.status == 200:
                     return
         except (urllib.error.URLError, OSError):
@@ -627,7 +775,7 @@ def fetch_provider_catalog(port: int, token: str) -> dict[str, dict]:
         headers={"Authorization": f"Bearer {token}"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with _open_loopback(request, timeout=5) as response:
             data = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
         raise CycloError(f"failed to read gateway provider catalog: {exc}") from exc
@@ -651,7 +799,7 @@ def fetch_usage(registry_dir: Path) -> dict[str, object]:
         headers={"Authorization": f"Bearer {token}"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with _open_loopback(request, timeout=5) as response:
             data = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
         raise CycloError(f"failed to read gateway usage: {exc}") from exc
@@ -660,10 +808,17 @@ def fetch_usage(registry_dir: Path) -> dict[str, object]:
     return data
 
 
-def start_gateway(config: GatewayConfig, token: str, build: bool = False) -> dict[str, dict]:
-    """Ensure the one shared gateway is up (start it if not) and return its
-    catalog. Idempotent: a second project reuses the already-running gateway
-    rather than launching another container."""
+def ensure_gateway(
+    config: GatewayConfig,
+    token: str,
+    build: bool = False,
+    *,
+    force_restart: bool = False,
+) -> int:
+    """Ensure the shared credential gateway is healthy and return its host port."""
+    client_registry = getattr(config, "client_registry_dir", None)
+    if client_registry is not None:
+        ensure_client_registry_mount(Path(client_registry))
     container_info = _owned_gateway_container(config.gateway_container)
     ensure_gateway_image(config.gateway_image, build=build)
     network_id = ensure_network(config.gateway_network)
@@ -679,7 +834,13 @@ def start_gateway(config: GatewayConfig, token: str, build: bool = False) -> dic
     network_current = container_info is not None and _container_uses_network(
         container_info, network_id=network_id
     )
-    if build or not running or not network_current or current_fingerprint != expected_fingerprint:
+    if (
+        force_restart
+        or build
+        or not running
+        or not network_current
+        or current_fingerprint != expected_fingerprint
+    ):
         stop_gateway_container(config.gateway_container)
         rc, _ = runner_docker.run_command_capture(
             gateway_run_command(config, token, network_identifier=network_id)
@@ -694,6 +855,24 @@ def start_gateway(config: GatewayConfig, token: str, build: bool = False) -> dic
     assert container_info is not None
     port = _published_port(container_info, name=config.gateway_container)
     wait_healthy(port)
+    return port
+
+
+def start_gateway(
+    config: GatewayConfig,
+    token: str,
+    build: bool = False,
+    *,
+    force_restart: bool = False,
+) -> dict[str, dict]:
+    """Ensure the shared gateway is healthy and return its current catalogue."""
+
+    port = ensure_gateway(
+        config,
+        token,
+        build=build,
+        force_restart=force_restart,
+    )
     catalog = fetch_provider_catalog(port, token)
     if not catalog:
         raise CycloError(

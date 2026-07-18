@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import http.server
 import json
 import stat
 import subprocess
+import threading
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from cyclo.errors import CycloError
-from cyclo.credential_gateway import auth, cli, commands, gateway, safe_model_fields, source
+from cyclo.credential_gateway import auth, cli, gateway, safe_model_fields, source
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,41 @@ class Config:
     host_models_json: Path
     client_registry_dir: Path
     name: str = "test"
+
+
+def test_loopback_control_requests_do_not_follow_token_bearing_redirects() -> None:
+    captured: list[str | None] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/capture")
+                self.end_headers()
+                return
+            captured.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/redirect",
+            headers={"Authorization": "Bearer must-not-follow"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            gateway._open_loopback(request, timeout=2)
+        assert rejected.value.code == 302
+        assert captured == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_registry_contains_hashes_and_scopes_but_not_capabilities(tmp_path: Path) -> None:
@@ -57,8 +96,8 @@ def test_registry_contains_hashes_and_scopes_but_not_capabilities(tmp_path: Path
     ).hexdigest()
     serialized = registry_path.read_text(encoding="utf-8")
     assert all(token not in serialized for token in tokens.values())
-    assert stat.S_IMODE(registry_path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(registry_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(registry_path.stat().st_mode) == 0o644
+    assert stat.S_IMODE(registry_path.parent.stat().st_mode) == 0o755
     assert stat.S_IMODE(gateway.client_token_path(root, "one").stat().st_mode) == 0o600
 
 
@@ -84,6 +123,36 @@ def test_registry_rejects_duplicate_clients_and_invalid_provider(tmp_path: Path)
             allowed_models={"one": ("../secret/model",)},
         )
     assert not gateway.client_token_path(tmp_path / "provider", "one").exists()
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["OpenAI", "with.dot", "constructor", "gateway", "prototype"],
+)
+def test_registry_provider_names_match_public_gateway_routes(
+    tmp_path: Path, provider: str
+) -> None:
+    with pytest.raises(CycloError, match="invalid gateway provider scope"):
+        gateway.prepare_client_registry(
+            tmp_path / provider.replace("/", "-"),
+            [Client("one", "team", "generation")],
+            allowed_providers={"one": (provider,)},
+            allowed_models={"one": (f"{provider}/model",)},
+        )
+
+
+@pytest.mark.parametrize("provider", ["_legacy", "-legacy"])
+def test_registry_preserves_legacy_direct_provider_names(
+    tmp_path: Path, provider: str
+) -> None:
+    tokens = gateway.prepare_client_registry(
+        tmp_path / provider,
+        [Client("one", "team", "generation")],
+        allowed_providers={"one": (provider,)},
+        allowed_models={"one": (f"{provider}/model",)},
+    )
+
+    assert list(tokens) == ["one"]
 
 
 @pytest.mark.parametrize(
@@ -260,7 +329,9 @@ def test_python_projection_uses_every_canonical_allowlist() -> None:
             }
 
 
-def test_gateway_run_command_mounts_only_gateway_owned_inputs(tmp_path: Path) -> None:
+def test_gateway_run_command_mounts_only_credential_gateway_inputs(
+    tmp_path: Path,
+) -> None:
     models = tmp_path / "models.json"
     models.write_text("{}\n", encoding="utf-8")
     registry = tmp_path / "registry"
@@ -279,6 +350,19 @@ def test_gateway_run_command_mounts_only_gateway_owned_inputs(tmp_path: Path) ->
 
     assert "CYCLO_GATEWAY_TOKEN=admin-capability" in command
     assert f"CYCLO_GATEWAY_CLIENTS_JSON={gateway.GATEWAY_CLIENT_REGISTRY_PATH}" in command
+    mounts = [
+        command[index + 1]
+        for index, part in enumerate(command)
+        if part == "--mount"
+    ]
+    assert mounts == [
+        f"type=volume,src={config.store_volume},dst={gateway.GATEWAY_STORE_PATH}",
+        (
+            f"type=bind,src={registry},"
+            f"dst={gateway.GATEWAY_CLIENT_REGISTRY_DIR},readonly"
+        ),
+        f"type=bind,src={models},dst={gateway.GATEWAY_MODELS_PATH},readonly",
+    ]
     assert all("multiagent" not in part.lower() for part in command)
     assert "127.0.0.1::8787" in command
     assert "no-new-privileges" in command
@@ -293,6 +377,23 @@ def test_gateway_run_command_mounts_only_gateway_owned_inputs(tmp_path: Path) ->
         config, "admin-capability", network_identifier="verified-network-id"
     )
     assert by_id[by_id.index("--network") + 1] == "verified-network-id"
+
+    without_models = Config(
+        gateway_image=config.gateway_image,
+        gateway_container=config.gateway_container,
+        gateway_network=config.gateway_network,
+        store_volume=config.store_volume,
+        host_models_json=tmp_path / "missing-models.json",
+        client_registry_dir=registry,
+    )
+    command_without_models = gateway.gateway_run_command(
+        without_models, "admin-capability"
+    )
+    assert [
+        command_without_models[index + 1]
+        for index, part in enumerate(command_without_models)
+        if part == "--mount"
+    ] == mounts[:2]
 
 
 def test_gateway_network_creation_sets_ownership_label(monkeypatch) -> None:
@@ -334,6 +435,26 @@ def test_gateway_network_creation_sets_ownership_label(monkeypatch) -> None:
     ]
 
 
+def test_owned_network_id_requires_existing_owned_network(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gateway,
+        "_inspect_gateway_network",
+        lambda _name: {
+            "Id": "owned-network-id",
+            "Labels": {
+                gateway.GATEWAY_OWNERSHIP_LABEL: gateway.GATEWAY_OWNERSHIP_VALUE,
+                gateway.GATEWAY_RESOURCE_LABEL: "cyclo-gateway-net-test",
+            },
+        },
+    )
+
+    assert gateway.owned_network_id("cyclo-gateway-net-test") == "owned-network-id"
+
+    monkeypatch.setattr(gateway, "_inspect_gateway_network", lambda _name: None)
+    with pytest.raises(CycloError, match="restart the gateway first"):
+        gateway.owned_network_id("cyclo-gateway-net-test")
+
+
 def test_gateway_network_is_part_of_configuration_fingerprint(tmp_path: Path) -> None:
     common = {
         "gateway_image": "cyclo-gateway:test",
@@ -348,6 +469,116 @@ def test_gateway_network_is_part_of_configuration_fingerprint(tmp_path: Path) ->
     assert gateway.gateway_config_fingerprint(
         first, "admin-capability"
     ) != gateway.gateway_config_fingerprint(second, "admin-capability")
+
+
+def test_running_gateway_validation_rejects_extra_networks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = Config(
+        gateway_image="cyclo-gateway:test",
+        gateway_container="cyclo-gateway-test",
+        gateway_network="cyclo-gateway-net-test",
+        store_volume="cyclo-store",
+        host_models_json=tmp_path / "models.json",
+        client_registry_dir=tmp_path / "registry",
+    )
+    container = {
+        "Id": "gateway-container-id",
+        "Config": {
+            "Labels": {
+                gateway.GATEWAY_CONFIG_FINGERPRINT_LABEL: "expected-config"
+            }
+        },
+        "State": {"Running": True},
+        "NetworkSettings": {
+            "Networks": {
+                "private": {"NetworkID": "owned-network-id"},
+                "team": {"NetworkID": "team-network-id"},
+            }
+        },
+    }
+    monkeypatch.setattr(gateway, "gateway_image_fingerprint", lambda: "source")
+    monkeypatch.setattr(gateway, "gateway_image_current", lambda *_args: True)
+    monkeypatch.setattr(gateway, "owned_network_id", lambda _name: "owned-network-id")
+    monkeypatch.setattr(gateway, "_owned_gateway_container", lambda _name: container)
+    monkeypatch.setattr(
+        gateway, "gateway_config_fingerprint", lambda *_args: "expected-config"
+    )
+    monkeypatch.setattr(gateway, "_published_port", lambda *_args, **_kwargs: 4242)
+    monkeypatch.setattr(gateway, "wait_healthy", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(CycloError, match="unsafe Docker network attachments"):
+        gateway.validate_running_gateway(config, "admin")
+
+    container["NetworkSettings"] = {
+        "Networks": {"private": {"NetworkID": "owned-network-id"}}
+    }
+    assert gateway.validate_running_gateway(config, "admin") == (
+        "gateway-container-id",
+        "owned-network-id",
+        4242,
+    )
+
+
+def test_client_registry_path_but_not_dynamic_contents_affects_fingerprint(
+    tmp_path: Path,
+) -> None:
+    first_registry = tmp_path / "clients-one"
+    second_registry = tmp_path / "clients-two"
+    first_registry.mkdir()
+    second_registry.mkdir()
+    first_file = first_registry / "clients.json"
+    first_file.write_text('{"version":1,"clients":[]}\n', encoding="utf-8")
+    common = {
+        "gateway_image": "cyclo-gateway:test",
+        "gateway_container": "cyclo-gateway-test",
+        "gateway_network": "cyclo-gateway-net-test",
+        "store_volume": "cyclo-gateway-store-test",
+        "host_models_json": tmp_path / "models.json",
+    }
+    first = Config(client_registry_dir=first_registry, **common)
+    second = Config(client_registry_dir=second_registry, **common)
+    before = gateway.gateway_config_fingerprint(first, "admin-capability")
+
+    first_file.write_text(
+        '{"version":1,"clients":[{"client_id":"changed"}]}\n',
+        encoding="utf-8",
+    )
+
+    assert gateway.gateway_config_fingerprint(first, "admin-capability") == before
+    assert gateway.gateway_config_fingerprint(second, "admin-capability") != before
+
+
+def test_gateway_start_establishes_live_empty_registry_without_overwriting(
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "registry"
+    path = gateway.ensure_client_registry_mount(registry)
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "clients": [],
+        "version": 1,
+    }
+    config = Config(
+        gateway_image="cyclo-gateway:test",
+        gateway_container="cyclo-gateway-test",
+        gateway_network="cyclo-gateway-net-test",
+        store_volume="cyclo-store",
+        host_models_json=tmp_path / "models.json",
+        client_registry_dir=registry,
+    )
+    before = gateway.gateway_config_fingerprint(config, "admin-capability")
+    replacement = '{"clients":[{"client_id":"team"}],"version":1}\n'
+    path.write_text(replacement, encoding="utf-8")
+
+    assert gateway.ensure_client_registry_mount(registry) == path
+    assert path.read_text(encoding="utf-8") == replacement
+    assert gateway.gateway_config_fingerprint(config, "admin-capability") == before
+    command = gateway.gateway_run_command(config, "admin-capability")
+    assert any(
+        f"src={registry},dst={gateway.GATEWAY_CLIENT_REGISTRY_DIR},readonly"
+        in part
+        for part in command
+    )
 
 
 def test_gateway_network_refuses_foreign_reuse_and_removal(monkeypatch) -> None:
@@ -931,6 +1162,66 @@ def test_gateway_restarts_on_wrong_network_and_runs_by_verified_network_id(
     }
 
 
+def test_gateway_force_restart_recreates_a_current_owned_container(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = Config(
+        gateway_image="cyclo-gateway:test",
+        gateway_container="cyclo-gateway-test",
+        gateway_network="cyclo-gateway-net-test",
+        store_volume="cyclo-gateway-store-test",
+        host_models_json=tmp_path / "models.json",
+        client_registry_dir=tmp_path / "registry",
+    )
+    labels = {
+        gateway.GATEWAY_OWNERSHIP_LABEL: gateway.GATEWAY_OWNERSHIP_VALUE,
+        gateway.GATEWAY_RESOURCE_LABEL: config.gateway_container,
+        gateway.GATEWAY_CONFIG_FINGERPRINT_LABEL: "expected-fingerprint",
+    }
+    current = {
+        "Id": "current-container-id",
+        "Config": {"Labels": labels},
+        "State": {"Running": True},
+        "NetworkSettings": {
+            "Networks": {"gateway": {"NetworkID": "verified-network-id"}}
+        },
+    }
+    replacement = {**current, "Id": "replacement-container-id"}
+    inspections = iter([current, replacement])
+    stopped: list[str] = []
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        gateway, "_owned_gateway_container", lambda _name: next(inspections)
+    )
+    monkeypatch.setattr(gateway, "ensure_gateway_image", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gateway, "ensure_network", lambda _name: "verified-network-id")
+    monkeypatch.setattr(
+        gateway, "gateway_config_fingerprint", lambda *_args: "expected-fingerprint"
+    )
+    monkeypatch.setattr(
+        gateway,
+        "stop_gateway_container",
+        lambda name: stopped.append(name) or True,
+    )
+    monkeypatch.setattr(
+        gateway.runner_docker,
+        "run_command_capture",
+        lambda command: commands.append(command) or (0, "replacement-container-id"),
+    )
+    monkeypatch.setattr(gateway, "_published_port", lambda *_args, **_kwargs: 49152)
+    monkeypatch.setattr(gateway, "wait_healthy", lambda _port: None)
+    monkeypatch.setattr(
+        gateway,
+        "fetch_provider_catalog",
+        lambda _port, _token: {"openai": {"models": [{"id": "gpt-test"}]}},
+    )
+
+    gateway.start_gateway(config, "admin-capability", force_restart=True)
+
+    assert stopped == [config.gateway_container]
+    assert len(commands) == 1
+
+
 def test_login_env_forwards_name_not_secret() -> None:
     name = cli.login_env_var(
         "openai",
@@ -949,6 +1240,43 @@ def test_login_env_forwards_name_not_secret() -> None:
     assert "top-secret" not in command
     assert "no-new-privileges" in command
     assert "--read-only" in command
+
+
+def test_login_account_name_is_the_gateway_route_and_fails_closed() -> None:
+    command = cli.login_command(
+        "cyclo-gateway:test",
+        "cyclo-store",
+        "openai",
+        account="openai-work",
+        api_key_stdin=True,
+    )
+    assert command[command.index("--as") + 1] == "openai-work"
+
+    for invalid in (
+        "",
+        "-leading",
+        "UPPER",
+        "has.dot",
+        "has/slash",
+        "__proto__",
+        "gateway",
+    ):
+        with pytest.raises(CycloError, match="invalid gateway account name"):
+            cli.login_command(
+                "cyclo-gateway:test",
+                "cyclo-store",
+                "openai",
+                account=invalid,
+                api_key_stdin=True,
+            )
+
+    with pytest.raises(CycloError, match="invalid gateway provider name"):
+        cli.login_command(
+            "cyclo-gateway:test",
+            "cyclo-store",
+            "OpenAI",
+            api_key_stdin=True,
+        )
 
 
 def test_oauth_login_is_interactive_hardened_and_uses_a_writable_store() -> None:
@@ -983,10 +1311,8 @@ def test_status_container_is_hardened_and_credential_volume_is_read_only() -> No
     )
 
 
-def test_packaged_contexts_are_the_only_build_inputs() -> None:
-    runtime_root = source.runtime_context_root()
+def test_packaged_gateway_context_is_the_only_gateway_build_input() -> None:
     gateway_root = source.gateway_context_root()
-    assert source.dockerfile_path().parent == runtime_root
     assert source.gateway_dockerfile_path().parent == gateway_root
     assert (gateway_root / "package-lock.json").is_file()
     assert (gateway_root / "oauth-ui.mjs").is_file()
@@ -994,15 +1320,10 @@ def test_packaged_contexts_are_the_only_build_inputs() -> None:
     assert (gateway_root / "safe-model-fields.json").is_file()
     assert (gateway_root / "safe-model-fields.mjs").is_file()
     assert (gateway_root / "model-metadata.mjs").is_file()
+    assert (gateway_root / "response-redaction.mjs").is_file()
     assert (gateway_root / "supported-providers.mjs").is_file()
     assert (gateway_root / "server.mjs").is_file()
-    assert (runtime_root / "entrypoint.sh").is_file()
-
-    fingerprint = source.source_fingerprint()
-    command = commands.docker_build_command("cyclo-runtime:test", fingerprint)
-    assert command[-1] == str(runtime_root)
-    assert str(source.dockerfile_path()) in command
-    assert len(fingerprint) == 64
+    assert len(source.source_fingerprint(gateway_root)) == 64
 
 
 def test_gateway_javascript_uses_only_cyclo_runtime_names() -> None:
@@ -1022,6 +1343,7 @@ def test_gateway_javascript_uses_only_cyclo_runtime_names() -> None:
     assert "MULTIAGENT_GATEWAY" not in server
     assert 'from "./pi-registry.mjs"' in server
     assert 'from "./model-metadata.mjs"' in server
+    assert 'from "./response-redaction.mjs"' in server
     assert "SAFE_COMPAT_BOOLEAN_FIELDS" not in server
     assert 'from "./pi-registry.mjs"' in login
     assert 'from "./oauth-ui.mjs"' in login
@@ -1039,6 +1361,7 @@ def test_gateway_javascript_uses_only_cyclo_runtime_names() -> None:
     assert "safe-model-fields.json" in dockerfile
     assert "safe-model-fields.mjs" in dockerfile
     assert "model-metadata.mjs" in dockerfile
+    assert "response-redaction.mjs" in dockerfile
     assert "oauth-ui.mjs" in dockerfile
     assert "supported-providers.mjs" in dockerfile
     assert package["name"] == "cyclo-gateway"

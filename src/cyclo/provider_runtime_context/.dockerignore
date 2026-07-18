@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!package.json
+!package-lock.json
+!safe-model-fields.json
+!metadata.mjs
+!protocol.mjs
+!server.mjs
