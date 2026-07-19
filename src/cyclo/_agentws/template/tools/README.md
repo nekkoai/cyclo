@@ -69,6 +69,10 @@ the same task, then marks the source job failed. Repeating settlement reuses
 that job, and a planner failure never creates another planner job. This does
 not change explicit agent-driven `job-fail`: the agent remains responsible for
 the protocol-required follow-up work in that case.
+When Cyclo supplies its provider-runtime health URL, workers wait for runtime
+health before claiming. A runtime loss immediately after claim or during an
+engine invocation releases the job and restores its prior attempt count; it is
+not charged to the agent suspension circuit breaker.
 Operator-requested SIGINT/SIGTERM shutdown releases the job without consuming
 an attempt. These safe defaults can be adjusted with positive integer
 environment variables:

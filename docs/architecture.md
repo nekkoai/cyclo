@@ -348,6 +348,13 @@ usage ledger are not in that tree. They live in the Docker-managed
 state cleanup do not delete it. `cyclo gateway destroy-store` is the separate,
 explicit destructive operation.
 
+The gateway administrator capability remains in a mode-0600 canonical host
+file. On explicit gateway restart, Cyclo atomically copies it into a
+container-readable file beneath a mode-0700 host directory and bind-mounts
+only that exact file read-only at `/run/secrets/cyclo-gateway-admin-token`.
+The capability is never placed in Docker command arguments or container
+environment values.
+
 ## Observation and host trust
 
 The per-team AgentWS viewer and fleet dashboard are read-only and bind to

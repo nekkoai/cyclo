@@ -52,6 +52,17 @@ def queue(store: StateStore, identifier: str) -> Path:
     return root
 
 
+class InMemoryInstanceStore(StateStore):
+    """Exercise dashboard defenses after strict persisted-state validation."""
+
+    def __init__(self, root: Path, instances: list[Instance]) -> None:
+        super().__init__(root)
+        self._instances = instances
+
+    def list_report(self) -> tuple[list[Instance], list[str]]:
+        return list(self._instances), []
+
+
 def mark_supervisor_ready(root: Path) -> Path:
     runs = root / "agents" / ".team-runs"
     runs.mkdir(parents=True, exist_ok=True)
@@ -649,7 +660,6 @@ def test_snapshot_exposes_project_definition_and_named_mounts(tmp_path: Path) ->
 
 
 def test_snapshot_isolates_malformed_project_mount_state(tmp_path: Path) -> None:
-    store = StateStore(tmp_path / "state")
     good = instance("good")
     broken = instance("broken")
     broken.project_file = "/configs/broken/project.cyclo"
@@ -657,8 +667,7 @@ def test_snapshot_isolates_malformed_project_mount_state(tmp_path: Path) -> None
     broken.project_description = "Broken mount state"
     broken.project_generation = "broken-generation"
     broken.project_mounts = None  # type: ignore[assignment]
-    store.save(good)
-    store.save(broken)
+    store = InMemoryInstanceStore(tmp_path / "state", [good, broken])
     mark_supervisor_ready(queue(store, good.id))
     mark_supervisor_ready(queue(store, broken.id))
 
@@ -683,7 +692,6 @@ def test_snapshot_isolates_malformed_project_mount_state(tmp_path: Path) -> None
 def test_snapshot_preserves_valid_mounts_beside_invalid_entries(
     tmp_path: Path,
 ) -> None:
-    store = StateStore(tmp_path / "state")
     configured = instance("alpha")
     configured.project_file = "/configs/alpha/project.cyclo"
     configured.project_name = "alpha-project"
@@ -707,7 +715,7 @@ def test_snapshot_preserves_valid_mounts_beside_invalid_entries(
             "mode": "ro",
         },
     ]  # type: ignore[list-item]
-    store.save(configured)
+    store = InMemoryInstanceStore(tmp_path / "state", [configured])
     mark_supervisor_ready(queue(store, configured.id))
 
     result = DashboardSnapshot(
@@ -759,7 +767,6 @@ def test_snapshot_reports_legacy_read_only_state_as_requiring_restart(
 def test_snapshot_rejects_empty_or_non_string_project_definition_state(
     tmp_path: Path,
 ) -> None:
-    store = StateStore(tmp_path / "state")
     empty = instance("empty")
     empty.project_file = "/configs/empty/project.cyclo"
     empty.project_name = "empty-project"
@@ -767,8 +774,7 @@ def test_snapshot_rejects_empty_or_non_string_project_definition_state(
     empty.project_generation = "empty-generation"
     malformed = instance("malformed")
     malformed.project_file = {"unexpected": True}  # type: ignore[assignment]
-    store.save(empty)
-    store.save(malformed)
+    store = InMemoryInstanceStore(tmp_path / "state", [empty, malformed])
     mark_supervisor_ready(queue(store, empty.id))
     mark_supervisor_ready(queue(store, malformed.id))
 

@@ -191,12 +191,15 @@ jobs:
           fi
           grep -F "Select OpenAI Codex login method" /tmp/cyclo-oauth-login
           grep -F "login failed: Login cancelled" /tmp/cyclo-oauth-login
-          docker run --rm --network none \
-            --env CYCLO_GATEWAY_TOKEN=image-smoke-token \
+          printf '%s\n' image-smoke-token > /tmp/cyclo-gateway-token
+          chmod 0400 /tmp/cyclo-gateway-token
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+            --env CYCLO_GATEWAY_TOKEN_FILE=/run/secrets/cyclo-gateway-admin-token \
             --env CYCLO_GATEWAY_AUTH_JSON=/tmp/cyclo-auth.json \
             --env CYCLO_GATEWAY_MODELS_JSON=/tmp/cyclo-models.json \
             --env CYCLO_GATEWAY_CLIENTS_JSON=/tmp/cyclo-clients.json \
             --env CYCLO_GATEWAY_USAGE_JSONL=/tmp/cyclo-usage.jsonl \
+            --volume /tmp/cyclo-gateway-token:/run/secrets/cyclo-gateway-admin-token:ro \
             --volume "$PWD/tests/fixtures/credential_gateway_image_smoke.mjs:/tmp/smoke.mjs:ro" \
             cyclo-gateway:ci /tmp/smoke.mjs
           docker run --rm --network none --entrypoint node \

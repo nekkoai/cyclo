@@ -91,6 +91,14 @@ Provider composition and runtime-isolation release.
   explicit source errors.
 - Make `cyclo doctor` actively probe both the credential gateway and provider
   runtime before trusting the runtime catalogue.
+- Gate job claims on shared-runtime health. If the runtime disappears between
+  readiness and launch, or while an engine is running, release the job without
+  consuming its attempt or incrementing the agent suspension circuit breaker.
+- Keep the gateway administrator capability out of Docker command arguments
+  and environment values by mounting an atomically projected token file.
+- Reject malformed persisted project fields and mounts at the state boundary,
+  and make `cyclo doctor` prescribe `runtime restart` for an existing stopped
+  runtime container.
 
 ## [0.1.0] - 2026-07-14
 

@@ -136,6 +136,8 @@ def main() -> int:
     max_job_attempts = agent_mod.positive_env_int(
         "AGENTWS_MAX_JOB_ATTEMPTS", agent_mod.DEFAULT_MAX_JOB_ATTEMPTS
     )
+    runtime_health_target = agent_mod.provider_runtime_health_target()
+    runtime_boot_identity: str | None = None
 
     agent_dir_out = agent_mod.run_bin(
         ROOT, "agent-new", args.agent_name, args.role
@@ -229,22 +231,20 @@ def main() -> int:
         else:
             while True:
                 agent_mod.run_bin(ROOT, "job-wait", "-r", args.role, capture=True)
+                runtime_boot_identity = agent_mod.wait_for_provider_runtime(
+                    runtime_health_target
+                )
                 defer_shutdown = True
                 try:
-                    claim = agent_mod.run_bin(
+                    claimed = agent_mod.claim_job_if_runtime_ready(
                         ROOT,
-                        "job-claim",
-                        "-r",
                         args.role,
-                        "--agent-id",
                         args.agent_name,
-                    ).stdout.strip()
-                    if claim.startswith("CLAIMED: "):
-                        job_id = claim.removeprefix("CLAIMED: ").strip()
-                        job_dir = ROOT / "jobs" / job_id
+                        runtime_health_target,
+                    )
+                    if claimed is not None:
+                        job_id, job_dir, runtime_boot_identity = claimed
                         settlement_needed = True
-                    elif claim != "NO_JOBS":
-                        agent_mod.die(f"unexpected job-claim output: {claim}")
                 finally:
                     defer_shutdown = False
                 if deferred_shutdown_signum:
@@ -464,6 +464,16 @@ def main() -> int:
                     maximum=max_job_attempts,
                 )
             else:
+                dependency_unavailable = (
+                    agent_mod.provider_runtime_changed_during_failed_run(
+                        runtime_health_target,
+                        runtime_boot_identity,
+                        process_started=proc is not None,
+                        process_status=process_status,
+                        interrupted=interrupted,
+                        job_dir=job_dir,
+                    )
+                )
                 process_status = agent_mod.settle_job_after_process(
                     ROOT,
                     job_dir,
@@ -474,6 +484,7 @@ def main() -> int:
                     attempt=attempt,
                     maximum=max_job_attempts,
                     interrupted=interrupted,
+                    dependency_unavailable=dependency_unavailable,
                     label="Interactive agent",
                 )
         interactive_lock.close()

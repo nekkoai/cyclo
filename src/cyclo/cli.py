@@ -871,8 +871,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         try:
             status = runtime.status()
             if not status.running:
+                action = "restart" if status.exists else "start"
                 raise CycloError(
-                    "provider runtime is not running; run `cyclo runtime start`"
+                    "provider runtime is not running; run "
+                    f"`cyclo runtime {action}`"
                 )
             if not status.current:
                 raise CycloError(

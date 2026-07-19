@@ -10,11 +10,13 @@ const authPath = process.env.CYCLO_GATEWAY_AUTH_JSON;
 const modelsPath = process.env.CYCLO_GATEWAY_MODELS_JSON;
 const clientsPath = process.env.CYCLO_GATEWAY_CLIENTS_JSON;
 const usagePath = process.env.CYCLO_GATEWAY_USAGE_JSONL;
-const gatewayToken = process.env.CYCLO_GATEWAY_TOKEN;
+const gatewayTokenFile = process.env.CYCLO_GATEWAY_TOKEN_FILE;
 assert.ok(authPath);
 assert.ok(modelsPath);
 assert.ok(clientsPath);
 assert.ok(usagePath);
+assert.ok(gatewayTokenFile);
+const gatewayToken = (await readFile(gatewayTokenFile, "utf8")).trim();
 assert.ok(gatewayToken);
 
 const teamToken = "image-smoke-team-token";

@@ -17,6 +17,7 @@
 
 import { createServer } from "node:http";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { getOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import { getBuiltinModels, getBuiltinProviders } from "./pi-registry.mjs";
@@ -45,7 +46,8 @@ import {
 } from "./policy.mjs";
 
 const PORT = Number(process.env.CYCLO_GATEWAY_PORT ?? 8787);
-const TOKEN = process.env.CYCLO_GATEWAY_TOKEN;
+const TOKEN_FILE = process.env.CYCLO_GATEWAY_TOKEN_FILE
+  ?? "/run/secrets/cyclo-gateway-admin-token";
 // The gateway's own private credential store (writable volume, sole writer).
 const AUTH_JSON_PATH = process.env.CYCLO_GATEWAY_AUTH_JSON ?? "/var/lib/cyclo-gateway/auth.json";
 // Read-only provider config projected from the host pi (baseUrls, dialects).
@@ -111,8 +113,16 @@ const DROPPED_RESPONSE_HEADERS = new Set([
   "x-api-key",
 ]);
 
-if (!TOKEN) {
-  console.error("error: CYCLO_GATEWAY_TOKEN is required");
+let TOKEN;
+try {
+  TOKEN = readFileSync(TOKEN_FILE, "utf8").trim();
+} catch (error) {
+  const cause = error.code ?? "read failed";
+  console.error(`error: cannot read gateway administrator token file ${TOKEN_FILE}: ${cause}`);
+  process.exit(2);
+}
+if (!TOKEN || /\s/u.test(TOKEN)) {
+  console.error(`error: gateway administrator token file is malformed: ${TOKEN_FILE}`);
   process.exit(2);
 }
 
