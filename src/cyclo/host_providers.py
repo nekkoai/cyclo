@@ -274,16 +274,6 @@ class HostProviders:
         )
         os.close(descriptor)
 
-    def ensure_registry(self) -> None:
-        # The runtime runs as the invoking host UID and reads this hash-only
-        # registry from its persistent state mount.
-        descriptor = _open_state_directory(
-            self.state_root, self.registry_dir, 0o700
-        )
-        os.close(descriptor)
-        if not self.registry_path.exists():
-            self.publish(())
-
     def _secret_paths(self, prefix: str) -> tuple[Path, Path]:
         root = self.secrets_dir / prefix
         descriptor = _open_state_directory(self.state_root, root, 0o700)
@@ -369,19 +359,6 @@ class HostProviders:
             earlier.add(definition.prefix)
         return tuple(prepared)
 
-    @staticmethod
-    def provider_scopes(
-        prepared: Iterable[PreparedProvider],
-    ) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
-        providers: dict[str, tuple[str, ...]] = {}
-        models: dict[str, tuple[str, ...]] = {}
-        for item in prepared:
-            providers[item.client.project_id] = tuple(
-                dict.fromkeys(model.partition("/")[0] for model in item.definition.inputs)
-            )
-            models[item.client.project_id] = item.definition.inputs
-        return providers, models
-
     def spec(self, item: PreparedProvider) -> ProviderSpec:
         return ProviderSpec(
             identity=item.identity,
@@ -444,11 +421,6 @@ class HostProviders:
             "revoked": False,
             "expires_at": None,
         }
-
-    def client_records(
-        self, prepared: Iterable[PreparedProvider]
-    ) -> tuple[dict[str, object], ...]:
-        return tuple(self.client_record(item) for item in prepared)
 
     def publish(self, providers: Iterable[Mapping[str, object]]) -> None:
         directory_descriptor = _open_state_directory(

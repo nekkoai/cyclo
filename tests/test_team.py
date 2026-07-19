@@ -73,7 +73,7 @@ def test_rejects_missing_role_file(team_repo: Path) -> None:
         load_team(team_repo)
 
 
-@pytest.mark.parametrize("name", [".", ".."])
+@pytest.mark.parametrize("name", [".", "..", ".hidden", "-hidden", "_hidden"])
 def test_rejects_path_segment_agent_names(team_repo: Path, name: str) -> None:
     (team_repo / "team").write_text(
         f"{name} planner pi openai-codex/gpt-test\n", encoding="utf-8"

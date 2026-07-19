@@ -46,8 +46,12 @@ require_tasks_dir
 
 TASK_DIR="$TASKS_DIR/$TASK_ID"
 
-[ -d "$TASK_DIR" ] || die "task '$TASK_ID' does not exist"
+[ -e "$TASK_DIR" ] || [ -L "$TASK_DIR" ] \
+    || die "task '$TASK_ID' does not exist"
+acquire_task_control_lock "$TASK_DIR"
+require_task_record_locked "$TASK_DIR"
 write_file_atomic "$TASK_DIR/state" "$STATE"
 append_task_log "$TASK_DIR" "State: $STATE" "$MESSAGE"
+release_task_control_lock
 
 echo "$TASK_ID: state -> $STATE"

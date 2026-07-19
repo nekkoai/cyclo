@@ -16,16 +16,21 @@ TASK_ID="$1"
 RESULT_FILE="$2"
 
 validate_task_id "$TASK_ID"
-[ -f "$RESULT_FILE" ] || die "result file '$RESULT_FILE' does not exist"
+[ -f "$RESULT_FILE" ] && [ ! -L "$RESULT_FILE" ] \
+    || die "result file '$RESULT_FILE' is symlinked or does not exist"
 [ -s "$RESULT_FILE" ] || die "result file '$RESULT_FILE' is empty"
 require_tasks_dir
 
 TASK_DIR="$TASKS_DIR/$TASK_ID"
 
-[ -d "$TASK_DIR" ] || die "task '$TASK_ID' does not exist"
-cp "$RESULT_FILE" "$TASK_DIR/result.md"
+[ -e "$TASK_DIR" ] || [ -L "$TASK_DIR" ] \
+    || die "task '$TASK_ID' does not exist"
+acquire_task_control_lock "$TASK_DIR"
+require_task_record_locked "$TASK_DIR"
+copy_file_atomic "$RESULT_FILE" "$TASK_DIR/result.md"
 write_file_atomic "$TASK_DIR/state" "done"
 append_task_log "$TASK_DIR" "Result recorded" "See result.md. State set to done."
+release_task_control_lock
 
 echo "$TASK_ID: result recorded"
 echo "$TASK_ID: state -> done"

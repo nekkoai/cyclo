@@ -15,7 +15,7 @@ from .errors import CycloError
 from .team_templates import packaged_team_template
 
 
-NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PROVIDER_RE = re.compile(r"^[a-z0-9_-]+$")
 RESERVED_PROVIDER_NAMES = {"__proto__", "constructor", "gateway", "prototype"}
 SUPPORTED_ENGINES = {"pi", "pi-interactive"}
@@ -84,10 +84,11 @@ def resolve_directory(value: str | os.PathLike[str], label: str) -> Path:
 
 
 def _validate_name(label: str, value: str, source: Path, line_no: int) -> None:
-    if value in {".", ".."} or not NAME_RE.fullmatch(value):
+    if not NAME_RE.fullmatch(value):
         raise CycloError(
-            f"{source}:{line_no}: invalid {label} {value!r}; use letters, "
-            "numbers, dot, underscore, or hyphen"
+            f"{source}:{line_no}: invalid {label} {value!r}; start with a "
+            "letter or number and use only letters, numbers, dot, underscore, "
+            "or hyphen"
         )
 
 
@@ -392,6 +393,7 @@ def verify_agentws_abi(root: Path) -> None:
         template / "tools" / "agent",
         template / "tools" / "agentws",
         template / "bin" / "agent-new",
+        template / "bin" / "job-reset-orphans",
         template / "bin" / "task-create",
     )
     missing = [str(path) for path in required if not path.is_file()]
@@ -402,6 +404,10 @@ def verify_agentws_abi(root: Path) -> None:
         template / "tools" / "agent": ("AGENTWS_TEAM_PROTOCOL", "AGENTWS_WORKSPACE"),
         template / "tools" / "agentws": ("--pin-root", "--read-only"),
         template / "bin" / "agent-new": ("AGENTWS_TEAM_ROLES_DIR",),
+        template / "bin" / "job-reset-orphans": (
+            "--all-active",
+            "CYCLO_RUNTIME_LOCK_FD",
+        ),
     }
     for path, markers in seams.items():
         text = path.read_text(encoding="utf-8", errors="replace")

@@ -704,6 +704,9 @@ def test_gateway_container_refuses_foreign_reuse_and_removal(
         host_models_json=tmp_path / "models.json",
         client_registry_dir=tmp_path / "registry",
     )
+    monkeypatch.setattr(
+        gateway, "validate_store_gateway_compatibility", lambda *_args, **_kwargs: ()
+    )
 
     with pytest.raises(CycloError, match="container name is already owned outside"):
         gateway.start_gateway(config, "admin-capability")
@@ -771,6 +774,233 @@ def _store_gateway_info(
             }
         ],
     }
+
+
+def _login_gateway_info(
+    resource_id: str,
+    name: str,
+    volume: str,
+    *,
+    source: str,
+    running: bool = True,
+    restarting: bool = False,
+) -> dict[str, object]:
+    info = _store_gateway_info(
+        resource_id,
+        name,
+        volume,
+        labels={
+            gateway.GATEWAY_OWNERSHIP_LABEL: gateway.GATEWAY_OWNERSHIP_VALUE,
+            gateway.GATEWAY_RESOURCE_LABEL: name,
+            gateway.GATEWAY_CONFIG_FINGERPRINT_LABEL: "configuration",
+        },
+    )
+    info["Image"] = f"image-{source}"
+    info["State"] = {
+        "Running": running,
+        "Restarting": restarting,
+        "Status": "restarting" if restarting else ("running" if running else "exited"),
+    }
+    return info
+
+
+def _patch_store_gateway_scan(monkeypatch, volume, containers) -> None:
+    monkeypatch.setattr(gateway, "gateway_image_fingerprint", lambda: "current")
+    monkeypatch.setattr(
+        gateway.runner_docker,
+        "docker_image_label",
+        lambda image, _label: image.removeprefix("image-"),
+    )
+
+    def candidates(selected):
+        assert selected == volume
+        return list(containers)
+
+    monkeypatch.setattr(gateway, "_container_ids_using_volume", candidates)
+    monkeypatch.setattr(
+        gateway,
+        "_inspect_gateway_container",
+        lambda identifier: containers.get(identifier),
+    )
+
+
+def test_login_refuses_any_stale_running_gateway_on_selected_store(
+    monkeypatch,
+) -> None:
+    volume = "selected-store"
+    containers = {
+        "current-id": _login_gateway_info(
+            "current-id", "cyclo-gateway-current", volume, source="current"
+        ),
+        "old-id": _login_gateway_info(
+            "old-id", "cyclo-gateway-old", volume, source="old"
+        ),
+    }
+    _patch_store_gateway_scan(monkeypatch, volume, containers)
+
+    with pytest.raises(CycloError, match=r"gateway restart --build"):
+        gateway.validate_login_store_gateways(volume)
+
+
+def test_login_allows_current_running_gateways_and_validates_configured_one(
+    monkeypatch,
+) -> None:
+    volume = "selected-store"
+    containers = {
+        "configured-id": _login_gateway_info(
+            "configured-id",
+            "cyclo-gateway-configured",
+            volume,
+            source="current",
+        ),
+        "other-id": _login_gateway_info(
+            "other-id", "cyclo-gateway-other", volume, source="current"
+        ),
+    }
+    validated: list[str] = []
+    _patch_store_gateway_scan(monkeypatch, volume, containers)
+
+    gateway.validate_login_store_gateways(
+        volume,
+        configured_container="cyclo-gateway-configured",
+        validate_config=lambda: validated.append("configured"),
+    )
+
+    assert validated == ["configured"]
+
+
+def test_login_allows_selected_store_when_no_gateway_is_running(monkeypatch) -> None:
+    volume = "selected-store"
+    stopped = _login_gateway_info(
+        "stopped-id",
+        "cyclo-gateway-old",
+        volume,
+        source="old",
+        running=False,
+    )
+    _patch_store_gateway_scan(
+        monkeypatch, volume, {"stopped-id": stopped}
+    )
+
+    gateway.validate_login_store_gateways(volume)
+
+
+def test_login_refuses_stale_restarting_gateway_even_when_not_running(
+    monkeypatch,
+) -> None:
+    volume = "selected-store"
+    restarting = _login_gateway_info(
+        "restarting-id",
+        "cyclo-gateway-old",
+        volume,
+        source="old",
+        running=False,
+        restarting=True,
+    )
+    _patch_store_gateway_scan(
+        monkeypatch, volume, {"restarting-id": restarting}
+    )
+
+    with pytest.raises(CycloError, match=r"gateway restart --build"):
+        gateway.validate_login_store_gateways(volume)
+
+
+def test_gateway_restart_retires_two_stale_store_peers_in_legal_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    volume = "selected-store"
+    first = "cyclo-gateway-first"
+    second = "cyclo-gateway-second"
+    stale = {first, second}
+    current: set[str] = set()
+    events: list[tuple[object, ...]] = []
+
+    def container_info(name: str) -> dict[str, object] | None:
+        if name not in stale and name not in current:
+            return None
+        return {
+            "Id": f"{name}-id",
+            "Config": {
+                "Labels": {
+                    gateway.GATEWAY_OWNERSHIP_LABEL: gateway.GATEWAY_OWNERSHIP_VALUE,
+                    gateway.GATEWAY_RESOURCE_LABEL: name,
+                    gateway.GATEWAY_CONFIG_FINGERPRINT_LABEL: "configuration",
+                }
+            },
+            "State": {"Running": True},
+            "NetworkSettings": {
+                "Networks": {"gateway": {"NetworkID": "network-id"}}
+            },
+        }
+
+    def stop(name: str) -> bool:
+        events.append(("stop", name))
+        stale.discard(name)
+        current.discard(name)
+        return True
+
+    def validate(selected_volume: str) -> tuple[str, ...]:
+        assert selected_volume == volume
+        events.append(("scan", *sorted(stale)))
+        if stale:
+            peer = sorted(stale)[0]
+            raise CycloError(
+                f"running gateway {peer} uses stale packaged code; "
+                "run `cyclo gateway restart --build`"
+            )
+        return tuple(sorted(current))
+
+    def run(command: list[str]) -> tuple[int, str]:
+        name = command[command.index("--name") + 1]
+        events.append(("run", name))
+        current.add(name)
+        return 0, f"{name}-id"
+
+    def config(name: str) -> Config:
+        return Config(
+            gateway_image="cyclo-gateway:test",
+            gateway_container=name,
+            gateway_network="cyclo-gateway-net-test",
+            store_volume=volume,
+            host_models_json=tmp_path / "models.json",
+            client_registry_dir=tmp_path / name,
+        )
+
+    monkeypatch.setattr(gateway, "_owned_gateway_container", container_info)
+    monkeypatch.setattr(gateway, "ensure_gateway_image", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gateway, "ensure_network", lambda _name: "network-id")
+    monkeypatch.setattr(
+        gateway, "gateway_config_fingerprint", lambda *_args: "configuration"
+    )
+    monkeypatch.setattr(gateway, "stop_gateway_container", stop)
+    monkeypatch.setattr(gateway, "validate_store_gateway_compatibility", validate)
+    monkeypatch.setattr(gateway.runner_docker, "run_command_capture", run)
+    monkeypatch.setattr(gateway, "_published_port", lambda *_args, **_kwargs: 49152)
+    monkeypatch.setattr(gateway, "wait_healthy", lambda _port: None)
+
+    with pytest.raises(CycloError, match=rf"{second}.*restart --build"):
+        gateway.ensure_gateway(
+            config(first), "admin-capability", force_restart=True
+        )
+    assert first not in stale
+    assert second in stale
+    assert events == [("stop", first), ("scan", second)]
+
+    gateway.ensure_gateway(config(second), "admin-capability", force_restart=True)
+    gateway.ensure_gateway(config(first), "admin-capability", force_restart=True)
+
+    assert stale == set()
+    assert current == {first, second}
+    assert events == [
+        ("stop", first),
+        ("scan", second),
+        ("stop", second),
+        ("scan",),
+        ("run", second),
+        ("stop", first),
+        ("scan",),
+        ("run", first),
+    ]
 
 
 def test_destroy_store_stops_every_verified_gateway_by_immutable_id(
@@ -1130,6 +1360,9 @@ def test_gateway_restarts_on_wrong_network_and_runs_by_verified_network_id(
     monkeypatch.setattr(
         gateway, "_owned_gateway_container", lambda _name: next(inspections)
     )
+    monkeypatch.setattr(
+        gateway, "validate_store_gateway_compatibility", lambda *_args, **_kwargs: ()
+    )
     monkeypatch.setattr(gateway, "ensure_gateway_image", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(gateway, "ensure_network", lambda _name: "verified-network-id")
     monkeypatch.setattr(
@@ -1192,6 +1425,9 @@ def test_gateway_force_restart_recreates_a_current_owned_container(
     commands: list[list[str]] = []
     monkeypatch.setattr(
         gateway, "_owned_gateway_container", lambda _name: next(inspections)
+    )
+    monkeypatch.setattr(
+        gateway, "validate_store_gateway_compatibility", lambda *_args, **_kwargs: ()
     )
     monkeypatch.setattr(gateway, "ensure_gateway_image", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(gateway, "ensure_network", lambda _name: "verified-network-id")
@@ -1301,6 +1537,7 @@ def test_oauth_login_is_interactive_hardened_and_uses_a_writable_store() -> None
 def test_status_container_is_hardened_and_credential_volume_is_read_only() -> None:
     command = cli.status_command("cyclo-gateway:test", "cyclo-store")
 
+    assert "--pull=never" in command
     assert "no-new-privileges" in command
     assert command[command.index("--cap-drop") + 1] == "ALL"
     assert "--read-only" in command
@@ -1309,6 +1546,65 @@ def test_status_container_is_hardened_and_credential_volume_is_read_only() -> No
         f"type=volume,src=cyclo-store,dst={gateway.GATEWAY_STORE_PATH},readonly"
         in command
     )
+
+
+def test_status_requires_current_image_without_building(
+    monkeypatch, capsys
+) -> None:
+    events: list[object] = []
+    monkeypatch.setattr(
+        gateway,
+        "require_gateway_image_current",
+        lambda image: events.append(("validate", image)),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "ensure_gateway_image",
+        lambda *_args, **_kwargs: pytest.fail("status must not build an image"),
+    )
+    monkeypatch.setattr(
+        cli.docker,
+        "run_command",
+        lambda command: events.append(("run", command)) or 0,
+    )
+
+    assert (
+        cli.main(
+            [
+                "status",
+                "--image",
+                "cyclo-gateway:test",
+                "--store-volume",
+                "cyclo-store",
+            ]
+        )
+        == 0
+    )
+
+    assert events[0] == ("validate", "cyclo-gateway:test")
+    assert events[1][0] == "run"
+    assert "--pull=never" in events[1][1]
+    assert capsys.readouterr().out == "gateway store volume: cyclo-store\n"
+
+
+def test_status_stale_image_fails_without_running_a_container(
+    monkeypatch, capsys
+) -> None:
+    def stale(_image: str) -> None:
+        raise CycloError(
+            "credential gateway image is missing or stale; run "
+            "`cyclo gateway restart --build`"
+        )
+
+    monkeypatch.setattr(gateway, "require_gateway_image_current", stale)
+    monkeypatch.setattr(
+        cli.docker,
+        "run_command",
+        lambda _command: pytest.fail("status must fail before docker run"),
+    )
+
+    assert cli.main(["status", "--image", "stale:test"]) == 1
+    assert "cyclo gateway restart --build" in capsys.readouterr().err
 
 
 def test_packaged_gateway_context_is_the_only_gateway_build_input() -> None:

@@ -99,6 +99,15 @@ class CredentialGateway:
             raise CycloError(f"gateway token is empty: {token_path}")
         return self.gateway.validate_running_gateway(self.config(), token)
 
+    def validate_login(self) -> None:
+        """Fail closed if a running writer on this store is incompatible."""
+
+        self.gateway.validate_login_store_gateways(
+            self.store_volume,
+            configured_container=self.container_name,
+            validate_config=self.validate_running,
+        )
+
     def restart(self, *, build: bool = False) -> dict[str, dict]:
         """Explicitly replace the gateway without rewriting its client registry."""
 

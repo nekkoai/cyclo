@@ -31,17 +31,25 @@ cyclo validate ~/teams/adversarial-audit
 
 ## Run
 
+Create `~/experiments/my-project/project.cyclo`:
+
+```text
+name my-project
+description Audit a project without modifying its source.
+team ../../teams/adversarial-audit ro
+mount source-snapshot ../../src/my-project ro
+```
+
 ```sh
-cyclo run --name adversarial-audit \
-  --project-read-only \
-  --offline \
-  ~/teams/adversarial-audit \
-  ~/src/my-project
-cyclo task adversarial-audit audit-001 /tmp/audit-001.md
-cyclo logs -f adversarial-audit
+cyclo validate ~/experiments/my-project/project.cyclo
+cyclo run --offline ~/experiments/my-project/project.cyclo
+cyclo task my-project-adversarial-audit audit-001 /tmp/audit-001.md
+cyclo logs -f my-project-adversarial-audit
 ```
 
 The task spec should state the audit scope, assets, attacker assumptions,
-excluded operations, and required evidence. Offline mode deliberately has no
+excluded operations, and required evidence. The read-only input is available at
+`/readonly/source-snapshot`; this audit configuration has no writable project.
+Offline mode deliberately has no
 per-team host viewer; use `cyclo logs`, `cyclo path`, or `cyclo dashboard`.
 This team cannot see another Cyclo team's private queue or transcripts.

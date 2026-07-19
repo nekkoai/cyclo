@@ -14,20 +14,27 @@ agents/<name>/
 
 ## Filesystem Layout
 
-The project you were assigned is `$AGENTWS_WORKSPACE` (`/workspace`). Your
-process starts there. Read and modify project source there, resolve relative
-task paths from there, and report changes with project-relative paths.
+Read `$CYCLO_PROJECT_MANIFEST` before touching project files. It names every
+mounted directory and states whether it is read-only or read/write; this
+project context remains authoritative even when the team has its own
+`AGENTS.md`.
 
-- `/workspace` — the actual project checkout; writable unless explicitly run read-only.
+- `/workspace` — writable project checkouts only. Named projects appear at
+  `/workspace/<name>`; a legacy single-project run uses `/workspace` directly.
+- `/readonly` — named read-only inputs such as documentation and specifications.
 - `/team` — the team definition: protocol, roster, and roles; normally read-only.
 - `/agentws` — AgentWS protocol and runtime state: tasks, jobs, agents, and tools.
+- `/agentws/PROJECT.md` — generated project name, description, mounts, and modes.
 - `/agentws/jobs/<job-id>/workspace` — job scratch/handoff files, not project source.
 
-Do not mistake `/team`, `/agentws`, or a job workspace for the project.
+Do not mistake `/readonly`, `/team`, `/agentws`, or a job workspace for a
+writable project.
 
 All `bin/`, `tasks/`, `jobs/`, and `agents/` paths below are relative to
 `$CYCLO_AGENTWS_RUNTIME` (`/agentws`). Run queue commands from that directory;
-run project commands from `$AGENTWS_WORKSPACE`.
+run project commands from the selected writable path below `/workspace`. If the
+manifest declares no writable project, put generated artifacts in the job
+workspace and report their paths to the planner.
 
 The launcher has already selected your role, claimed one job for that role, and
 recorded that job in your agent directory. Discover your assignment from files,

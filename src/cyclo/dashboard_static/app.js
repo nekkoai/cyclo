@@ -187,12 +187,27 @@
       id,
     ]);
     const team = basename(teamReference) || id;
+    const rawProject = asObject(raw.project);
     const project = firstString([
+      rawProject.name,
       typeof raw.project === "string" ? raw.project : "",
-      asObject(raw.project).path,
-      asObject(raw.project).name,
-      raw.project_path,
+      rawProject.path,
     ], "—");
+    const projectReference = firstString([
+      rawProject.definition,
+      rawProject.path,
+    ], project);
+    const projectDescription = stringValue(rawProject.description);
+    const normalizeProjectLocations = (values) => asArray(values).map((value) => {
+      const mount = asObject(value);
+      return {
+        name: stringValue(mount.name),
+        path: stringValue(mount.path),
+        containerPath: stringValue(mount.container_path),
+      };
+    }).filter((mount) => mount.name && mount.containerPath);
+    const workspaces = normalizeProjectLocations(rawProject.workspaces);
+    const readOnlyMounts = normalizeProjectLocations(rawProject.read_only_mounts);
     const mode = asObject(raw.mode);
     const counts = asObject(raw.counts);
     const tasks = normalizeCounterGroup(counts.tasks, ["total", "open", "closed"]);
@@ -217,7 +232,25 @@
     };
     const errors = asArray(raw.errors).map(errorMessage).filter(Boolean);
     const runtimeState = normalizeState(raw.state);
+    const rawHealth = asObject(raw.health);
+    const healthState = firstString([rawHealth.state], runtimeState === "running" ? "runtime-unknown" : "inactive").toLowerCase();
+    const knownHealthStates = [
+      "ready",
+      "runtime-down",
+      "runtime-stale",
+      "runtime-unknown",
+      "agents-attention",
+      "agents-suspended",
+      "agents-unknown",
+      "inactive",
+    ];
+    const health = {
+      state: knownHealthStates.includes(healthState) ? healthState : "runtime-unknown",
+      reason: firstString([rawHealth.reason], raw.health ? "" : "runtime status unavailable"),
+    };
     const needsAttention = runtimeState === "attention"
+      || health.state.startsWith("runtime-")
+      || health.state.startsWith("agents-")
       || errors.length > 0
       || jobs.failed > 0
       || jobs.unknown > 0;
@@ -227,13 +260,17 @@
       team,
       teamReference,
       project,
+      projectReference,
+      projectDescription,
+      workspaces,
+      readOnlyMounts,
       state: runtimeState,
       displayState,
       rawState: stringValue(raw.state, "unknown"),
+      health,
       mode: {
         offline: Boolean(mode.offline),
         teamWrite: Boolean(mode.team_write),
-        projectReadOnly: Boolean(mode.project_read_only),
       },
       generation: firstString([raw.generation, raw.team_generation], "—"),
       agentwsUrl: agentwsUrlForCurrentHost(raw.agentws_port),
@@ -283,6 +320,7 @@
     const summary = {
       ...computed,
       running: asNumber(provided.running, computed.running),
+      runtimeIssues: asNumber(provided.runtime_issues, computed.runtimeIssues),
       attention: asNumber(provided.attention, computed.attention),
       sourceErrors: sourceErrors.length,
     };
@@ -305,6 +343,7 @@
     const summary = {
       total: instances.length,
       running: 0,
+      runtimeIssues: 0,
       attention: 0,
       tasks: { total: 0, open: 0, closed: 0 },
       jobs: { total: 0, active: 0, done: 0, failed: 0, unknown: 0 },
@@ -315,6 +354,7 @@
     };
     for (const instance of instances) {
       if (instance.state === "running") summary.running += 1;
+      if (instance.health.state.startsWith("runtime-")) summary.runtimeIssues = 1;
       if (instance.displayState === "attention") summary.attention += 1;
       summary.tasks.total += instance.tasks.total;
       summary.tasks.open += instance.tasks.open;
@@ -412,7 +452,6 @@
 
   function stateLabel(instance) {
     if (instance.state === "attention") return instance.rawState;
-    if (instance.displayState === "attention") return "attention";
     if (instance.state === "running") return "running";
     if (instance.state === "starting") return "starting";
     if (instance.state === "stopped") return "stopped";
@@ -452,7 +491,7 @@
     elements.statTokens.title = `${formatCount(summary.tokens)} tokens`;
     elements.statTokensDetail.textContent = `${plural(summary.requests, "request")} · input + output`;
     elements.statAttention.textContent = formatCount(summary.attention);
-    elements.statAttentionDetail.textContent = `${plural(summary.jobs.failed, "failed job")} · ${plural(summary.errors, "data error")}`;
+    elements.statAttentionDetail.textContent = `${plural(summary.jobs.failed, "failed job")} · ${plural(summary.runtimeIssues, "runtime issue")} · ${plural(summary.errors, "data error")}`;
     elements.attentionStat.classList.toggle("has-attention", summary.attention > 0);
   }
 
@@ -461,10 +500,6 @@
       {
         label: instance.mode.offline ? "network: offline" : "network: online",
         className: instance.mode.offline ? "mode-badge--offline" : "mode-badge--online",
-      },
-      {
-        label: instance.mode.projectReadOnly ? "project: read-only" : "project: writable",
-        className: instance.mode.projectReadOnly ? "mode-badge--readonly" : "mode-badge--write",
       },
       {
         label: instance.mode.teamWrite ? "team: writable" : "team: read-only",
@@ -537,7 +572,7 @@
     name.title = instance.teamReference;
     identifier.textContent = instance.id;
     identifier.title = instance.id;
-    pill.dataset.state = instance.displayState;
+    pill.dataset.state = instance.state;
     pill.querySelector("b").textContent = stateLabel(instance);
 
     const workspaceIsAvailable = Boolean(instance.agentwsUrl) && instance.state === "running" && !instance.mode.offline;
@@ -549,9 +584,34 @@
 
     appendModeBadges(fragment.querySelector(".mode-list"), instance);
 
+    const runtimeHealth = fragment.querySelector(".runtime-health");
+    runtimeHealth.dataset.state = instance.health.state;
+    runtimeHealth.textContent = instance.health.state === "inactive"
+      ? "—"
+      : [instance.health.state, instance.health.reason].filter(Boolean).join(" · ");
+    runtimeHealth.title = instance.health.reason;
+
     const project = fragment.querySelector(".project-path");
     project.textContent = instance.project;
-    project.title = instance.project;
+    project.title = [instance.projectDescription, instance.projectReference]
+      .filter(Boolean)
+      .join("\n");
+    const describeLocations = (locations, singular) => {
+      if (!locations.length) return "None";
+      if (locations.length === 1) {
+        return `${locations[0].name} → ${locations[0].containerPath}`;
+      }
+      return plural(locations.length, singular);
+    };
+    const locationTitle = (locations) => locations
+      .map((mount) => `${mount.name}: ${mount.path} → ${mount.containerPath}`)
+      .join("\n");
+    const workspaces = fragment.querySelector(".workspace-paths");
+    workspaces.textContent = describeLocations(instance.workspaces, "workspace");
+    workspaces.title = locationTitle(instance.workspaces);
+    const readOnlyMounts = fragment.querySelector(".readonly-paths");
+    readOnlyMounts.textContent = describeLocations(instance.readOnlyMounts, "mount");
+    readOnlyMounts.title = locationTitle(instance.readOnlyMounts);
     const generation = fragment.querySelector(".generation");
     generation.textContent = instance.generation;
     generation.title = instance.generation;
@@ -607,9 +667,15 @@
         instance.team,
         instance.teamReference,
         instance.project,
+        instance.projectDescription,
+        instance.projectReference,
+        ...instance.workspaces.flatMap((mount) => [mount.name, mount.path, mount.containerPath]),
+        ...instance.readOnlyMounts.flatMap((mount) => [mount.name, mount.path, mount.containerPath]),
         instance.id,
         instance.generation,
         instance.rawState,
+        instance.health.state,
+        instance.health.reason,
         ...instance.errors,
       ].join(" ").toLocaleLowerCase();
       const queryMatches = !query || searchText.includes(query);
@@ -618,7 +684,6 @@
       const modeMatches = mode === "all"
         || (mode === "online" && !instance.mode.offline)
         || (mode === "offline" && instance.mode.offline)
-        || (mode === "project-read-only" && instance.mode.projectReadOnly)
         || (mode === "team-write" && instance.mode.teamWrite);
       return queryMatches && statusMatches && modeMatches;
     });

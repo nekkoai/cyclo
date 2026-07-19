@@ -25,7 +25,7 @@ PUBLIC_DIR = Path(__file__).resolve().parent / "agentws-public"
 DEFAULT_PORT = 4137
 PROCESS_CHECK_INTERVAL = 1.0
 PROCESS_RESTART_DELAY = 1.0
-VALID_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+VALID_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 VALID_TEAM_ENGINES = {"pi", "pi-interactive", "codex", "claude"}
 ALLOWED_FILES = {
     "task": {"log.md", "spec.md", "result.md", "state"},
@@ -96,7 +96,8 @@ def _validate_team_role(role: str, label: str, manifest: Path):
     if not VALID_ID.match(role):
         raise ValueError(
             f"team manifest {manifest}: invalid {label} '{role}' - "
-            "only alphanumeric, dot, underscore, and hyphen allowed"
+            "must start with an alphanumeric character and contain only "
+            "alphanumeric, dot, underscore, and hyphen"
         )
 
 

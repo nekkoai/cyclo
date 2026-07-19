@@ -41,9 +41,11 @@ empty_home=$work_root/home
 state_root=$work_root/state
 team=$work_root/team
 project=$work_root/project
+documentation=$work_root/documentation
+project_file=$work_root/project.cyclo
 doctor_log=$work_root/doctor.log
 
-mkdir -p "$dist" "$source_tree" "$empty_home" "$project"
+mkdir -p "$dist" "$source_tree" "$empty_home" "$project" "$documentation"
 
 # Build from exactly the files that could enter a source publication. This
 # prevents setuptools from reusing ignored build/lib files deleted from source.
@@ -127,10 +129,12 @@ forbidden_names = {
     "cyclo/credential_gateway/UPSTREAM.json",
 }
 required_names = {
+    "cyclo/project.py",
     "cyclo/host_config.py",
     "cyclo/host_providers.py",
     "cyclo/provider_runtime.py",
     "cyclo/provider_service.py",
+    "cyclo/runtime_container.py",
     "cyclo/credential_gateway/gateway_context/Dockerfile",
     "cyclo/credential_gateway/gateway_context/model-metadata.mjs",
     "cyclo/credential_gateway/gateway_context/response-redaction.mjs",
@@ -280,6 +284,42 @@ expected_templates=$(printf '%s\n' \
     --model openai-codex/release-acceptance
 "$cyclo" validate "$team"
 
+printf '%s\n' \
+    'name release-acceptance' \
+    'description Exercise packaged multi-mount project definitions.' \
+    'team ./team ro' \
+    'mount source ./project rw' \
+    'mount documentation ./documentation ro' \
+    >"$project_file"
+"$cyclo" validate "$project_file"
+
+project_dry_run=$(
+    "$cyclo" --state-root "$state_root" run \
+        --dry-run \
+        "$project_file"
+)
+printf '%s\n' "$project_dry_run"
+case $project_dry_run in
+    *"dst=/workspace,readonly"*) ;;
+    *) fail "project.cyclo dry-run did not make the workspace namespace read-only" ;;
+esac
+case $project_dry_run in
+    *"dst=/readonly,readonly"*) ;;
+    *) fail "project.cyclo dry-run did not make the read-only namespace inert" ;;
+esac
+case $project_dry_run in
+    *"type=bind,src=$project,dst=/workspace/source"*) ;;
+    *) fail "project.cyclo dry-run omitted its writable source mount" ;;
+esac
+case $project_dry_run in
+    *"type=bind,src=$documentation,dst=/readonly/documentation,readonly"*) ;;
+    *) fail "project.cyclo dry-run omitted its read-only documentation mount" ;;
+esac
+case $project_dry_run in
+    *"CYCLO_PROJECT_MANIFEST=/agentws/PROJECT.md"*) ;;
+    *) fail "project.cyclo dry-run omitted agent project context" ;;
+esac
+
 dry_run=$(
     "$cyclo" --state-root "$state_root" run \
         --name release-acceptance \
@@ -298,7 +338,7 @@ case $dry_run in
 esac
 case $dry_run in
     *"type=bind,src=$project,dst=/workspace"*) ;;
-    *) fail "dry-run did not isolate the project mount" ;;
+    *) fail "dry-run did not isolate the writable project" ;;
 esac
 case $dry_run in
     *multiagent*|*"$HOME/agentws"*|*"$HOME/multiagent"*)

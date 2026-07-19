@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -13,20 +16,24 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 
-NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEFAULT_MAX_JOB_ATTEMPTS = 3
 RETRYABLE_AGENT_EXIT = 75
 FATAL_AGENT_EXIT = 70
 JOB_ATTEMPTS_FILE = ".agent-attempts"
 ENGINE_STOP_SECONDS = 2.0
+PR_SET_CHILD_SUBREAPER = 36
+_SUBREAPER_ENABLED = False
 
 
 def timestamp() -> str:
@@ -44,9 +51,16 @@ class ShutdownRequested(Exception):
         self.signum = signum
 
 
+class StoredRetryBudgetExhausted(Exception):
+    """Skip the engine and settle an already-exhausted claimed job."""
+
+
 def validate_name(label: str, value: str) -> None:
-    if not value or not NAME_RE.match(value):
-        die(f"invalid {label} '{value}' - only alphanumeric, dot, underscore, and hyphen allowed")
+    if not value or not NAME_RE.fullmatch(value):
+        die(
+            f"invalid {label} '{value}' - must start with an alphanumeric "
+            "character and contain only alphanumeric, dot, underscore, and hyphen"
+        )
 
 
 def configured_team_path(root: Path, env_name: str, default: Path) -> Path:
@@ -79,6 +93,16 @@ def load_team_context(root: Path, role: str):
     return protocol_file, role_file, protocol_text, role_text
 
 
+def load_project_context(root: Path) -> tuple[Path | None, str]:
+    value = os.environ.get("CYCLO_PROJECT_MANIFEST")
+    if not value:
+        return None, ""
+    manifest = configured_team_path(root, "CYCLO_PROJECT_MANIFEST", root / "PROJECT.md")
+    if not manifest.is_file():
+        die(f"Cyclo project manifest not found: {manifest}")
+    return manifest, manifest.read_text(encoding="utf-8", errors="replace")
+
+
 def build_initial_prompt(
     agent_name: str,
     role: str,
@@ -89,6 +113,8 @@ def build_initial_prompt(
     protocol_text: str,
     role_text: str,
     console: bool = False,
+    project_file: Path | None = None,
+    project_text: str = "",
 ) -> str:
     mode_text = """
 You are the AgentWS console assistant. You are not assigned a queued job and do
@@ -96,24 +122,41 @@ not have a current-job. The queued-job lifecycle portions of the generic
 protocol do not apply to this console session. Use the local AgentWS bin/ tools
 to inspect and manage tasks, jobs, and agents, and dispatch work when asked.
 """ if console else ""
+    project_source = str(project_file) if project_file is not None else "not provided"
+    project_section = (
+        f"""
+<cyclo-project>
+{project_text.strip()}
+</cyclo-project>
+"""
+        if project_text.strip()
+        else ""
+    )
     return f"""You are agent {agent_name} with role {role}.
 
 AgentWS runtime root: {runtime_root}
-Project root (current working directory): {workspace}
+Workspace namespace (current working directory): {workspace}
+Cyclo project manifest: {project_source}
 Team protocol source: {protocol_file}
 Role instruction source: {role_file}
 {mode_text}
-Run AgentWS queue and state commands from the runtime root above. Use the agent
-project root as the default location for inspection and work unless the task or
-job names a more specific worktree. Interpret relative paths in user tasks from
-that project root. The container mount name is an internal runtime detail: do
-not require the task author to name it, and report changed artifacts with
-repository-relative paths whenever possible.
+Run AgentWS queue and state commands from the runtime root above. Use the
+project layout as the default location for inspection and work unless the task
+or job names a more specific worktree. Interpret task paths using the Cyclo
+project manifest. Writable named projects are under `/workspace/<name>`;
+read-only inputs are under `/readonly/<name>`. In a direct compatibility run,
+project paths are relative to `/workspace`. Report changed artifacts using
+their actual mounted paths.
 
-The complete protocol and role instructions are included below. Treat this
-included content as authoritative; you do not need cwd-based prompt discovery.
+The Cyclo project manifest is independent of the team protocol. It defines the
+actual writable workspaces and read-only inputs. Read it before touching project
+files, including when the team supplies its own AGENTS.md.
+
+The complete project, protocol, and role instructions are included below.
+Treat this included content as authoritative; you do not need cwd-based prompt discovery.
 When the protocol tells you to read roles/<role>.md, use the role instructions
 included here or their explicit source path above.
+{project_section}
 
 <agentws-protocol>
 {protocol_text.strip()}
@@ -160,6 +203,38 @@ def job_owned_by(job_dir: Path, agent_name: str) -> bool:
         and read_job_owner(job_dir) == agent_name
         and (job_dir / "lock").is_dir()
     )
+
+
+@contextmanager
+def job_control_lock(job_dir: Path) -> Iterable[None]:
+    control_path = job_dir / ".control.lock"
+    open_flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    open_flags |= (
+        getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(control_path, open_flags, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as control_file:
+        if not stat.S_ISREG(os.fstat(control_file.fileno()).st_mode):
+            raise OSError(f"invalid job control lock: {control_path}")
+        fcntl.flock(control_file.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def write_job_status_atomic(job_dir: Path, status_text: str) -> None:
+    status_path = job_dir / "status"
+    temporary = status_path.with_name(
+        f".{status_path.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}"
+    )
+    try:
+        temporary.write_text(status_text + "\n", encoding="utf-8")
+        os.replace(temporary, status_path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _attempt_path(job_dir: Path) -> Path:
@@ -276,36 +351,27 @@ def force_fail_owned_job(
     job lock; otherwise this function leaves state untouched.
     """
 
-    if not job_owned_by(job_dir, agent_name):
-        print(
-            f"warning: cannot fail job {job_id} safely: ownership was lost",
-            file=sys.stderr,
-        )
-        return False
     try:
-        append_job_log(job_dir, "Failed by agent safety fallback", message)
-        status_path = job_dir / "status"
-        temporary = status_path.with_name(
-            f".{status_path.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}"
-        )
-        try:
-            temporary.write_text("failed\n", encoding="utf-8")
-            os.replace(temporary, status_path)
-        finally:
+        with job_control_lock(job_dir):
+            if not job_owned_by(job_dir, agent_name):
+                print(
+                    f"warning: cannot fail job {job_id} safely: ownership was lost",
+                    file=sys.stderr,
+                )
+                return False
+
+            append_job_log(job_dir, "Failed by agent safety fallback", message)
+            write_job_status_atomic(job_dir, "failed")
             try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-        try:
-            (job_dir / "lock").rmdir()
-        except OSError as exc:
-            # The terminal status is already durable and prevents another
-            # launch. Leave the lock for job-reap and report the damage.
-            print(
-                f"warning: job {job_id} failed closed but its lock remains: {exc}",
-                file=sys.stderr,
-            )
-        return True
+                (job_dir / "lock").rmdir()
+            except OSError as exc:
+                # The terminal status is already atomically published and prevents another
+                # launch. Leave the lock for job-reap and report the damage.
+                print(
+                    f"warning: job {job_id} failed closed but its lock remains: {exc}",
+                    file=sys.stderr,
+                )
+            return True
     except OSError as exc:
         print(f"warning: cannot fail job {job_id} safely: {exc}", file=sys.stderr)
         return False
@@ -324,7 +390,7 @@ def transition_or_fail_closed(
     if run_job_transition(root, command, job_id, agent_name, message):
         return True, False
     fallback_message = (
-        f"The normal {command} transition failed. The wrapper failed this job "
+        f"The normal {command} transition failed. The worker failed this job "
         "closed to prevent an unbounded retry or a stranded owned job."
     )
     return (
@@ -333,22 +399,265 @@ def transition_or_fail_closed(
     )
 
 
-def fail_exhausted_job(
+def _read_regular_text(path: Path, maximum: int) -> str | None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            raw = stream.read(maximum + 1)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(raw) > maximum:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _is_regular_file(path: Path) -> bool:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        return stat.S_ISREG(os.fstat(descriptor).st_mode)
+    except OSError:
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def automatic_failure_notification_id(task_id: str, job_id: str) -> str:
+    digest = hashlib.sha256(f"{task_id}\0{job_id}".encode()).hexdigest()[:20]
+    stem = job_id[:40].rstrip("._-")
+    return f"{stem}-engine-failure-{digest}"
+
+
+def automatic_failure_notification_spec(
+    task_id: str,
+    job_id: str,
+    source_role: str,
+) -> str:
+    return f"""# Notify Planner: {job_id}
+
+## Task
+{task_id}
+
+## Source Job
+{job_id}
+
+## Source Role
+{source_role}
+
+## Event
+terminal engine failure
+
+## Reason
+The model engine did not finish the source job within AgentWS's bounded
+automatic retry lifecycle.
+
+## Settlement
+AgentWS publishes this notice before terminally failing the source job so a
+worker crash cannot lose the alert. The source may still be claimed briefly;
+restart recovery reuses this exact notice and completes settlement. The source
+job's log.md will contain the precise terminal error once settlement completes.
+
+## Follow-Up Jobs Created
+none
+
+## Documentation Requests Created
+none
+
+## Evidence
+After settlement, read jobs/{job_id}/log.md for the exact terminal engine error
+and retry history.
+
+## When Done
+Record the failure on the task, decide how the task should recover, and mark
+this planner notification done.
+"""
+
+
+def automatic_failure_notification_matches(
+    notification_dir: Path,
+    *,
+    task_id: str,
+    expected_spec: str,
+) -> bool:
+    try:
+        directory_info = notification_dir.lstat()
+        workspace_info = (notification_dir / "workspace").lstat()
+    except OSError:
+        return False
+    if not stat.S_ISDIR(directory_info.st_mode) or not stat.S_ISDIR(
+        workspace_info.st_mode
+    ):
+        return False
+    role = _read_regular_text(notification_dir / "role", 1024)
+    task = _read_regular_text(notification_dir / "task-id", 1024)
+    status = _read_regular_text(notification_dir / "status", 1024)
+    spec = _read_regular_text(notification_dir / "spec.md", 256 * 1024)
+    return (
+        role is not None
+        and role.strip() == "planner"
+        and task is not None
+        and task.strip() == task_id
+        and status is not None
+        and status.strip() in {"pending", "claimed", "running", "done", "failed"}
+        and spec is not None
+        and spec == expected_spec
+        and _is_regular_file(notification_dir / "log.md")
+        and _is_regular_file(notification_dir / ".control.lock")
+    )
+
+
+def ensure_automatic_failure_notification(
+    root: Path,
+    job_dir: Path,
+    job_id: str,
+) -> bool:
+    source_role_text = _read_regular_text(job_dir / "role", 1024)
+    if source_role_text is None:
+        print(
+            f"warning: cannot notify planner for {job_id}: invalid source role",
+            file=sys.stderr,
+        )
+        return False
+    source_role = source_role_text.strip()
+    if source_role == "planner":
+        return True
+
+    task_text = _read_regular_text(job_dir / "task-id", 1024)
+    task_id = task_text.strip() if task_text is not None else ""
+    if not NAME_RE.fullmatch(source_role) or not NAME_RE.fullmatch(task_id):
+        print(
+            f"warning: cannot notify planner for {job_id}: invalid role or task ID",
+            file=sys.stderr,
+        )
+        return False
+
+    notification_id = automatic_failure_notification_id(task_id, job_id)
+    notification_dir = root / "jobs" / notification_id
+    spec = automatic_failure_notification_spec(task_id, job_id, source_role)
+    if notification_dir.exists() or notification_dir.is_symlink():
+        if automatic_failure_notification_matches(
+            notification_dir,
+            task_id=task_id,
+            expected_spec=spec,
+        ):
+            return True
+        print(
+            f"warning: planner notification collision for {job_id}: "
+            f"{notification_id}",
+            file=sys.stderr,
+        )
+        return False
+
+    descriptor = -1
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="agentws-engine-failure-",
+            suffix=".md",
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(spec)
+        process = subprocess.run(
+            [
+                str(root / "bin" / "job-create"),
+                notification_id,
+                "-r",
+                "planner",
+                "-t",
+                task_id,
+                str(temporary),
+            ],
+            cwd=root,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        if automatic_failure_notification_matches(
+            notification_dir,
+            task_id=task_id,
+            expected_spec=spec,
+        ):
+            return True
+        detail = (process.stderr or "").strip() or f"exit status {process.returncode}"
+        print(
+            f"warning: planner notification creation failed for {job_id}: {detail}",
+            file=sys.stderr,
+        )
+        return False
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(
+            f"warning: planner notification creation failed for {job_id}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def settle_stored_retry_budget_exhaustion(
     root: Path,
     job_dir: Path,
     job_id: str,
     agent_name: str,
+    *,
     maximum: int,
-) -> tuple[bool, bool]:
-    if not job_owned_by(job_dir, agent_name):
-        return False, False
-    message = (
+) -> int:
+    """Fail a job whose retry budget was exhausted before engine launch."""
+
+    failure_message = (
         f"Agent retry safety budget exhausted after {maximum} unsuccessful "
         "process attempts; refusing another model launch."
     )
-    return transition_or_fail_closed(
-        root, job_dir, job_id, agent_name, "job-fail", message
+    if not ensure_automatic_failure_notification(
+        root,
+        job_dir,
+        job_id,
+    ):
+        return FATAL_AGENT_EXIT
+    settled, used_fallback = transition_or_fail_closed(
+        root,
+        job_dir,
+        job_id,
+        agent_name,
+        "job-fail",
+        failure_message,
     )
+    if not settled or used_fallback:
+        return FATAL_AGENT_EXIT
+    return RETRYABLE_AGENT_EXIT
 
 
 def settle_job_after_process(
@@ -367,6 +676,10 @@ def settle_job_after_process(
     """Settle the claimed job and return the supervisor-visible process status."""
 
     status = read_job_status(job_dir)
+    if status in {"done", "failed"}:
+        clear_job_attempts(job_dir)
+        return 0
+
     if interrupted:
         if job_owned_by(job_dir, agent_name):
             try:
@@ -389,20 +702,27 @@ def settle_job_after_process(
                 return FATAL_AGENT_EXIT
         return process_status
 
-    if status in {"done", "failed"}:
-        clear_job_attempts(job_dir)
-        return 0
-
     if job_owned_by(job_dir, agent_name):
-        if attempt <= 0 or attempt >= maximum:
+        terminal_failure = attempt <= 0 or attempt >= maximum
+        if terminal_failure:
+            failure_message = (
+                f"{label} process exited with status {process_status} without "
+                f"finishing the job; retry safety budget exhausted "
+                f"({attempt}/{maximum})."
+            )
+            if not ensure_automatic_failure_notification(
+                root,
+                job_dir,
+                job_id,
+            ):
+                return FATAL_AGENT_EXIT
             settled, used_fallback = transition_or_fail_closed(
                 root,
                 job_dir,
                 job_id,
                 agent_name,
                 "job-fail",
-                f"{label} process exited with status {process_status} without "
-                f"finishing the job; retry safety budget exhausted ({attempt}/{maximum}).",
+                failure_message,
             )
         else:
             settled, used_fallback = transition_or_fail_closed(
@@ -440,7 +760,11 @@ def append_job_log(job_dir: Path, summary: str, detail: str) -> None:
         f.write(detail.rstrip() + "\n\n")
 
 
-def run_bin(root: Path, *args: str, capture: bool = True) -> subprocess.CompletedProcess[str]:
+def run_bin(
+    root: Path,
+    *args: str,
+    capture: bool = True,
+) -> subprocess.CompletedProcess[str]:
     proc = subprocess.run(
         [str(root / "bin" / args[0]), *args[1:]],
         cwd=root,
@@ -878,7 +1202,32 @@ def build_command(engine: str, model: str | None, agent_dir: Path, prompt: str) 
     raise AssertionError(engine)
 
 
+def enable_child_subreaper() -> None:
+    """Make this worker the adoption point for daemonized engine descendants."""
+
+    global _SUBREAPER_ENABLED
+    if _SUBREAPER_ENABLED:
+        return
+    if sys.platform != "linux":
+        raise OSError("AgentWS process fencing requires Linux child-subreaper support")
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    prctl.restype = ctypes.c_int
+    if prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    _SUBREAPER_ENABLED = True
+
+
 def launch_engine(command: list[str], workspace: Path, **kwargs):
+    enable_child_subreaper()
     kwargs.setdefault("start_new_session", True)
     return subprocess.Popen(command, cwd=workspace, **kwargs)
 
@@ -893,26 +1242,92 @@ def _engine_group_exists(process: subprocess.Popen[str]) -> bool:
     return True
 
 
+def _direct_child_pids() -> list[int] | None:
+    children = Path(
+        f"/proc/{os.getpid()}/task/{threading.get_native_id()}/children"
+    )
+    try:
+        values = children.read_text(encoding="ascii").split()
+        return [int(value) for value in values]
+    except (OSError, ValueError):
+        return None
+
+
+def _reap_adopted_children() -> None:
+    while True:
+        try:
+            child, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except InterruptedError:
+            continue
+        if child == 0:
+            return
+
+
+def _stop_adopted_children(*, timeout: float = ENGINE_STOP_SECONDS) -> bool:
+    """Stop every child adopted from the engine, including new sessions."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _reap_adopted_children()
+        children = _direct_child_pids()
+        if children is None:
+            return False
+        if not children:
+            return True
+        for child in children:
+            try:
+                os.kill(child, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return False
+        time.sleep(0.02)
+
+    kill_deadline = time.monotonic() + 1.0
+    while time.monotonic() < kill_deadline:
+        _reap_adopted_children()
+        children = _direct_child_pids()
+        if children is None:
+            return False
+        if not children:
+            return True
+        for child in children:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return False
+        time.sleep(0.02)
+    _reap_adopted_children()
+    return _direct_child_pids() == []
+
+
 def stop_engine_process_group(
     process: subprocess.Popen[str] | None,
     *,
     timeout: float = ENGINE_STOP_SECONDS,
-) -> None:
-    """Terminate the engine session, including descendants of an exited CLI."""
+) -> bool:
+    """Best-effort cleanup for controlled exits.
+
+    An abruptly killed worker cannot execute this function. In that case the
+    team supervisor exits and Docker tears down the complete container cgroup.
+    """
 
     if process is None:
-        return
+        return True
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
 
     deadline = time.monotonic() + timeout
-    if process.poll() is None:
-        try:
-            process.wait(timeout=max(0.05, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            pass
+    try:
+        process.wait(timeout=max(0.05, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        pass
     while _engine_group_exists(process) and time.monotonic() < deadline:
         time.sleep(0.02)
     if _engine_group_exists(process):
@@ -924,32 +1339,26 @@ def stop_engine_process_group(
         try:
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=1)
+            return False
+    adopted_stopped = _stop_adopted_children()
+    group_stopped = not _engine_group_exists(process)
+    return group_stopped and adopted_stopped
 
 
 def join_reader_threads(
     threads: Iterable[threading.Thread],
-    process: subprocess.Popen[str] | None,
     *,
     timeout: float = ENGINE_STOP_SECONDS,
 ) -> bool:
-    """Drain engine pipes, closing them only if a reader refuses to exit."""
+    """Drain engine pipes without blocking cleanup on a stuck reader."""
 
     thread_list = list(threads)
     deadline = time.monotonic() + timeout
     for thread in thread_list:
         thread.join(timeout=max(0.0, deadline - time.monotonic()))
-    alive = [thread for thread in thread_list if thread.is_alive()]
-    if alive and process is not None:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-        for thread in alive:
-            thread.join(timeout=0.5)
+    # Closing a TextIOWrapper can block on a reader thread's internal lock.
+    # Report failure instead; exit status 70 makes the supervisor restart the
+    # container, whose cgroup teardown closes every remaining pipe holder.
     return not any(thread.is_alive() for thread in thread_list)
 
 
@@ -964,8 +1373,13 @@ def main() -> int:
 
     if shutil.which(args.engine) is None:
         die(f"required command not found: {args.engine}")
+    try:
+        enable_child_subreaper()
+    except OSError as exc:
+        die(f"cannot establish the agent process fence: {exc}")
 
     protocol_file, role_file, protocol_text, role_text = load_team_context(root, args.role)
+    project_file, project_text = load_project_context(root)
     max_job_attempts = positive_env_int(
         "AGENTWS_MAX_JOB_ATTEMPTS", DEFAULT_MAX_JOB_ATTEMPTS
     )
@@ -994,6 +1408,7 @@ def main() -> int:
     previous_handlers = {signum: signal.getsignal(signum) for signum in shutdown_signals}
     process_status = 1
     interrupted = False
+    stored_retry_budget_exhausted = False
     defer_shutdown = False
     deferred_shutdown_signum = 0
 
@@ -1037,20 +1452,8 @@ def main() -> int:
         assert job_dir is not None
         previous_attempts, attempt = record_job_attempt(job_dir, max_job_attempts)
         if previous_attempts >= max_job_attempts:
-            settled, used_fallback = fail_exhausted_job(
-                root,
-                job_dir,
-                job_id,
-                args.agent_name,
-                max_job_attempts,
-            )
-            settlement_needed = not settled
-            process_status = (
-                FATAL_AGENT_EXIT
-                if not settled or used_fallback
-                else RETRYABLE_AGENT_EXIT
-            )
-            return process_status
+            stored_retry_budget_exhausted = True
+            raise StoredRetryBudgetExhausted
 
         prompt = build_initial_prompt(
             args.agent_name,
@@ -1061,6 +1464,8 @@ def main() -> int:
             role_file,
             protocol_text,
             role_text,
+            project_file=project_file,
+            project_text=project_text,
         )
         write_file(agent_dir / "prompt.md", prompt)
 
@@ -1136,26 +1541,32 @@ def main() -> int:
         for thread in reader_threads:
             thread.start()
         process_status = proc.wait()
+    except StoredRetryBudgetExhausted:
+        process_status = RETRYABLE_AGENT_EXIT
     except ShutdownRequested as exc:
         if transcript is not None:
             transcript.event("run interrupted", f"signal: {exc.signum}")
         process_status = 128 + exc.signum
         interrupted = True
     except Exception as exc:
-        print(f"error: agent wrapper failed: {exc}", file=sys.stderr)
+        print(f"error: agent worker failed: {exc}", file=sys.stderr)
         traceback.print_exc()
         if transcript is not None:
             transcript.event("run failed", f"{type(exc).__name__}: {exc}")
         process_status = 1
     finally:
-        # Once cleanup begins, a repeated stop request must not interrupt the
+        # Once cleanup begins, a repeated stop request must not interrupt a
         # durable job transition.
         for signum, handler in previous_handlers.items():
             signal.signal(signum, signal.SIG_IGN)
-        stop_engine_process_group(proc)
-        readers_stopped = join_reader_threads(reader_threads, proc)
-        if not readers_stopped:
-            print("warning: engine output reader did not stop", file=sys.stderr)
+        cleanup_clean = stop_engine_process_group(proc)
+        readers_stopped = join_reader_threads(reader_threads)
+        cleanup_clean = cleanup_clean and readers_stopped
+        if not cleanup_clean:
+            print(
+                "error: engine cleanup did not complete; restarting the team container",
+                file=sys.stderr,
+            )
             process_status = FATAL_AGENT_EXIT
         if transcript is not None and proc is not None and not interrupted:
             last_message = agent_dir / "last-message.md"
@@ -1169,18 +1580,27 @@ def main() -> int:
                 if text and not renderer.saw_assistant_text:
                     transcript.text_block("Assistant", text.rstrip() + "\n")
             transcript.event("run end", f"exit: {process_status}")
-        if settlement_needed and job_dir is not None:
-            process_status = settle_job_after_process(
-                root,
-                job_dir,
-                job_id,
-                args.agent_name,
-                process_status=process_status,
-                previous_attempts=previous_attempts,
-                attempt=attempt,
-                maximum=max_job_attempts,
-                interrupted=interrupted,
-            )
+        if cleanup_clean and settlement_needed and job_dir is not None:
+            if stored_retry_budget_exhausted and not interrupted:
+                process_status = settle_stored_retry_budget_exhaustion(
+                    root,
+                    job_dir,
+                    job_id,
+                    args.agent_name,
+                    maximum=max_job_attempts,
+                )
+            else:
+                process_status = settle_job_after_process(
+                    root,
+                    job_dir,
+                    job_id,
+                    args.agent_name,
+                    process_status=process_status,
+                    previous_attempts=previous_attempts,
+                    attempt=attempt,
+                    maximum=max_job_attempts,
+                    interrupted=interrupted,
+                )
         if transcript is not None:
             transcript.close()
         for f in error_files:

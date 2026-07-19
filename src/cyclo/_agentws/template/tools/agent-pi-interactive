@@ -100,6 +100,8 @@ def build_prompt(
     role_file: Path,
     protocol_text: str,
     role_text: str,
+    project_file: Path | None = None,
+    project_text: str = "",
 ) -> str:
     return agent_mod.build_initial_prompt(
         agent_name,
@@ -111,6 +113,8 @@ def build_prompt(
         protocol_text,
         role_text,
         console=console,
+        project_file=project_file,
+        project_text=project_text,
     )
 
 
@@ -122,13 +126,20 @@ def main() -> int:
 
     if shutil.which("pi") is None:
         agent_mod.die("required command not found: pi")
+    try:
+        agent_mod.enable_child_subreaper()
+    except OSError as exc:
+        agent_mod.die(f"cannot establish the agent process fence: {exc}")
 
     protocol_file, role_file, protocol_text, role_text = agent_mod.load_team_context(ROOT, args.role)
+    project_file, project_text = agent_mod.load_project_context(ROOT)
     max_job_attempts = agent_mod.positive_env_int(
         "AGENTWS_MAX_JOB_ATTEMPTS", agent_mod.DEFAULT_MAX_JOB_ATTEMPTS
     )
 
-    agent_dir_out = agent_mod.run_bin(ROOT, "agent-new", args.agent_name, args.role).stdout.strip()
+    agent_dir_out = agent_mod.run_bin(
+        ROOT, "agent-new", args.agent_name, args.role
+    ).stdout.strip()
     if not agent_dir_out:
         agent_mod.die("agent-new returned no agent directory")
     agent_dir = Path(agent_dir_out)
@@ -154,6 +165,8 @@ def main() -> int:
         role_file,
         protocol_text,
         role_text,
+        project_file,
+        project_text,
     )
     agent_mod.write_file(agent_dir / "prompt.md", prompt)
 
@@ -187,6 +200,7 @@ def main() -> int:
     reader_threads: list[threading.Thread] = []
     defer_shutdown = False
     deferred_shutdown_signum = 0
+    stored_retry_budget_exhausted = False
 
     def request_shutdown(signum: int, _frame: Any) -> None:
         nonlocal deferred_shutdown_signum
@@ -244,20 +258,8 @@ def main() -> int:
                 job_dir, max_job_attempts
             )
             if previous_attempts >= max_job_attempts:
-                settled, used_fallback = agent_mod.fail_exhausted_job(
-                    ROOT,
-                    job_dir,
-                    job_id,
-                    args.agent_name,
-                    max_job_attempts,
-                )
-                settlement_needed = not settled
-                process_status = (
-                    agent_mod.FATAL_AGENT_EXIT
-                    if not settled or used_fallback
-                    else agent_mod.RETRYABLE_AGENT_EXIT
-                )
-                return process_status
+                stored_retry_budget_exhausted = True
+                raise agent_mod.StoredRetryBudgetExhausted
 
             agent_mod.append_job_log(
                 job_dir,
@@ -417,12 +419,14 @@ def main() -> int:
                 proc.wait(timeout=5)
         process_status = proc.returncode if proc.returncode is not None else 1
         transcript.event("interactive run end", f"exit: {process_status}")
+    except agent_mod.StoredRetryBudgetExhausted:
+        process_status = agent_mod.RETRYABLE_AGENT_EXIT
     except agent_mod.ShutdownRequested as exc:
         transcript.event("interactive run interrupted", f"signal: {exc.signum}")
         process_status = 128 + exc.signum
         interrupted = True
     except Exception as exc:
-        print(f"error: interactive agent wrapper failed: {exc}", file=sys.stderr)
+        print(f"error: interactive agent worker failed: {exc}", file=sys.stderr)
         traceback.print_exc()
         transcript.event("interactive run failed", f"{type(exc).__name__}: {exc}")
         process_status = 1
@@ -431,28 +435,47 @@ def main() -> int:
             signal.signal(signum, signal.SIG_IGN)
         stop_event.set()
         agent_mod.write_file(agent_busy, "0\n")
-        agent_mod.stop_engine_process_group(proc)
+        cleanup_clean = agent_mod.stop_engine_process_group(proc)
+        if not cleanup_clean:
+            print(
+                "error: engine cleanup did not complete; restarting the team container",
+                file=sys.stderr,
+            )
+            process_status = agent_mod.FATAL_AGENT_EXIT
         try:
             os.close(fifo_anchor)
         except OSError:
             pass
-        readers_stopped = agent_mod.join_reader_threads(reader_threads, proc)
+        readers_stopped = agent_mod.join_reader_threads(reader_threads)
+        cleanup_clean = cleanup_clean and readers_stopped
         if not readers_stopped:
-            print("warning: interactive reader did not stop", file=sys.stderr)
-            process_status = agent_mod.FATAL_AGENT_EXIT
-        if settlement_needed and job_dir is not None:
-            process_status = agent_mod.settle_job_after_process(
-                ROOT,
-                job_dir,
-                job_id,
-                args.agent_name,
-                process_status=process_status,
-                previous_attempts=previous_attempts,
-                attempt=attempt,
-                maximum=max_job_attempts,
-                interrupted=interrupted,
-                label="Interactive agent",
+            print(
+                "error: interactive reader did not stop; restarting the team container",
+                file=sys.stderr,
             )
+            process_status = agent_mod.FATAL_AGENT_EXIT
+        if cleanup_clean and settlement_needed and job_dir is not None:
+            if stored_retry_budget_exhausted and not interrupted:
+                process_status = agent_mod.settle_stored_retry_budget_exhaustion(
+                    ROOT,
+                    job_dir,
+                    job_id,
+                    args.agent_name,
+                    maximum=max_job_attempts,
+                )
+            else:
+                process_status = agent_mod.settle_job_after_process(
+                    ROOT,
+                    job_dir,
+                    job_id,
+                    args.agent_name,
+                    process_status=process_status,
+                    previous_attempts=previous_attempts,
+                    attempt=attempt,
+                    maximum=max_job_attempts,
+                    interrupted=interrupted,
+                    label="Interactive agent",
+                )
         interactive_lock.close()
         try:
             input_fifo.unlink()

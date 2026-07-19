@@ -9,8 +9,9 @@ authoritative.
    expected behavior, focused reproduction, wider verification, and constraints.
 2. Require a Git-backed target. Record the base branch, base commit, dirty state,
    and pre-existing user changes; never discard them.
-3. Create a dedicated branch and worktree at
-   `/workspace/.cyclo-worktrees/<task-id>` from the recorded base commit. Add
+3. Create a dedicated branch and worktree inside the selected writable project
+   at `<project>/.cyclo-worktrees/<task-id>` (for example,
+   `/workspace/source/.cyclo-worktrees/<task-id>`) from the recorded base commit. Add
    `.cyclo-worktrees/` to the repository's local exclude file, not its tracked
    `.gitignore`.
 4. Create exactly one `role=implementer` job with the workspace metadata,

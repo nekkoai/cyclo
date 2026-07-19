@@ -51,6 +51,7 @@ def test_gateway_node_install_is_locked_to_the_runtime_pi_generation() -> None:
 
     expected = {"@earendil-works/pi-ai": "0.80.6"}
     assert "npm ci" in dockerfile
+    assert "command -v flock" in dockerfile
     assert re.search(r"^FROM node:22-[^@\s]+@sha256:[0-9a-f]{64}", dockerfile)
     assert package["private"] is True
     assert package["dependencies"] == expected

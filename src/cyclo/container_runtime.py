@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+RUNTIME_LOCK_FD_ENV = "CYCLO_RUNTIME_LOCK_FD"
 
 
 def required(name: str) -> str:
@@ -40,17 +45,39 @@ def terminate(processes: list[subprocess.Popen[bytes]]) -> None:
             process.wait()
 
 
+def acquire_runtime_lock(runtime: Path) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(runtime, flags)
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(f"runtime root is not a directory: {runtime}")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
 def main() -> int:
     runtime = Path(required("CYCLO_AGENTWS_RUNTIME"))
     roster = required("AGENTWS_TEAM_ROSTER")
     verbose = os.environ.get("CYCLO_VERBOSE") == "1"
     stopping = False
     processes: list[subprocess.Popen[bytes]] = []
+    runtime_lock = -1
 
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stopping
         stopping = True
 
+    previous_handlers = {
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+    }
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
 
@@ -73,7 +100,45 @@ def main() -> int:
     runner.append(roster)
 
     try:
+        runtime_lock = acquire_runtime_lock(runtime)
+    except OSError as exc:
+        print(
+            f"cyclo runtime: cannot acquire the queue lifetime lock: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        return 70
+
+    try:
+        recovery_environment = os.environ.copy()
+        recovery_environment[RUNTIME_LOCK_FD_ENV] = str(runtime_lock)
+        recovery = subprocess.Popen(
+            [str(runtime / "bin" / "job-reset-orphans"), "--all-active"],
+            env=recovery_environment,
+            pass_fds=(runtime_lock,),
+            start_new_session=True,
+        )
+        processes.append(recovery)
+        while recovery.poll() is None and not stopping:
+            time.sleep(0.05)
+        if stopping:
+            return 0
+        recovery_status = recovery.wait()
+        processes.remove(recovery)
+        if recovery_status != 0:
+            print(
+                "cyclo runtime: cannot recover queue state from the previous "
+                f"container generation (status {recovery_status})",
+                file=sys.stderr,
+                flush=True,
+            )
+            return recovery_status or 1
+
         for command in (viewer, runner):
+            if stopping:
+                return 0
             processes.append(subprocess.Popen(command, start_new_session=True))
         while not stopping:
             for process, label in zip(processes, ("viewer", "team")):
@@ -85,6 +150,9 @@ def main() -> int:
         return 0
     finally:
         terminate(processes)
+        os.close(runtime_lock)
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

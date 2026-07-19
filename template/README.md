@@ -42,4 +42,5 @@ needed.
 
 These are starting points for experiments, not universally optimal teams. The
 copied repository is ordinary Git content: modify its roster and roles, commit
-variants, or run it with `--team-write` to experiment with self-modification.
+variants, or declare its `team` line `rw` in `project.cyclo` to experiment with
+self-modification. Keep it `ro` when agents should not edit their own team.

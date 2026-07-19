@@ -909,6 +909,15 @@ svg {
   white-space: nowrap;
 }
 
+.runtime-health[data-state="ready"] {
+  color: var(--green);
+}
+
+.runtime-health[data-state^="runtime-"],
+.runtime-health[data-state^="agents-"] {
+  color: var(--red);
+}
+
 .workload {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

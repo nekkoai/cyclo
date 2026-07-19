@@ -34,15 +34,24 @@ cyclo validate ~/teams/plan-execute-verify
 
 ## Run
 
-```sh
-cyclo run --name plan-execute-verify \
-  ~/teams/plan-execute-verify \
-  ~/src/my-project
-cyclo task plan-execute-verify change-001 /tmp/change-001.md
-cyclo logs -f plan-execute-verify
+Create `~/experiments/my-project/project.cyclo`:
+
+```text
+name my-project
+description Plan, implement, and independently verify changes.
+team ../../teams/plan-execute-verify ro
+mount source ../../src/my-project rw
 ```
 
-The team definition remains read-only and the project is writable. Add
+```sh
+cyclo validate ~/experiments/my-project/project.cyclo
+cyclo run ~/experiments/my-project/project.cyclo
+cyclo task my-project-plan-execute-verify change-001 /tmp/change-001.md
+cyclo logs -f my-project-plan-execute-verify
+```
+
+The team definition remains read-only and `/workspace/source` is writable;
+task paths into the checkout begin with `source/`. Add
 `--offline` when the task needs only the model gateway and already-local tools;
 offline mode has no per-team host viewer. The host-wide dashboard remains
 available with `cyclo dashboard`.
