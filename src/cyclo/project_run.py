@@ -26,10 +26,6 @@ from .project import (
 )
 from .project_state import decode_instance_project, encode_project_mounts
 from .provider_service import ProviderService
-from .runtime_container import (
-    provider_runtime_container_name,
-    provider_runtime_health_url,
-)
 from .state import Instance, StateStore, instance_id, validate_instance_id
 from .team import (
     Team,
@@ -343,9 +339,6 @@ def container_spec(
         agents_dir=store.agents_dir(instance.id),
         pi_root=store.pi_root(instance.id),
         port=args.port,
-        provider_runtime_health_url=provider_runtime_health_url(
-            provider_runtime_container_name(store.provider_runtime_root)
-        ),
         verbose=args.verbose,
         project_mounts=binding.project_mounts,
         workspace_layout=store.workspace_root(instance.id) if named else None,

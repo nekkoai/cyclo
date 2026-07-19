@@ -69,10 +69,9 @@ the same task, then marks the source job failed. Repeating settlement reuses
 that job, and a planner failure never creates another planner job. This does
 not change explicit agent-driven `job-fail`: the agent remains responsible for
 the protocol-required follow-up work in that case.
-When Cyclo supplies its provider-runtime health URL, workers wait for runtime
-health before claiming. A runtime loss immediately after claim or during an
-engine invocation releases the job and restores its prior attempt count; it is
-not charged to the agent suspension circuit breaker.
+AgentWS does not probe model services or infer why an engine exited. An engine
+failure follows this same bounded settlement path; only an operator-requested
+shutdown restores the previous attempt count.
 Operator-requested SIGINT/SIGTERM shutdown releases the job without consuming
 an attempt. These safe defaults can be adjusted with positive integer
 environment variables:
@@ -159,7 +158,10 @@ starts and completes the claimed job according to
 It starts `pi --mode rpc`, writes the rendered transcript to
 `agents/<agent-name>/transcript.log`, and exposes a local `input.fifo` for
 external RPC tooling. The AgentWS web viewer displays transcripts and errors
-but never sends or steers agent input.
+but never sends or steers agent input. For a queued agent, Pi's
+`agent_settled` event ends the current attempt; AgentWS then reads the durable
+job state and either accepts its completion or applies the normal bounded-retry
+settlement. The queue-less console remains alive for later input.
 
 ## Task Commands
 

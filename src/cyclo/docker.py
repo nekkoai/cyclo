@@ -219,7 +219,6 @@ class ContainerSpec:
     agents_dir: Path
     pi_root: Path
     port: int
-    provider_runtime_health_url: str | None = None
     verbose: bool = False
     project_mounts: tuple[ProjectMount, ...] = ()
     workspace_layout: Path | None = None
@@ -313,14 +312,6 @@ def container_command(spec: ContainerSpec) -> list[str]:
             f"CYCLO_PROJECT_MANIFEST={CONTAINER_AGENTWS / 'PROJECT.md'}",
         ]
     )
-    if spec.provider_runtime_health_url is not None:
-        command.extend(
-            [
-                "-e",
-                "CYCLO_PROVIDER_RUNTIME_HEALTH_URL="
-                f"{spec.provider_runtime_health_url}",
-            ]
-        )
     for name in AGENTWS_RETRY_ENVIRONMENT:
         value = os.environ.get(name)
         if value is not None:

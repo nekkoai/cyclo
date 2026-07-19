@@ -174,8 +174,7 @@ def test_project_file_dry_run_expands_every_team_and_named_mount_without_state(
     assert f"src={second_team},dst=/team" in output
     assert f"src={second_team},dst=/team,readonly" not in output
     assert output.count("CYCLO_PROJECT_MANIFEST=/agentws/PROJECT.md") == 2
-    assert output.count("CYCLO_PROVIDER_RUNTIME_HEALTH_URL=http://") == 2
-    assert output.count(":8788/health") == 2
+    assert "CYCLO_PROVIDER_RUNTIME_HEALTH_URL" not in output
     assert not state.exists()
 
 

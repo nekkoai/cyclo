@@ -100,8 +100,6 @@ const REGISTRATION_REWRITE_INTERVAL_MS = 5_000;
 const GLOBAL_REGISTRATION_REWRITE_INTERVAL_MS = 1_000;
 const MAX_COMPONENT_HEALTH_BODY = 1024;
 const REQUEST_CONTEXT_HEADER = "x-cyclo-request-context";
-const RUNTIME_BOOT_ID_HEADER = "x-cyclo-runtime-boot-id";
-const RUNTIME_BOOT_ID = randomBytes(16).toString("hex");
 const REQUEST_CONTEXT_TTL_MS = UPSTREAM_TIMEOUT_MS + 30_000;
 const MAX_NESTED_PROVIDER_CALLS = 16;
 const MAX_PROVIDER_CHAIN_DEPTH = 16;
@@ -2291,7 +2289,6 @@ function createRuntimeServer({
       }
       const url = new URL(req.url ?? "/", "http://provider-runtime");
       if (req.method === "GET" && url.pathname === "/health") {
-        res.setHeader(RUNTIME_BOOT_ID_HEADER, RUNTIME_BOOT_ID);
         sendPlain(res, 200, "ok\n");
         return;
       }

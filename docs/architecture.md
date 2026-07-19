@@ -34,28 +34,66 @@ the provider orchestrator.
                                concrete model services
 ```
 
-The host-side `cyclo` controller is Python. It validates definitions and mount
-boundaries, manages explicitly requested Docker lifecycle operations, and
-publishes scoped client records. The Pi agent engine, provider runtime, and
-credential gateway execute inside packaged images; Node.js is a maintainer
-requirement, not a normal host runtime requirement.
+## Ownership contract
 
-The three long-running runtime roles are distinct:
+Cyclo assigns every internal control-state transition to one component. Project
+and writable-team files remain ordinary shared filesystem state. A consumer
+uses the producer's protocol; it does not inspect the producer's internals or
+infer failure causes from an unrelated health signal.
 
-- A **team runtime** owns one team/project-definition binding, its agents,
-  viewer, and durable filesystem queue. A multi-team project therefore creates
-  several independent team runtimes.
-- The shared **provider runtime** owns the merged model catalogue, host-provider
-  policy, virtual routes, short-lived request contexts, and provider-component
-  registration. It contains no physical provider credential.
-- The **credential gateway** owns API keys and subscription sessions, exposes
-  only concrete account/model routes, substitutes real credentials, talks to
-  concrete upstream services, and records concrete usage. It does not read
-  `host.conf`, launch components, or implement composition.
+| Component | Owns | Must not own |
+|---|---|---|
+| Host `cyclo` controller | Configuration parsing, mount and network validation, explicit Docker lifecycle, persisted instance state, capability publication and revocation, and host-side operational checks | Agent job settlement, model routing, or physical credentials |
+| Cyclo team PID 1 | Queue recovery under the exclusive runtime lock, interpretation of runner exit, and supervision of the AgentWS runner and read-only viewer | Provider-stack health policy, model-failure classification, or job settlement |
+| AgentWS | Durable task/job state, `claim -> execute -> settle`, bounded engine retries, terminal planner notification, and cooperative engine-process cleanup | Provider/gateway health policy, endpoints, identities, boot identities, or outer container-lifecycle decisions |
+| Provider runtime | Merged catalogue, team model authorization, virtual routes, provider registration, and short-lived request contexts | Physical provider credentials, team queues, or container lifecycle |
+| Provider component | One virtual provider transformation declared by `host.conf` | Team identity, real credentials, sibling components, or Docker/network control |
+| Credential gateway | API keys, subscription sessions, concrete account/model routes, upstream calls, and concrete usage accounting | `host.conf`, virtual composition, provider-component lifecycle, or team queues |
+| Dashboards | Bounded read-only projections of instance, queue, runtime, and usage state | Lifecycle or queue mutation |
 
-Only the gateway mounts `cyclo-gateway-store`. A provider component and a team
-container never receive that volume, a real provider key, or a subscription
-session.
+The host controller is Python. Python types named `RuntimeContainer`,
+`ProviderService`, and `ProviderRuntime` are host control-plane adapters for
+Docker resources; they are not code executing inside the provider-runtime
+container. The model engines, provider runtime, and credential gateway execute
+inside packaged images; Node.js is a maintainer requirement, not a normal host
+runtime requirement. A multi-team project creates one independent team runtime
+per team. Only the gateway mounts
+`cyclo-gateway-store`; no team or provider component receives that volume, a
+real provider key, or a subscription session.
+
+## Protocol contract
+
+| Boundary | Transport | Contract |
+|---|---|---|
+| Host controller -> Docker | Docker CLI on the host | Create, inspect, attach, stop, and remove only explicitly owned resources; no container receives the Docker socket |
+| Host controller -> provider runtime | Atomic replacement of bind-mounted registries plus authenticated HTTP/1.1 reload/ack and catalogue operations over the mode-`0600` admin Unix socket | Publish or revoke dynamic authority durably, make the runtime acknowledge the new snapshot, refresh the concrete gateway input, and read the merged catalogue |
+| Host controller -> credential gateway | Atomic replacement of the hash-only client registry, authenticated loopback HTTP for catalogue/usage, and explicit one-shot login containers | Publish concrete authorization, provision accounts, and observe usage without exposing the credential store |
+| Cyclo team PID 1 -> AgentWS | Local subprocess, inherited runtime-lock file descriptor, and exit-status protocol | Recover orphaned jobs before startup, supervise the runner/viewer, and escalate an unsafe runner exit to container teardown |
+| AgentWS worker -> AgentWS queue | Filesystem state through bundled `bin/` commands and locks | Claim one role-compatible job, execute one engine attempt, and durably settle that claim |
+| AgentWS worker -> model engine | One fenced process group using standard streams, or Pi's line-delimited RPC mode | Execute an attempt and reduce engine completion to durable queue state plus a worker exit status |
+| Team model engine -> provider runtime | Bearer-authenticated HTTP over the team's private Docker network | List only the team's allowed models and invoke an allowed route |
+| Provider runtime -> credential gateway | HTTP over the separate runtime/gateway private network | Forward the original opaque team bearer; the gateway independently reauthorizes its concrete scope, substitutes the real credential, and records usage |
+| Provider runtime <-> provider component | HTTP/1.1 over two prefix-specific Unix sockets | Invoke one virtual route and allow only its declared upstream inputs, using distinct capabilities |
+| Dashboard -> system state | Read-only filesystem, Docker inspection, and GET requests | Observe bounded snapshots; never execute queue content or change state |
+
+AgentWS settlement is intentionally cause-blind. If the engine exits while it
+still owns a job, the attempt is charged and the job is either released for a
+bounded retry or terminally failed after a deterministic planner notification.
+An operator SIGINT/SIGTERM restores the previous attempt count and releases the
+job. Unsafe engine cleanup or an unprovable queue transition is a fatal worker
+exit handled by the team PID 1 and Docker process fence. For a queued Pi RPC
+worker, rejection of the initial command is an engine failure and
+`agent_settled` ends an accepted attempt. The durable job state then determines
+whether the worker completed or follows the ordinary bounded-retry path. Pi's
+long-lived RPC process is an implementation detail, not an attempt boundary.
+
+Provider-stack health belongs to Cyclo's control and observation surfaces.
+`cyclo doctor`, `cyclo ps`, and the fleet dashboard distinguish team-container
+state from provider-runtime and gateway state. They do not mutate AgentWS queue
+state or retroactively reclassify an engine result. If a future engine can
+report a temporary dependency failure reliably, that must be an explicit typed
+engine outcome; Cyclo must not infer it by comparing health probes or process
+identities around an engine exit.
 
 ## Project definitions
 

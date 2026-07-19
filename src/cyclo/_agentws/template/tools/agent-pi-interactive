@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Run one named AgentWS Pi agent in RPC mode with live browser input."""
+"""Run one named AgentWS Pi agent in RPC mode with external FIFO input."""
 
 from __future__ import annotations
 
@@ -136,8 +136,6 @@ def main() -> int:
     max_job_attempts = agent_mod.positive_env_int(
         "AGENTWS_MAX_JOB_ATTEMPTS", agent_mod.DEFAULT_MAX_JOB_ATTEMPTS
     )
-    runtime_health_target = agent_mod.provider_runtime_health_target()
-    runtime_boot_identity: str | None = None
 
     agent_dir_out = agent_mod.run_bin(
         ROOT, "agent-new", args.agent_name, args.role
@@ -193,6 +191,8 @@ def main() -> int:
     proc: subprocess.Popen[str] | None = None
     stop_event = threading.Event()
     is_streaming = threading.Event()
+    initial_command_failed = threading.Event()
+    attempt_settled = threading.Event()
     stdin_lock = threading.Lock()
     shutdown_signals = (signal.SIGTERM, signal.SIGINT)
     previous_handlers = {signum: signal.getsignal(signum) for signum in shutdown_signals}
@@ -231,20 +231,22 @@ def main() -> int:
         else:
             while True:
                 agent_mod.run_bin(ROOT, "job-wait", "-r", args.role, capture=True)
-                runtime_boot_identity = agent_mod.wait_for_provider_runtime(
-                    runtime_health_target
-                )
                 defer_shutdown = True
                 try:
-                    claimed = agent_mod.claim_job_if_runtime_ready(
+                    claim = agent_mod.run_bin(
                         ROOT,
+                        "job-claim",
+                        "-r",
                         args.role,
+                        "--agent-id",
                         args.agent_name,
-                        runtime_health_target,
-                    )
-                    if claimed is not None:
-                        job_id, job_dir, runtime_boot_identity = claimed
+                    ).stdout.strip()
+                    if claim.startswith("CLAIMED: "):
+                        job_id = claim.removeprefix("CLAIMED: ").strip()
+                        job_dir = ROOT / "jobs" / job_id
                         settlement_needed = True
+                    elif claim != "NO_JOBS":
+                        agent_mod.die(f"unexpected job-claim output: {claim}")
                 finally:
                     defer_shutdown = False
                 if deferred_shutdown_signum:
@@ -328,6 +330,9 @@ def main() -> int:
                     continue
                 if isinstance(event, dict):
                     typ = event.get("type")
+                    initial_response = (
+                        typ == "response" and event.get("id") == "initial"
+                    )
                     if typ in ("agent_start", "turn_start"):
                         set_streaming(True)
                     elif typ in ("agent_end", "turn_end"):
@@ -340,7 +345,14 @@ def main() -> int:
                         set_streaming(False)
                     if typ == "response" and event.get("success") is False:
                         transcript.event("pi rpc error", str(event.get("error") or event))
+                        if not args.console and initial_response:
+                            initial_command_failed.set()
+                            stop_event.set()
                         continue
+                    if typ == "agent_settled" and not args.console:
+                        set_streaming(False)
+                        attempt_settled.set()
+                        stop_event.set()
                 renderer.render_line(raw)
 
         def read_browser_input() -> None:
@@ -404,6 +416,8 @@ def main() -> int:
         if not args.console:
             set_streaming(True)
             if not write_json_line(proc.stdin, {"id": "initial", "type": "prompt", "message": prompt}, stdin_lock):
+                initial_command_failed.set()
+                stop_event.set()
                 set_streaming(False)
 
         while proc.poll() is None and not stop_event.is_set():
@@ -454,6 +468,14 @@ def main() -> int:
                 file=sys.stderr,
             )
             process_status = agent_mod.FATAL_AGENT_EXIT
+        elif cleanup_clean and not interrupted:
+            if initial_command_failed.is_set():
+                # Rejection happens before Pi accepts the queued attempt.
+                process_status = 1
+            elif attempt_settled.is_set():
+                # Pi remains alive after a complete RPC run. Queue settlement,
+                # not that idle process, determines the worker's final status.
+                process_status = 0
         if cleanup_clean and settlement_needed and job_dir is not None:
             if stored_retry_budget_exhausted and not interrupted:
                 process_status = agent_mod.settle_stored_retry_budget_exhaustion(
@@ -464,16 +486,6 @@ def main() -> int:
                     maximum=max_job_attempts,
                 )
             else:
-                dependency_unavailable = (
-                    agent_mod.provider_runtime_changed_during_failed_run(
-                        runtime_health_target,
-                        runtime_boot_identity,
-                        process_started=proc is not None,
-                        process_status=process_status,
-                        interrupted=interrupted,
-                        job_dir=job_dir,
-                    )
-                )
                 process_status = agent_mod.settle_job_after_process(
                     ROOT,
                     job_dir,
@@ -484,7 +496,6 @@ def main() -> int:
                     attempt=attempt,
                     maximum=max_job_attempts,
                     interrupted=interrupted,
-                    dependency_unavailable=dependency_unavailable,
                     label="Interactive agent",
                 )
         interactive_lock.close()
