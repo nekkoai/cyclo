@@ -528,9 +528,15 @@ test("standalone runtime uses one cached state and preserves team attribution", 
     rmSync(temporary, { recursive: true, force: true });
   });
 
+  let response = await fetch(`${runtimeBase}/health`);
+  assert.equal(response.status, 200);
+  const runtimeBootId = response.headers.get("x-cyclo-runtime-boot-id");
+  assert.match(runtimeBootId, /^[a-f0-9]{32}$/u);
+  assert.equal(await response.text(), "ok\n");
+
   // Startup has a configured but not-yet-registered component. Its concrete
   // input remains available without probing an absent component endpoint.
-  let response = await fetch(`${runtimeBase}/providers`, {
+  response = await fetch(`${runtimeBase}/providers`, {
     headers: { authorization: `Bearer ${teamToken}` },
   });
   assert.equal(response.status, 200);
@@ -610,6 +616,8 @@ test("standalone runtime uses one cached state and preserves team attribution", 
   );
   unixResponse = await unixRequest(otherRuntimeSocket, "/health");
   assert.equal(unixResponse.status, 200);
+  assert.equal(unixResponse.headers["x-cyclo-runtime-boot-id"], runtimeBootId);
+  assert.equal(unixResponse.text(), "ok\n");
   controlResponse = await unixRequest(adminSocket, "/_cyclo/v1/control/reload", {
     method: "POST",
     headers: { authorization: `Bearer ${runtimeAdminToken}` },

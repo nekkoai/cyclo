@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
@@ -173,6 +174,8 @@ def test_project_file_dry_run_expands_every_team_and_named_mount_without_state(
     assert f"src={second_team},dst=/team" in output
     assert f"src={second_team},dst=/team,readonly" not in output
     assert output.count("CYCLO_PROJECT_MANIFEST=/agentws/PROJECT.md") == 2
+    assert output.count("CYCLO_PROVIDER_RUNTIME_HEALTH_URL=http://") == 2
+    assert output.count(":8788/health") == 2
     assert not state.exists()
 
 
@@ -454,6 +457,13 @@ def _project_state_instance(
         project_file=str(definition.resolve()),
         project_description="Exercise multiple Cyclo teams and named mounts.",
         project_generation="project-generation",
+        project_mounts=[
+            {
+                "name": "source",
+                "path": str(definition.parent.resolve()),
+                "mode": "rw",
+            }
+        ],
     )
 
 
@@ -1235,7 +1245,11 @@ def test_ps_refuses_to_report_an_incomplete_instance_inventory(
     )
     broken = store.metadata_path("broken")
     broken.parent.mkdir(parents=True)
-    broken.write_text("{not-json\n", encoding="utf-8")
+    payload = _project_state_instance(
+        "broken", tmp_path / "broken-team", tmp_path / "broken.cyclo"
+    ).as_json()
+    payload["project_path"] = {"not": "a path"}
+    broken.write_text(json.dumps(payload), encoding="utf-8")
 
     class FakeDocker:
         @staticmethod
@@ -2268,6 +2282,80 @@ def test_doctor_fails_when_gateway_is_unavailable_behind_a_current_runtime(
     assert "ok  provider runtime catalog" not in output
 
 
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (
+            SimpleNamespace(exists=False, running=False, current=False),
+            "provider runtime is not running; run `cyclo runtime start`",
+        ),
+        (
+            SimpleNamespace(exists=True, running=False, current=True),
+            "provider runtime is not running; run `cyclo runtime restart`",
+        ),
+        (
+            SimpleNamespace(exists=True, running=True, current=False),
+            "provider runtime is stale; run `cyclo runtime restart`",
+        ),
+    ],
+)
+def test_doctor_prescribes_the_valid_runtime_lifecycle_action(
+    status: SimpleNamespace,
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    state = tmp_path / "state"
+
+    class FakeDocker:
+        @staticmethod
+        def available():
+            return True, "test daemon"
+
+    class FakeService:
+        state_root = state / "provider-runtime"
+        container_name = "cyclo-provider-runtime-test"
+
+        @staticmethod
+        def status():
+            return status
+
+        @staticmethod
+        def probe_operational(*, timeout):
+            raise AssertionError("an absent, stopped, or stale runtime must not be probed")
+
+        @staticmethod
+        def catalog():
+            raise AssertionError("an absent, stopped, or stale runtime has no live catalog")
+
+    monkeypatch.setattr("cyclo.cli.agentws_root", lambda: tmp_path / "agentws")
+    monkeypatch.setattr(
+        "cyclo.cli.gateway",
+        lambda _args, _store: SimpleNamespace(
+            gateway=SimpleNamespace(__file__="credential-gateway.py")
+        ),
+    )
+    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_service", lambda _args, _store: FakeService()
+    )
+
+    assert main(
+        [
+            "--state-root",
+            str(state),
+            "--host-config",
+            str(tmp_path / "missing-host.conf"),
+            "doctor",
+        ]
+    ) == 1
+
+    output = capsys.readouterr().out
+    assert f"no  provider runtime: {message}" in output
+    assert "provider runtime catalog" not in output
+
+
 def test_doctor_reports_corrupt_persisted_instance_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2277,7 +2365,11 @@ def test_doctor_reports_corrupt_persisted_instance_state(
     store = StateStore(state)
     broken = store.metadata_path("broken")
     broken.parent.mkdir(parents=True)
-    broken.write_text("{not-json\n", encoding="utf-8")
+    payload = _project_state_instance(
+        "broken", tmp_path / "broken-team", tmp_path / "broken.cyclo"
+    ).as_json()
+    payload["project_mounts"] = None
+    broken.write_text(json.dumps(payload), encoding="utf-8")
 
     class UnavailableDocker:
         @staticmethod

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -25,6 +26,8 @@ GATEWAY_STORE_PATH = "/var/lib/cyclo-gateway"
 GATEWAY_MODELS_PATH = "/run/pi/models.json"
 GATEWAY_CLIENT_REGISTRY_DIR = "/run/cyclo-gateway"
 GATEWAY_CLIENT_REGISTRY_PATH = f"{GATEWAY_CLIENT_REGISTRY_DIR}/clients.json"
+GATEWAY_ADMIN_TOKEN_PATH = "/run/secrets/cyclo-gateway-admin-token"
+GATEWAY_ADMIN_TOKEN_MODE = 0o444
 CLIENT_REGISTRY_VERSION = 1
 GATEWAY_OWNERSHIP_LABEL = "cyclo.gateway"
 GATEWAY_OWNERSHIP_VALUE = "1"
@@ -70,6 +73,7 @@ class GatewayConfig(Protocol):
     store_volume: str
     host_models_json: Path
     client_registry_dir: Path
+    admin_token_file: Path
     name: str
 
 
@@ -93,6 +97,176 @@ def host_client_registry_dir(registry_dir: Path) -> Path:
 
 def host_client_registry_path(registry_dir: Path) -> Path:
     return host_client_registry_dir(registry_dir) / "clients.json"
+
+
+def host_admin_token_file(registry_dir: Path) -> Path:
+    return Path(registry_dir) / "runs" / "gateway" / "admin-token" / "token"
+
+
+def _open_real_directory(path: Path, *, create: bool) -> int:
+    """Open ``path`` without following a symlink in any path component."""
+
+    selected = Path(path)
+    if (
+        not selected.is_absolute()
+        or selected == Path(selected.anchor)
+        or ".." in selected.parts
+    ):
+        raise CycloError(f"unsafe gateway admin token directory: {selected}")
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(selected.anchor, flags)
+    except OSError as exc:
+        raise CycloError(
+            f"cannot securely open gateway admin token directory {selected}: {exc}"
+        ) from exc
+    walked = Path(selected.anchor)
+    try:
+        for component in selected.parts[1:]:
+            walked /= component
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except OSError as exc:
+        os.close(descriptor)
+        raise CycloError(
+            f"unsafe gateway admin token directory component {walked}: {exc}"
+        ) from exc
+
+
+def prepare_admin_token_file(path: Path, token: str) -> Path:
+    """Atomically project one gateway token into a private host directory.
+
+    The file's ``other-read`` bit is intentional: the image has a fixed
+    unprivileged UID which need not match the invoking host UID.  Host privacy
+    comes from the containing 0700 directory; Docker bind-mounts only this
+    exact file, read-only, into the gateway container.
+    """
+
+    if not token or any(character.isspace() for character in token):
+        raise CycloError("gateway admin token is malformed")
+    selected = Path(path)
+    parent = selected.parent
+    parent_descriptor = -1
+    temporary = f".{selected.name}.tmp.{os.getpid()}.{os.urandom(6).hex()}"
+    descriptor = -1
+    try:
+        parent_descriptor = _open_real_directory(parent, create=True)
+        os.fchmod(parent_descriptor, 0o700)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            GATEWAY_ADMIN_TOKEN_MODE,
+            dir_fd=parent_descriptor,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(token + "\n")
+            stream.flush()
+            os.fchmod(stream.fileno(), GATEWAY_ADMIN_TOKEN_MODE)
+            os.fsync(stream.fileno())
+        os.replace(
+            temporary,
+            selected.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+    except CycloError:
+        raise
+    except OSError as exc:
+        raise CycloError(
+            f"cannot project gateway admin token {selected}: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            try:
+                os.unlink(temporary, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+            os.close(parent_descriptor)
+    return selected
+
+
+def validate_admin_token_file(path: Path, token: str) -> None:
+    """Validate the persisted read-only projection without mutating it."""
+
+    selected = Path(path)
+    parent_descriptor = -1
+    descriptor = -1
+    try:
+        parent_descriptor = _open_real_directory(selected.parent, create=False)
+        parent = os.fstat(parent_descriptor)
+        if stat.S_IMODE(parent.st_mode) != 0o700:
+            raise CycloError(
+                f"gateway admin token directory must be mode 0700: "
+                f"{selected.parent}"
+            )
+        metadata = os.stat(
+            selected.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != GATEWAY_ADMIN_TOKEN_MODE
+        ):
+            raise CycloError(
+                f"gateway admin token projection must be a regular mode-"
+                f"{GATEWAY_ADMIN_TOKEN_MODE:04o} file: {selected}"
+            )
+        descriptor = os.open(
+            selected.name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
+            raise CycloError(
+                f"gateway admin token projection changed while reading: {selected}"
+            )
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            raw = stream.read(64 * 1024 + 1)
+    except CycloError:
+        raise
+    except OSError as exc:
+        raise CycloError(
+            f"cannot read gateway admin token file {selected}: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+    if not raw or len(raw) > 64 * 1024:
+        raise CycloError(
+            f"gateway admin token projection has an invalid size: {selected}"
+        )
+    try:
+        projected = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise CycloError(
+            f"gateway admin token projection is not UTF-8: {selected}"
+        ) from exc
+    if not projected or not hmac.compare_digest(projected, token):
+        raise CycloError(f"gateway admin token projection is stale: {selected}")
 
 
 def ensure_client_registry_mount(directory: Path) -> Path:
@@ -385,7 +559,11 @@ def gateway_run_command(
         "--publish",
         f"127.0.0.1::{GATEWAY_PORT}",
         "-e",
-        f"CYCLO_GATEWAY_TOKEN={token}",
+        f"CYCLO_GATEWAY_TOKEN_FILE={GATEWAY_ADMIN_TOKEN_PATH}",
+        "--mount",
+        "type=bind,"
+        f"src={config.admin_token_file},"
+        f"dst={GATEWAY_ADMIN_TOKEN_PATH},readonly",
         "--mount",
         f"type=volume,src={config.store_volume},dst={GATEWAY_STORE_PATH}",
     ]
@@ -427,6 +605,7 @@ def gateway_config_fingerprint(config: GatewayConfig, token: str) -> str:
             if client_registry is not None and Path(client_registry).is_dir()
             else ""
         ),
+        "admin_token_file": str(config.admin_token_file),
         "token_hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
     }
     return hashlib.sha256(
@@ -739,6 +918,7 @@ def validate_running_gateway(
             "credential gateway has unsafe Docker network attachments; run "
             "`cyclo gateway restart` before starting the provider runtime"
         )
+    validate_admin_token_file(config.admin_token_file, token)
     container_id = _resource_id(
         info, kind="container", name=config.gateway_container
     )
@@ -848,6 +1028,7 @@ def ensure_gateway(
     )
     replacement_command: list[str] | None = None
     if replace:
+        prepare_admin_token_file(config.admin_token_file, token)
         # Remove the selected writer before checking its peers.  This gives an
         # installation with several stale gateways a legal migration order:
         # each explicit restart can retire one old writer, even when it then

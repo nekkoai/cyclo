@@ -35,6 +35,14 @@ class Config:
     client_registry_dir: Path
     name: str = "test"
 
+    @property
+    def admin_token_file(self) -> Path:
+        return (
+            self.client_registry_dir.parent
+            / f".{self.client_registry_dir.name}-admin-token"
+            / "token"
+        )
+
 
 def test_loopback_control_requests_do_not_follow_token_bearing_redirects() -> None:
     captured: list[str | None] = []
@@ -346,16 +354,27 @@ def test_gateway_run_command_mounts_only_credential_gateway_inputs(
         client_registry_dir=registry,
     )
 
+    gateway.prepare_admin_token_file(config.admin_token_file, "admin-capability")
     command = gateway.gateway_run_command(config, "admin-capability")
 
-    assert "CYCLO_GATEWAY_TOKEN=admin-capability" in command
-    assert f"CYCLO_GATEWAY_CLIENTS_JSON={gateway.GATEWAY_CLIENT_REGISTRY_PATH}" in command
+    assert all("admin-capability" not in argument for argument in command)
+    assert (
+        f"CYCLO_GATEWAY_TOKEN_FILE={gateway.GATEWAY_ADMIN_TOKEN_PATH}" in command
+    )
+    assert (
+        f"CYCLO_GATEWAY_CLIENTS_JSON={gateway.GATEWAY_CLIENT_REGISTRY_PATH}"
+        in command
+    )
     mounts = [
         command[index + 1]
         for index, part in enumerate(command)
         if part == "--mount"
     ]
     assert mounts == [
+        (
+            f"type=bind,src={config.admin_token_file},"
+            f"dst={gateway.GATEWAY_ADMIN_TOKEN_PATH},readonly"
+        ),
         f"type=volume,src={config.store_volume},dst={gateway.GATEWAY_STORE_PATH}",
         (
             f"type=bind,src={registry},"
@@ -393,7 +412,54 @@ def test_gateway_run_command_mounts_only_credential_gateway_inputs(
         command_without_models[index + 1]
         for index, part in enumerate(command_without_models)
         if part == "--mount"
-    ] == mounts[:2]
+    ] == mounts[:3]
+
+
+def test_gateway_admin_token_projection_is_private_and_validated(
+    tmp_path: Path,
+) -> None:
+    projected = tmp_path / "private" / "token"
+
+    assert gateway.prepare_admin_token_file(projected, "admin-capability") == projected
+    assert projected.read_text(encoding="utf-8") == "admin-capability\n"
+    assert stat.S_IMODE(projected.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(projected.stat().st_mode) == gateway.GATEWAY_ADMIN_TOKEN_MODE
+    gateway.validate_admin_token_file(projected, "admin-capability")
+
+    with pytest.raises(CycloError, match="stale"):
+        gateway.validate_admin_token_file(projected, "different-capability")
+
+
+def test_gateway_admin_token_projection_rejects_unsafe_paths(
+    tmp_path: Path,
+) -> None:
+    real_directory = tmp_path / "real"
+    real_directory.mkdir()
+    linked_directory = tmp_path / "linked"
+    linked_directory.symlink_to(real_directory, target_is_directory=True)
+
+    with pytest.raises(CycloError, match="unsafe gateway admin token directory"):
+        gateway.prepare_admin_token_file(linked_directory / "token", "admin")
+    with pytest.raises(CycloError, match="malformed"):
+        gateway.prepare_admin_token_file(tmp_path / "private" / "token", "bad token")
+
+
+def test_gateway_admin_token_projection_rejects_symlinked_ancestor(
+    tmp_path: Path,
+) -> None:
+    outside_token = tmp_path / "outside" / "gateway" / "admin-token" / "token"
+    gateway.prepare_admin_token_file(outside_token, "outside-capability")
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "runs").symlink_to(tmp_path / "outside", target_is_directory=True)
+    redirected = state / "runs" / "gateway" / "admin-token" / "token"
+
+    with pytest.raises(CycloError, match="unsafe gateway admin token directory"):
+        gateway.prepare_admin_token_file(redirected, "replacement-capability")
+    with pytest.raises(CycloError, match="unsafe gateway admin token directory"):
+        gateway.validate_admin_token_file(redirected, "outside-capability")
+
+    assert outside_token.read_text(encoding="utf-8") == "outside-capability\n"
 
 
 def test_gateway_network_creation_sets_ownership_label(monkeypatch) -> None:
@@ -513,6 +579,7 @@ def test_running_gateway_validation_rejects_extra_networks(
     container["NetworkSettings"] = {
         "Networks": {"private": {"NetworkID": "owned-network-id"}}
     }
+    gateway.prepare_admin_token_file(config.admin_token_file, "admin")
     assert gateway.validate_running_gateway(config, "admin") == (
         "gateway-container-id",
         "owned-network-id",
@@ -1635,7 +1702,8 @@ def test_gateway_javascript_uses_only_cyclo_runtime_names() -> None:
     dockerfile = (context / "Dockerfile").read_text(encoding="utf-8")
     package = json.loads((context / "package.json").read_text(encoding="utf-8"))
     lock = json.loads((context / "package-lock.json").read_text(encoding="utf-8"))
-    assert "CYCLO_GATEWAY_TOKEN" in server
+    assert "CYCLO_GATEWAY_TOKEN_FILE" in server
+    assert "process.env.CYCLO_GATEWAY_TOKEN;" not in server
     assert "MULTIAGENT_GATEWAY" not in server
     assert 'from "./pi-registry.mjs"' in server
     assert 'from "./model-metadata.mjs"' in server

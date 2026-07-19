@@ -9,6 +9,12 @@ from .project import MOUNT_NAME_RE, ProjectMount
 from .state import Instance
 
 
+LEGACY_READ_ONLY_PROJECT_ERROR = (
+    "legacy read-only project state: stop and rerun it to use "
+    "a writable /workspace project"
+)
+
+
 @dataclass(frozen=True)
 class InstanceProject:
     """One normalized view of the project fields persisted for an instance."""
@@ -29,6 +35,21 @@ class InstanceProject:
             raise CycloError(
                 f"invalid project metadata for Cyclo instance {self.instance_id!r}: "
                 + "; ".join(self.errors)
+            )
+        return self
+
+    def require_persistable(self) -> "InstanceProject":
+        """Reject corrupt state while retaining the supported v0.1 marker."""
+
+        errors = tuple(
+            error
+            for error in self.errors
+            if error != LEGACY_READ_ONLY_PROJECT_ERROR
+        )
+        if errors:
+            raise CycloError(
+                f"invalid project metadata for Cyclo instance {self.instance_id!r}: "
+                + "; ".join(errors)
             )
         return self
 
@@ -155,10 +176,7 @@ def decode_instance_project(instance: Instance) -> InstanceProject:
         errors.append("legacy_project_read_only must be a boolean")
         legacy_read_only = False
     if legacy_read_only and not configured:
-        errors.append(
-            "legacy read-only project state: stop and rerun it to use "
-            "a writable /workspace project"
-        )
+        errors.append(LEGACY_READ_ONLY_PROJECT_ERROR)
 
     return InstanceProject(
         instance_id=instance.id,

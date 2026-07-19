@@ -19,6 +19,7 @@ class GatewayConfig:
     store_volume: str
     host_models_json: Path
     client_registry_dir: Path
+    admin_token_file: Path
 
 
 class CredentialGateway:
@@ -63,6 +64,9 @@ class CredentialGateway:
             store_volume=self.store_volume,
             host_models_json=self.host_pi_agent_dir / "models.json",
             client_registry_dir=self.gateway.host_client_registry_dir(self.store.gateway_registry),
+            admin_token_file=self.gateway.host_admin_token_file(
+                self.store.gateway_registry
+            ),
         )
 
     def _set_restart_policy(self) -> str:

@@ -21,6 +21,9 @@ def test_gateway_config_remains_credential_boundary_only(
     assert config.client_registry_dir == (
         store.gateway_registry / "runs" / "gateway" / "client-registry"
     )
+    assert config.admin_token_file == (
+        store.gateway_registry / "runs" / "gateway" / "admin-token" / "token"
+    )
     assert not hasattr(config, "host_config")
     assert not hasattr(config, "provider_socket_root")
 

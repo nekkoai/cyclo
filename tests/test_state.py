@@ -100,6 +100,20 @@ def test_direct_instance_load_rejects_undecodable_and_symlinked_metadata(
         ("active", "false", "active must be a boolean"),
         ("providers", "openai", "providers must be a list of strings"),
         ("port", True, "port must be null or an integer"),
+        ("project_path", {}, "project_path must be a string"),
+        ("project_name", [], "project_name must be a string"),
+        ("project_file", 3, "project_file must be a string"),
+        (
+            "project_description",
+            None,
+            "project_description must be a string",
+        ),
+        ("project_generation", False, "project_generation must be a string"),
+        (
+            "legacy_project_read_only",
+            "false",
+            "legacy_project_read_only must be a boolean",
+        ),
         (
             "container_name",
             "cyclo-someone-else",
@@ -131,6 +145,93 @@ def test_instance_metadata_rejects_wrong_field_types(
     assert instances == []
     assert len(errors) == 1
     assert message in errors[0]
+
+
+@pytest.mark.parametrize(
+    ("project_mounts", "message"),
+    [
+        (None, "project_mounts must be a list"),
+        ([None], r"project_mounts\[0\] must be an object"),
+        (
+            [{"name": "../escape", "path": "/tmp/project", "mode": "rw"}],
+            r"project_mounts\[0\] has an invalid name",
+        ),
+        (
+            [{"name": "source", "path": "relative", "mode": "rw"}],
+            r"project_mounts\[0\] has an invalid host path",
+        ),
+        (
+            [{"name": "source", "path": "/tmp/project", "mode": "write"}],
+            r"project_mounts\[0\] has an invalid mode",
+        ),
+    ],
+)
+def test_instance_metadata_rejects_invalid_persisted_project_mounts(
+    tmp_path: Path,
+    project_mounts: object,
+    message: str,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    path = store.metadata_path("invalid-mounts")
+    path.parent.mkdir(parents=True)
+    payload = make_instance("invalid-mounts").as_json()
+    payload.update(
+        {
+            "project_name": "project",
+            "project_file": "/tmp/project.cyclo",
+            "project_description": "Project description",
+            "project_generation": "project-generation",
+            "project_mounts": project_mounts,
+        }
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CycloError, match=message):
+        store.load("invalid-mounts")
+    instances, errors = store.list_report()
+    assert instances == []
+    assert len(errors) == 1
+    assert message.replace(r"\[", "[").replace(r"\]", "]") in errors[0]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("project_path", "relative", "project_path must be absolute"),
+        ("project_file", "relative.cyclo", "project_file must be absolute"),
+        (
+            "project_mounts",
+            [],
+            "project_mounts must contain at least one mount",
+        ),
+    ],
+)
+def test_instance_metadata_rejects_inconsistent_persisted_project_state(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    path = store.metadata_path("bad-project")
+    path.parent.mkdir(parents=True)
+    payload = make_instance("bad-project").as_json()
+    payload.update(
+        {
+            "project_name": "project",
+            "project_file": "/tmp/project.cyclo",
+            "project_description": "Project description",
+            "project_generation": "project-generation",
+            "project_mounts": [
+                {"name": "source", "path": "/tmp/project", "mode": "rw"}
+            ],
+        }
+    )
+    payload[field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CycloError, match=message):
+        store.load("bad-project")
 
 
 def test_instance_metadata_fifo_is_rejected_without_blocking(tmp_path: Path) -> None:

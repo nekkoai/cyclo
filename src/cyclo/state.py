@@ -79,7 +79,7 @@ class Instance:
     project_file: str = ""
     project_description: str = ""
     project_generation: str = ""
-    project_mounts: object = field(default_factory=list)
+    project_mounts: list[dict[str, str]] = field(default_factory=list)
     legacy_project_read_only: bool = False
     launch_id: str = ""
 
@@ -98,6 +98,7 @@ class Instance:
             "id",
             "team_name",
             "team_path",
+            "project_path",
             "generation",
             "container_name",
             "network_name",
@@ -105,12 +106,21 @@ class Instance:
             "agentws_host",
             "created_at",
             "updated_at",
+            "project_name",
+            "project_file",
+            "project_description",
+            "project_generation",
             "launch_id",
         )
         for name in string_fields:
             if name in payload and not isinstance(payload[name], str):
                 raise TypeError(f"{name} must be a string")
-        for name in ("team_write", "offline", "active"):
+        for name in (
+            "team_write",
+            "offline",
+            "active",
+            "legacy_project_read_only",
+        ):
             if name in payload and type(payload[name]) is not bool:
                 raise TypeError(f"{name} must be a boolean")
         for name in ("providers", "models"):
@@ -140,6 +150,12 @@ class Instance:
                 f"network_name must be {expected_network!r} for instance "
                 f"{instance.id!r}"
             )
+        # Keep the persistence boundary and every project-state consumer on
+        # the same decoder.  The local import avoids a state/project_state
+        # module cycle while preserving the v0.1 read-only migration marker.
+        from .project_state import decode_instance_project
+
+        decode_instance_project(instance).require_persistable()
         return instance
 
     def as_json(self) -> dict[str, object]:

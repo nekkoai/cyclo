@@ -621,6 +621,12 @@ are documented in the bundled `tools/README.md`. Set any of
 environment of `cyclo run`; Cyclo forwards only this retry-control allowlist to
 the team container, where the values are range-checked before agents start.
 
+Workers also check the shared provider runtime before claiming work. Runtime
+maintenance or a runtime crash therefore leaves queued work pending. If the
+runtime disappears immediately after a claim or during an engine invocation,
+the worker restores the previous attempt count, releases the job, and waits for
+runtime health without advancing its suspension circuit breaker.
+
 ## Observe and operate
 
 ```sh

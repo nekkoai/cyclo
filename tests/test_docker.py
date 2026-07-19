@@ -68,6 +68,7 @@ def test_container_argv_has_only_scoped_runtime_mounts(
         agents_dir=queue / "agents",
         pi_root=pi,
         port=0,
+        provider_runtime_health_url="http://cyclo-runtime:8788/health",
     )
 
     command = container_command(spec)
@@ -77,6 +78,10 @@ def test_container_argv_has_only_scoped_runtime_mounts(
     assert "--publish" not in command
     assert "AGENTWS_TEAM_ROSTER=/team/team" in command
     assert "AGENTWS_WORKSPACE=/workspace" in command
+    assert (
+        "CYCLO_PROVIDER_RUNTIME_HEALTH_URL=http://cyclo-runtime:8788/health"
+        in command
+    )
     assert f"type=bind,src={team_repo},dst=/team,readonly" in command
     assert f"type=bind,src={project_repo},dst=/workspace" in command
     assert f"type=bind,src={project_repo},dst=/workspace,readonly" not in command
