@@ -25,8 +25,9 @@
 
 Cyclo is a local-first runtime for experimenting with multi-agent systems. A
 team is ordinary Git content: a roster, role prompts, and an optional shared
-protocol. Attach that team to any project directory, submit a task, and Cyclo
-runs a durable filesystem job loop inside its own Docker container.
+protocol. A small `project.cyclo` file composes one or more teams with writable
+project directories and read-only supporting inputs. Submit a task and Cyclo runs a durable
+filesystem job loop for each selected team inside its own Docker container.
 
 Model traffic enters a shared provider runtime and reaches a separate
 credential gateway only for concrete upstream calls. API keys and subscription
@@ -156,29 +157,44 @@ Replace `PROVIDER/MODEL_ID` with an exact value printed by `cyclo models`.
 `cyclo init` creates an independent Git repository; edit and commit it like any
 other source project.
 
-### 3. Attach the team to a project
+### 3. Define and run a project
 
 ```sh
-cyclo run --name my-team \
-  ~/teams/my-team \
-  ~/src/my-project
+mkdir -p ~/experiments/my-project ~/src/my-project
+$EDITOR ~/experiments/my-project/project.cyclo
 ```
 
-The team definition is read-only by default. The project is writable by
-default, so agents can change its source and tests. Cyclo prints the instance
-name, project root, persistent queue path, and per-team viewer URL.
+```text
+name my-project
+description Develop and review my project.
+team ../../teams/my-team ro
+mount source ../../src/my-project rw
+```
+
+```sh
+cyclo validate ~/experiments/my-project/project.cyclo
+cyclo run ~/experiments/my-project/project.cyclo
+```
+
+Paths resolve from the directory containing `project.cyclo`. Each team gets its
+own container and sees its own definition at `/team`; every declared mount is
+available at `/workspace/<name>`, so this example exposes the writable checkout
+at `/workspace/source`. A `ro` mount instead appears under `/readonly/<name>`.
+Add more `team` or `mount` lines to compose a larger experiment, and choose
+`ro` or `rw` explicitly on every line.
 
 ### 4. Give it work
 
 ```sh
 $EDITOR /tmp/task.md
-cyclo task my-team task-001 /tmp/task.md
-cyclo logs -f my-team
+cyclo task my-project-my-team task-001 /tmp/task.md
+cyclo logs -f my-project-my-team
 ```
 
-The task specification describes the desired outcome in the attached project;
-it does not need to mention an internal container path. Open the fleet view in
-another terminal:
+The task specification describes the desired outcome in the writable
+workspaces. Cyclo generates a host-path-free project manifest for every agent, so
+the team knows the available directories and their write modes. Open the fleet
+view in another terminal:
 
 ```sh
 cyclo dashboard
@@ -188,8 +204,9 @@ cyclo dashboard
 
 ```mermaid
 flowchart LR
-    T["Team Git repository<br/>team + roles/*.md"]
-    P["Project directory<br/>source + tests"]
+    D["project.cyclo<br/>teams + named mounts + modes"]
+    T["Team Git repositories<br/>team + roles/*.md"]
+    P["Mounted directories<br/>projects + read-only inputs"]
     R["cyclo-runtime<br/>agents + filesystem loop"]
     S[("Host state<br/>tasks + jobs + transcripts")]
     X["cyclo-provider-runtime<br/>catalogue + composition + routing"]
@@ -199,8 +216,10 @@ flowchart LR
     V[("Gateway volume<br/>credentials + subscriptions")]
     M["Concrete model provider"]
 
-    T -->|/team · read-only| R
-    P -->|/workspace · writable| R
+    D --> T
+    D --> P
+    T -->|one /team per runtime · ro/rw| R
+    P -->|rw → /workspace/name<br/>ro → /readonly/name| R
     R <-->|durable queue| S
     R -->|scoped capability · TCP| X
     V <-->|gateway only| G
@@ -221,8 +240,8 @@ attributes provider-reported usage to the team/project binding and generation.
 
 A submitted task begins with a planner job. Agents claim jobs matching their
 roles, write evidence and results to the filesystem queue, and create follow-up
-jobs for the next role. The wrapper keeps every agent available for later work;
-the team stops only when you stop the instance.
+jobs for the next role. A per-agent worker keeps each role available for later
+work; the team stops only when you stop the instance.
 
 ## Define a team
 
@@ -252,8 +271,10 @@ Every role needs a matching `roles/<role>.md`, and at least one agent must have
 the `planner` role. A team can mix models or providers. When `AGENTS.md` is
 absent, Cyclo supplies its bundled filesystem-loop protocol.
 
-Use `--team-write` only when a team should edit its own roster or roles; those
-ordinary Git working-tree changes take effect on the next run.
+Declare a team `rw` in `project.cyclo` only when it should edit its own roster
+or roles; those ordinary Git working-tree changes take effect on the next run.
+The legacy `cyclo run TEAM PROJECT --team-write` spelling remains available for
+compatibility.
 
 ## Included loops
 
@@ -275,11 +296,16 @@ cyclo usage
 cyclo gateway restart
 cyclo runtime status
 cyclo provider status --all
-cyclo path my-team
-cyclo stop my-team
+cyclo path my-project-my-team
+cyclo stop my-project-my-team
 ```
 
-The dashboard combines lifecycle state, bounded queue summaries, recent
+`cyclo ps` and the dashboard keep container lifecycle separate from provider-
+runtime status. A running team therefore remains visibly `runtime-down`,
+`runtime-stale`, or `runtime-unknown` when that shared prerequisite is absent,
+outdated, or cannot be inspected. `ready` means the provider-runtime container
+is running with its current image and configuration; use `cyclo doctor` for the
+broader host check. The dashboard also combines bounded queue summaries, recent
 task/job activity, and gateway usage across all instances. It and the per-team
 AgentWS viewer are read-only and bind to loopback by default.
 
@@ -301,10 +327,10 @@ unless network access is already controlled.
 
 ## Security boundary
 
-The team container receives its team mount, project mount, durable job state,
-and a writable Pi state tree containing only its scoped provider-runtime
-capability. That capability is valid only through the team's own private
-provider-runtime interface.
+The team container receives its own team mount, the writable workspaces and
+read-only inputs from `project.cyclo`, durable job state, and a writable Pi state tree containing only
+its scoped provider-runtime capability. That capability is valid only through
+the team's own private provider-runtime interface.
 It does **not** receive provider credentials, subscription files, the
 credential volume, gateway or provider-runtime administrator token, host home
 directory, Docker socket, or another team's state.
@@ -312,15 +338,16 @@ directory, Docker socket, or another team's state.
 This isolates credentials; it is not a general-purpose sandbox or data-loss
 prevention system. An agent can send readable project content to an allowed
 model provider. `--offline` blocks direct outbound networking while preserving
-model-proxy access, and `--project-read-only` removes project write access. See
-the [architecture](docs/architecture.md) and [security policy](SECURITY.md) for
-the full trust model.
+model-proxy access. Writable projects live under `/workspace`; read-only inputs
+live under `/readonly`. See the [architecture](docs/architecture.md) and
+[security policy](SECURITY.md) for the full trust model.
 
 ## Documentation
 
 | Document | What it covers |
 |---|---|
 | [User guide](docs/guide.md) | Complete installation, provider, runtime, retry, operation, mount, and persistent-state reference |
+| [`project.cyclo` format](docs/project-format.md) | Exact project grammar, named mounts, multi-team runs, modes, and compatibility syntax |
 | [Architecture](docs/architecture.md) | Components, generations, networks, state, and trust boundaries |
 | [Team templates](template/README.md) | The bundled loops and how to customize them |
 | [Security policy](SECURITY.md) | Supported versions, reporting, and explicit guarantees |

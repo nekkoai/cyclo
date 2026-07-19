@@ -7,13 +7,18 @@ the provider orchestrator.
 ## Components
 
 ```text
-team repository              project directory
-team + roles/*.md            source + tests
-       | read-only                  | writable
-       +--------------+-------------+
-                      v
-             team runtime container
-          agents + filesystem job loop
+                         project.cyclo
+                 teams + named mounts + modes
+                    /                    \
+                   v                      v
+       team repositories          mounted directories
+       team + roles/*.md          projects + read-only inputs
+                   \                      /
+                    +--------+-----------+
+                             v
+                  team runtime containers
+             one isolated instance per team
+                agents + filesystem job loop
                       |
           scoped per-instance bearer
                       | TCP on team network
@@ -37,8 +42,9 @@ requirement, not a normal host runtime requirement.
 
 The three long-running runtime roles are distinct:
 
-- A **team runtime** owns one team/project binding, its agents, viewer, and
-  durable filesystem queue.
+- A **team runtime** owns one team/project-definition binding, its agents,
+  viewer, and durable filesystem queue. A multi-team project therefore creates
+  several independent team runtimes.
 - The shared **provider runtime** owns the merged model catalogue, host-provider
   policy, virtual routes, short-lived request contexts, and provider-component
   registration. It contains no physical provider credential.
@@ -50,6 +56,47 @@ The three long-running runtime roles are distinct:
 Only the gateway mounts `cyclo-gateway-store`. A provider component and a team
 container never receive that volume, a real provider key, or a subscription
 session.
+
+## Project definitions
+
+The normal run interface is a strict, line-oriented `project.cyclo` file:
+
+```text
+name core-et-uart
+description Design and verify a UART IP.
+team ../teams/jon-rtl ro
+team ../teams/rtl-auditor ro
+mount source ../sources/core-et rw
+mount specifications ../references/specifications ro
+```
+
+`name` and `description` occur exactly once; at least one `team` and one
+`mount` are required. Team and mount lines carry an explicit `ro` or `rw`
+mode. A `rw` mount is a writable project; a `ro` mount is a read-only supporting
+input. Relative paths resolve from the definition's directory, not the caller's
+working directory. Resolved team and mount trees must be unique and mutually
+non-overlapping, and the complete collection is checked against Cyclo state,
+trusted runtime/configuration paths, pseudo-filesystems, host Pi state, and
+Docker sockets before any team starts. Unknown directives fail closed; `mcp`
+is reserved but rejected until Cyclo implements MCP attachment.
+
+`cyclo run project.cyclo` starts one independent instance per team. Each
+container sees only its selected definition at `/team`, with the line's access
+mode. Writable mounts appear at `/workspace/<name>` and read-only inputs appear
+at `/readonly/<name>`. Both parents are generated read-only namespaces, so
+undeclared top-level paths cannot be created. Cyclo writes a separate,
+host-path-free `/agentws/PROJECT.md` into each runtime and includes it in every
+agent's initial prompt; it records the project name, description, definition
+digest, logical mount paths, and modes. This project context is independent of
+and remains authoritative alongside a team's optional `AGENTS.md`.
+
+Every team and mount is preflighted before the first start. If a later start
+fails, Cyclo stops and revokes the instances already started by that invocation.
+Each instance still owns its own network, model capability, queue, Pi state, and
+viewer. The compatibility form `cyclo run TEAM PROJECT` retains the former
+single-team writable `/workspace` binding and its `--team-write` flag, but new
+composable experiments use `project.cyclo`. The exact grammar is documented in
+[`project-format.md`](project-format.md).
 
 ## Host provider configuration
 
@@ -240,7 +287,7 @@ runtime-interface capability binding hold even for a custom image or a Cyclo
 invocation running as root: the team cannot forge raw traffic addressed to the
 runtime's interface on a different private network.
 
-Normal team mode may also have direct outbound networking. `--offline` makes
+Normal instance mode may also have direct outbound networking. `--offline` makes
 the team network internal while preserving its route to the provider runtime.
 It does not make readable project data confidential from an allowed model: an
 agent can still include that data in a model request.
@@ -251,11 +298,25 @@ A team is an ordinary Git repository containing a `team` roster, role prompts,
 and optionally `AGENTS.md`. The roster binds each agent to a role, engine, and
 exact provider/model. A generation combines the repository commit with a
 digest of the live definition, so runs remain attributable with uncommitted
-edits.
+edits. The project definition has its own semantic digest over its name,
+description, ordered teams, ordered named mounts, resolved paths, and modes.
 
-The team mount is read-only by default; `--team-write` permits deliberate
-self-modification. The separate project mount is writable by default;
-`--project-read-only` removes that write access.
+In normal `project.cyclo` operation, every team and mount has an explicit mode.
+A `rw` team may self-modify; a `rw` mount is a project that may be changed by
+every team in that project. A `ro` mount is supporting input, never a read-only
+project. Concurrent writers therefore have ordinary filesystem races,
+and separate Git worktrees remain the isolation mechanism when required. The
+legacy `cyclo run TEAM PROJECT` form keeps a read-only team and writable project,
+with `--team-write` available for deliberate team self-modification.
+
+Mount validation is both per-definition and cross-instance. A new source may
+exactly reuse an existing source of the same kind—for example, two teams sharing
+one declared project checkout—but it may not be a parent or child of a running
+instance's source, or reuse a team source as a project source. After parsing,
+Cyclo records the selected device and inode in the invocation's run bindings
+and rechecks them immediately before Docker creates the container. Each launch
+also has an independent identity;
+multi-team rollback removes only the container launched by that invocation.
 
 Tasks, jobs, comments, transcripts, and results live below the selected Cyclo
 state root and survive container replacement. The runtime sees a materialized,
@@ -275,6 +336,8 @@ cyclo/
   instances/<instance>/
     run.json
     runtime/                     # bundled filesystem loop copy
+    workspace/                   # inert namespace for writable projects
+    readonly/                    # inert namespace for read-only inputs
     agentws-state/               # tasks, jobs, comments, results, transcripts
     pi/agent/                    # projected model config and scoped runtime bearer
 ```
@@ -299,7 +362,8 @@ input and must be reviewed before `cyclo provider build`; runtime isolation
 does not make a malicious Dockerfile safe to build.
 
 Team and project trees are untrusted agent-controlled data. Cyclo does not mount
-the Docker socket, host home, gateway volume, another team's queue, or another
-team's project into a team container. Writable Git trees may contain hostile
-hooks or configuration and should be treated accordingly by later host-side
-commands.
+the Docker socket, host home, gateway volume, another instance's queue, or an
+undeclared project tree into a team container. Teams intentionally share only
+the named mounts in their common `project.cyclo`. Writable Git trees may contain
+hostile hooks or configuration and should be treated accordingly by later
+host-side commands.

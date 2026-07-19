@@ -6,6 +6,20 @@ All notable changes to Cyclo are documented in this file.
 
 Provider composition and runtime-isolation release.
 
+- Add strict, line-oriented `project.cyclo` definitions with a name,
+  description, one or more Git-defined teams, and one or more named `ro`/`rw`
+  mounts. Writable mounts are projects; read-only mounts are supporting inputs.
+  Paths resolve relative to the definition, and unsupported or
+  unknown directives—including the reserved `mcp` directive—fail closed.
+- Start one isolated instance per project team, expose writable projects at
+  `/workspace/<name>` and read-only inputs at `/readonly/<name>`, and generate a
+  host-path-free `/agentws/PROJECT.md`
+  manifest for every agent. Multi-team starts preflight the complete definition
+  and roll back instances started by a failed invocation. Bind-source identity,
+  running-instance overlap, and per-launch rollback checks prevent path
+  substitution or concurrent instance reuse from crossing that boundary.
+- Retain `cyclo run TEAM PROJECT` and `--team-write` as a compatibility
+  interface while making `cyclo run project.cyclo` the normal reusable path.
 - Separate the credential gateway from the provider runtime: the gateway owns
   credentials, concrete upstream traffic, and usage, while the provider runtime
   owns composition, policy, routing, and team capabilities.
@@ -54,10 +68,29 @@ Provider composition and runtime-isolation release.
   start or build shared services or provider containers.
 - Recreate the shared gateway without deleting credentials or restarting teams
   with `cyclo gateway restart`.
+- Keep `cyclo gateway status` observational with respect to gateway images: it
+  validates the existing image and refuses to build or pull one implicitly.
 - Scrub exact credential reflections from upstream response headers and
   streaming bodies at the gateway boundary.
 - Split the owned team-runtime image from the credential-gateway package and
   package the provider runtime and protocol as first-class Cyclo resources.
+- Reap detached engine descendants through per-worker Linux subreapers, treat
+  unclean worker exits as team-container failures, use Docker teardown as the
+  outer process-tree fence, and capability-gate startup queue recovery with an
+  exclusive runtime lifetime lock.
+- Report team-container lifecycle separately from shared provider-runtime
+  status in `cyclo ps` and the dashboard, including explicit down, stale, and
+  uninspectable states.
+- Serialize task comments, state transitions, and result publication with a
+  persistent per-task mutex while retaining atomic task and file publication.
+- On a terminal automatic worker failure, publish one deterministic,
+  idempotent planner recovery job before failing the source job; planner
+  failures do not recursively create recovery work.
+- Refuse control operations when any persisted instance record is corrupt or
+  unreadable, while letting the dashboard show readable instances alongside
+  explicit source errors.
+- Make `cyclo doctor` actively probe both the credential gateway and provider
+  runtime before trusting the runtime catalogue.
 
 ## [0.1.0] - 2026-07-14
 

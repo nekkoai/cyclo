@@ -11,7 +11,7 @@ the gateway nor connect to it.
 
 Building an installed provider executes its `Dockerfile` and is therefore a
 host-administration action. Keep provider source outside agent-writable team
-and project mounts, review it, and pin it through your deployment process.
+and workspace mounts, review it, and pin it through your deployment process.
 Runtime isolation cannot make an unsafe Dockerfile safe to build.
 
 ## Transport and isolation
