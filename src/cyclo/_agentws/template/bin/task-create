@@ -61,6 +61,8 @@ cleanup() {
         [ "${OWN_PLAN_STAGE:-0}" -eq 0 ] \
             || remove_owned_stage "$PLAN_JOB_STAGE" ".task-create-transaction"
     fi
+    [ -z "${TASK_BUILD:-}" ] || rm -rf -- "$TASK_BUILD"
+    [ -z "${PLAN_JOB_BUILD:-}" ] || rm -rf -- "$PLAN_JOB_BUILD"
     exec 9>&-
     exit "$status"
 }
@@ -98,7 +100,8 @@ planner_job_has_complete_base() {
         && regular_nonempty_file "$directory/spec.md" \
         && file_equals "$directory/role" "planner" \
         && file_equals "$directory/task-id" "$TASK_ID" \
-        && regular_file "$directory/log.md"
+        && regular_file "$directory/log.md" \
+        && regular_file "$directory/.control.lock"
 }
 
 planner_job_is_staged() {
@@ -175,6 +178,11 @@ finish_commit() {
         || die "published task '$TASK_ID' is incomplete"
     planner_job_has_complete_base "$PLAN_JOB_DIR" "$TRANSACTION_ID" \
         || die "published initial planner job '$PLAN_JOB_ID' is incomplete"
+    # New stages already contain this persistent mutex. Acquiring it here also
+    # upgrades a recoverable task staged by an older AgentWS version before the
+    # initial planner job becomes claimable.
+    acquire_task_control_lock "$TASK_DIR"
+    release_task_control_lock
     if ! path_exists "$PLAN_JOB_DIR/status"; then
         write_file_atomic "$PLAN_JOB_DIR/status" "pending"
     fi
@@ -227,6 +235,19 @@ recover_interrupted_commit() {
     fi
 
     if [ "$final_task" -eq 0 ] && [ "$final_job" -eq 0 ] \
+        && [ "$staged_task" -eq 1 ] && [ "$staged_job" -eq 0 ]; then
+        TRANSACTION_ID="$(read_transaction "$TASK_STAGE/.creating" 2>/dev/null || true)"
+        [ -n "$TRANSACTION_ID" ] \
+            && task_is_complete "$TASK_STAGE" "$TRANSACTION_ID" "open" \
+            || die "task '$TASK_ID' has ambiguous or corrupt staged creation data"
+        create_planner_job_stage
+        planner_job_is_staged "$PLAN_JOB_STAGE" "$TRANSACTION_ID" \
+            || die "staged initial planner job '$PLAN_JOB_ID' is incomplete"
+        finish_commit 1 1
+        return 0
+    fi
+
+    if [ "$final_task" -eq 0 ] && [ "$final_job" -eq 0 ] \
         && [ "$staged_task" -eq 1 ] && [ "$staged_job" -eq 1 ]; then
         TRANSACTION_ID="$(read_transaction "$TASK_STAGE/.creating" 2>/dev/null || true)"
         [ -n "$TRANSACTION_ID" ] \
@@ -241,30 +262,33 @@ recover_interrupted_commit() {
 }
 
 create_task_stage() {
-    mask_commit_signals
-    mkdir -m 700 "$TASK_STAGE" 2>/dev/null \
-        || die "cannot stage task '$TASK_ID'"
-    printf '%s\n' "$TRANSACTION_ID" > "$TASK_STAGE/.creating" \
+    TASK_BUILD="$(mktemp -d "$TASKS_DIR/.task-create-build+XXXXXX")" \
+        || die "cannot create private task stage for '$TASK_ID'"
+    chmod 700 "$TASK_BUILD"
+    printf '%s\n' "$TRANSACTION_ID" > "$TASK_BUILD/.creating" \
         || die "cannot mark staged task '$TASK_ID'"
-    OWN_TASK_STAGE=1
-    catch_signals
 
-    cp -- "$SPEC_FILE" "$TASK_STAGE/spec.md"
-    : > "$TASK_STAGE/log.md"
-    write_file_atomic "$TASK_STAGE/state" "open"
+    cp -- "$SPEC_FILE" "$TASK_BUILD/spec.md"
+    : > "$TASK_BUILD/log.md"
+    : > "$TASK_BUILD/.control.lock"
+    write_file_atomic "$TASK_BUILD/state" "open"
+    task_is_complete "$TASK_BUILD" "$TRANSACTION_ID" "open" \
+        || die "private task stage '$TASK_ID' is incomplete"
+
+    publish_noreplace "$TASK_BUILD" "$TASK_STAGE" "staged task"
+    TASK_BUILD=""
+    OWN_TASK_STAGE=1
 }
 
 create_planner_job_stage() {
-    mask_commit_signals
-    mkdir -m 700 "$PLAN_JOB_STAGE" 2>/dev/null \
-        || die "cannot stage initial planner job '$PLAN_JOB_ID'"
-    printf '%s\n' "$TRANSACTION_ID" > "$PLAN_JOB_STAGE/.task-create-transaction" \
+    PLAN_JOB_BUILD="$(mktemp -d "$JOBS_DIR/.task-create-job-build+XXXXXX")" \
+        || die "cannot create private planner stage for '$PLAN_JOB_ID'"
+    chmod 700 "$PLAN_JOB_BUILD"
+    printf '%s\n' "$TRANSACTION_ID" > "$PLAN_JOB_BUILD/.task-create-transaction" \
         || die "cannot mark staged initial planner job '$PLAN_JOB_ID'"
-    OWN_PLAN_STAGE=1
-    catch_signals
 
-    mkdir "$PLAN_JOB_STAGE/workspace"
-    cat > "$PLAN_JOB_STAGE/spec.md" <<EOF
+    mkdir "$PLAN_JOB_BUILD/workspace"
+    cat > "$PLAN_JOB_BUILD/spec.md" <<EOF
 # Plan for task $TASK_ID
 
 ## Task
@@ -284,9 +308,17 @@ Create the required follow-up jobs for this task, then close this planner job.
 The task is complete only when a planner decides it is complete and records the
 result with \`bin/task-result $TASK_ID <result-file>\`.
 EOF
-    write_file_atomic "$PLAN_JOB_STAGE/role" "planner"
-    write_file_atomic "$PLAN_JOB_STAGE/task-id" "$TASK_ID"
-    : > "$PLAN_JOB_STAGE/log.md"
+    write_file_atomic "$PLAN_JOB_BUILD/role" "planner"
+    write_file_atomic "$PLAN_JOB_BUILD/task-id" "$TASK_ID"
+    : > "$PLAN_JOB_BUILD/log.md"
+    : > "$PLAN_JOB_BUILD/.control.lock"
+    planner_job_is_staged "$PLAN_JOB_BUILD" "$TRANSACTION_ID" \
+        || die "private planner stage '$PLAN_JOB_ID' is incomplete"
+
+    publish_noreplace "$PLAN_JOB_BUILD" "$PLAN_JOB_STAGE" \
+        "staged initial planner job"
+    PLAN_JOB_BUILD=""
+    OWN_PLAN_STAGE=1
 }
 
 TASK_ID=""
@@ -326,11 +358,13 @@ command -v flock >/dev/null 2>&1 || die "required command not found: flock"
 TASK_DIR="$TASKS_DIR/$TASK_ID"
 PLAN_JOB_ID="$TASK_ID-plan"
 PLAN_JOB_DIR="$JOBS_DIR/$PLAN_JOB_ID"
-TASK_STAGE="$TASKS_DIR/.$TASK_ID.task-create-stage"
-PLAN_JOB_STAGE="$JOBS_DIR/.$PLAN_JOB_ID.task-create-stage"
+TASK_STAGE="$TASKS_DIR/.$TASK_ID+.task-create-stage"
+PLAN_JOB_STAGE="$JOBS_DIR/.$PLAN_JOB_ID+.task-create-stage"
 TRANSACTION_ID=""
 OWN_TASK_STAGE=0
 OWN_PLAN_STAGE=0
+TASK_BUILD=""
+PLAN_JOB_BUILD=""
 COMMIT_STARTED=0
 
 trap cleanup 0

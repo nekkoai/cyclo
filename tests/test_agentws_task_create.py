@@ -95,18 +95,34 @@ def executable_script(path: Path, text: str) -> Path:
     return path
 
 
+def wait_for(path: Path, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                f"process exited before {path.name}: {stdout=} {stderr=}"
+            )
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path}")
+
+
 def assert_complete_pair(state: Path, task_id: str = "change-1") -> None:
     task = state / "tasks" / task_id
     job = state / "jobs" / f"{task_id}-plan"
     assert (task / "state").read_text(encoding="utf-8").strip() == "open"
     assert (task / "spec.md").is_file()
     assert (task / "log.md").is_file()
+    assert (task / ".control.lock").is_file()
     assert not (task / ".creating").exists()
     assert (job / "role").read_text(encoding="utf-8").strip() == "planner"
     assert (job / "task-id").read_text(encoding="utf-8").strip() == task_id
     assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
     assert (job / "spec.md").stat().st_size > 0
     assert (job / "log.md").is_file()
+    assert (job / ".control.lock").is_file()
     assert (job / "workspace").is_dir()
     assert (job / ".task-create-transaction").stat().st_size > 0
 
@@ -208,8 +224,113 @@ def test_staging_failure_removes_only_owned_hidden_stages(tmp_path: Path) -> Non
     assert result.returncode == 42
     assert not (state / "tasks" / "change-1").exists()
     assert not (state / "jobs" / "change-1-plan").exists()
-    assert not (state / "tasks" / ".change-1.task-create-stage").exists()
-    assert not (state / "jobs" / ".change-1-plan.task-create-stage").exists()
+    assert not (state / "tasks" / ".change-1+.task-create-stage").exists()
+    assert not (state / "jobs" / ".change-1-plan+.task-create-stage").exists()
+
+
+def test_sigkill_during_private_task_build_never_publishes_fixed_stage(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_copy(tmp_path)
+    state = tmp_path / "state"
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    entered = tmp_path / "private-task-copy-entered"
+    release = tmp_path / "private-task-copy-release"
+    real_cp = shutil.which("cp")
+    assert real_cp is not None
+    executable_script(
+        wrappers / "cp",
+        "#!/bin/sh\n"
+        '"$REAL_CP" "$@"\n'
+        ': > "$ENTERED"\n'
+        'while [ ! -e "$RELEASE" ]; do sleep 0.01; done\n',
+    )
+    process = start_task_create(
+        runtime,
+        state,
+        environment={
+            "PATH": f"{wrappers}:{os.environ['PATH']}",
+            "REAL_CP": real_cp,
+            "ENTERED": str(entered),
+            "RELEASE": str(release),
+        },
+    )
+    try:
+        wait_for(entered, process)
+        assert not (state / "tasks" / ".change-1+.task-create-stage").exists()
+        assert list((state / "tasks").glob(".task-create-build+*"))
+        process.kill()
+        process.wait(timeout=5)
+    finally:
+        release.touch(exist_ok=True)
+        process.communicate(timeout=5)
+
+    assert process.returncode == -signal.SIGKILL
+    assert not (state / "tasks" / "change-1").exists()
+    assert not (state / "jobs" / "change-1-plan").exists()
+
+    recovered = invoke_task_create(runtime, state)
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert_complete_pair(state)
+
+
+def test_sigkill_during_private_planner_build_recovers_task_only_stage(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_copy(tmp_path)
+    state = tmp_path / "state"
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    entered = tmp_path / "private-planner-workspace-entered"
+    release = tmp_path / "private-planner-workspace-release"
+    real_mkdir = shutil.which("mkdir")
+    assert real_mkdir is not None
+    executable_script(
+        wrappers / "mkdir",
+        "#!/bin/sh\n"
+        'last=""\n'
+        'for argument do last="$argument"; done\n'
+        '"$REAL_MKDIR" "$@"\n'
+        'case "$last" in\n'
+        '  "$JOBS_ROOT"/.task-create-job-build+*/workspace)\n'
+        '    : > "$ENTERED"\n'
+        '    while [ ! -e "$RELEASE" ]; do sleep 0.01; done\n'
+        "    ;;\n"
+        "esac\n",
+    )
+    process = start_task_create(
+        runtime,
+        state,
+        environment={
+            "PATH": f"{wrappers}:{os.environ['PATH']}",
+            "REAL_MKDIR": real_mkdir,
+            "JOBS_ROOT": str(state / "jobs"),
+            "ENTERED": str(entered),
+            "RELEASE": str(release),
+        },
+    )
+    try:
+        wait_for(entered, process)
+        staged_task = state / "tasks" / ".change-1+.task-create-stage"
+        assert (staged_task / ".creating").is_file()
+        assert (staged_task / "state").read_text(encoding="utf-8").strip() == "open"
+        assert not (state / "jobs" / ".change-1-plan+.task-create-stage").exists()
+        assert list((state / "jobs").glob(".task-create-job-build+*"))
+        process.kill()
+        process.wait(timeout=5)
+    finally:
+        release.touch(exist_ok=True)
+        process.communicate(timeout=5)
+
+    assert process.returncode == -signal.SIGKILL
+
+    recovered = invoke_task_create(runtime, state)
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert "recovered completed task creation" in recovered.stdout
+    assert_complete_pair(state)
 
 
 def test_ambiguous_partial_creation_is_refused_without_deletion(
@@ -302,7 +423,7 @@ def test_sigkill_between_task_and_job_publication_recovers_staged_pair(
     assert interrupted.returncode == -signal.SIGKILL
     assert (state / "tasks" / "change-1" / ".creating").is_file()
     assert not (state / "jobs" / "change-1-plan").exists()
-    assert (state / "jobs" / ".change-1-plan.task-create-stage").is_dir()
+    assert (state / "jobs" / ".change-1-plan+.task-create-stage").is_dir()
 
     recovered = invoke_task_create(runtime, state)
 
@@ -388,7 +509,7 @@ def test_foreign_job_collision_at_commit_boundary_is_never_deleted(
     assert "publish initial planner job" in result.stderr
     assert sentinel.read_text(encoding="utf-8") == "foreign\n"
     assert (state / "tasks" / "change-1" / ".creating").is_file()
-    staged_job = state / "jobs" / ".change-1-plan.task-create-stage"
+    staged_job = state / "jobs" / ".change-1-plan+.task-create-stage"
     assert staged_job.is_dir()
     assert not (staged_job / "status").exists()
     claim = subprocess.run(
@@ -409,6 +530,7 @@ def test_foreign_job_collision_at_commit_boundary_is_never_deleted(
         check=False,
     )
     assert claim.returncode != 0
+    assert "invalid job ID" in claim.stderr
     assert not (staged_job / "lock").exists()
 
     retry = invoke_task_create(runtime, state)

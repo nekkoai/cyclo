@@ -24,8 +24,8 @@ validate_name() {
     value="${2:-}"
 
     case "$value" in
-        ""|.|..|*[!A-Za-z0-9._-]*)
-            die "invalid $label '$value' - only alphanumeric, dot, underscore, and hyphen allowed"
+        ""|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+            die "invalid $label '$value' - must start with an alphanumeric character and contain only alphanumeric, dot, underscore, and hyphen"
             ;;
     esac
 }
@@ -124,6 +124,144 @@ write_file_atomic() {
     }
 }
 
+# Queue ownership uses the job's lock/ directory.  This separate, persistent
+# file is an advisory mutex for changing that ownership and the job status.
+# Keeping the inode for the lifetime of the job avoids the remove-and-recreate
+# race that occurs when lock/ itself is used as both ownership and mutex.
+acquire_job_control_lock() {
+    job_dir="$1"
+    control_lock="$job_dir/.control.lock"
+
+    command -v flock >/dev/null 2>&1 \
+        || die "required command not found: flock"
+    [ ! -L "$control_lock" ] \
+        || die "job control lock is a symbolic link: $control_lock"
+
+    # Opening with append creates the control file for queues made by older
+    # AgentWS versions without truncating an existing persistent inode.
+    exec 8>>"$control_lock" \
+        || die "cannot open job control lock: $control_lock"
+    [ -f "$control_lock" ] && [ ! -L "$control_lock" ] || {
+        exec 8>&-
+        die "job control lock is not a regular file: $control_lock"
+    }
+    flock -x 8 || {
+        exec 8>&-
+        die "cannot acquire job control lock: $control_lock"
+    }
+}
+
+release_job_control_lock() {
+    exec 8>&-
+}
+
+# Task comments, state, and results are shared by every role working on the
+# task. Keep one persistent inode per task and hold it across each complete
+# logical mutation so records and finalization cannot interleave.
+acquire_task_control_lock() {
+    _task_lock_dir="$1"
+    _task_control_lock="$_task_lock_dir/.control.lock"
+
+    command -v flock >/dev/null 2>&1 \
+        || die "required command not found: flock"
+    [ -d "$_task_lock_dir" ] && [ ! -L "$_task_lock_dir" ] \
+        || die "task directory is symlinked or is not a directory: $_task_lock_dir"
+    if [ -e "$_task_control_lock" ] || [ -L "$_task_control_lock" ]; then
+        [ -f "$_task_control_lock" ] && [ ! -L "$_task_control_lock" ] \
+            || die "task control lock is symlinked or is not a regular file: $_task_control_lock"
+    fi
+
+    # Opening with append safely creates the persistent lock for tasks made by
+    # older AgentWS versions without truncating an existing inode.
+    exec 7>>"$_task_control_lock" \
+        || die "cannot open task control lock: $_task_control_lock"
+    [ -f "$_task_control_lock" ] && [ ! -L "$_task_control_lock" ] || {
+        exec 7>&-
+        die "task control lock is symlinked or is not a regular file: $_task_control_lock"
+    }
+    flock -x 7 || {
+        exec 7>&-
+        die "cannot acquire task control lock: $_task_control_lock"
+    }
+    [ -d "$_task_lock_dir" ] && [ ! -L "$_task_lock_dir" ] \
+        || die "task directory changed while acquiring its control lock: $_task_lock_dir"
+    [ -f "$_task_control_lock" ] && [ ! -L "$_task_control_lock" ] \
+        || die "task control lock changed while it was being acquired: $_task_control_lock"
+}
+
+release_task_control_lock() {
+    exec 7>&-
+}
+
+require_task_record_locked() {
+    _task_record_dir="$1"
+
+    if [ -e "$_task_record_dir/.creating" ] || [ -L "$_task_record_dir/.creating" ]; then
+        die "task '$(basename "$_task_record_dir")' has an incomplete creation marker"
+    fi
+    for _task_record_name in spec.md state log.md; do
+        _task_record_path="$_task_record_dir/$_task_record_name"
+        [ -f "$_task_record_path" ] && [ ! -L "$_task_record_path" ] \
+            || die "task '$(basename "$_task_record_dir")' has an invalid $_task_record_name"
+    done
+    [ -s "$_task_record_dir/spec.md" ] \
+        || die "task '$(basename "$_task_record_dir")' has an empty spec.md"
+    _task_record_state="$(cat "$_task_record_dir/state" 2>/dev/null || true)"
+    is_valid_task_state "$_task_record_state" \
+        || die "task '$(basename "$_task_record_dir")' has invalid state '$_task_record_state'"
+}
+
+# A pending job cannot have a committed owner.  If a claimant or releaser died
+# between its atomic status write and removing lock/, finish that interrupted
+# transition while the caller holds .control.lock.  A non-empty lock is treated
+# as corruption and left untouched.
+repair_pending_ownership_locked() {
+    job_dir="$1"
+
+    [ "$(read_status "$job_dir")" = "pending" ] || return 1
+    if [ -e "$job_dir/lock" ] || [ -L "$job_dir/lock" ]; then
+        [ -d "$job_dir/lock" ] && [ ! -L "$job_dir/lock" ] \
+            || die "pending job '$(basename "$job_dir")' has an invalid ownership lock"
+        rmdir "$job_dir/lock" 2>/dev/null \
+            || die "pending job '$(basename "$job_dir")' has a non-empty ownership lock"
+        rm -f "$job_dir/agent-id"
+        append_log "$job_dir" "Recovered interrupted transition" \
+            "Removed stale ownership from a pending job."
+    else
+        rm -f "$job_dir/agent-id"
+    fi
+    return 0
+}
+
+# Print why a claimed/running job is demonstrably orphaned.  No output and a
+# non-zero result mean that its named agent directory still exists; callers
+# must not infer death merely from elapsed time in that case.
+job_orphan_reason() {
+    job_dir="$1"
+
+    if [ ! -f "$job_dir/agent-id" ]; then
+        echo "missing agent-id"
+        return 0
+    fi
+
+    orphan_agent_id="$(cat "$job_dir/agent-id" 2>/dev/null || true)"
+    case "$orphan_agent_id" in
+        "")
+            echo "empty agent-id"
+            return 0
+            ;;
+        [!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+            echo "invalid agent-id '$orphan_agent_id'"
+            return 0
+            ;;
+    esac
+    if [ ! -d "$AGENTWS_ROOT/agents/$orphan_agent_id" ]; then
+        echo "agent '$orphan_agent_id' has no agents/$orphan_agent_id directory"
+        return 0
+    fi
+    return 1
+}
+
 require_agent_owner() {
     action="$1"
     job_id="$2"
@@ -157,10 +295,39 @@ append_task_log() {
     summary="$2"
     detail="${3:-}"
 
+    [ -f "$task_dir/log.md" ] && [ ! -L "$task_dir/log.md" ] \
+        || die "task '$(basename "$task_dir")' has an invalid log.md"
+
     {
         printf '## %s - %s\n\n' "$(timestamp)" "$summary"
         if [ -n "$detail" ]; then
             printf '%s\n\n' "$detail"
         fi
     } >> "$task_dir/log.md"
+}
+
+copy_file_atomic() {
+    source="$1"
+    destination="$2"
+
+    [ -f "$source" ] && [ ! -L "$source" ] \
+        || die "source file is symlinked or is not a regular file: $source"
+    if [ -e "$destination" ] || [ -L "$destination" ]; then
+        [ -f "$destination" ] && [ ! -L "$destination" ] \
+            || die "destination is symlinked or is not a regular file: $destination"
+    fi
+    temporary="$(mktemp "$destination.tmp.XXXXXX")" \
+        || die "cannot create temporary file for '$destination'"
+    if ! cp -- "$source" "$temporary"; then
+        rm -f -- "$temporary"
+        die "cannot copy '$source' to '$destination'"
+    fi
+    [ -f "$temporary" ] && [ ! -L "$temporary" ] || {
+        rm -f -- "$temporary"
+        die "temporary destination changed while copying '$destination'"
+    }
+    mv -f -- "$temporary" "$destination" || {
+        rm -f -- "$temporary"
+        die "cannot replace '$destination'"
+    }
 }

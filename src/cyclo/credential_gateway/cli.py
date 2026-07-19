@@ -110,6 +110,7 @@ def status_command(image: str, store_volume: str) -> list[str]:
     return [
         "docker",
         "run",
+        "--pull=never",
         "--rm",
         *GATEWAY_CONTAINER_HARDENING,
         "--network",
@@ -178,6 +179,9 @@ def cmd_login(args: argparse.Namespace) -> int:
         api_key_stdin=args.api_key_stdin,
         environ=os.environ,
     )
+    gateway.ensure_gateway_image(args.image, build=args.build)
+    if args.login_guard is not None:
+        args.login_guard(args)
     command = login_command(
         args.image,
         args.store_volume,
@@ -188,14 +192,11 @@ def cmd_login(args: argparse.Namespace) -> int:
         api_key_stdin=args.api_key_stdin,
         stdin_is_tty=sys.stdin.isatty(),
     )
-    gateway.ensure_gateway_image(args.image, build=args.build)
-    return docker.run_command(
-        command
-    )
+    return docker.run_command(command)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    gateway.ensure_gateway_image(args.image, build=args.build)
+    gateway.require_gateway_image_current(args.image)
     print(f"gateway store volume: {args.store_volume}")
     return docker.run_command(status_command(args.image, args.store_volume))
 
@@ -221,6 +222,7 @@ def cmd_destroy_store(args: argparse.Namespace) -> int:
 
 def build_parser(
     restart_handler: Callable[[argparse.Namespace], int] | None = None,
+    login_guard: Callable[[argparse.Namespace], None] | None = None,
 ) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cyclo gateway",
@@ -295,9 +297,18 @@ def build_parser(
         action="store_true",
         help="read the API key from standard input",
     )
-    login.set_defaults(func=cmd_login)
+    login.set_defaults(func=cmd_login, login_guard=login_guard)
 
-    status = sub.add_parser("status", parents=[store_common], help="list provisioned accounts")
+    status = sub.add_parser(
+        "status",
+        help="list provisioned accounts without building or pulling an image",
+    )
+    status.add_argument("--image", default=gateway.DEFAULT_GATEWAY_IMAGE)
+    status.add_argument(
+        "--store-volume",
+        default=gateway.DEFAULT_STORE_VOLUME,
+        help=STORE_VOLUME_HELP,
+    )
     status.set_defaults(func=cmd_status)
 
     if restart_handler is not None:
@@ -349,8 +360,9 @@ def main(
     argv: list[str] | None = None,
     *,
     restart_handler: Callable[[argparse.Namespace], int] | None = None,
+    login_guard: Callable[[argparse.Namespace], None] | None = None,
 ) -> int:
-    args = build_parser(restart_handler).parse_args(
+    args = build_parser(restart_handler, login_guard).parse_args(
         sys.argv[1:] if argv is None else argv
     )
     try:

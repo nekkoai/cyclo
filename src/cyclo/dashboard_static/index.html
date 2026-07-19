@@ -161,7 +161,6 @@
               <option value="all">All modes</option>
               <option value="online">Online</option>
               <option value="offline">Offline</option>
-              <option value="project-read-only">Project read-only</option>
               <option value="team-write">Team writable</option>
             </select>
           </label>
@@ -237,7 +236,10 @@
         <div class="mode-list" aria-label="Instance modes"></div>
 
         <dl class="instance-meta">
+          <div><dt>Health</dt><dd class="runtime-health"></dd></div>
           <div><dt>Project</dt><dd class="project-path"></dd></div>
+          <div><dt>Workspaces</dt><dd class="workspace-paths"></dd></div>
+          <div><dt>Read-only mounts</dt><dd class="readonly-paths"></dd></div>
           <div><dt>Generation</dt><dd class="generation"></dd></div>
         </dl>
 

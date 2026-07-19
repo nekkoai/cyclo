@@ -35,15 +35,24 @@ cyclo validate ~/teams/test-driven-repair
 
 The target must be a writable Git checkout with a usable test command:
 
+Create `~/experiments/my-project/project.cyclo`:
+
+```text
+name my-project
+description Reproduce, repair, judge, and integrate a project failure.
+team ../../teams/test-driven-repair ro
+mount source ../../src/my-project rw
+```
+
 ```sh
-cyclo run --name test-driven-repair \
-  ~/teams/test-driven-repair \
-  ~/src/my-project
-cyclo task test-driven-repair repair-001 /tmp/repair-001.md
-cyclo logs -f test-driven-repair
+cyclo validate ~/experiments/my-project/project.cyclo
+cyclo run ~/experiments/my-project/project.cyclo
+cyclo task my-project-test-driven-repair repair-001 /tmp/repair-001.md
+cyclo logs -f my-project-test-driven-repair
 ```
 
 A good task spec states the observed failure, expected behavior, reproduction,
 focused and wider verification commands, and compatibility constraints. The
 team repository stays read-only; this loop modifies the project. Use
-`--offline` only when all required dependencies are already local.
+`source/` at the start of task paths into the checkout. Use `--offline` only
+when all required dependencies are already local.

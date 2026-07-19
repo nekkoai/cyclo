@@ -22,7 +22,11 @@ require_tasks_dir
 
 TASK_DIR="$TASKS_DIR/$TASK_ID"
 
-[ -d "$TASK_DIR" ] || die "task '$TASK_ID' does not exist"
+[ -e "$TASK_DIR" ] || [ -L "$TASK_DIR" ] \
+    || die "task '$TASK_ID' does not exist"
+acquire_task_control_lock "$TASK_DIR"
+require_task_record_locked "$TASK_DIR"
 append_task_log "$TASK_DIR" "Comment" "$MESSAGE"
+release_task_control_lock
 
 echo "$TASK_ID: comment added"

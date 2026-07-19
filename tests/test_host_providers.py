@@ -167,22 +167,10 @@ def test_provider_client_is_stable_and_scoped_only_to_declared_inputs(
             ),
         )
     )[0]
-    provider_scopes, model_scopes = host.provider_scopes((item,))
-
     assert item.client.project_id == provider_client_id("pool")
     assert item.client.kind == "provider"
     assert item.client.provider_prefix == "pool"
     assert item.client.generation == item.generation
-    assert provider_scopes == {
-        item.client.project_id: ("codex-a", "anthropic")
-    }
-    assert model_scopes == {
-        item.client.project_id: (
-            "codex-a/gpt-5",
-            "codex-a/gpt-5-mini",
-            "anthropic/claude-sonnet",
-        )
-    }
 
     first_record = host.client_record(item)
     repeated_record = host.client_record(host.prepare((item.definition,))[0])
@@ -230,7 +218,7 @@ def test_expected_registry_contains_only_hashes_and_verified_route_metadata(
             ),
         )
     )[0]
-    host.ensure_registry()
+    host.publish(())
 
     empty = json.loads(host.registry_path.read_text(encoding="utf-8"))
     assert empty == {"providers": [], "version": 1}

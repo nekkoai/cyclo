@@ -5,8 +5,52 @@ set -eu
 AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$AGENTWS_ROOT/bin/lib-agentws"
 
-STALE_MINUTES="${1:-60}"
-[ "$#" -le 1 ] || die "unexpected argument '$2'"
+usage() {
+    echo "Usage: job-reap [--force] [minutes]"
+    echo ""
+    echo "Remove old terminal or structurally inconsistent ownership locks."
+    echo "A claimed or running job is never reset by age alone."
+    echo "After stopping its owner, use --force to reset it explicitly."
+    exit "${1:-1}"
+}
+
+lock_mtime() {
+    lock_dir="$1"
+    if stat -c %Y "$lock_dir" >/dev/null 2>&1; then
+        stat -c %Y "$lock_dir"
+        return 0
+    fi
+    if stat -f %m "$lock_dir" >/dev/null 2>&1; then
+        stat -f %m "$lock_dir"
+        return 0
+    fi
+    return 1
+}
+
+STALE_MINUTES=60
+MINUTES_SEEN=0
+FORCE=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --force)
+            FORCE=1
+            ;;
+        --help|-h)
+            usage 0
+            ;;
+        -*)
+            die "unknown option '$1'"
+            ;;
+        *)
+            [ "$MINUTES_SEEN" -eq 0 ] || die "unexpected argument '$1'"
+            STALE_MINUTES="$1"
+            MINUTES_SEEN=1
+            ;;
+    esac
+    shift
+done
+
 require_positive_integer "minutes" "$STALE_MINUTES"
 require_jobs_dir
 
@@ -20,37 +64,85 @@ for job_dir in "$JOBS_DIR"/*; do
     [ -f "$job_dir/status" ] || continue
     [ -d "$job_dir/lock" ] || continue
 
-    job_id="$(basename "$job_dir")"
-    status="$(cat "$job_dir/status" 2>/dev/null || true)"
-
-    if stat -c %Y "$job_dir/lock" >/dev/null 2>&1; then
-        lock_time="$(stat -c %Y "$job_dir/lock")"
-    elif stat -f %m "$job_dir/lock" >/dev/null 2>&1; then
-        lock_time="$(stat -f %m "$job_dir/lock")"
-    else
-        lock_time=0
-    fi
-
+    lock_time="$(lock_mtime "$job_dir/lock" 2>/dev/null || true)"
+    [ -n "$lock_time" ] || continue
     age=$(( (now - lock_time) / 60 ))
-    if [ "$age" -ge "$STALE_MINUTES" ]; then
-        echo "reaping: $job_id (status: $status, stale for ${age}m)"
-        if ! rmdir "$job_dir/lock" 2>/dev/null; then
-            echo "error: cannot reap job '$job_id': lock directory is not empty" >&2
-            continue
-        fi
+    [ "$age" -ge "$STALE_MINUTES" ] || continue
 
-        case "$status" in
-            done|failed)
-                append_log "$job_dir" "Removed stale lock" "Removed stale lock from terminal $status job after ${age}m."
-                ;;
-            *)
-                rm -f "$job_dir/agent-id"
-                write_file_atomic "$job_dir/status" "pending"
-                append_log "$job_dir" "Reaped stale job" "Reset stale $status job after ${age}m."
-                ;;
-        esac
-        reaped=$((reaped + 1))
+    job_id="$(basename "$job_dir")"
+    acquire_job_control_lock "$job_dir"
+
+    # State may have changed while waiting for the control mutex. Recheck both
+    # the ownership directory and its age before making any decision.
+    if [ ! -d "$job_dir/lock" ]; then
+        release_job_control_lock
+        continue
     fi
+    lock_time="$(lock_mtime "$job_dir/lock" 2>/dev/null || true)"
+    if [ -z "$lock_time" ]; then
+        release_job_control_lock
+        continue
+    fi
+    age=$(( (now - lock_time) / 60 ))
+    if [ "$age" -lt "$STALE_MINUTES" ]; then
+        release_job_control_lock
+        continue
+    fi
+
+    status="$(read_status "$job_dir")"
+    reset_reason=""
+    case "$status" in
+        done|failed)
+            ;;
+        pending)
+            reset_reason="pending job has an ownership lock"
+            ;;
+        claimed|running)
+            if [ "$FORCE" -eq 0 ]; then
+                echo "skipped: $job_id is $status; age never proves its owner is dead (stop it, then use --force)" >&2
+                release_job_control_lock
+                continue
+            fi
+            reset_reason="$(job_orphan_reason "$job_dir" || true)"
+            if [ -z "$reset_reason" ]; then
+                reset_reason="explicit forced reset after owner shutdown"
+            else
+                reset_reason="explicit forced reset ($reset_reason)"
+            fi
+            ;;
+        *)
+            if [ "$FORCE" -eq 0 ]; then
+                echo "skipped: $job_id has invalid status '$status'; use --force to override" >&2
+                release_job_control_lock
+                continue
+            fi
+            reset_reason="forced reset of invalid status '$status'"
+            ;;
+    esac
+
+    echo "reaping: $job_id (status: $status, stale for ${age}m)"
+    case "$status" in
+        done|failed)
+            append_log "$job_dir" "Removed stale lock" \
+                "Removed stale lock from terminal $status job after ${age}m."
+            ;;
+        *)
+            append_log "$job_dir" "Reaped stale job" \
+                "Reset $status job after ${age}m: $reset_reason."
+            write_file_atomic "$job_dir/status" "pending"
+            rm -f "$job_dir/agent-id"
+            ;;
+    esac
+
+    # Claimers cannot pass the persistent control mutex until the complete
+    # reset is visible, so removing ownership here cannot expose partial state.
+    if ! rmdir "$job_dir/lock" 2>/dev/null; then
+        echo "error: cannot reap job '$job_id': lock directory is not empty" >&2
+        release_job_control_lock
+        continue
+    fi
+    release_job_control_lock
+    reaped=$((reaped + 1))
 done
 
 echo "Reaped $reaped job(s)."

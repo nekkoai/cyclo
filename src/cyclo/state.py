@@ -6,8 +6,9 @@ import json
 import os
 import re
 import shutil
+import stat
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
@@ -44,7 +45,11 @@ def instance_id(team: Path, project: Path, name: str | None = None) -> str:
 
 
 def validate_instance_id(value: str) -> str:
-    if value in {".", ".."} or not INSTANCE_RE.fullmatch(value):
+    if (
+        not isinstance(value, str)
+        or value in {".", ".."}
+        or not INSTANCE_RE.fullmatch(value)
+    ):
         raise CycloError(
             f"invalid Cyclo instance ID {value!r}; use 1-64 letters, numbers, dot, underscore, or hyphen"
         )
@@ -64,20 +69,87 @@ class Instance:
     network_name: str
     image: str
     team_write: bool
-    project_read_only: bool
     offline: bool
     agentws_host: str = DEFAULT_AGENTWS_HOST
     active: bool = False
     port: int | None = None
     created_at: str = ""
     updated_at: str = ""
+    project_name: str = ""
+    project_file: str = ""
+    project_description: str = ""
+    project_generation: str = ""
+    project_mounts: object = field(default_factory=list)
+    legacy_project_read_only: bool = False
+    launch_id: str = ""
 
     @classmethod
     def from_json(cls, data: dict[str, object]) -> "Instance":
-        return cls(**data)  # type: ignore[arg-type]
+        payload = dict(data)
+        # Cyclo 0.1 persisted project_read_only. Retain it until the operator
+        # restarts that instance with the writable-project behavior.
+        legacy_read_only = payload.pop("project_read_only", False)
+        if legacy_read_only is True:
+            payload["legacy_project_read_only"] = True
+        else:
+            payload.setdefault("legacy_project_read_only", legacy_read_only)
+
+        string_fields = (
+            "id",
+            "team_name",
+            "team_path",
+            "generation",
+            "container_name",
+            "network_name",
+            "image",
+            "agentws_host",
+            "created_at",
+            "updated_at",
+            "launch_id",
+        )
+        for name in string_fields:
+            if name in payload and not isinstance(payload[name], str):
+                raise TypeError(f"{name} must be a string")
+        for name in ("team_write", "offline", "active"):
+            if name in payload and type(payload[name]) is not bool:
+                raise TypeError(f"{name} must be a boolean")
+        for name in ("providers", "models"):
+            if name not in payload:
+                continue
+            value = payload[name]
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) for item in value
+            ):
+                raise TypeError(f"{name} must be a list of strings")
+        port = payload.get("port")
+        if port is not None and (
+            type(port) is not int or port < 1 or port > 65535
+        ):
+            raise TypeError("port must be null or an integer from 1 to 65535")
+        instance = cls(**payload)  # type: ignore[arg-type]
+        validate_instance_id(instance.id)
+        expected_container = f"cyclo-{instance.id}"
+        expected_network = f"{expected_container}-net"
+        if instance.container_name != expected_container:
+            raise TypeError(
+                f"container_name must be {expected_container!r} for instance "
+                f"{instance.id!r}"
+            )
+        if instance.network_name != expected_network:
+            raise TypeError(
+                f"network_name must be {expected_network!r} for instance "
+                f"{instance.id!r}"
+            )
+        return instance
 
     def as_json(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        legacy_read_only = payload.pop("legacy_project_read_only")
+        if legacy_read_only:
+            # Preserve the shipped v0.1 field on disk; the clearer internal name
+            # must not create a second compatibility format.
+            payload["project_read_only"] = True
+        return payload
 
 
 class StateStore:
@@ -152,20 +224,24 @@ class StateStore:
     def pi_root(self, identifier: str) -> Path:
         return self.instance_dir(identifier) / "pi"
 
+    def workspace_root(self, identifier: str) -> Path:
+        return self.instance_dir(identifier) / "workspace"
+
+    def readonly_root(self, identifier: str) -> Path:
+        return self.instance_dir(identifier) / "readonly"
+
     def load(self, identifier: str) -> Instance:
         identifier = validate_instance_id(identifier)
         path = self.metadata_path(identifier)
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = self._read_metadata(path)
         except FileNotFoundError as exc:
             raise CycloError(f"Cyclo instance not found: {identifier}") from exc
-        except (OSError, json.JSONDecodeError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, RecursionError, CycloError) as exc:
             raise CycloError(f"cannot read Cyclo instance {path}: {exc}") from exc
-        if not isinstance(data, dict):
-            raise CycloError(f"invalid Cyclo instance metadata: {path}")
         try:
             instance = Instance.from_json(data)
-        except TypeError as exc:
+        except (TypeError, CycloError) as exc:
             raise CycloError(f"invalid Cyclo instance metadata {path}: {exc}") from exc
         if instance.id != identifier:
             raise CycloError(
@@ -173,24 +249,99 @@ class StateStore:
             )
         return instance
 
+    @staticmethod
+    def _read_metadata(path: Path) -> dict[str, object]:
+        """Read one regular, non-symlink JSON object without following links."""
+
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise CycloError("run.json is not a regular file")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                descriptor = -1
+                data = json.load(stream)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if not isinstance(data, dict):
+            raise CycloError("metadata is not a JSON object")
+        return data
+
     def list(self) -> list[Instance]:
+        """Return the complete instance fleet or fail on any unreadable record."""
+
+        instances, errors = self.list_report()
+        if errors:
+            raise CycloError(
+                "cannot enumerate Cyclo instance state: " + "; ".join(errors)
+            )
+        return instances
+
+    def list_report(self) -> tuple[list[Instance], list[str]]:
+        """Return readable instances and a separate error for every bad record."""
+
+        if self.instances_dir.is_symlink():
+            return [], [
+                f"invalid Cyclo instances directory: {self.instances_dir}"
+            ]
+        if not self.instances_dir.exists():
+            return [], []
         if not self.instances_dir.is_dir():
-            return []
+            return [], [
+                f"invalid Cyclo instances directory: {self.instances_dir}"
+            ]
         result: list[Instance] = []
-        for path in sorted(self.instances_dir.glob("*/run.json")):
+        errors: list[str] = []
+        try:
+            directories = sorted(self.instances_dir.iterdir())
+        except OSError as exc:
+            return [], [
+                f"cannot enumerate Cyclo instances directory "
+                f"{self.instances_dir}: {exc}"
+            ]
+        for directory in directories:
+            path = directory / "run.json"
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    instance = Instance.from_json(data)
-                    validate_instance_id(instance.id)
-                    if instance.id == path.parent.name:
-                        result.append(instance)
-            except (OSError, json.JSONDecodeError, TypeError, CycloError):
-                continue
-        return result
+                if directory.is_symlink() or not directory.is_dir():
+                    raise CycloError("instance state entry is not a directory")
+                data = self._read_metadata(path)
+                instance = Instance.from_json(data)
+                validate_instance_id(instance.id)
+                if instance.id != path.parent.name:
+                    raise CycloError(
+                        f"metadata ID {instance.id!r} does not match directory "
+                        f"{path.parent.name!r}"
+                    )
+                result.append(instance)
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                RecursionError,
+                CycloError,
+            ) as exc:
+                detail = str(exc) or type(exc).__name__
+                errors.append(f"invalid Cyclo instance metadata {path}: {detail}")
+        return result, errors
 
     def save(self, instance: Instance) -> None:
         validate_instance_id(instance.id)
+        payload = instance.as_json()
+        # Refuse to persist an internally constructed record that the strict
+        # reader would reject on the next command.
+        try:
+            Instance.from_json(payload)
+        except (TypeError, CycloError) as exc:
+            raise CycloError(
+                f"invalid Cyclo instance metadata for {instance.id!r}: {exc}"
+            ) from exc
         directory = self.instance_dir(instance.id)
         directory.mkdir(parents=True, mode=0o700, exist_ok=True)
         os.chmod(directory, 0o700)
@@ -199,7 +350,8 @@ class StateStore:
         instance.updated_at = utc_now()
         path = self.metadata_path(instance.id)
         temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-        temporary.write_text(json.dumps(instance.as_json(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        payload = instance.as_json()
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
 
@@ -245,7 +397,14 @@ class StateStore:
             if moved_old and installed:
                 self._remove_tree(quarantine)
 
-    def materialize_agentws(self, identifier: str, template: Path, runtime_script: Path) -> Path:
+    def materialize_agentws(
+        self,
+        identifier: str,
+        template: Path,
+        runtime_script: Path,
+        *,
+        project_manifest: str | None = None,
+    ) -> Path:
         runtime = self.runtime_root(identifier)
         temporary = self.new_tree(runtime)
 
@@ -274,6 +433,14 @@ class StateStore:
                 runtime_destination.unlink()
             runtime_destination.write_bytes(runtime_bytes)
             os.chmod(runtime_destination, 0o555)
+            if project_manifest is not None:
+                manifest_destination = temporary / "PROJECT.md"
+                if manifest_destination.exists() or manifest_destination.is_symlink():
+                    manifest_destination.unlink()
+                manifest_destination.write_text(
+                    project_manifest.rstrip() + "\n", encoding="utf-8"
+                )
+                os.chmod(manifest_destination, 0o444)
             self.replace_tree(temporary, runtime)
         except Exception:
             self._remove_tree(temporary)
@@ -283,8 +450,47 @@ class StateStore:
         if queue.is_symlink():
             raise CycloError(f"refusing symlinked AgentWS state root: {queue}")
         queue.mkdir(parents=True, mode=0o700, exist_ok=True)
-        for path in (self.tasks_dir(identifier), self.jobs_dir(identifier), self.agents_dir(identifier)):
+        for path in (
+            self.tasks_dir(identifier),
+            self.jobs_dir(identifier),
+            self.agents_dir(identifier),
+        ):
             if path.is_symlink():
-                raise CycloError(f"refusing symlinked AgentWS state directory: {path}")
+                raise CycloError(
+                    f"refusing symlinked AgentWS state directory: {path}"
+                )
             path.mkdir(parents=True, mode=0o700, exist_ok=True)
         return runtime
+
+    def _materialize_named_layout(
+        self, target: Path, mount_names: list[str]
+    ) -> Path:
+        temporary = self.new_tree(target)
+        try:
+            for name in mount_names:
+                validate_instance_id(name)
+                child = temporary / name
+                child.mkdir(mode=0o755)
+            self.replace_tree(temporary, target)
+        except Exception:
+            self._remove_tree(temporary)
+            raise
+        return target
+
+    def materialize_workspace_layout(
+        self, identifier: str, mount_names: list[str]
+    ) -> Path:
+        """Create the inert namespace containing writable workspace mounts."""
+
+        return self._materialize_named_layout(
+            self.workspace_root(identifier), mount_names
+        )
+
+    def materialize_readonly_layout(
+        self, identifier: str, mount_names: list[str]
+    ) -> Path:
+        """Create the inert namespace containing read-only supporting mounts."""
+
+        return self._materialize_named_layout(
+            self.readonly_root(identifier), mount_names
+        )

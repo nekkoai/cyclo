@@ -47,7 +47,12 @@ has_pending_job() {
             continue
         fi
 
-        [ ! -d "$job_dir/lock" ] || continue
+        acquire_job_control_lock "$job_dir"
+        if ! repair_pending_ownership_locked "$job_dir"; then
+            release_job_control_lock
+            continue
+        fi
+        release_job_control_lock
         return 0
     done
 

@@ -44,16 +44,34 @@ Options:
 ## `run_agentws`
 
 `run_agentws` starts a named team from a team file and keeps successful agents
-available for later jobs. Failed agent processes restart with exponential,
-capped backoff. After five consecutive process failures the affected agent is
-suspended until the Cyclo container is restarted, preventing Docker's restart
-policy from turning a bad configuration into a tight crash loop.
+available for later jobs. A worker that durably releases or fails its job
+restarts with exponential, capped backoff. After five consecutive settled
+retry exits the affected agent is suspended, preventing a bad model or job
+from becoming a tight retry loop.
+
+Each worker is a Linux child subreaper. Before a local retry it terminates and
+reaps the engine's complete adopted process tree, including descendants that
+created new sessions. If that cleanup cannot be proven, the worker exits
+unclean instead of starting beside a leftover engine.
+
+Any other worker exit is unclean: `run_agentws` exits, Cyclo's PID 1 exits, and
+Docker restarts the same container without rebuilding it. Docker teardown is
+the process-tree fence. Before new workers start, the runtime resets persisted
+`claimed` and `running` jobs to `pending` and clears stale agent assignments.
+Recovery requires an inherited capability for the runtime's exclusive queue
+lifetime lock, so a live agent cannot invoke the all-active reset.
 
 Each claimed job receives at most three model-process attempts by default. If a
-process exits while it still owns the job, the wrapper releases it only while
-attempts remain; on the final attempt it marks the job failed. Operator-requested
-SIGINT/SIGTERM shutdown releases the job without consuming an attempt. These
-safe defaults can be adjusted with positive integer environment variables:
+process exits while it still owns the job, the per-agent worker releases it
+only while attempts remain. On the final automatic failure of a non-planner
+job, it first creates or verifies one deterministic planner recovery job for
+the same task, then marks the source job failed. Repeating settlement reuses
+that job, and a planner failure never creates another planner job. This does
+not change explicit agent-driven `job-fail`: the agent remains responsible for
+the protocol-required follow-up work in that case.
+Operator-requested SIGINT/SIGTERM shutdown releases the job without consuming
+an attempt. These safe defaults can be adjusted with positive integer
+environment variables:
 
 - `AGENTWS_MAX_JOB_ATTEMPTS` (default `3`, maximum `100`)
 - `AGENTWS_MAX_CONSECUTIVE_FAILURES` (default `5`, maximum `100`)
@@ -124,8 +142,9 @@ Options:
 
 CLI stderr is saved in `error.log`.
 
-The agent name is mandatory. `agent` calls `bin/agent-new`, `bin/job-wait`, and
-`bin/job-claim`; the agent itself starts and completes the job according to
+The agent name is mandatory. `agent` calls `bin/agent-new` and repeatedly calls
+`bin/job-claim` with a bounded wait between empty-queue checks. The agent itself
+starts and completes the claimed job according to
 `AGENTS.md`. The rendered transcript is stored only in
 `agents/<agent-name>/transcript.log`; the job log points to that file.
 
@@ -151,6 +170,12 @@ agentws/bin/task-state <task-id> done -m "completed"
 agentws/bin/task-result <task-id> <result-file>
 agentws/bin/task-list
 ```
+
+Every task owns a persistent `.control.lock`. Creation publishes the complete
+task atomically, and each result/state file replacement is atomic. Commands
+that update multiple task files hold the task mutex for the full operation, so
+concurrent mutations cannot interleave. The mutex serializes writers; it does
+not turn a multi-file update into a crash transaction.
 
 ## `bin/agent-new`
 

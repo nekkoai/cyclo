@@ -6,11 +6,11 @@ import os
 import shlex
 import secrets
 import sys
-import time
 from pathlib import Path
 
 from . import __version__
 from .agentws_bundle import packaged_agentws_root
+from .agentws_queue import read_agent_supervisor_status
 from .dashboard import (
     DEFAULT_DASHBOARD_HOST,
     DashboardSnapshot,
@@ -19,24 +19,55 @@ from .dashboard import (
     packaged_dashboard_assets,
 )
 from .docker import (
-    ContainerSpec,
     Docker,
     container_command,
+    validate_mount_collection,
     validate_mount_boundaries,
 )
 from .errors import CycloError
 from .gateway import CredentialGateway
+from .health import (
+    INACTIVE_TEAM_HEALTH,
+    RuntimeHealth,
+    read_runtime_health,
+    team_health,
+)
 from .host_config import DEFAULT_HOST_CONFIG, HostConfig
-from .host_providers import HostProviders, provider_definition_spec
+from .host_providers import provider_definition_spec
+from .instance_lifecycle import (
+    active_instances,
+    attach_active_networks,
+    rotate_client_tokens,
+    stop_remove_instance_container,
+    stop_instance as stop_managed_instance,
+    token_rotation_failure,
+)
+from .provider_commands import run_provider_command
 from .provider_runtime import ProviderRuntime
-from .provider_service import ProviderService, provider_runtime_context_root
-from .state import Instance, StateStore, instance_id
-from .team_runtime_image import ensure as ensure_team_runtime_image
+from .provider_service import ProviderService
+from .runtime_container import provider_runtime_context_root
+from .project_run import (
+    RunBinding,
+    container_spec,
+    legacy_run_binding,
+    load_project_teams,
+    preflight_binding,
+    project_run_bindings,
+    start_binding,
+    validate_run_options,
+)
+from .project import (
+    ProjectDefinition,
+    ProjectTeam,
+    load_project,
+)
+from .project_state import decode_instance_project
+from .state import Instance, StateStore, validate_instance_id
 from .team import (
+    Team,
     init_team,
     load_team,
     require_team_repository,
-    resolve_directory,
     team_generation,
     verify_agentws_abi,
 )
@@ -57,7 +88,7 @@ def state_store(args: argparse.Namespace) -> StateStore:
 
 
 def host_configuration(args: argparse.Namespace) -> HostConfig:
-    return HostConfig(getattr(args, "host_config", DEFAULT_HOST_CONFIG))
+    return HostConfig(args.host_config)
 
 
 def agentws_root() -> Path:
@@ -78,108 +109,9 @@ def provider_service(args: argparse.Namespace, store: StateStore) -> ProviderSer
     return ProviderService(
         store,
         host_configuration(args),
-        image=getattr(
-            args, "provider_runtime_image", DEFAULT_PROVIDER_RUNTIME_IMAGE
-        ),
+        image=args.provider_runtime_image,
         gateway_image=args.gateway_image,
         store_volume=args.store_volume,
-    )
-
-
-def new_instance(args: argparse.Namespace, team, project: Path) -> Instance:
-    identifier = instance_id(team.root, project, args.name)
-    return Instance(
-        id=identifier,
-        team_name=team.name,
-        team_path=str(team.root),
-        project_path=str(project),
-        generation=team_generation(team),
-        providers=list(team.providers),
-        models=sorted({agent.model for agent in team.agents}),
-        container_name=f"cyclo-{identifier}",
-        network_name=f"cyclo-{identifier}-net",
-        image=args.image,
-        team_write=args.team_write,
-        project_read_only=args.project_read_only,
-        offline=args.offline,
-        agentws_host=args.host,
-        active=True,
-    )
-
-
-def active_instances(
-    store: StateStore,
-    docker: Docker,
-    *,
-    candidate: Instance | None = None,
-    stale: list[Instance] | None = None,
-) -> list[Instance]:
-    result: list[Instance] = []
-    for instance in store.list():
-        if candidate is not None and instance.id == candidate.id:
-            result.append(candidate)
-            continue
-        if not instance.active:
-            continue
-        if docker.container_running(instance.container_name):
-            result.append(instance)
-            continue
-        instance.active = False
-        store.save(instance)
-        if stale is not None:
-            stale.append(instance)
-    if candidate is not None and all(item.id != candidate.id for item in result):
-        result.append(candidate)
-    return result
-
-
-def attach_active_networks(
-    docker: Docker,
-    runtime: ProviderService,
-    instances: list[Instance],
-) -> None:
-    """Attach the already-running provider runtime to team networks."""
-
-    if not instances:
-        return
-    status = runtime.status()
-    if not status.running or not status.container_id:
-        raise CycloError(
-            "provider runtime is not running; run `cyclo runtime start`"
-        )
-    for instance in instances:
-        network_id = docker.ensure_network(
-            instance.network_name, offline=instance.offline
-        )
-        docker.connect_runtime(
-            network_id, status.container_id, runtime.container_name
-        )
-
-
-def rotate_client_tokens(
-    proxy: ProviderService,
-    identifiers: list[str],
-) -> list[str]:
-    """Best-effort local token-file rotation after client-registry publication.
-
-    Publishing the runtime and gateway client registries revokes a live
-    capability. Token-file deletion prevents that capability from being reused
-    on a future run, but must never prevent the provider runtime from remaining
-    attached to otherwise healthy team networks.
-    """
-    errors: list[str] = []
-    for identifier in dict.fromkeys(identifiers):
-        try:
-            proxy.rotate_client_token(identifier)
-        except Exception as exc:
-            errors.append(f"{identifier}: {exc}")
-    return errors
-
-
-def token_rotation_failure(errors: list[str]) -> CycloError:
-    return CycloError(
-        "client registries were published, but obsolete local capability files "
-        "could not be rotated: " + "; ".join(errors)
     )
 
 
@@ -197,8 +129,76 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _trusted_mount_roots(
+    source: Path, model_runtime: ProviderService
+) -> tuple[tuple[Path, str], ...]:
+    return (
+        (source, "bundled job-loop runtime"),
+        (gateway_source.package_root(), "bundled credential-gateway runtime"),
+        (provider_runtime_context_root(), "bundled provider runtime"),
+        (model_runtime.host_config.path, "host provider configuration"),
+        (Path(__file__).resolve().parents[2], "trusted Cyclo controller source"),
+    )
+
+
+def _validate_project_mounts(
+    definition: ProjectDefinition,
+    teams: tuple[tuple[ProjectTeam, Team], ...],
+    store: StateStore,
+    proxy: CredentialGateway,
+    model_runtime: ProviderService,
+    source: Path,
+) -> None:
+    validate_mount_collection(
+        (
+            (team.root, f"team {selected.name!r}")
+            for selected, team in teams
+        ),
+        (
+            (project_mount.path, f"mount {project_mount.name!r}")
+            for project_mount in definition.mounts
+        ),
+        store.root,
+        proxy.host_pi_agent_dir,
+        _trusted_mount_roots(source, model_runtime),
+    )
+
+
+def _looks_like_project_file(value: str | os.PathLike[str]) -> bool:
+    path = Path(value).expanduser()
+    if path.is_dir():
+        return False
+    return path.is_file() or path.name == "project.cyclo" or path.suffix == ".cyclo"
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
-    team = load_team(args.team)
+    if _looks_like_project_file(args.definition):
+        definition = load_project(args.definition)
+        teams = load_project_teams(definition)
+        source = agentws_root()
+        store = state_store(args)
+        proxy = gateway(args, store)
+        model_runtime = provider_service(args, store)
+        _validate_project_mounts(
+            definition, teams, store, proxy, model_runtime, source
+        )
+        print(f"project: {definition.name}")
+        print(f"description: {definition.description}")
+        print(f"definition: {definition.path}")
+        print(f"generation: {definition.definition_sha256}")
+        for selected, team in teams:
+            print(
+                f"team ({selected.mode}): {team.name} {team.root} "
+                f"[{len(team.agents)} agents]"
+            )
+        for project_mount in definition.mounts:
+            print(
+                f"mount ({project_mount.mode}): {project_mount.name} "
+                f"{project_mount.path} -> {project_mount.container_path}"
+            )
+        return 0
+
+    team = load_team(args.definition)
     require_team_repository(team)
     agentws_root()
     print(f"team: {team.name}")
@@ -216,152 +216,24 @@ def cmd_templates(_args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    team = load_team(args.team)
-    require_team_repository(team)
-    project = resolve_directory(args.project, "project")
-    source = agentws_root()
-    store = state_store(args)
-    proxy = gateway(args, store)
-    model_runtime = provider_service(args, store)
-    docker = Docker()
-    validate_mount_boundaries(
-        team.root,
-        project,
-        store.root,
-        proxy.host_pi_agent_dir,
-        (
-            (source, "bundled job-loop runtime"),
-            (gateway_source.package_root(), "bundled credential-gateway runtime"),
-            (provider_runtime_context_root(), "bundled provider runtime"),
-            (model_runtime.host_config.path, "host provider configuration"),
-            (Path(__file__).resolve().parents[2], "trusted Cyclo controller source"),
-        ),
-    )
-    if args.port < 0 or args.port > 65535:
-        raise CycloError("port must be 0 or an integer from 1 to 65535")
-    if args.offline and args.port:
-        raise CycloError("--port cannot be used with --offline because no host UI is published")
-    agentws_host_is_loopback = dashboard_host_is_loopback(args.host)
-    instance = new_instance(args, team, project)
-    runtime = store.runtime_root(instance.id)
-    pi_root = store.pi_root(instance.id)
-    spec = ContainerSpec(
-        instance=instance,
-        team=team,
-        project=project,
-        runtime_root=runtime,
-        tasks_dir=store.tasks_dir(instance.id),
-        jobs_dir=store.jobs_dir(instance.id),
-        agents_dir=store.agents_dir(instance.id),
-        pi_root=pi_root,
-        port=args.port,
-        verbose=args.verbose,
-    )
-    if args.dry_run:
-        print(shlex.join(container_command(spec)))
-        return 0
-
-    # Team lifecycle may update capabilities and network membership, but it
-    # never provisions any shared service or provider container.
-    model_runtime.require_running()
-
-    with store.locked():
-        if docker.container_running(instance.container_name):
-            raise CycloError(f"Cyclo instance is already running: {instance.id}")
-        if store.metadata_path(instance.id).is_file():
-            previous = store.load(instance.id)
-            if (
-                Path(previous.team_path).resolve() != team.root
-                or Path(previous.project_path).resolve() != project
-            ):
-                raise CycloError(
-                    f"instance name {instance.id!r} is already bound to a different team or project"
-                )
-        store.materialize_agentws(
-            instance.id,
-            source / "template",
-            Path(__file__).with_name("container_runtime.py"),
-        )
-        store.save(instance)
-        stale: list[Instance] = []
-        running = active_instances(store, docker, candidate=instance, stale=stale)
-        try:
-            ensure_team_runtime_image(instance.image, build=args.build)
-            # A stopped/crashed instance must never resurrect a previously
-            # issued capability when its stable binding name is reused.
-            model_runtime.rotate_client_token(instance.id)
-            # Bind the shared runtime to this team's private network before
-            # issuing a capability. Authentication is pinned to the runtime's
-            # local address on that network.
-            attach_active_networks(docker, model_runtime, running)
-            model_runtime.prepare_instance(
-                instance,
-                team,
-                running,
-            )
-            rotation_errors = rotate_client_tokens(
-                model_runtime, [item.id for item in stale]
-            )
-            if rotation_errors:
-                raise token_rotation_failure(rotation_errors)
-            instance.port = docker.start(spec)
-            docker.wait_ready(
-                instance.container_name,
-                instance.port,
-                host=instance.agentws_host,
-            )
-            store.save(instance)
-        except Exception:
-            instance.active = False
-            instance.port = None
-            store.save(instance)
-            try:
-                stale = []
-                remaining = active_instances(store, docker, stale=stale)
-                network_error: Exception | None = None
-                try:
-                    attach_active_networks(docker, model_runtime, remaining)
-                except Exception as exc:
-                    # Network drift must not prevent the revocation publication
-                    # below. Missing bindings are deliberately unusable.
-                    network_error = exc
-                model_runtime.update_clients(remaining)
-                rotation_errors = rotate_client_tokens(
-                    model_runtime, [instance.id, *[item.id for item in stale]]
-                )
-                if network_error is not None:
-                    raise CycloError(
-                        f"active network repair failed after capability revocation: "
-                        f"{network_error}"
-                    ) from network_error
-                if rotation_errors:
-                    print(
-                        f"warning: {token_rotation_failure(rotation_errors)}",
-                        file=sys.stderr,
-                    )
-            except Exception as cleanup_error:
-                print(
-                    f"warning: failed to finish runtime rollback for {instance.id}: {cleanup_error}",
-                    file=sys.stderr,
-                )
-            try:
-                docker.stop_remove(instance.container_name, instance.id)
-                docker.remove_network(
-                    instance.network_name, model_runtime.container_name
-                )
-            except Exception:
-                pass
-            raise
-
+def _announce_binding(binding: RunBinding, store: StateStore) -> None:
+    instance = binding.instance
     print(f"started Cyclo instance: {instance.id}")
     team_mode = "writable" if instance.team_write else "read-only"
-    project_mode = "read-only" if instance.project_read_only else "writable"
-    print(f"team definition ({team_mode}): {team.root}")
-    print(f"project root ({project_mode}): {project}")
+    print(f"team definition ({team_mode}): {binding.team.root}")
+    if not instance.project_file:
+        print(f"project root (writable): {binding.project_root}")
+    else:
+        print(f"project: {instance.project_name}")
+        print(f"project definition: {instance.project_file}")
+        for project_mount in binding.project_mounts:
+            print(
+                f"mount ({project_mount.mode}): {project_mount.name} "
+                f"{project_mount.path} -> {project_mount.container_path}"
+            )
     if instance.port is not None:
         print(f"AgentWS: http://{instance.agentws_host}:{instance.port}")
-        if not agentws_host_is_loopback:
+        if not dashboard_host_is_loopback(instance.agentws_host):
             print(
                 "WARNING: AgentWS has no authentication and is exposed on a "
                 "non-loopback address; anyone who can reach this host can view "
@@ -370,74 +242,185 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         print("AgentWS UI: not published in --offline mode")
     print(f"state: {store.queue_root(instance.id)}")
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    source = agentws_root()
+    store = state_store(args)
+    proxy = gateway(args, store)
+    model_runtime = provider_service(args, store)
+    docker = Docker()
+
+    if args.project is None:
+        definition = load_project(args.definition)
+        configured_teams = load_project_teams(definition)
+        validate_run_options(
+            args, project_file=True, team_count=len(configured_teams)
+        )
+        _validate_project_mounts(
+            definition,
+            configured_teams,
+            store,
+            proxy,
+            model_runtime,
+            source,
+        )
+        bindings = project_run_bindings(args, definition, configured_teams)
+    else:
+        validate_run_options(args, project_file=False, team_count=1)
+        binding = legacy_run_binding(args)
+        validate_mount_boundaries(
+            binding.team.root,
+            binding.project_root,
+            store.root,
+            proxy.host_pi_agent_dir,
+            _trusted_mount_roots(source, model_runtime),
+        )
+        bindings = (binding,)
+
+    if args.dry_run:
+        for binding in bindings:
+            if len(bindings) > 1:
+                print(f"# instance {binding.instance.id}")
+            print(shlex.join(container_command(container_spec(binding, store, args))))
+        return 0
+
+    model_runtime.require_running()
+
+    for binding in bindings:
+        preflight_binding(binding, store, docker)
+
+    started: list[RunBinding] = []
+    current: RunBinding | None = None
+    try:
+        for index, binding in enumerate(bindings):
+            current = binding
+            start_binding(
+                args,
+                binding,
+                source,
+                store,
+                model_runtime,
+                docker,
+                build=args.build and index == 0,
+            )
+            started.append(binding)
+            current = None
+    except BaseException:
+        rollback_errors: list[str] = []
+        rollback = list(started)
+        if current is not None and all(
+            item.instance.id != current.instance.id for item in rollback
+        ):
+            try:
+                persisted = store.load(current.instance.id)
+            except CycloError as exc:
+                if store.metadata_path(current.instance.id).is_file():
+                    rollback_errors.append(
+                        f"{current.instance.id}: cannot verify the in-flight "
+                        f"launch for rollback: {exc}"
+                    )
+            else:
+                if (
+                    persisted.active
+                    and persisted.launch_id == current.instance.launch_id
+                ):
+                    rollback.append(current)
+        for binding in reversed(rollback):
+            try:
+                stop_instance(
+                    args,
+                    store,
+                    binding.instance.id,
+                    expected_launch_id=binding.instance.launch_id,
+                )
+            except Exception as exc:
+                rollback_errors.append(f"{binding.instance.id}: {exc}")
+        if rollback_errors:
+            print(
+                "warning: project startup rollback was incomplete: "
+                + "; ".join(rollback_errors),
+                file=sys.stderr,
+            )
+        raise
+
+    for binding in bindings:
+        _announce_binding(binding, store)
+
     if args.foreground:
+        binding = bindings[0]
         try:
-            return docker.logs(instance.container_name, follow=True)
+            return docker.logs(binding.instance.container_name, follow=True)
         except KeyboardInterrupt:
-            stop_instance(args, store, instance.id)
+            stop_instance(args, store, binding.instance.id)
     return 0
 
 
-def stop_instance(args: argparse.Namespace, store: StateStore, identifier: str) -> None:
-    docker = Docker()
-    model_runtime = provider_service(args, store)
-    with store.locked():
-        instance = store.load(identifier)
-        instance.active = False
-        instance.port = None
-        store.save(instance)
-        revoke_error: Exception | None = None
-        rotation_errors: list[str] = []
-        repair_error: Exception | None = None
-        cleanup_error: Exception | None = None
-        stale: list[Instance] = []
-        remaining: list[Instance] = []
-        try:
-            remaining = active_instances(store, docker, stale=stale)
-        except Exception as exc:
-            revoke_error = exc
-        else:
-            try:
-                # Repair first so the single publication below contains the
-                # current per-team interface addresses. If repair fails, still
-                # publish: empty bindings fail closed and the stopped team's
-                # grant must be revoked.
-                attach_active_networks(docker, model_runtime, remaining)
-            except Exception as exc:
-                repair_error = exc
-            try:
-                model_runtime.update_clients(remaining)
-            except Exception as exc:
-                revoke_error = exc
-        rotation_errors = rotate_client_tokens(
-            model_runtime, [instance.id, *[item.id for item in stale]]
-        )
-        try:
-            docker.stop_remove(instance.container_name, instance.id)
-            docker.remove_network(
-                instance.network_name, model_runtime.container_name
-            )
-        except Exception as exc:
-            cleanup_error = exc
-        if revoke_error is not None:
-            raise CycloError(
-                f"instance stopped in metadata but proxy capability revocation failed: {revoke_error}"
-            ) from revoke_error
-        if cleanup_error is not None:
-            raise CycloError(
-                f"proxy capability was revoked but Docker cleanup failed: {cleanup_error}"
-            ) from cleanup_error
-        if repair_error is not None:
-            raise CycloError(
-                f"capability was revoked and the instance stopped, but active network repair failed: {repair_error}"
-            ) from repair_error
-        if rotation_errors:
-            raise token_rotation_failure(rotation_errors)
+def stop_instance(
+    args: argparse.Namespace,
+    store: StateStore,
+    identifier: str,
+    *,
+    expected_launch_id: str | None = None,
+) -> None:
+    stop_managed_instance(
+        store,
+        Docker(),
+        provider_service(args, store),
+        identifier,
+        expected_launch_id=expected_launch_id,
+    )
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    stop_instance(args, state_store(args), args.instance)
-    print(f"stopped Cyclo instance: {args.instance}")
+    store = state_store(args)
+    target = args.target
+
+    # Preserve the original instance-ID interface even when an instance happens
+    # to have a project-like name such as ``foo.cyclo``.
+    try:
+        candidate_id = validate_instance_id(target)
+    except CycloError:
+        candidate_id = None
+    if candidate_id is not None and store.metadata_path(candidate_id).is_file():
+        stop_instance(args, store, candidate_id)
+        print(f"stopped Cyclo instance: {candidate_id}")
+        return 0
+
+    selected = Path(target).expanduser()
+    if not selected.is_absolute():
+        selected = Path.cwd() / selected
+    selected = Path(os.path.abspath(selected))
+    canonical = selected.resolve()
+    targets = [
+        instance
+        for instance in store.list()
+        if instance.project_file
+        and Path(instance.project_file).expanduser().resolve() == canonical
+    ]
+
+    if not targets:
+        if not _looks_like_project_file(selected):
+            stop_instance(args, store, target)
+            print(f"stopped Cyclo instance: {target}")
+            return 0
+        raise CycloError(
+            f"no Cyclo instances found for project definition {selected}"
+        )
+
+    failures: list[str] = []
+    for instance in targets:
+        try:
+            stop_instance(args, store, instance.id)
+        except Exception as exc:
+            failures.append(f"{instance.id}: {exc}")
+        else:
+            print(f"stopped Cyclo instance: {instance.id}")
+    if failures:
+        raise CycloError(
+            f"project definition {selected} stop incomplete: "
+            + "; ".join(failures)
+        )
     return 0
 
 
@@ -445,6 +428,8 @@ def cmd_ps(args: argparse.Namespace) -> int:
     store = state_store(args)
     docker = Docker()
     rows = []
+    shared_runtime_health: RuntimeHealth | None = None
+    model_runtime: ProviderService | None = None
     for instance in store.list():
         running = docker.container_running(instance.container_name)
         if running and instance.active:
@@ -455,20 +440,47 @@ def cmd_ps(args: argparse.Namespace) -> int:
             state = "stale"
         else:
             state = "stopped"
+        if state == "running":
+            if shared_runtime_health is None:
+                model_runtime = model_runtime or provider_service(args, store)
+                shared_runtime_health = read_runtime_health(model_runtime)
+            try:
+                supervisor = read_agent_supervisor_status(
+                    store.queue_root(instance.id)
+                )
+                suspended_agents = supervisor.suspended_agents
+                planner_attention_jobs = supervisor.planner_attention_jobs
+                supervisor_error = supervisor.error
+            except Exception as exc:
+                suspended_agents = ()
+                planner_attention_jobs = ()
+                supervisor_error = str(exc)
+            health = team_health(
+                shared_runtime_health,
+                suspended_agents,
+                supervisor_error,
+                planner_attention_jobs,
+            ).label()
+        else:
+            health = INACTIVE_TEAM_HEALTH.label()
         rows.append(
             (
                 instance.id,
                 state,
+                health,
                 instance.team_name,
-                Path(instance.project_path).name,
+                instance.project_name or Path(instance.project_path).name,
                 str(instance.port or ""),
             )
         )
     if not rows:
         print("no Cyclo instances")
         return 0
-    widths = [max(len(row[index]) for row in [("INSTANCE", "STATE", "TEAM", "PROJECT", "PORT"), *rows]) for index in range(5)]
-    header = ("INSTANCE", "STATE", "TEAM", "PROJECT", "PORT")
+    header = ("INSTANCE", "STATE", "HEALTH", "TEAM", "PROJECT", "PORT")
+    widths = [
+        max(len(row[index]) for row in [header, *rows])
+        for index in range(len(header))
+    ]
     print("  ".join(value.ljust(widths[index]) for index, value in enumerate(header)))
     for row in rows:
         print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
@@ -498,6 +510,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         store,
         docker=Docker(),
         usage_reader=_DashboardUsageReader(args, store),
+        runtime_reader=provider_service(args, store),
     )
     server = make_dashboard_server(
         snapshot.build,
@@ -525,6 +538,38 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def _task_project_summary(instance: Instance) -> tuple[str, ...]:
+    project = decode_instance_project(instance).require_valid()
+    if not project.configured:
+        assert project.path is not None
+        return (
+            f"project root: {project.path}",
+            "task paths are relative to this project root; no container mount "
+            "path is required",
+        )
+
+    writable = [
+        f"  {mount.name}: {mount.container_path}"
+        for mount in project.mounts
+        if mount.writable
+    ]
+    readonly = [
+        f"  {mount.name}: {mount.container_path}"
+        for mount in project.mounts
+        if mount.read_only
+    ]
+    return (
+        f"project: {project.name}",
+        f"project definition: {project.definition}",
+        "writable workspace mounts:",
+        *(writable or ["  none"]),
+        "read-only mounts:",
+        *(readonly or ["  none"]),
+        "write only below configured /workspace/<name> paths; read-only "
+        "inputs are below /readonly/<name>",
+    )
+
+
 def cmd_task(args: argparse.Namespace) -> int:
     store = state_store(args)
     instance = store.load(args.instance)
@@ -536,6 +581,7 @@ def cmd_task(args: argparse.Namespace) -> int:
     spec = Path(args.spec).expanduser().resolve()
     if not spec.is_file():
         raise CycloError(f"task specification not found: {spec}")
+    project_summary = _task_project_summary(instance)
     docker = Docker()
     if not docker.container_running(instance.container_name):
         raise CycloError(f"Cyclo instance is not running: {instance.id}")
@@ -556,11 +602,8 @@ def cmd_task(args: argparse.Namespace) -> int:
             check=False,
             user="0:0",
         )
-    print(f"project root: {instance.project_path}")
-    print(
-        "task paths are relative to this project root; no container mount path "
-        "is required"
-    )
+    for line in project_summary:
+        print(line)
     return 0
 
 
@@ -625,7 +668,7 @@ def cmd_repair(args: argparse.Namespace) -> int:
         for instance in inactive:
             try:
                 existed = docker.container_exists(instance.container_name)
-                docker.stop_remove(instance.container_name, instance.id)
+                stop_remove_instance_container(docker, instance)
                 docker.remove_network(
                     instance.network_name, model_runtime.container_name
                 )
@@ -700,258 +743,14 @@ def cmd_runtime(args: argparse.Namespace) -> int:
     raise CycloError(f"unknown provider-runtime action: {args.runtime_action}")
 
 
-def _selected_provider_definitions(
-    args: argparse.Namespace, definitions=None
-):
-    definitions = (
-        host_configuration(args).load()
-        if definitions is None
-        else tuple(definitions)
-    )
-    if args.all_providers:
-        return definitions
-    if args.provider_prefix is None:
-        raise CycloError("provider command requires PREFIX or --all")
-    selected = tuple(
-        definition
-        for definition in definitions
-        if definition.prefix == args.provider_prefix
-    )
-    if not selected:
-        raise CycloError(
-            f"provider {args.provider_prefix!r} is not defined in "
-            f"{host_configuration(args).path}"
-        )
-    return selected
-
-
 def cmd_provider(args: argparse.Namespace) -> int:
     store = state_store(args)
-    action = args.provider_action
-    if action == "status":
-        definitions = host_configuration(args).load()
-        configured = {definition.prefix: definition for definition in definitions}
-        runtime = ProviderRuntime(store.provider_runtime_root)
-        if not args.all_providers:
-            assert args.provider_prefix is not None
-        if args.all_providers:
-            identities_by_prefix = {
-                identity.prefix: identity for identity in runtime.owned_identities()
-            }
-            for definition in definitions:
-                identities_by_prefix.setdefault(
-                    definition.prefix, runtime.identity(definition.prefix)
-                )
-            identities = tuple(
-                identities_by_prefix[prefix]
-                for prefix in sorted(identities_by_prefix)
-            )
-        else:
-            identities = (runtime.identity(args.provider_prefix),)
-        for identity in identities:
-            definition = configured.get(identity.prefix)
-            spec = (
-                provider_definition_spec(store.provider_runtime_root, definition)
-                if definition is not None
-                else None
-            )
-            status = runtime.status(identity, spec)
-            state = (
-                "running"
-                if status.container_running
-                else "stopped"
-                if status.container_exists
-                else "absent"
-            )
-            detail = ""
-            if definition is None:
-                detail = "\tunconfigured"
-            elif status.container_exists:
-                detail = (
-                    "\tcurrent"
-                    if status.image_current and status.configuration_current
-                    else "\tstale"
-                )
-            elif status.image_exists and not status.image_current:
-                detail = "\tstale"
-            print(f"{identity.prefix}\t{state}{detail}")
-        return 0
-
-    with store.locked():
-        host = HostProviders(store.provider_runtime_root)
-        service = provider_service(args, store)
-        if action == "stop":
-            if args.all_providers:
-                by_prefix = {
-                    identity.prefix: identity
-                    for identity in host.runtime.owned_identities()
-                }
-                known_prefixes = {
-                    str(record["prefix"])
-                    for record in host.published_expectations()
-                    if isinstance(record.get("prefix"), str)
-                }
-                known_prefixes.update(service.provider_client_prefixes())
-                for prefix in known_prefixes:
-                    by_prefix.setdefault(prefix, host.runtime.identity(prefix))
-                identities = tuple(
-                    by_prefix[prefix] for prefix in sorted(by_prefix)
-                )
-            else:
-                assert args.provider_prefix is not None
-                identities = (host.runtime.identity(args.provider_prefix),)
-            prefixes = tuple(identity.prefix for identity in identities)
-            # Revoke both component capabilities before touching Docker. If
-            # container cleanup fails, a hostile process remains unable to
-            # register, receive new routed work, or call an upstream model.
-            errors: list[str] = []
-            try:
-                # This is the first fail-closed cut: removing expected state
-                # disables ingress authentication, routing, and registration.
-                with service.capability_update_guard():
-                    host.remove_expectations(prefixes)
-                    service.reload_control(require_current=False)
-            except CycloError as exc:
-                errors.append(f"expectation revocation: {exc}")
-            try:
-                service.remove_provider_clients(prefixes)
-            except CycloError as exc:
-                errors.append(f"upstream-capability revocation: {exc}")
-            for identity in identities:
-                try:
-                    host.runtime.stop(identity)
-                except CycloError as exc:
-                    errors.append(f"container cleanup for {identity.prefix}: {exc}")
-                else:
-                    print(f"stopped provider: {identity.prefix}")
-            if errors:
-                raise CycloError("provider stop incomplete: " + "; ".join(errors))
-            return 0
-
-        definitions = host_configuration(args).load()
-        selected_definitions = _selected_provider_definitions(args, definitions)
-        selected_prefixes = {
-            definition.prefix for definition in selected_definitions
-        }
-        if action == "build":
-            for definition in selected_definitions:
-                host.runtime.build(host.build_spec(definition))
-                print(f"built provider: {definition.prefix}")
-            return 0
-
-        prepared = host.prepare(
-            definitions, selected_prefixes=selected_prefixes
-        )
-
-        if action not in {"start", "restart"}:
-            raise CycloError(f"unknown provider action: {action}")
-        service.require_running()
-        docker = Docker()
-        running = active_instances(store, docker)
-        for item in prepared:
-            spec = host.spec(item)
-            if action == "restart" and args.build:
-                host.runtime.build(spec)
-            elif action == "start":
-                host.runtime.require_startable(spec)
-            else:
-                host.runtime.require_current_image(spec)
-
-            previous_expectations = host.published_expectations()
-            previous_clients = service.provider_clients()
-            remaining_provider_clients = tuple(
-                record
-                for record in previous_clients
-                if record.get("provider_prefix") != item.definition.prefix
-            )
-            if action == "restart":
-                # Revoke and acknowledge the old route before retiring its
-                # process. This removes the durable registration, so a
-                # same-generation launch cannot be mistaken for an idempotent
-                # renewal through socket-inode reuse.
-                with service.capability_update_guard():
-                    host.remove_expectations((item.definition.prefix,))
-                    service.reload_control(require_current=False)
-                service.update_clients(
-                    running,
-                    provider_clients=remaining_provider_clients,
-                )
-                host.runtime.stop(item.identity)
-                # The replacement receives new ingress and upstream bearers.
-                # Atomic file replacement leaves no still-mounted old process
-                # with the new capability bytes.
-                host.rotate_capabilities(item)
-
-            # Publish only this selected prefix, immediately before its explicit
-            # launch. Existing omitted-provider routes and containers are kept.
-            launched = False
-            try:
-                host.upsert_expectations((host.expectation(item),))
-                provider_clients = service.merged_provider_clients(
-                    (host.client_record(item),)
-                )
-                service.update_clients(
-                    running, provider_clients=provider_clients
-                )
-                # The catalog carries millisecond timestamps. Floor the launch
-                # marker to that same precision so a registration in this exact
-                # millisecond is still recognized as fresh.
-                launch_started_at = (time.time_ns() // 1_000_000) / 1000
-                if action == "start":
-                    status = host.runtime.start(spec)
-                    launched = status.container_restarted
-                    verb = "started" if launched else "running"
-                else:
-                    status = host.runtime.start(spec)
-                    launched = status.container_restarted
-                    verb = "restarted"
-                service.wait_provider(
-                    item.definition.prefix,
-                    status.generation,
-                    runtime=host.runtime,
-                    identity=item.identity,
-                    registered_after=(launch_started_at if launched else None),
-                )
-            except Exception as exc:
-                rollback_errors: list[str] = []
-                if launched:
-                    try:
-                        host.runtime.stop(item.identity)
-                    except Exception as rollback_exc:
-                        rollback_errors.append(f"container: {rollback_exc}")
-                if action == "restart":
-                    try:
-                        with service.capability_update_guard():
-                            host.remove_expectations((item.definition.prefix,))
-                            service.reload_control(require_current=False)
-                    except Exception as rollback_exc:
-                        rollback_errors.append(f"expectation revocation: {rollback_exc}")
-                    try:
-                        service.update_clients(
-                            running,
-                            provider_clients=remaining_provider_clients,
-                        )
-                    except Exception as rollback_exc:
-                        rollback_errors.append(f"client revocation: {rollback_exc}")
-                else:
-                    try:
-                        host.publish(previous_expectations)
-                    except Exception as rollback_exc:
-                        rollback_errors.append(f"expectation: {rollback_exc}")
-                    try:
-                        service.update_clients(
-                            running, provider_clients=previous_clients
-                        )
-                    except Exception as rollback_exc:
-                        rollback_errors.append(f"clients: {rollback_exc}")
-                if rollback_errors:
-                    raise CycloError(
-                        f"{exc}; provider rollback failed: "
-                        + "; ".join(rollback_errors)
-                    ) from exc
-                raise
-            print(f"{verb} provider: {item.definition.prefix}")
-    return 0
+    return run_provider_command(
+        args,
+        store,
+        host_configuration(args),
+        lambda: provider_service(args, store),
+    )
 
 
 def _reload_runtime_after_gateway_change(
@@ -976,11 +775,24 @@ def cmd_gateway_restart(args: argparse.Namespace, *, build: bool = False) -> int
 
 
 def cmd_gateway(args: argparse.Namespace) -> int:
+    login_selection: argparse.Namespace | None = None
+
     def restart_handler(restart_args: argparse.Namespace) -> int:
         selected = argparse.Namespace(**vars(args))
         selected.gateway_image = restart_args.image
         selected.store_volume = restart_args.store_volume
         return cmd_gateway_restart(selected, build=restart_args.build)
+
+    def login_guard(login_args: argparse.Namespace) -> None:
+        nonlocal login_selection
+        # The delegated parser resolves command-local overrides.  Build the
+        # gateway from those final values, not the outer defaults.
+        selected = argparse.Namespace(**vars(args))
+        selected.gateway_image = login_args.image
+        selected.store_volume = login_args.store_volume
+        proxy = gateway(selected, state_store(selected))
+        proxy.validate_login()
+        login_selection = selected
 
     if args.gateway_help:
         return gateway_cli.main(["--help"], restart_handler=restart_handler)
@@ -1002,15 +814,20 @@ def cmd_gateway(args: argparse.Namespace) -> int:
             [*delegated, *rest],
             restart_handler=restart_handler,
         )
-    result = gateway_cli.main([*delegated, *rest])
+    if action == "login":
+        result = gateway_cli.main([*delegated, *rest], login_guard=login_guard)
+    else:
+        result = gateway_cli.main([*delegated, *rest])
     if action == "login" and result == 0:
-        _reload_runtime_after_gateway_change(args, state_store(args))
+        selected = login_selection or args
+        _reload_runtime_after_gateway_change(selected, state_store(selected))
     return result
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     failures = 0
     configured_providers = ()
+    store = state_store(args)
     try:
         root = agentws_root()
         print(f"ok  bundled job-loop ABI: {root}")
@@ -1018,7 +835,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         failures += 1
         print(f"no  bundled job-loop ABI: {exc}")
     try:
-        proxy = gateway(args, state_store(args))
+        instances = store.list()
+        print(f"ok  persisted instance state: {len(instances)} instance(s)")
+    except CycloError as exc:
+        failures += 1
+        print(f"no  persisted instance state: {exc}")
+    try:
+        proxy = gateway(args, store)
         print(f"ok  Cyclo credential gateway API: {proxy.gateway.__file__}")
     except CycloError as exc:
         failures += 1
@@ -1043,11 +866,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     ok, detail = docker.available()
     if ok:
         print(f"ok  Docker daemon: {detail}")
-        runtime = provider_service(args, state_store(args))
-        runtime_running = False
+        runtime = provider_service(args, store)
+        runtime_operational = False
         try:
             status = runtime.status()
-            runtime_running = status.running
             if not status.running:
                 raise CycloError(
                     "provider runtime is not running; run `cyclo runtime start`"
@@ -1057,12 +879,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     "provider runtime is stale; run `cyclo runtime restart` "
                     "(add `--build` only if Cyclo reports that the image is stale)"
                 )
-            print(f"ok  provider runtime: {runtime.container_name} (current)")
+            runtime.probe_operational(timeout=2.0)
+            runtime_operational = True
+            print(
+                f"ok  provider runtime: {runtime.container_name} "
+                "(current and operational)"
+            )
         except CycloError as exc:
             failures += 1
             print(f"no  provider runtime: {exc}")
         catalog: dict[str, dict] = {}
-        if runtime_running:
+        if runtime_operational:
             try:
                 catalog = runtime.catalog()
                 print(f"ok  provider runtime catalog: {len(catalog)} provider(s)")
@@ -1155,7 +982,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cyclo", description="Run Git-defined agent teams in a secure model loop")
     parser.add_argument("--version", action="version", version=f"cyclo {__version__}")
     add_common_options(parser)
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(required=True)
 
     init = commands.add_parser("init", help="create a minimal AgentWS-compatible team repository")
     init.add_argument("team")
@@ -1167,8 +994,10 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--no-git", action="store_true", help="do not run git init")
     init.set_defaults(func=cmd_init)
 
-    validate = commands.add_parser("validate", help="validate a team repository")
-    validate.add_argument("team")
+    validate = commands.add_parser(
+        "validate", help="validate a team repository or project.cyclo"
+    )
+    validate.add_argument("definition", help="team directory or project.cyclo file")
     validate.set_defaults(func=cmd_validate)
 
     templates = commands.add_parser("templates", help="list team templates bundled with Cyclo")
@@ -1176,31 +1005,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser(
         "run",
-        help="start a team against a writable project workspace",
+        help="start every team in project.cyclo, or use legacy TEAM PROJECT syntax",
         description=(
-            "Start a team with its definition read-only by default and its "
-            "project root writable by default."
+            "Start all teams and named mounts declared by project.cyclo. "
+            "The compatibility form `cyclo run TEAM PROJECT` starts one team "
+            "with its definition read-only by default and its project root "
+            "writable by default."
         ),
     )
     run.add_argument(
-        "team",
-        help="team definition repository (read-only by default)",
+        "definition",
+        help="project.cyclo, or a team repository in compatibility mode",
     )
     run.add_argument(
         "project",
-        help="project root directory (writable by default)",
+        nargs="?",
+        help="compatibility-mode project root directory (writable by default)",
     )
-    run.add_argument("--name", help="stable instance name (default: derived from team and project paths)")
+    run.add_argument(
+        "--name",
+        help=(
+            "compatibility-mode instance name (project.cyclo uses its name "
+            "and team repositories)"
+        ),
+    )
     run.add_argument("--image", default=os.environ.get("CYCLO_RUNTIME_IMAGE", DEFAULT_RUNTIME_IMAGE))
     run.add_argument(
         "--team-write",
         action="store_true",
-        help="allow the team to modify its own definition repository",
-    )
-    run.add_argument(
-        "--project-read-only",
-        action="store_true",
-        help="make the project root read-only (default: writable)",
+        help=(
+            "compatibility mode: allow the team to modify its definition "
+            "(project.cyclo declares this per team)"
+        ),
     )
     run.add_argument("--offline", action="store_true", help="block direct outbound network access; the model proxy remains reachable")
     run.add_argument(
@@ -1218,8 +1054,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true", help="print the redacted team Docker command without changing state")
     run.set_defaults(func=cmd_run)
 
-    stop = commands.add_parser("stop", help="stop an instance and revoke its proxy capability")
-    stop.add_argument("instance")
+    stop = commands.add_parser(
+        "stop",
+        help="stop one instance or every instance launched from project.cyclo",
+    )
+    stop.add_argument("target", help="instance ID or project.cyclo file")
     stop.set_defaults(func=cmd_stop)
 
     ps = commands.add_parser("ps", help="list Cyclo instances")

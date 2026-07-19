@@ -16,6 +16,14 @@ usage() {
     exit 1
 }
 
+cleanup() {
+    status=$?
+    trap - 0 HUP INT TERM
+    set +e
+    [ -n "${JOB_STAGE:-}" ] && rm -rf -- "$JOB_STAGE"
+    exit "$status"
+}
+
 JOB_ID=""
 JOB_ROLE=""
 TASK_ID=""
@@ -66,18 +74,34 @@ require_tasks_dir
 [ -d "$TASKS_DIR/$TASK_ID" ] || die "task '$TASK_ID' does not exist"
 
 JOB_DIR="$JOBS_DIR/$JOB_ID"
+JOB_STAGE=""
 
-if ! mkdir "$JOB_DIR" 2>/dev/null; then
-    die "job '$JOB_ID' already exists"
-fi
+[ -e "$JOB_DIR" ] && die "job '$JOB_ID' already exists"
 
-mkdir "$JOB_DIR/workspace"
-cp "$SPEC_FILE" "$JOB_DIR/spec.md"
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+JOB_STAGE="$(mktemp -d "$JOBS_DIR/.job-create+XXXXXX")" \
+    || die "cannot create staging directory for job '$JOB_ID'"
+chmod 700 "$JOB_STAGE"
 
-write_file_atomic "$JOB_DIR/role" "$JOB_ROLE"
-write_file_atomic "$JOB_DIR/task-id" "$TASK_ID"
-touch "$JOB_DIR/log.md"
-write_file_atomic "$JOB_DIR/status" "pending"
+mkdir "$JOB_STAGE/workspace"
+cp -- "$SPEC_FILE" "$JOB_STAGE/spec.md"
+
+write_file_atomic "$JOB_STAGE/role" "$JOB_ROLE"
+write_file_atomic "$JOB_STAGE/task-id" "$TASK_ID"
+touch "$JOB_STAGE/log.md"
+: > "$JOB_STAGE/.control.lock"
+write_file_atomic "$JOB_STAGE/status" "pending"
+
+# The rename is the only publication point. GNU mv -n returns success when it
+# declines to replace a destination, so the surviving source detects that case.
+mv -nT -- "$JOB_STAGE" "$JOB_DIR" \
+    || die "failed to publish job '$JOB_ID': $JOB_DIR"
+[ ! -e "$JOB_STAGE" ] \
+    || die "job '$JOB_ID' already exists"
+JOB_STAGE=""
 
 echo "created: $JOB_DIR (task: $TASK_ID, role: $JOB_ROLE)"
 echo "spec: $JOB_DIR/spec.md"

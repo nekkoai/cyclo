@@ -11,14 +11,13 @@ import pytest
 
 from cyclo.errors import CycloError
 from cyclo.host_config import HostConfig
-from cyclo.provider_service import (
-    PROVIDER_RUNTIME_CONFIG_DIR,
+from cyclo.provider_service import ProviderService
+from cyclo.runtime_container import (
     PROVIDER_RUNTIME_CONFIG_FILE,
     PROVIDER_RUNTIME_PROVIDER_SOCKET_ROOT,
     PROVIDER_RUNTIME_SOCKET_DIR,
     PROVIDER_RUNTIME_STATE,
     ProviderRuntimeConfig,
-    ProviderService,
     provider_runtime_config_fingerprint,
     provider_runtime_private_socket_dir,
     provider_runtime_run_command,
@@ -83,7 +82,6 @@ def test_runtime_run_command_has_readonly_config_and_stable_socket_mounts(
     config = runtime_config(tmp_path)
     command = provider_runtime_run_command(
         config,
-        source_fingerprint="source",
         config_fingerprint="config",
         gateway_network_id="gateway-network-id",
     )
@@ -124,7 +122,6 @@ def test_runtime_run_command_resolves_host_config_symlink_before_binding(
 
     command = provider_runtime_run_command(
         config,
-        source_fingerprint="source",
         config_fingerprint="config",
         gateway_network_id="gateway-network-id",
     )
@@ -140,7 +137,6 @@ def test_runtime_run_command_omits_missing_host_config_mount(
     config = replace(runtime_config(tmp_path), host_config=None)
     command = provider_runtime_run_command(
         config,
-        source_fingerprint="source",
         config_fingerprint="config",
         gateway_network_id="gateway-network-id",
     )
@@ -171,7 +167,6 @@ def active_instance() -> Instance:
         network_name="cyclo-team-one-net",
         image="cyclo-runtime:test",
         team_write=False,
-        project_read_only=False,
         offline=False,
         active=True,
     )
@@ -343,7 +338,7 @@ def test_runtime_controls_use_authenticated_private_requests(
     monkeypatch.setattr(service, "_runtime_port", runtime_port)
     monkeypatch.setattr(service, "admin_token", lambda: "private-admin")
     monkeypatch.setattr(
-        "cyclo.provider_service._unix_http_request", unix_http_request
+        "cyclo.runtime_container._unix_http_request", unix_http_request
     )
 
     getattr(service, control)(attempts=1, timeout=0.25)
@@ -354,6 +349,58 @@ def test_runtime_controls_use_authenticated_private_requests(
     assert captured["body"] == b""
     assert captured["token"] == "private-admin"
     assert captured["timeout"] == 0.25
+
+
+def test_catalog_uses_authenticated_private_admin_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = ProviderService(
+        StateStore(tmp_path / "state"), HostConfig(tmp_path / "host.conf")
+    )
+    captured: dict[str, object] = {}
+    current_checks = 0
+
+    def require_running() -> int:
+        nonlocal current_checks
+        current_checks += 1
+        return 4321
+
+    def unix_http_request(
+        socket_path,
+        method,
+        request_path,
+        *,
+        token,
+        body,
+        timeout,
+    ):
+        captured.update(
+            socket_path=socket_path,
+            method=method,
+            path=request_path,
+            token=token,
+            body=body,
+            timeout=timeout,
+        )
+        return 200, b'{"account":{"models":[]}}'
+
+    monkeypatch.setattr(service, "require_running", require_running)
+    monkeypatch.setattr(service, "admin_token", lambda: "private-admin")
+    monkeypatch.setattr(
+        "cyclo.runtime_container._unix_http_request", unix_http_request
+    )
+
+    assert service.catalog() == {"account": {"models": []}}
+    assert current_checks == 1
+    assert captured == {
+        "socket_path": service.admin_socket_file,
+        "method": "GET",
+        "path": "/providers",
+        "token": "private-admin",
+        "body": None,
+        "timeout": 5.0,
+    }
 
 
 def test_catalog_can_explicitly_refresh_runtime_snapshot(
@@ -370,11 +417,11 @@ def test_catalog_can_explicitly_refresh_runtime_snapshot(
     monkeypatch.setattr(
         service,
         "_request",
-        lambda path, token: events.append((path, token)) or {"account": {}},
+        lambda path: events.append(path) or {"account": {}},
     )
 
-    assert service.catalog("team-token", refresh=True) == {"account": {}}
-    assert events == ["refresh", ("/providers", "team-token")]
+    assert service.catalog(refresh=True) == {"account": {}}
+    assert events == ["refresh", "/providers"]
 
 
 def test_unacknowledged_catalog_refresh_keeps_the_previous_runtime_snapshot(
@@ -403,7 +450,7 @@ def test_unacknowledged_catalog_refresh_keeps_the_previous_runtime_snapshot(
         "stop",
         lambda: pytest.fail("catalog refresh failure must not stop the runtime"),
     )
-    monkeypatch.setattr("cyclo.provider_service.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("cyclo.runtime_container.time.sleep", lambda _delay: None)
 
     with pytest.raises(CycloError, match="catalog refresh could not be acknowledged"):
         service.refresh_catalog_control()
@@ -499,7 +546,7 @@ def test_unacknowledged_bridge_reload_stops_runtime_before_gateway_publication(
 
     monkeypatch.setattr(service, "_control_request_once", fail_reload)
     monkeypatch.setattr(service, "stop", lambda: stopped.append(True) or True)
-    monkeypatch.setattr("cyclo.provider_service.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("cyclo.runtime_container.time.sleep", lambda _delay: None)
     changed = replace(active_instance(), generation="next-generation")
 
     with pytest.raises(CycloError, match="provider runtime was stopped"):
@@ -590,10 +637,10 @@ def test_final_capability_activation_requires_a_current_runtime(
     monkeypatch.setattr(service, "_runtime_port", runtime_port)
     monkeypatch.setattr(service, "admin_token", lambda: "private-admin")
     monkeypatch.setattr(
-        "cyclo.provider_service._unix_http_request", unix_http_request
+        "cyclo.runtime_container._unix_http_request", unix_http_request
     )
     monkeypatch.setattr(service, "stop", lambda: stopped.append(True) or True)
-    monkeypatch.setattr("cyclo.provider_service.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("cyclo.runtime_container.time.sleep", lambda _delay: None)
 
     with pytest.raises(CycloError, match="provider runtime was stopped"):
         service.update_clients(

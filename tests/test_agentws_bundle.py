@@ -70,13 +70,16 @@ def test_packaged_agentws_materializes_as_an_executable_runtime(tmp_path: Path) 
     assert (runtime / "tools" / "agentws-public" / "index.html").is_file()
 
 
-def test_queue_names_reject_parent_directory_segments(tmp_path: Path) -> None:
+@pytest.mark.parametrize("agent_id", ["..", ".hidden", "-hidden", "_hidden"])
+def test_queue_names_must_start_alphanumeric(
+    tmp_path: Path, agent_id: str
+) -> None:
     runtime = Path(
         shutil.copytree(packaged_agentws_template(), tmp_path / "runtime")
     )
 
     result = subprocess.run(
-        [str(runtime / "bin" / "agent-new"), "..", "planner"],
+        [str(runtime / "bin" / "agent-new"), agent_id, "planner"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -86,6 +89,17 @@ def test_queue_names_reject_parent_directory_segments(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "invalid agent ID" in result.stderr
     assert not (runtime / "name").exists()
+
+
+def test_viewer_team_validation_rejects_hidden_agent_names() -> None:
+    namespace = runpy.run_path(
+        str(packaged_agentws_template() / "tools" / "agentws")
+    )
+
+    with pytest.raises(ValueError, match="must start with an alphanumeric"):
+        namespace["_validate_team_role"](
+            ".hidden", "agent name", Path("team.json")
+        )
 
 
 def test_packaged_agentws_initializes_a_team_without_a_checkout(tmp_path: Path) -> None:

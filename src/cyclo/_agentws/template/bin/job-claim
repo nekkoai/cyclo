@@ -61,20 +61,38 @@ claim_job() {
     [ -f "$job_dir/status" ] || return 1
     [ -f "$job_dir/role" ] || return 1
 
+    acquire_job_control_lock "$job_dir"
+
     status="$(cat "$job_dir/status" 2>/dev/null || true)"
-    [ "$status" = "pending" ] || return 1
-
-    role="$(cat "$job_dir/role" 2>/dev/null || true)"
-    [ -n "$role" ] || return 1
-
-    if [ -n "$JOB_ROLE" ] && [ "$role" != "$JOB_ROLE" ]; then
+    if [ "$status" != "pending" ]; then
+        release_job_control_lock
         return 1
     fi
 
-    mkdir "$job_dir/lock" 2>/dev/null || return 1
+    role="$(cat "$job_dir/role" 2>/dev/null || true)"
+    if [ -z "$role" ]; then
+        release_job_control_lock
+        return 1
+    fi
+
+    if [ -n "$JOB_ROLE" ] && [ "$role" != "$JOB_ROLE" ]; then
+        release_job_control_lock
+        return 1
+    fi
+
+    if ! repair_pending_ownership_locked "$job_dir"; then
+        release_job_control_lock
+        return 1
+    fi
+
+    if ! mkdir "$job_dir/lock" 2>/dev/null; then
+        release_job_control_lock
+        return 1
+    fi
 
     write_file_atomic "$job_dir/agent-id" "$AGENT_ID"
     write_file_atomic "$job_dir/status" "claimed"
+    release_job_control_lock
     echo "CLAIMED: $job_id"
     return 0
 }

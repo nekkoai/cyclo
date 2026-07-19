@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Iterable, Mapping, Protocol
+from typing import Callable, Iterable, Mapping, Protocol
 
 from . import docker as runner_docker
 from . import source as runner_source
@@ -645,6 +645,16 @@ def gateway_image_current(image: str, fingerprint: str) -> bool:
     )
 
 
+def require_gateway_image_current(image: str) -> None:
+    """Validate the local gateway image without building or pulling it."""
+
+    if not gateway_image_current(image, gateway_image_fingerprint()):
+        raise CycloError(
+            "credential gateway image is missing or stale; run "
+            "`cyclo gateway restart --build`"
+        )
+
+
 def ensure_gateway_image(image: str, build: bool = False) -> None:
     fingerprint = gateway_image_fingerprint()
     if build or not gateway_image_current(image, fingerprint):
@@ -693,12 +703,7 @@ def validate_running_gateway(
     private gateway network.
     """
 
-    source_fingerprint = gateway_image_fingerprint()
-    if not gateway_image_current(config.gateway_image, source_fingerprint):
-        raise CycloError(
-            "credential gateway image is missing or stale; run "
-            "`cyclo gateway restart --build`"
-        )
+    require_gateway_image_current(config.gateway_image)
     network_id = owned_network_id(config.gateway_network)
     info = _owned_gateway_container(config.gateway_container)
     if info is None:
@@ -834,17 +839,32 @@ def ensure_gateway(
     network_current = container_info is not None and _container_uses_network(
         container_info, network_id=network_id
     )
-    if (
+    replace = (
         force_restart
         or build
         or not running
         or not network_current
         or current_fingerprint != expected_fingerprint
-    ):
+    )
+    replacement_command: list[str] | None = None
+    if replace:
+        # Remove the selected writer before checking its peers.  This gives an
+        # installation with several stale gateways a legal migration order:
+        # each explicit restart can retire one old writer, even when it then
+        # fails closed on the next stale peer.
         stop_gateway_container(config.gateway_container)
-        rc, _ = runner_docker.run_command_capture(
-            gateway_run_command(config, token, network_identifier=network_id)
+        container_info = None
+        replacement_command = gateway_run_command(
+            config, token, network_identifier=network_id
         )
+
+    # This is the final compatibility gate before a writable store mount.  Do
+    # not exclude the selected name: a replacement has already been removed.
+    validate_store_gateway_compatibility(config.store_volume)
+
+    if replace:
+        assert replacement_command is not None
+        rc, _ = runner_docker.run_command_capture(replacement_command)
         if rc != 0:
             raise CycloError("failed to start gateway container")
         container_info = _owned_gateway_container(config.gateway_container)
@@ -992,10 +1012,102 @@ def _verified_store_gateway(
     )
     if not owned or not expected_mount:
         raise CycloError(
-            "refusing to destroy gateway credentials while an unverified Docker "
+            "refusing credential-store access while an unverified Docker "
             f"container uses volume {volume}: {name}"
         )
     return resource_id, name
+
+
+def validate_store_gateway_compatibility(
+    volume: str,
+) -> tuple[str, ...]:
+    """Validate running store writers before mounting ``volume`` writable.
+
+    Every active container on the selected volume is inspected by immutable
+    ID.  Every active gateway must carry the current packaged source and a
+    configuration marker, which is the lock-protocol compatibility boundary.
+    """
+
+    expected_source = gateway_image_fingerprint()
+    compatible: list[str] = []
+    for identifier in _container_ids_using_volume(volume):
+        info = _inspect_gateway_container(identifier)
+        if info is None:
+            continue
+        state = info.get("State")
+        if not isinstance(state, Mapping):
+            raise CycloError(
+                f"cannot inspect Docker container state: {identifier}"
+            )
+        if (
+            state.get("Running") is not True
+            and state.get("Restarting") is not True
+            and state.get("Status") != "restarting"
+        ):
+            continue
+        verified = _verified_store_gateway(
+            info, volume=volume, identifier=identifier
+        )
+        if verified is None:
+            continue
+        _resource_id_value, name = verified
+        config = info.get("Config")
+        labels = config.get("Labels") if isinstance(config, Mapping) else None
+        if not isinstance(labels, Mapping):
+            raise CycloError(f"cannot inspect existing Docker container: {name}")
+        # The source fingerprint is an image label, not a container label.
+        # Inspect the immutable image ID recorded by the container so retagging
+        # the configured image cannot make an old running gateway look current.
+        image_id = info.get("Image")
+        if not isinstance(image_id, str) or not image_id:
+            raise CycloError(
+                f"cannot inspect running gateway image for {name}; run `cyclo "
+                "gateway restart --build` before using this store"
+            )
+        if (
+            runner_docker.docker_image_label(image_id, SOURCE_FINGERPRINT_LABEL)
+            != expected_source
+        ):
+            raise CycloError(
+                f"running gateway {name} uses stale packaged code on store volume "
+                f"{volume}; run `cyclo gateway restart --build` for that Cyclo "
+                "installation before using this store"
+            )
+        config_fingerprint = labels.get(GATEWAY_CONFIG_FINGERPRINT_LABEL)
+        if not isinstance(config_fingerprint, str) or not config_fingerprint:
+            raise CycloError(
+                f"running gateway {name} has unverified configuration on store "
+                f"volume {volume}; run `cyclo gateway restart` (add `--build` "
+                "for a stale image) before using this store"
+            )
+        compatible.append(name)
+    return tuple(compatible)
+
+
+def validate_login_store_gateways(
+    volume: str,
+    *,
+    configured_container: str | None = None,
+    validate_config: Callable[[], object] | None = None,
+) -> None:
+    """Reject login while any running store writer is incompatible."""
+
+    compatible = validate_store_gateway_compatibility(volume)
+    if configured_container is None or configured_container not in compatible:
+        return
+    name = configured_container
+    if validate_config is None:
+        raise CycloError(
+            f"cannot validate configured running gateway {name} before login"
+        )
+    try:
+        validate_config()
+    except CycloError as exc:
+        raise CycloError(
+            f"running gateway {name} is not the current packaged gateway "
+            f"configuration: {exc}; run `cyclo gateway restart` (add "
+            "`--build` for a stale image) before logging in"
+        ) from exc
 
 
 def _stop_verified_store_gateway(resource_id: str, name: str, volume: str) -> None:

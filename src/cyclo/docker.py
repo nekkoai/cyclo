@@ -7,11 +7,18 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from enum import Enum
+from itertools import combinations
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 from urllib.parse import unquote, urlsplit
 
 from .errors import CycloError
+from .project import (
+    CONTAINER_READONLY_ROOT,
+    MOUNT_NAME_RE,
+    ProjectMount,
+)
 from .state import DEFAULT_AGENTWS_HOST, Instance
 from .team import Team
 
@@ -20,6 +27,7 @@ CYCLO_LABEL = "cyclo.instance"
 CONTAINER_AGENTWS = Path("/agentws")
 CONTAINER_TEAM = Path("/team")
 CONTAINER_WORKSPACE = Path("/workspace")
+CONTAINER_READONLY = CONTAINER_READONLY_ROOT
 CONTAINER_PI = Path("/home/cyclo/.pi")
 HOST_PSEUDO_FILESYSTEMS = (
     (Path("/proc"), "host process filesystem"),
@@ -33,6 +41,62 @@ AGENTWS_RETRY_ENVIRONMENT = (
     "AGENTWS_RETRY_INITIAL_SECONDS",
     "AGENTWS_RETRY_MAX_SECONDS",
 )
+
+
+class DockerContainerState(str, Enum):
+    ABSENT = "absent"
+    RUNNING = "running"
+    PAUSED = "paused"
+    RESTARTING = "restarting"
+    STOPPED = "stopped"
+    DEAD = "dead"
+
+    @property
+    def operational(self) -> bool:
+        return self is DockerContainerState.RUNNING
+
+    @property
+    def lifecycle_active(self) -> bool:
+        return self in {
+            DockerContainerState.RUNNING,
+            DockerContainerState.PAUSED,
+            DockerContainerState.RESTARTING,
+        }
+
+
+def docker_container_state(
+    info: Mapping[str, object] | None, *, name: str
+) -> DockerContainerState:
+    """Classify Docker lifecycle separately from operational readiness."""
+
+    if info is None:
+        return DockerContainerState.ABSENT
+    state = info.get("State")
+    if not isinstance(state, Mapping):
+        raise CycloError(f"cannot parse Docker container state: {name}")
+    status = state.get("Status")
+    if status is not None and not isinstance(status, str):
+        raise CycloError(f"cannot parse Docker container state: {name}")
+    normalized = status.lower() if isinstance(status, str) else ""
+    if state.get("Dead") is True or normalized == "dead":
+        return DockerContainerState.DEAD
+    if state.get("Restarting") is True or normalized == "restarting":
+        return DockerContainerState.RESTARTING
+    if state.get("Paused") is True or normalized == "paused":
+        return DockerContainerState.PAUSED
+    if state.get("Running") is True or normalized == "running":
+        return DockerContainerState.RUNNING
+    if state.get("Running") is False or normalized in {
+        "",
+        "created",
+        "exited",
+        "removing",
+        "stopped",
+    }:
+        return DockerContainerState.STOPPED
+    raise CycloError(
+        f"cannot parse Docker container state for {name}: {status!r}"
+    )
 
 
 def overlaps(left: Path, right: Path) -> bool:
@@ -90,8 +154,31 @@ def validate_mount_boundaries(
     host_pi_agent_dir: Path,
     trusted_roots: Iterable[tuple[Path, str]] = (),
 ) -> None:
-    if overlaps(team, project):
-        raise CycloError(f"team and project must be separate filesystem trees: {team} and {project}")
+    validate_mount_collection(
+        ((team, "team"),),
+        ((project, "project"),),
+        state_root,
+        host_pi_agent_dir,
+        trusted_roots,
+    )
+
+
+def validate_mount_collection(
+    teams: Iterable[tuple[Path, str]],
+    projects: Iterable[tuple[Path, str]],
+    state_root: Path,
+    host_pi_agent_dir: Path,
+    trusted_roots: Iterable[tuple[Path, str]] = (),
+) -> None:
+    """Validate a complete team/mounted-directory set before Docker sees it."""
+
+    mounted = [*teams, *projects]
+    for (left, left_label), (right, right_label) in combinations(mounted, 2):
+        if overlaps(left, right) or overlaps_lexically(left, right):
+            raise CycloError(
+                f"{left_label} and {right_label} must be separate filesystem "
+                f"trees: {left} and {right}"
+            )
     protected: list[tuple[Path, str]] = [
         (state_root, "Cyclo state"),
         (host_pi_agent_dir, "host Pi credential/configuration directory"),
@@ -100,14 +187,21 @@ def validate_mount_boundaries(
     protected.extend((path, "Docker socket") for path in docker_socket_paths())
     protected.extend(trusted_roots)
     for source, label in protected:
-        for mounted, mounted_label in ((team, "team"), (project, "project")):
-            if overlaps(mounted, source) or overlaps_lexically(mounted, source):
-                raise CycloError(f"{mounted_label} mount overlaps {label}: {mounted} and {source}")
+        for mounted_path, mounted_label in mounted:
+            if overlaps(mounted_path, source) or overlaps_lexically(
+                mounted_path, source
+            ):
+                raise CycloError(
+                    f"{mounted_label} mount overlaps {label}: "
+                    f"{mounted_path} and {source}"
+                )
 
 
 def mount(source: Path, target: Path, mode: str = "rw") -> str:
     if "," in str(source):
         raise CycloError(f"Docker bind source cannot contain a comma: {source}")
+    if mode not in {"ro", "rw"}:
+        raise CycloError(f"invalid Docker bind mode: {mode!r}")
     value = f"type=bind,src={source},dst={target}"
     if mode == "ro":
         value += ",readonly"
@@ -126,10 +220,23 @@ class ContainerSpec:
     pi_root: Path
     port: int
     verbose: bool = False
+    project_mounts: tuple[ProjectMount, ...] = ()
+    workspace_layout: Path | None = None
+    readonly_layout: Path | None = None
 
 
 def container_command(spec: ContainerSpec) -> list[str]:
     instance = spec.instance
+    if spec.project_mounts and (
+        spec.workspace_layout is None or spec.readonly_layout is None
+    ):
+        raise CycloError(
+            "named mounts require workspace and read-only layout roots"
+        )
+    if not spec.project_mounts and (
+        spec.workspace_layout is not None or spec.readonly_layout is not None
+    ):
+        raise CycloError("named layout roots require configured mounts")
     protocol = (
         CONTAINER_TEAM / "AGENTS.md"
         if spec.team.protocol is not None
@@ -148,22 +255,28 @@ def container_command(spec: ContainerSpec) -> list[str]:
         f"cyclo.team={instance.team_name}",
         "--label",
         f"cyclo.generation={instance.generation}",
-        "--restart",
-        "unless-stopped",
-        "--stop-timeout",
-        "30",
-        "--pids-limit",
-        "2048",
-        "--security-opt",
-        "no-new-privileges",
-        # The runtime binds team capabilities to its destination interface.
-        # Removing raw-packet authority prevents a root/custom team image from
-        # forging traffic for another private-network interface.
-        "--cap-drop",
-        "NET_RAW",
-        "--network",
-        instance.network_name,
     ]
+    if instance.launch_id:
+        command.extend(["--label", f"cyclo.launch={instance.launch_id}"])
+    command.extend(
+        [
+            "--restart",
+            "unless-stopped",
+            "--stop-timeout",
+            "30",
+            "--pids-limit",
+            "2048",
+            "--security-opt",
+            "no-new-privileges",
+            # The runtime binds team capabilities to its destination interface.
+            # Removing raw-packet authority prevents a root/custom team image from
+            # forging traffic for another private-network interface.
+            "--cap-drop",
+            "NET_RAW",
+            "--network",
+            instance.network_name,
+        ]
+    )
     if not instance.offline:
         published = (
             f"{instance.agentws_host}:{spec.port}:4137"
@@ -173,28 +286,30 @@ def container_command(spec: ContainerSpec) -> list[str]:
         command.extend(["--publish", published])
     command.extend(
         [
-        "--workdir",
-        str(CONTAINER_WORKSPACE),
-        "-e",
-        f"CYCLO_HOST_UID={os.getuid()}",
-        "-e",
-        f"CYCLO_HOST_GID={os.getgid()}",
-        "-e",
-        f"PI_CODING_AGENT_DIR={CONTAINER_PI / 'agent'}",
-        "-e",
-        f"CYCLO_AGENTWS_RUNTIME={CONTAINER_AGENTWS}",
-        "-e",
-        f"CYCLO_VERBOSE={'1' if spec.verbose else '0'}",
-        "-e",
-        f"AGENTWS_TEAM_ROOT={CONTAINER_TEAM}",
-        "-e",
-        f"AGENTWS_TEAM_ROSTER={roster}",
-        "-e",
-        f"AGENTWS_TEAM_PROTOCOL={protocol}",
-        "-e",
-        f"AGENTWS_TEAM_ROLES_DIR={CONTAINER_TEAM / 'roles'}",
-        "-e",
-        f"AGENTWS_WORKSPACE={CONTAINER_WORKSPACE}",
+            "--workdir",
+            str(CONTAINER_WORKSPACE),
+            "-e",
+            f"CYCLO_HOST_UID={os.getuid()}",
+            "-e",
+            f"CYCLO_HOST_GID={os.getgid()}",
+            "-e",
+            f"PI_CODING_AGENT_DIR={CONTAINER_PI / 'agent'}",
+            "-e",
+            f"CYCLO_AGENTWS_RUNTIME={CONTAINER_AGENTWS}",
+            "-e",
+            f"CYCLO_VERBOSE={'1' if spec.verbose else '0'}",
+            "-e",
+            f"AGENTWS_TEAM_ROOT={CONTAINER_TEAM}",
+            "-e",
+            f"AGENTWS_TEAM_ROSTER={roster}",
+            "-e",
+            f"AGENTWS_TEAM_PROTOCOL={protocol}",
+            "-e",
+            f"AGENTWS_TEAM_ROLES_DIR={CONTAINER_TEAM / 'roles'}",
+            "-e",
+            f"AGENTWS_WORKSPACE={CONTAINER_WORKSPACE}",
+            "-e",
+            f"CYCLO_PROJECT_MANIFEST={CONTAINER_AGENTWS / 'PROJECT.md'}",
         ]
     )
     for name in AGENTWS_RETRY_ENVIRONMENT:
@@ -203,27 +318,79 @@ def container_command(spec: ContainerSpec) -> list[str]:
             command.extend(["-e", f"{name}={value}"])
     command.extend(
         [
-        "--mount",
-        mount(spec.runtime_root, CONTAINER_AGENTWS, "ro"),
-        "--mount",
-        mount(spec.tasks_dir, CONTAINER_AGENTWS / "tasks"),
-        "--mount",
-        mount(spec.jobs_dir, CONTAINER_AGENTWS / "jobs"),
-        "--mount",
-        mount(spec.agents_dir, CONTAINER_AGENTWS / "agents"),
-        "--mount",
-        # Pi creates lock files and mutable runtime metadata beside its projected
-        # configuration. This per-instance tree contains only a provider-runtime
-        # capability scoped to provider/model names; host credentials remain
-        # inside the gateway.
-        mount(spec.pi_root, CONTAINER_PI),
-        "--mount",
-        mount(spec.team.root, CONTAINER_TEAM, "rw" if instance.team_write else "ro"),
-        "--mount",
-        mount(spec.project, CONTAINER_WORKSPACE, "ro" if instance.project_read_only else "rw"),
-        instance.image,
-        "python3",
-        str(CONTAINER_AGENTWS / ".cyclo-runtime.py"),
+            "--mount",
+            mount(spec.runtime_root, CONTAINER_AGENTWS, "ro"),
+            "--mount",
+            mount(spec.tasks_dir, CONTAINER_AGENTWS / "tasks"),
+            "--mount",
+            mount(spec.jobs_dir, CONTAINER_AGENTWS / "jobs"),
+            "--mount",
+            mount(spec.agents_dir, CONTAINER_AGENTWS / "agents"),
+            "--mount",
+            # Pi creates lock files and mutable runtime metadata beside its
+            # projected configuration. This per-instance tree contains only a
+            # provider-runtime capability scoped to provider/model names; host
+            # credentials remain inside the gateway.
+            mount(spec.pi_root, CONTAINER_PI),
+            "--mount",
+            mount(
+                spec.team.root,
+                CONTAINER_TEAM,
+                "rw" if instance.team_write else "ro",
+            ),
+        ]
+    )
+    if spec.project_mounts:
+        assert spec.workspace_layout is not None
+        assert spec.readonly_layout is not None
+        command.extend(
+            [
+                "--mount",
+                mount(spec.workspace_layout, CONTAINER_WORKSPACE, "ro"),
+                "--mount",
+                mount(spec.readonly_layout, CONTAINER_READONLY, "ro"),
+            ]
+        )
+        for project_mount in spec.project_mounts:
+            expected_parent = (
+                CONTAINER_WORKSPACE
+                if project_mount.writable
+                else CONTAINER_READONLY
+            )
+            if (
+                project_mount.name in {".", ".."}
+                or not MOUNT_NAME_RE.fullmatch(project_mount.name)
+                or project_mount.container_path.parent != expected_parent
+            ):
+                raise CycloError(
+                    f"invalid named mount target: {project_mount.name!r}"
+                )
+            command.extend(
+                [
+                    "--mount",
+                    mount(
+                        project_mount.path,
+                        project_mount.container_path,
+                        project_mount.mode,
+                    ),
+                ]
+            )
+    else:
+        command.extend(
+            [
+                "--mount",
+                mount(
+                    spec.project,
+                    CONTAINER_WORKSPACE,
+                    "rw",
+                ),
+            ]
+        )
+    command.extend(
+        [
+            instance.image,
+            "python3",
+            str(CONTAINER_AGENTWS / ".cyclo-runtime.py"),
         ]
     )
     return command
@@ -320,9 +487,13 @@ class Docker:
         return info
 
     def container_running(self, name: str) -> bool:
-        info = self._inspect_container(name)
-        state = info.get("State") if info is not None else None
-        return isinstance(state, dict) and state.get("Running") is True
+        return self.container_lifecycle_state(name).operational
+
+    def container_lifecycle_state(self, name: str) -> DockerContainerState:
+        return docker_container_state(self._inspect_container(name), name=name)
+
+    def container_lifecycle_active(self, name: str) -> bool:
+        return self.container_lifecycle_state(name).lifecycle_active
 
     def container_label(self, name: str, label: str = CYCLO_LABEL) -> str | None:
         info = self._inspect_container(name)
@@ -408,9 +579,14 @@ class Docker:
     def start(self, spec: ContainerSpec) -> int | None:
         info = self._owned_container(spec.instance.container_name, spec.instance.id)
         if info is not None:
-            state = info.get("State")
-            if isinstance(state, dict) and state.get("Running") is True:
-                raise CycloError(f"Cyclo instance is already running: {spec.instance.id}")
+            state = docker_container_state(
+                info, name=spec.instance.container_name
+            )
+            if state.lifecycle_active:
+                raise CycloError(
+                    f"Cyclo instance is already active ({state.value}): "
+                    f"{spec.instance.id}"
+                )
             resource_id = self._resource_id(
                 info, kind="container", name=spec.instance.container_name
             )
@@ -486,15 +662,32 @@ class Docker:
         location = url if port is not None else f"inside {container} on port 4137"
         raise CycloError(f"timed out waiting for AgentWS {location}")
 
-    def stop_remove(self, container: str, expected_instance: str | None = None) -> None:
+    def stop_remove(
+        self,
+        container: str,
+        expected_instance: str | None = None,
+        expected_launch: str | None = None,
+    ) -> None:
         if expected_instance is None:
             raise CycloError("expected Cyclo instance ID is required for container removal")
         info = self._owned_container(container, expected_instance)
         if info is None:
             return
+        if expected_launch is not None:
+            config = info.get("Config")
+            labels = config.get("Labels") if isinstance(config, dict) else None
+            actual_launch = (
+                labels.get("cyclo.launch") if isinstance(labels, dict) else None
+            )
+            if actual_launch != expected_launch:
+                raise CycloError(
+                    f"Cyclo container launch identity changed: {container}"
+                )
         resource_id = self._resource_id(info, kind="container", name=container)
-        state = info.get("State")
-        if isinstance(state, dict) and state.get("Running") is True:
+        state = docker_container_state(info, name=container)
+        if state is DockerContainerState.PAUSED:
+            self._run(["docker", "unpause", resource_id])
+        if state.lifecycle_active:
             self._run(["docker", "stop", "--timeout", "30", resource_id])
         self._run(["docker", "rm", resource_id])
 

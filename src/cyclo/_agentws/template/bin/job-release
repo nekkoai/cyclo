@@ -50,6 +50,7 @@ require_jobs_dir
 JOB_DIR="$JOBS_DIR/$JOB_ID"
 
 [ -d "$JOB_DIR" ] || die "job '$JOB_ID' does not exist"
+acquire_job_control_lock "$JOB_DIR"
 current_status="$(read_status "$JOB_DIR")"
 case "$current_status" in
     claimed|running) ;;
@@ -63,5 +64,6 @@ append_log "$JOB_DIR" "Released back to pending" "$MESSAGE"
 write_file_atomic "$JOB_DIR/status" "pending"
 rm -f "$JOB_DIR/agent-id"
 rmdir "$JOB_DIR/lock" 2>/dev/null || die "cannot release job '$JOB_ID': lock directory is not empty"
+release_job_control_lock
 
 echo "$JOB_ID: $current_status -> pending"

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from cyclo.agentws_queue import read_agent_supervisor_status
 from cyclo.dashboard import (
     DashboardSnapshot,
     QueueLimits,
@@ -21,6 +22,7 @@ from cyclo.dashboard import (
     validate_dashboard_host,
 )
 from cyclo.errors import CycloError
+from cyclo.runtime_container import ProviderRuntimeStatus
 from cyclo.state import Instance, StateStore
 
 
@@ -37,7 +39,6 @@ def instance(identifier: str, *, active: bool = True, offline: bool = False) -> 
         network_name=f"cyclo-{identifier}-net",
         image="cyclo-runtime:test",
         team_write=False,
-        project_read_only=False,
         offline=offline,
         active=active,
         port=4100 if not offline else None,
@@ -49,6 +50,14 @@ def queue(store: StateStore, identifier: str) -> Path:
     for name in ("tasks", "jobs", "agents"):
         (root / name).mkdir(parents=True, exist_ok=True)
     return root
+
+
+def mark_supervisor_ready(root: Path) -> Path:
+    runs = root / "agents" / ".team-runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    ready = runs / "supervisor.ready"
+    ready.write_text("pid=123\n", encoding="utf-8")
+    return runs
 
 
 def test_queue_snapshot_counts_agentws_state(tmp_path: Path) -> None:
@@ -150,6 +159,80 @@ def test_queue_snapshot_never_follows_symlinks(tmp_path: Path) -> None:
     assert any("unavailable" in error for error in linked_result["errors"])
 
 
+def test_supervisor_status_reports_only_regular_suspension_markers(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    root = queue(store, "alpha")
+    runs = root / "agents" / ".team-runs"
+    runs.mkdir()
+    (runs / "supervisor.ready").write_text("pid=123\n", encoding="utf-8")
+    (runs / "planner-1.suspended").write_text("last_status=70\n", encoding="utf-8")
+    outside = tmp_path / "outside.suspended"
+    outside.write_text("not a supervisor marker\n", encoding="utf-8")
+    (runs / "linked.suspended").symlink_to(outside)
+    (runs / "ignored.last-status").write_text("70\n", encoding="utf-8")
+
+    status = read_agent_supervisor_status(root)
+
+    assert status.suspended_agents == ("planner-1",)
+    assert status.error == ""
+
+
+def test_supervisor_status_requires_a_fresh_readiness_heartbeat(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    root = queue(store, "alpha")
+    runs = mark_supervisor_ready(root)
+    os.utime(runs / "supervisor.ready", (95.0, 95.0))
+
+    fresh = read_agent_supervisor_status(
+        root, now=100.0, max_ready_age_seconds=15.0
+    )
+    assert fresh.error == ""
+
+    os.utime(runs / "supervisor.ready", (70.0, 70.0))
+    stale = read_agent_supervisor_status(
+        root, now=100.0, max_ready_age_seconds=15.0
+    )
+    assert "supervisor heartbeat stale" in stale.error
+
+
+def test_supervisor_status_reports_unresolved_planner_failure(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    root = queue(store, "alpha")
+    mark_supervisor_ready(root)
+    job = root / "jobs" / "uart-plan"
+    job.mkdir()
+    (job / "role").write_text("planner\n", encoding="utf-8")
+    (job / "status").write_text("failed\n", encoding="utf-8")
+
+    status = read_agent_supervisor_status(root)
+
+    assert status.planner_attention_jobs == ("uart-plan",)
+    assert status.error == ""
+
+
+def test_supervisor_status_fails_closed_on_linked_run_directory(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    root = queue(store, "alpha")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "agents" / ".team-runs").symlink_to(
+        outside, target_is_directory=True
+    )
+
+    status = read_agent_supervisor_status(root)
+
+    assert status.suspended_agents == ()
+    assert status.error
+
+
 def test_queue_snapshot_has_a_shared_entry_budget(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     root = queue(store, "alpha")
@@ -180,6 +263,25 @@ class FakeUsage:
         }
 
 
+class FakeRuntime:
+    def __init__(self, status: ProviderRuntimeStatus) -> None:
+        self.selected_status = status
+        self.calls = 0
+        self.probe_calls = 0
+
+    def status(self) -> ProviderRuntimeStatus:
+        self.calls += 1
+        return self.selected_status
+
+    def probe_operational(self, *, timeout: float) -> None:
+        assert timeout > 0
+        self.probe_calls += 1
+
+
+def ready_runtime() -> FakeRuntime:
+    return FakeRuntime(ProviderRuntimeStatus(True, True, True, "runtime"))
+
+
 def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     alpha = instance("alpha")
@@ -188,6 +290,7 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     store.save(old)
     alpha_queue = queue(store, "alpha")
     queue(store, "old")
+    mark_supervisor_ready(alpha_queue)
     task = alpha_queue / "tasks" / "work"
     task.mkdir()
     job = alpha_queue / "jobs" / "job"
@@ -195,16 +298,19 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     (job / "status").write_text("failed\n", encoding="utf-8")
     (alpha_queue / "agents" / "worker").mkdir()
 
+    runtime = FakeRuntime(ProviderRuntimeStatus(True, True, True, "runtime"))
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True, "cyclo-old": False}),  # type: ignore[arg-type]
         usage_reader=FakeUsage(),
+        runtime_reader=runtime,
     ).build()
 
-    assert result["version"] == 1
+    assert result["version"] == 2
     assert result["summary"] == {
         "instances": 2,
         "running": 1,
+        "runtime_issues": 0,
         "attention": 1,
         "tasks": 1,
         "jobs": 1,
@@ -217,8 +323,25 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     running, stopped = result["instances"]
     assert running["id"] == "alpha"
     assert running["state"] == "running"
+    assert running["health"] == {"state": "ready", "reason": ""}
     assert running["agentws_port"] == 4100
     assert "agentws_url" not in running
+    assert running["project"] == {
+        "name": "alpha",
+        "path": "/projects/alpha",
+        "definition": None,
+        "description": "",
+        "generation": "",
+        "workspaces": [
+            {
+                "name": "alpha",
+                "path": "/projects/alpha",
+                "container_path": "/workspace",
+            }
+        ],
+        "read_only_mounts": [],
+    }
+    assert "project_read_only" not in running["mode"]
     assert running["usage"] == {
         "input_tokens": 100,
         "output_tokens": 25,
@@ -226,7 +349,441 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
         "requests": 3,
     }
     assert stopped["state"] == "stopped"
+    assert stopped["health"] == {
+        "state": "inactive",
+        "reason": "not an active running Cyclo instance",
+    }
     assert stopped["agentws_port"] is None
+    assert runtime.calls == 1
+
+
+def test_snapshot_reports_suspended_agents_per_running_instance(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    for identifier in ("alpha", "beta"):
+        store.save(instance(identifier))
+        mark_supervisor_ready(queue(store, identifier))
+    runs = store.agents_dir("alpha") / ".team-runs"
+    (runs / "planner-1.suspended").write_text(
+        "reason=fatal-agent-safety-error\n", encoding="utf-8"
+    )
+    runtime = ready_runtime()
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({"cyclo-alpha": True, "cyclo-beta": True}),  # type: ignore[arg-type]
+        runtime_reader=runtime,
+    ).build()
+
+    rows = {row["id"]: row for row in result["instances"]}
+    assert rows["alpha"]["health"] == {
+        "state": "agents-suspended",
+        "reason": "1 agent suspended: planner-1",
+    }
+    assert rows["beta"]["health"] == {"state": "ready", "reason": ""}
+    assert result["summary"]["runtime_issues"] == 0
+    assert result["summary"]["attention"] == 1
+    assert runtime.calls == 1
+
+
+def test_snapshot_reports_unresolved_planner_failure_as_attention(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    store.save(instance("alpha"))
+    root = queue(store, "alpha")
+    mark_supervisor_ready(root)
+    job = root / "jobs" / "uart-plan"
+    job.mkdir()
+    (job / "role").write_text("planner\n", encoding="utf-8")
+    (job / "status").write_text("failed\n", encoding="utf-8")
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
+    ).build()
+
+    assert result["instances"][0]["health"] == {
+        "state": "agents-attention",
+        "reason": "1 unresolved planner failure: uart-plan",
+    }
+    assert result["summary"]["attention"] == 1
+
+
+def test_snapshot_does_not_report_ready_when_supervisor_state_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    store.save(instance("alpha"))
+    root = queue(store, "alpha")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "agents" / ".team-runs").symlink_to(
+        outside, target_is_directory=True
+    )
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
+    ).build()
+
+    health = result["instances"][0]["health"]
+    assert health["state"] == "agents-unknown"
+    assert health["reason"].startswith("AgentWS supervisor status unavailable:")
+    assert result["summary"]["attention"] == 1
+
+
+def test_snapshot_preserves_runtime_failure_beside_agent_suspension(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    store.save(instance("alpha"))
+    root = queue(store, "alpha")
+    runs = root / "agents" / ".team-runs"
+    runs.mkdir()
+    (runs / "supervisor.ready").write_text("pid=123\n", encoding="utf-8")
+    (runs / "planner-1.suspended").write_text("last_status=70\n", encoding="utf-8")
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
+        runtime_reader=FakeRuntime(
+            ProviderRuntimeStatus(True, False, True, "runtime")
+        ),
+    ).build()
+
+    assert result["instances"][0]["health"] == {
+        "state": "runtime-down",
+        "reason": "runtime container stopped; 1 agent suspended: planner-1",
+    }
+    assert result["summary"]["runtime_issues"] == 1
+    assert result["summary"]["attention"] == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "health_state", "reason"),
+    [
+        (
+            ProviderRuntimeStatus(False, False, False, None),
+            "runtime-down",
+            "runtime container absent",
+        ),
+        (
+            ProviderRuntimeStatus(True, False, True, "runtime"),
+            "runtime-down",
+            "runtime container stopped",
+        ),
+        (
+            ProviderRuntimeStatus(True, True, False, "runtime"),
+            "runtime-stale",
+            "configuration or image stale",
+        ),
+    ],
+)
+def test_snapshot_exposes_exact_runtime_health_and_reads_it_once(
+    tmp_path: Path,
+    status: ProviderRuntimeStatus,
+    health_state: str,
+    reason: str,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    for identifier in ("alpha", "beta"):
+        store.save(instance(identifier))
+        mark_supervisor_ready(queue(store, identifier))
+    store.save(instance("stopped", active=False))
+    queue(store, "stopped")
+    runtime = FakeRuntime(status)
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker(
+            {
+                "cyclo-alpha": True,
+                "cyclo-beta": True,
+                "cyclo-stopped": False,
+            }
+        ),  # type: ignore[arg-type]
+        runtime_reader=runtime,
+    ).build()
+
+    rows = {row["id"]: row for row in result["instances"]}
+    assert rows["alpha"]["state"] == "running"
+    assert rows["alpha"]["health"] == {
+        "state": health_state,
+        "reason": reason,
+    }
+    assert rows["beta"]["health"] == rows["alpha"]["health"]
+    assert rows["stopped"]["health"]["state"] == "inactive"
+    assert result["summary"]["running"] == 2
+    assert result["summary"]["runtime_issues"] == 1
+    assert result["summary"]["attention"] == 2
+    assert runtime.calls == 1
+
+
+def test_snapshot_reports_runtime_status_errors_as_unknown(tmp_path: Path) -> None:
+    class BrokenRuntime:
+        calls = 0
+
+        @classmethod
+        def status(cls) -> ProviderRuntimeStatus:
+            cls.calls += 1
+            raise CycloError("Docker socket denied")
+
+    store = StateStore(tmp_path / "state")
+    store.save(instance("alpha"))
+    mark_supervisor_ready(queue(store, "alpha"))
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
+        runtime_reader=BrokenRuntime(),
+    ).build()
+
+    assert result["instances"][0]["health"] == {
+        "state": "runtime-unknown",
+        "reason": "runtime status unavailable: Docker socket denied",
+    }
+    assert result["summary"]["runtime_issues"] == 1
+    assert BrokenRuntime.calls == 1
+
+
+def test_snapshot_fails_closed_when_exact_runtime_probe_fails(
+    tmp_path: Path,
+) -> None:
+    class BrokenProbe(FakeRuntime):
+        def probe_operational(self, *, timeout: float) -> None:
+            assert timeout > 0
+            raise CycloError("gateway returned malformed health response")
+
+    store = StateStore(tmp_path / "state")
+    store.save(instance("alpha"))
+    mark_supervisor_ready(queue(store, "alpha"))
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
+        runtime_reader=BrokenProbe(
+            ProviderRuntimeStatus(True, True, True, "runtime")
+        ),
+    ).build()
+
+    assert result["instances"][0]["health"] == {
+        "state": "runtime-down",
+        "reason": (
+            "runtime dependency health check failed: "
+            "gateway returned malformed health response"
+        ),
+    }
+
+
+def test_snapshot_does_not_persist_an_active_team_inactive_when_not_operational(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = instance("alpha")
+    store.save(selected)
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({"cyclo-alpha": False}),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
+    ).build()
+
+    assert result["instances"][0]["state"] == "stale"
+    assert result["instances"][0]["health"]["state"] == "inactive"
+    assert store.load("alpha").active is True
+
+
+def test_snapshot_exposes_project_definition_and_named_mounts(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    configured = instance("alpha")
+    configured.project_name = "silicon"
+    configured.project_file = "/configs/silicon/project.cyclo"
+    configured.project_description = "RTL development"
+    configured.project_generation = "project-generation"
+    configured.project_mounts = [
+        {
+            "name": "source",
+            "path": "/host/core-et",
+            "mode": "rw",
+        },
+        {
+            "name": "specifications",
+            "path": "/host/specifications",
+            "mode": "ro",
+        },
+    ]
+    store.save(configured)
+    mark_supervisor_ready(queue(store, configured.id))
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({configured.container_name: True}),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
+    ).build()
+
+    assert result["instances"][0]["project"] == {
+        "name": "silicon",
+        "path": "/projects/alpha",
+        "definition": "/configs/silicon/project.cyclo",
+        "description": "RTL development",
+        "generation": "project-generation",
+        "workspaces": [
+            {
+                "name": "source",
+                "path": "/host/core-et",
+                "container_path": "/workspace/source",
+            }
+        ],
+        "read_only_mounts": [
+            {
+                "name": "specifications",
+                "path": "/host/specifications",
+                "container_path": "/readonly/specifications",
+            }
+        ],
+    }
+
+
+def test_snapshot_isolates_malformed_project_mount_state(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    good = instance("good")
+    broken = instance("broken")
+    broken.project_file = "/configs/broken/project.cyclo"
+    broken.project_name = "broken-project"
+    broken.project_description = "Broken mount state"
+    broken.project_generation = "broken-generation"
+    broken.project_mounts = None  # type: ignore[assignment]
+    store.save(good)
+    store.save(broken)
+    mark_supervisor_ready(queue(store, good.id))
+    mark_supervisor_ready(queue(store, broken.id))
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker(
+            {good.container_name: True, broken.container_name: True}
+        ),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
+    ).build()
+
+    assert {row["id"] for row in result["instances"]} == {"good", "broken"}
+    broken_row = next(row for row in result["instances"] if row["id"] == "broken")
+    assert broken_row["project"]["workspaces"] == []
+    assert broken_row["project"]["read_only_mounts"] == []
+    assert broken_row["errors"] == [
+        "invalid project metadata: project_mounts must be a list"
+    ]
+    assert result["summary"]["attention"] == 1
+
+
+def test_snapshot_preserves_valid_mounts_beside_invalid_entries(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    configured = instance("alpha")
+    configured.project_file = "/configs/alpha/project.cyclo"
+    configured.project_name = "alpha-project"
+    configured.project_description = "Mixed valid and invalid mount state"
+    configured.project_generation = "alpha-generation"
+    configured.project_mounts = [
+        {
+            "name": "source",
+            "path": "/host/source",
+            "mode": "rw",
+        },
+        None,
+        {
+            "name": "bad-mode",
+            "path": "/host/bad",
+            "mode": "write",
+        },
+        {
+            "name": "docs",
+            "path": "/host/docs",
+            "mode": "ro",
+        },
+    ]  # type: ignore[list-item]
+    store.save(configured)
+    mark_supervisor_ready(queue(store, configured.id))
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({configured.container_name: True}),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
+    ).build()
+
+    row = result["instances"][0]
+    assert [mount["name"] for mount in row["project"]["workspaces"]] == [
+        "source"
+    ]
+    assert [mount["name"] for mount in row["project"]["read_only_mounts"]] == [
+        "docs"
+    ]
+    assert len(row["errors"]) == 2
+    assert any("project_mounts[1] must be an object" in error for error in row["errors"])
+    assert any("project_mounts[2] has an invalid mode" in error for error in row["errors"])
+
+
+def test_snapshot_reports_legacy_read_only_state_as_requiring_restart(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    legacy = instance("legacy")
+    legacy.legacy_project_read_only = True
+    store.save(legacy)
+    mark_supervisor_ready(queue(store, legacy.id))
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({legacy.container_name: True}),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
+    ).build()
+
+    row = result["instances"][0]
+    assert row["project"]["workspaces"] == []
+    assert row["project"]["read_only_mounts"] == [
+        {
+            "name": "legacy",
+            "path": "/projects/legacy",
+            "container_path": "/workspace",
+        }
+    ]
+    assert any("stop and rerun" in error for error in row["errors"])
+    assert result["summary"]["attention"] == 1
+
+
+def test_snapshot_rejects_empty_or_non_string_project_definition_state(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    empty = instance("empty")
+    empty.project_file = "/configs/empty/project.cyclo"
+    empty.project_name = "empty-project"
+    empty.project_description = "Missing mounts"
+    empty.project_generation = "empty-generation"
+    malformed = instance("malformed")
+    malformed.project_file = {"unexpected": True}  # type: ignore[assignment]
+    store.save(empty)
+    store.save(malformed)
+    mark_supervisor_ready(queue(store, empty.id))
+    mark_supervisor_ready(queue(store, malformed.id))
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker(
+            {empty.container_name: True, malformed.container_name: True}
+        ),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
+    ).build()
+
+    by_id = {row["id"]: row for row in result["instances"]}
+    assert any("must contain at least one mount" in error for error in by_id["empty"]["errors"])
+    assert by_id["malformed"]["project"]["workspaces"] == []
+    assert any("project_file must be a string" in error for error in by_id["malformed"]["errors"])
 
 
 def test_snapshot_counts_queue_errors_as_attention(tmp_path: Path) -> None:
@@ -236,6 +793,7 @@ def test_snapshot_counts_queue_errors_as_attention(tmp_path: Path) -> None:
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
     ).build()
 
     assert result["summary"]["attention"] == 1
@@ -243,16 +801,41 @@ def test_snapshot_counts_queue_errors_as_attention(tmp_path: Path) -> None:
     assert result["instances"][0]["errors"]
 
 
+def test_snapshot_reports_bad_instance_records_without_hiding_readable_ones(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    store.save(instance("alpha"))
+    mark_supervisor_ready(queue(store, "alpha"))
+    broken = store.metadata_path("broken")
+    broken.parent.mkdir(parents=True)
+    broken.write_text("{not-json\n", encoding="utf-8")
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
+    ).build()
+
+    assert [row["id"] for row in result["instances"]] == ["alpha"]
+    assert len(result["source_errors"]) == 1
+    assert str(broken) in result["source_errors"][0]
+    assert "invalid Cyclo instance metadata" in result["source_errors"][0]
+    assert result["summary"]["errors"] == 1
+
+
 def test_snapshot_counts_unknown_job_status_as_attention(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     store.save(instance("alpha"))
     root = queue(store, "alpha")
+    mark_supervisor_ready(root)
     job = root / "jobs" / "job-without-status"
     job.mkdir()
 
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
+        runtime_reader=ready_runtime(),
     ).build()
 
     row = result["instances"][0]
@@ -270,12 +853,13 @@ def test_snapshot_separates_gateway_source_errors_from_instance_errors(
 
     store = StateStore(tmp_path / "state")
     store.save(instance("alpha"))
-    queue(store, "alpha")
+    mark_supervisor_ready(queue(store, "alpha"))
 
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
         usage_reader=BrokenUsage(),
+        runtime_reader=ready_runtime(),
     ).build()
 
     assert result["source_errors"] == ["gateway usage unavailable: gateway stopped"]
