@@ -4,11 +4,13 @@ This guide is the complete operational reference for installing, configuring,
 running, and maintaining Cyclo. For the project overview and shortest path to a
 first team, start with the [main README](../README.md).
 
-Cyclo runs a Git-defined agent team against a separate project directory. Each
-team gets its own Docker container and filesystem job loop. Model requests enter
-a shared provider runtime; only concrete calls continue to the separate
-credential gateway, so API keys and subscription credentials never enter a
-team or provider-component container.
+Cyclo runs Git-defined agent teams against directories selected by a
+`project.cyclo` definition. Each team gets its own Docker container and
+filesystem job loop. Writable projects are mounted at `/workspace/<name>`;
+read-only supporting inputs are mounted at `/readonly/<name>`. Model
+requests enter a shared provider runtime; only concrete calls continue to the
+separate credential gateway, so API keys and subscription credentials never
+enter a team or provider-component container.
 
 Cyclo is a standalone distribution. It includes the queue runtime, agent
 launcher, read-only team viewer, provider runtime, credential gateway, Docker
@@ -21,12 +23,17 @@ release. The Python distribution is named `cyclo-agent`; the installed command,
 Python package, repository, and product name remain `cyclo` and Cyclo.
 
 ```text
-team Git repository                         project directory
-team + roles/*.md                           source being worked on
-        | /team: read-only by default              | /workspace: writable by default
-        +----------------------+-------------------+
-                               v
-                    cyclo-runtime team container
+                               project.cyclo
+                         teams + mounts + modes
+                           /               \
+                          v                 v
+              team Git repositories   mounted directories
+              team + roles/*.md       projects + read-only inputs
+                           \               /
+                            +------+------+
+                                   v
+                    cyclo-runtime team containers
+                      one independent instance/team
                     filesystem tasks/jobs + agents
                     writable scoped Pi runtime state
                                |
@@ -118,7 +125,7 @@ three owned Docker build contexts inside the installed package:
 | Credential gateway image | `cyclo-gateway:0.2.0` | Login, concrete model proxying, credential substitution, and usage |
 | Gateway data volume | `cyclo-gateway-store` | Provider credentials, subscriptions, and retained usage history |
 | Host configuration | `/etc/cyclo/host.conf` | Ordered host-wide provider composition; concrete pass-through when absent or empty |
-| Team container | `cyclo-<instance>` | One isolated running team/project binding |
+| Team container | `cyclo-<instance>` | One isolated running team/project-definition binding |
 | Team network | `cyclo-<instance>-net` | One private network per binding |
 | Provider container | `cyclo-provider-<prefix>` | One host-wide intermediate provider |
 | Provider transport | private Unix socket directories | HTTP between one networkless component and the provider runtime |
@@ -158,7 +165,7 @@ Names can be overridden deliberately:
 cyclo --gateway-image my-cyclo-gateway:dev \
   --store-volume my-cyclo-credentials gateway status
 cyclo --provider-runtime-image my-cyclo-provider-runtime:dev runtime start
-cyclo run --image my-cyclo-runtime:dev TEAM PROJECT
+cyclo run --image my-cyclo-runtime:dev project.cyclo
 ```
 
 The corresponding environment variables are `CYCLO_GATEWAY_IMAGE`,
@@ -225,11 +232,20 @@ upstream provider type. The separate provider runtime adds configured virtual
 prefixes to that concrete catalogue.
 
 `cyclo gateway status` lists provisioned accounts without credential material.
+It validates and uses the existing local gateway image, mounts the store
+read-only in a networkless one-shot inspector, and never builds or pulls an
+image. If that image is missing or stale, explicitly run
+`cyclo gateway restart --build`.
 `cyclo gateway restart` recreates only the Cyclo-owned credential gateway and
 preserves its volume. It does not read `host.conf`, manage provider routes, or
 restart the provider runtime, provider components, or teams.
 Use `cyclo gateway restart --build` to rebuild its image first. In-flight model
 requests can fail during the brief replacement and are not retried by Cyclo.
+When upgrading the gateway lock protocol, do not run an older Cyclo controller
+concurrently. If several state roots share one store, run the new
+`cyclo gateway restart --build` once for each state root; an early attempt may
+retire its selected old gateway and then fail closed on the next stale peer, so
+finish the other state roots and retry it.
 After a successful gateway login or restart, Cyclo asks a running provider
 runtime to refresh its concrete catalogue through an authenticated control
 operation; no provider-runtime restart is needed.
@@ -350,8 +366,12 @@ start` never builds. `runtime start` and `runtime restart` rebuild only when
 `--build` is present. Omitting a prefix from an operation never stops it as a
 side effect. `cyclo models` refreshes and queries the running runtime, and
 `cyclo run` requires that runtime; neither command manages shared-service lifecycle.
-`cyclo doctor` validates the host configuration, provider paths, packaged
-runtimes, and Docker availability without starting anything.
+`cyclo doctor` validates persisted instance records, the host configuration,
+provider paths, packaged runtimes, and Docker availability without starting
+anything. It also actively
+probes the running credential gateway and provider runtime before reading the
+runtime catalogue; a cached catalogue cannot make a dead service appear
+healthy.
 
 `provider restart` revokes and acknowledges the old prefix before stopping its
 container, rotates both provider-local capabilities, then publishes and
@@ -456,7 +476,7 @@ Cyclo records a team generation consisting of its Git commit and a digest of
 the live roster, role files, and optional protocol. Experiments therefore
 remain attributable when the team definition has uncommitted edits.
 
-## Create and run a team
+## Create a team and project
 
 List the example loops installed with Cyclo:
 
@@ -480,50 +500,122 @@ Omit `--template` to create Cyclo's generic default team. `cyclo init`
 initializes the destination as a Git repository unless `--no-git` is passed;
 it never writes into an existing non-empty directory.
 
-Start the team against a separate project:
+The normal run unit is a `project.cyclo` file. For example, create
+`~/experiments/my-project/project.cyclo` containing:
+
+```text
+name my-project
+description Implement and independently review my project.
+team ../../teams/plan-execute-verify ro
+mount source ../../src/my-project rw
+mount specifications ../../references/my-project ro
+```
+
+Its complete line grammar is:
+
+```text
+name <project-name>
+description <free text to end of line>
+team <directory> <ro|rw>
+mount <mount-name> <directory> <ro|rw>
+```
+
+Exactly one `name`, one `description`, at least one `team`, and at least one
+`mount` are required. Blank lines and whole-line `#` comments are ignored;
+there is no quoting or inline-comment syntax. Relative team and mount paths
+resolve from the directory containing `project.cyclo`, not the shell's current
+directory. They must be existing directories, and selected team/mount trees
+must be unique and non-overlapping. Every team must be a Git team repository.
+Each `ro` or `rw` token is mandatory: it controls `/team` for that team, or
+selects the writable-workspace/read-only-input namespace for a mount.
+
+Writable mount names become paths below `/workspace`; read-only mount names
+become paths below `/readonly`. The example exposes `/workspace/source` and
+`/readonly/specifications`. Both namespace parents are read-only and contain
+only declared mount names. Path
+tokens are unquoted and cannot contain whitespace, `~`, comma, quotes, or
+backslash. Unknown directives fail closed. In particular, `mcp` is rejected
+because this Cyclo version does not yet implement MCP server attachment. See
+the exact [`project.cyclo` format](project-format.md) for identifier, file, and
+run-option constraints.
+
+Validate the whole definition and start its teams:
 
 ```sh
-cyclo run --name plan-execute-verify \
-  ~/teams/plan-execute-verify \
-  ~/src/my-project
+cyclo validate ~/experiments/my-project/project.cyclo
+cyclo run ~/experiments/my-project/project.cyclo
 ```
 
 Cyclo checks its bundled loop ABI, requires the shared provider runtime to be
-running, updates scoped client records, materializes a read-only queue runtime,
-and starts the team container. It may build the team-runtime image when needed,
-but it never starts or builds the gateway, provider runtime, or provider
-components.
-It prints the instance name, per-team viewer URL, and persistent queue-state
-path. The container runs detached by default. With `--foreground`, Ctrl-C
-removes that team's runtime and network and revokes its model capability;
-persistent queue history remains.
+running, preflights every selected team and mount, updates scoped client
+records, materializes a read-only queue runtime and host-path-free project
+manifest, and starts one team container per `team` line. It may build the
+team-runtime image when needed, but it never starts or builds the gateway,
+provider runtime, or provider components. If a later team fails to start,
+Cyclo rolls back instances already started by that invocation.
+
+Every team receives the same mounted directories but its own `/team`, queue,
+viewer, network, and model capability. Add another line such as
+`team ../../teams/auditor ro` to run another independent team. Instance names
+combine the project name and team repository name, for example
+`my-project-plan-execute-verify` and `my-project-auditor`. The containers run
+detached by default; use `cyclo logs -f INSTANCE` for an individual team.
+`--foreground` and an explicit `--port` are intentionally rejected for a
+multi-team definition because they do not identify one instance.
 
 Submit a task specification to the filesystem loop:
 
 ```sh
 $EDITOR /tmp/change-001.md
-cyclo task plan-execute-verify change-001 /tmp/change-001.md
-cyclo logs -f plan-execute-verify
+cyclo task my-project-plan-execute-verify change-001 /tmp/change-001.md
+cyclo logs -f my-project-plan-execute-verify
 ```
 
-A task specification describes work relative to the project passed to
-`cyclo run`; it never needs to mention Cyclo's internal `/workspace` mount.
-After creating a task, Cyclo prints the actual host project root so generated
-artifacts are easy to locate.
+A task specification describes work in the logical project and can name its
+projects or input mount names without knowing host paths. Every agent receives
+`/agentws/PROJECT.md` in its initial prompt; that manifest lists writable
+`/workspace/<name>` paths and read-only `/readonly/<name>` paths and remains authoritative even when the
+team supplies its own `AGENTS.md`.
+
+The original two-path command remains a compatibility form:
+
+```sh
+cyclo run TEAM PROJECT
+```
+
+It starts one team with `/team` read-only and the single `/workspace` project
+read-write. `--name` and `--team-write` apply only to this compatibility form.
+In `project.cyclo`, the project name and every access mode come from the file,
+so those two overrides are rejected.
 
 A task is the durable objective. Agents claim role-matching jobs, record their
 work and evidence in ordinary files, and create follow-up jobs for the next
-role. The per-agent wrapper continues waiting for later work. Tasks, jobs,
+role. The per-agent worker continues waiting for later work. Tasks, jobs,
 comments, transcripts, and results survive container restarts in Cyclo's host
-state.
+state. Each task has a persistent mutex. Task publication and each individual
+file replacement are atomic, while comment, state, and result operations hold
+that mutex across their complete multi-file update so concurrent mutations
+cannot interleave. Multi-file updates are serialized, not crash-transactional.
 
 Agent retries are bounded to protect experiments from runaway model spend. A
 job gets three model-process attempts by default; an unfinished final attempt
-marks the job failed instead of returning it to the queue forever. Process
-restarts use capped exponential backoff, and an agent is suspended after five
-consecutive failures until its Cyclo container is restarted. SIGINT/SIGTERM
-shutdown does not consume a job attempt. The advanced controls are documented
-in the bundled `tools/README.md`. Set any of
+does not silently strand the task: for a non-planner job, the worker first
+publishes a deterministic, idempotent planner recovery job for the same task,
+then marks the source job failed. A retry verifies and reuses that recovery job
+instead of duplicating it. Planner failures do not recurse. This automatic path
+does not replace the normal AgentWS protocol: an agent that explicitly calls
+`job-fail` remains responsible for creating any required follow-up work.
+Process
+exits that safely settle queue state use capped exponential backoff, and an
+agent is suspended after five consecutive settled retry exits. An unclean
+worker exit instead restarts the same team container without rebuilding it;
+startup recovers active jobs before launching replacement workers.
+Workers act as Linux child subreapers, so a clean local retry first terminates
+and reaps detached engine descendants. Startup recovery is authorized by the
+runtime's exclusive queue lifetime lock; agents cannot request an all-active
+reset while the team is running.
+SIGINT/SIGTERM shutdown does not consume a job attempt. The advanced controls
+are documented in the bundled `tools/README.md`. Set any of
 `AGENTWS_MAX_JOB_ATTEMPTS`, `AGENTWS_MAX_CONSECUTIVE_FAILURES`,
 `AGENTWS_RETRY_INITIAL_SECONDS`, or `AGENTWS_RETRY_MAX_SECONDS` in the
 environment of `cyclo run`; Cyclo forwards only this retry-control allowlist to
@@ -534,20 +626,28 @@ the team container, where the values are range-checked before agents start.
 ```sh
 cyclo ps
 cyclo dashboard
-cyclo path plan-execute-verify
+cyclo path my-project-plan-execute-verify
 cyclo usage
 cyclo repair
-cyclo stop plan-execute-verify
+cyclo stop my-project-plan-execute-verify
 ```
 
-`cyclo ps` reports `running`, `stopped`, `stale`, or `orphan` instances.
+`cyclo ps` reports container lifecycle (`running`, `stopped`, `stale`, or
+`orphan`) separately from provider-runtime status. A running team is `ready`
+only when the provider-runtime container is running with its current
+configuration and image. Otherwise it is `runtime-down`, `runtime-stale`, or
+`runtime-unknown`; an instance outside the normal active-running lifecycle is
+`inactive`. This is a shared-runtime prerequisite check, not a synthetic model
+request or proof that every upstream is reachable; use `cyclo doctor` for the
+broader host check.
 `cyclo path` prints the ordinary filesystem queue tree for direct inspection.
 Queue mutations, such as task creation, are sent into the running container;
 Cyclo does not execute container-writable queue files on the host.
 
 `cyclo dashboard` starts a read-only fleet view on a random loopback port by
-default and prints its URL. It combines lifecycle state, bounded queue
-summaries, recent task/job activity, and gateway token usage for every instance.
+default and prints its URL. It shows the same separate lifecycle and provider-
+runtime states as `cyclo ps`, plus bounded queue summaries, recent task/job
+activity, and gateway token usage for every instance.
 Queue scans are limited per refresh to 4,096 direct entries and 2 MiB of file
 data, with eight recent tasks and twelve recent activity records retained;
 truncation is reported. If the gateway is unavailable, fleet and queue data
@@ -566,6 +666,11 @@ until Ctrl-C. Version 0.2 has no application authentication, so only use a
 non-loopback bind on a trusted network with appropriate firewall controls. Each
 online instance links to its detailed read-only queue viewer; stopped and
 offline instances remain visible from persistent host state.
+
+Cyclo never silently omits a corrupt or unreadable `instances/*/run.json`.
+Commands that require a complete instance inventory fail closed and identify
+the bad source. The dashboard remains useful during repair: it shows every
+readable instance and reports each invalid source separately.
 
 `cyclo usage` prints an aggregate JSON snapshot of the retained gateway ledger.
 Records contain attribution and provider-reported accounting metadata; Cyclo
@@ -589,7 +694,11 @@ client capabilities, reattaches the already-running provider runtime to active
 team networks, revokes stale capabilities, and removes team containers left by
 an interrupted stop. It does not start or rebuild a shared service. `cyclo
 stop` preserves the instance's queue history but revokes its model capability
-and removes its team runtime and network.
+and removes its team runtime and network. If an agent worker dies without a
+clean settlement, Cyclo exits the team runtime and Docker destroys that
+container's complete process tree. Docker then restarts the same container;
+before agents launch, startup resets persisted `claimed` and `running` jobs to
+`pending` and clears stale agent assignments.
 
 Use `cyclo gateway restart` for an intentional gateway replacement. It does not
 destroy credentials or restart teams, the provider runtime, or components. Use
@@ -618,43 +727,56 @@ for its loop and recommended mount/network modes.
 
 ## Mount and network modes
 
-These controls are independent:
+For a `project.cyclo` run, filesystem authority is explicit in the definition
+and network/UI authority remains a run option:
 
-| Setting | Team repository | Project | Network / UI |
+| Setting | Team repository | Mounted directories | Network / UI |
 |---|---|---|---|
-| default | read-only | writable | direct egress; loopback viewer |
-| `--team-write` | writable | unchanged | unchanged |
-| `--project-read-only` | unchanged | read-only | unchanged |
-| `--offline` | unchanged | unchanged | model proxy only; no per-team host viewer |
+| `team PATH ro` or `team PATH rw` | selected mode for that team | unchanged | unchanged |
+| `mount NAME PATH rw` | unchanged | writable project at `/workspace/NAME` | unchanged |
+| `mount NAME PATH ro` | unchanged | read-only input at `/readonly/NAME` | unchanged |
+| default run | as declared | as declared | direct egress; loopback viewer |
+| `--offline` | as declared | as declared | model proxy only; no per-team host viewer |
 
 The per-team viewer binds to `127.0.0.1` by default. To expose a team's
 read-only viewer deliberately on every IPv4 interface, pass `--host 0.0.0.0`:
 
 ```sh
-cyclo run --host 0.0.0.0 ~/teams/reviewer ~/src/project
+cyclo run --host 0.0.0.0 ~/experiments/my-project/project.cyclo
 ```
 
 AgentWS has no application authentication in 0.2.0, so use a non-loopback
 bind only on a trusted network with appropriate firewall controls.
 
-The default protects the team definition while allowing it to work on the
-project. Allow a team to edit its own roles or roster explicitly:
+Allow a team to edit its own roles or roster by declaring that team writable:
 
-```sh
-cyclo run --team-write ~/teams/self-editor ~/src/project
+```text
+team ../../teams/self-editor rw
+mount source ../../src/project rw
 ```
 
 Those changes stay in the team's Git working tree and are picked up on the
-next run. Run an auditor without project writes or direct internet egress:
+next run. Give an auditor a read-only source snapshot without direct internet egress:
 
-```sh
-cyclo run --project-read-only --offline ~/teams/auditor ~/src/project
+```text
+team ../../teams/auditor ro
+mount source-snapshot ../../src/project ro
 ```
 
-Several teams may mount the same project, but concurrent writable teams have
-ordinary filesystem race conditions. Use separate Git worktrees when their
-changes should be isolated. A read-only auditor can safely inspect a writer's
-project tree.
+```sh
+cyclo run --offline ~/experiments/audit/project.cyclo
+```
+
+Every team in one definition receives the same mounted directories. Concurrent
+writers of a project under `/workspace` therefore have ordinary filesystem race
+conditions. Use separate Git worktrees as distinct writable mounts when changes
+should be isolated. An auditor may inspect a snapshot under `/readonly`, but it
+does not have a writable project in that configuration.
+
+The compatibility command `cyclo run TEAM PROJECT` retains the old defaults:
+the team is read-only and the single `/workspace` project is writable.
+`--team-write` changes the legacy team mode; it is rejected with
+`project.cyclo` because its team lines already express that authority.
 
 Every instance has a separate Docker network. Cyclo attaches its team runtime
 and the provider runtime to that network; the credential gateway stays on its
@@ -668,8 +790,8 @@ root process cannot forge a packet for another runtime interface. Offline
 mode does not publish the per-team viewer; use `cyclo logs`,
 `cyclo path`, or the host dashboard.
 
-An auditor can currently inspect the same project read-only and judge its
-effects. Cyclo does not expose another team's private tasks, transcripts, or
+An auditor can currently inspect a read-only snapshot and judge its effects.
+Cyclo does not expose another team's private tasks, transcripts, or
 queue state to an agent team. That requires a separate, explicit read-only
 observation interface rather than weakening the filesystem boundary.
 
@@ -705,7 +827,7 @@ operations.
 The team container receives:
 
 - its team repository;
-- its project mount;
+- the writable workspaces and read-only inputs declared in `project.cyclo`;
 - writable task, job, agent, and transcript state;
 - writable per-instance Pi runtime state containing only its projected model
   config and scoped provider-runtime capability. Pi needs this tree for lock
@@ -718,22 +840,22 @@ It does **not** receive:
 - the host Pi configuration directory;
 - the Docker socket;
 - the host home directory;
-- another team's filesystem mounts or private Docker network.
+- another team's `/team` repository, private queue, or Docker network.
 
 The scoped capability is additionally bound to the provider runtime interface
-on this team's private network. Cyclo rejects overlapping team/project mounts
-and mounts covering Cyclo's
-state, embedded controller/runtime source, the host Pi directory, or the Docker
-socket. The scoped token protects credentials and provides attribution; it is
-not general data-loss prevention. An agent that can read project data and call
-an allowed model can send that data to the model provider. Non-model web egress
-is available unless `--offline` is used.
+on this team's private network. Teams in one `project.cyclo` intentionally
+share its writable workspaces and read-only inputs, but never their team repositories or queue
+state. Cyclo rejects overlaps among declared team/project trees and mounts
+covering Cyclo's state, embedded controller/runtime source, the host Pi
+directory, or the Docker socket. The scoped token protects credentials and
+provides attribution; it is not general data-loss prevention. An agent that can
+read project data and call an allowed model can send that data to the model
+provider. Non-model web egress is available unless `--offline` is used.
 
-Writable Git trees are untrusted output. With the default writable project—or
-with `--team-write`—an agent can change repository-local configuration and
-hooks as well as ordinary files. Cyclo avoids hook-triggering host-side Git
-operations, but subsequent host Git commands should treat agent-produced trees
-as untrusted.
+Writable Git trees are untrusted output. A `rw` workspace or team allows an
+agent to change repository-local configuration and hooks as well as ordinary
+files. Cyclo avoids hook-triggering host-side Git operations, but subsequent
+host Git commands should treat agent-produced trees as untrusted.
 
 Gateway usage accounting is per team/project binding and team generation,
 concrete provider, and model, not per individual agent. It uses
@@ -750,8 +872,10 @@ $XDG_STATE_HOME/cyclo/
   gateway/                    # client registry and controller capabilities
   provider-runtime/           # registry, capabilities, registration recovery, sockets
   instances/<instance>/
-    run.json                  # paths and lifecycle metadata
+    run.json                  # project, paths, modes, generation, lifecycle
     runtime/                  # materialized, container-read-only filesystem loop
+    workspace/                # inert namespace for writable projects
+    readonly/                 # inert namespace for read-only inputs
     agentws-state/            # writable tasks, jobs, agents, and transcripts
     pi/agent/                 # writable projected config, scoped token, Pi state
 ```
@@ -797,9 +921,10 @@ gateways stopped in that race remain stopped until the explicit
 `cyclo gateway restart` command.
 
 For a component map and explicit trust boundaries, see
-[`architecture.md`](architecture.md). The local release build and verification
-procedure is in [`releasing.md`](releasing.md), and vulnerability reporting is
-in [`SECURITY.md`](../SECURITY.md).
+[`architecture.md`](architecture.md). The exact project-definition contract is
+in [`project-format.md`](project-format.md). The local release build and
+verification procedure is in [`releasing.md`](releasing.md), and vulnerability
+reporting is in [`SECURITY.md`](../SECURITY.md).
 
 ## Development
 
