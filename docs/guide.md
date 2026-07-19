@@ -621,11 +621,10 @@ are documented in the bundled `tools/README.md`. Set any of
 environment of `cyclo run`; Cyclo forwards only this retry-control allowlist to
 the team container, where the values are range-checked before agents start.
 
-Workers also check the shared provider runtime before claiming work. Runtime
-maintenance or a runtime crash therefore leaves queued work pending. If the
-runtime disappears immediately after a claim or during an engine invocation,
-the worker restores the previous attempt count, releases the job, and waits for
-runtime health without advancing its suspension circuit breaker.
+AgentWS deliberately does not probe the provider stack or infer why an engine
+failed. Engine failures use the bounded retry and planner-notification path;
+operator shutdown is the only uncharged release. Use `cyclo ps`, `cyclo doctor`,
+and the fleet dashboard for provider-runtime and gateway health.
 
 ## Observe and operate
 

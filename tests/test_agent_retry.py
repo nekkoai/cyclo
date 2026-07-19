@@ -8,7 +8,6 @@ import subprocess
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -17,63 +16,6 @@ from cyclo.agentws_bundle import packaged_agentws_template
 
 
 RETRYABLE_AGENT_EXIT = 75
-
-
-class RuntimeHealthServer:
-    def __init__(
-        self,
-        *,
-        ready: bool,
-        fail_after_ready_response: int | None = None,
-    ) -> None:
-        self.ready = threading.Event()
-        if ready:
-            self.ready.set()
-        self.requests = 0
-        self.request_seen = threading.Event()
-        self.boot_identity = "1" * 32
-        owner = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                owner.requests += 1
-                owner.request_seen.set()
-                is_ready = owner.ready.is_set()
-                body = b"ok\n" if is_ready else b"unavailable\n"
-                self.send_response(200 if is_ready else 503)
-                self.send_header("Content-Type", "text/plain")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Connection", "close")
-                self.send_header(
-                    "X-Cyclo-Runtime-Boot-ID", owner.boot_identity
-                )
-                self.end_headers()
-                self.wfile.write(body)
-                if (
-                    is_ready
-                    and fail_after_ready_response is not None
-                    and owner.requests >= fail_after_ready_response
-                ):
-                    owner.ready.clear()
-
-            def log_message(self, _format: str, *_args: object) -> None:
-                pass
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self.server.server_port}/health"
-
-    def __enter__(self) -> "RuntimeHealthServer":
-        self.thread.start()
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
 
 
 def test_agent_prompt_treats_workspace_as_an_internal_project_root() -> None:
@@ -162,6 +104,175 @@ def test_interactive_agent_prompt_includes_configured_project_manifest(
     )
     assert f"Cyclo project manifest: {manifest}" in prompt
     assert "/workspace/core (read-write)" in prompt
+
+
+def test_interactive_initial_rpc_failure_settles_the_claimed_job(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_planner_job(runtime, tmp_path, "interactive-rpc-failure")
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        r"""#!/usr/bin/env python3
+import json
+import sys
+import time
+
+request = json.loads(sys.stdin.readline())
+assert request["id"] == "initial"
+print(json.dumps({
+    "id": "web-early",
+    "type": "response",
+    "success": True,
+}), flush=True)
+print(json.dumps({
+    "id": "initial",
+    "type": "response",
+    "success": False,
+    "error": "model request rejected",
+}), flush=True)
+time.sleep(30)
+""",
+    )
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent-pi-interactive"),
+            "--headless",
+            "planner",
+            "planner-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
+    assert not (job / "lock").exists()
+    assert (job / ".agent-attempts").read_text(encoding="utf-8").strip() == "1"
+    transcript = (runtime / "agents" / "planner-1" / "transcript.log").read_text(
+        encoding="utf-8"
+    )
+    assert "pi rpc error" in transcript
+    assert "model request rejected" in transcript
+
+
+def test_interactive_noninitial_rpc_failure_does_not_settle_the_job(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_planner_job(runtime, tmp_path, "interactive-rpc-order")
+    continued = tmp_path / "pi-continued"
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        r"""#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+request = json.loads(sys.stdin.readline())
+assert request["id"] == "initial"
+print(json.dumps({
+    "id": "web-early",
+    "type": "response",
+    "success": False,
+    "error": "unrelated external input failed",
+}), flush=True)
+time.sleep(0.5)
+with open(os.environ["FAKE_PI_CONTINUED"], "w", encoding="utf-8") as stream:
+    stream.write("yes\n")
+print(json.dumps({
+    "id": "initial",
+    "type": "response",
+    "success": False,
+    "error": "initial model request rejected",
+}), flush=True)
+time.sleep(30)
+""",
+    )
+    environment["FAKE_PI_CONTINUED"] = str(continued)
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent-pi-interactive"),
+            "--headless",
+            "planner",
+            "planner-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    assert continued.is_file()
+    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
+    assert not (job / "lock").exists()
+    assert (job / ".agent-attempts").read_text(encoding="utf-8").strip() == "1"
+
+
+def test_interactive_agent_settled_ends_the_claimed_attempt(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_planner_job(runtime, tmp_path, "interactive-agent-settled")
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        r"""#!/usr/bin/env python3
+import json
+import sys
+import time
+
+request = json.loads(sys.stdin.readline())
+assert request["id"] == "initial"
+print(json.dumps({
+    "id": "initial",
+    "type": "response",
+    "command": "prompt",
+    "success": True,
+}), flush=True)
+print(json.dumps({
+    "type": "message",
+    "message": {
+        "role": "assistant",
+        "stopReason": "error",
+        "errorMessage": "upstream request failed",
+    },
+}), flush=True)
+print(json.dumps({"type": "agent_settled"}), flush=True)
+time.sleep(30)
+""",
+    )
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent-pi-interactive"),
+            "--headless",
+            "planner",
+            "planner-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
+    assert not (job / "lock").exists()
+    assert (job / ".agent-attempts").read_text(encoding="utf-8").strip() == "1"
+    log = (job / "log.md").read_text(encoding="utf-8")
+    assert "exited with status 0 without finishing the job" in log
 
 
 def test_python_agent_worker_rejects_hidden_agent_id(tmp_path: Path) -> None:
@@ -289,213 +400,6 @@ def stop_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         return process.communicate(timeout=5)
-
-
-def agent_command(runtime: Path, *, interactive: bool) -> list[str]:
-    if interactive:
-        return [
-            str(runtime / "tools" / "agent-pi-interactive"),
-            "--headless",
-            "planner",
-            "planner-1",
-        ]
-    return [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"]
-
-
-@pytest.mark.parametrize("interactive", [False, True], ids=["batch", "interactive"])
-def test_provider_runtime_outage_waits_without_claim_or_attempt(
-    tmp_path: Path,
-    interactive: bool,
-) -> None:
-    runtime, workspace = copy_runtime(tmp_path)
-    job = create_planner_job(runtime, tmp_path, "runtime-wait")
-    environment = agent_environment(
-        tmp_path,
-        workspace,
-        "#!/bin/sh\n: > \"$FAKE_PI_STARTED\"\nexit 23\n",
-    )
-
-    with RuntimeHealthServer(ready=False) as health:
-        environment["CYCLO_PROVIDER_RUNTIME_HEALTH_URL"] = health.url
-        process = subprocess.Popen(
-            agent_command(runtime, interactive=interactive),
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            assert health.request_seen.wait(timeout=5)
-            assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
-            assert not (job / "lock").exists()
-            assert not (job / ".agent-attempts").exists()
-            assert not (tmp_path / "pi-started").exists()
-
-            health.ready.set()
-            _stdout, stderr = process.communicate(timeout=8)
-        finally:
-            if process.poll() is None:
-                stop_process_group(process)
-
-    assert process.returncode == RETRYABLE_AGENT_EXIT, stderr
-    assert (tmp_path / "pi-started").is_file()
-    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
-    assert (job / ".agent-attempts").read_text(encoding="utf-8").strip() == "1"
-    assert "waiting before claiming work" in stderr
-    assert "resuming job claims" in stderr
-
-
-@pytest.mark.parametrize("interactive", [False, True], ids=["batch", "interactive"])
-def test_runtime_loss_between_probe_and_claim_releases_without_attempt(
-    tmp_path: Path,
-    interactive: bool,
-) -> None:
-    runtime, workspace = copy_runtime(tmp_path)
-    job = create_planner_job(runtime, tmp_path, "runtime-claim-race")
-    environment = agent_environment(
-        tmp_path,
-        workspace,
-        "#!/bin/sh\n: > \"$FAKE_PI_STARTED\"\nexit 23\n",
-    )
-
-    with RuntimeHealthServer(
-        ready=True,
-        fail_after_ready_response=1,
-    ) as health:
-        environment["CYCLO_PROVIDER_RUNTIME_HEALTH_URL"] = health.url
-        process = subprocess.Popen(
-            agent_command(runtime, interactive=interactive),
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            deadline = time.monotonic() + 5
-            log = ""
-            while time.monotonic() < deadline:
-                log = (job / "log.md").read_text(encoding="utf-8")
-                if (
-                    "Provider runtime became unavailable before model launch" in log
-                    and (job / "status").read_text(encoding="utf-8").strip()
-                    == "pending"
-                    and not (job / "lock").exists()
-                ):
-                    break
-                time.sleep(0.02)
-            else:
-                raise AssertionError("timed out waiting for readiness-race release")
-
-            assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
-            assert not (job / "lock").exists()
-            assert not (job / ".agent-attempts").exists()
-            assert not (tmp_path / "pi-started").exists()
-        finally:
-            _stdout, stderr = stop_process_group(process)
-
-    assert process.returncode in (1, 128 + signal.SIGTERM), stderr
-
-
-@pytest.mark.parametrize("interactive", [False, True], ids=["batch", "interactive"])
-def test_engine_failure_during_runtime_outage_is_released_without_charge(
-    tmp_path: Path,
-    interactive: bool,
-) -> None:
-    runtime, workspace = copy_runtime(tmp_path)
-    job = create_planner_job(runtime, tmp_path, "runtime-engine-outage")
-    release_engine = tmp_path / "release-engine"
-    environment = agent_environment(
-        tmp_path,
-        workspace,
-        """#!/bin/sh
-set -eu
-: > "$FAKE_PI_STARTED"
-while [ ! -f "$FAKE_PI_RELEASE" ]; do sleep 0.02; done
-exit 23
-""",
-    )
-    environment["FAKE_PI_RELEASE"] = str(release_engine)
-
-    with RuntimeHealthServer(ready=True) as health:
-        environment["CYCLO_PROVIDER_RUNTIME_HEALTH_URL"] = health.url
-        process = subprocess.Popen(
-            agent_command(runtime, interactive=interactive),
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            wait_for(tmp_path / "pi-started")
-            assert (job / "status").read_text(encoding="utf-8").strip() == "claimed"
-            assert (job / ".agent-attempts").read_text(encoding="utf-8").strip() == "1"
-            health.ready.clear()
-            release_engine.touch()
-            _stdout, stderr = process.communicate(timeout=8)
-        finally:
-            if process.poll() is None:
-                stop_process_group(process)
-
-    assert process.returncode == 0, stderr
-    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
-    assert not (job / "lock").exists()
-    assert not (job / ".agent-attempts").exists()
-    assert "provider runtime was restarted or unavailable" in (
-        job / "log.md"
-    ).read_text(encoding="utf-8")
-
-
-@pytest.mark.parametrize("interactive", [False, True], ids=["batch", "interactive"])
-def test_runtime_recovery_before_failed_engine_settlement_is_not_charged(
-    tmp_path: Path,
-    interactive: bool,
-) -> None:
-    runtime, workspace = copy_runtime(tmp_path)
-    job = create_planner_job(runtime, tmp_path, "runtime-restarted")
-    release_engine = tmp_path / "release-engine"
-    environment = agent_environment(
-        tmp_path,
-        workspace,
-        """#!/bin/sh
-set -eu
-: > "$FAKE_PI_STARTED"
-while [ ! -f "$FAKE_PI_RELEASE" ]; do sleep 0.02; done
-exit 23
-""",
-    )
-    environment["FAKE_PI_RELEASE"] = str(release_engine)
-
-    with RuntimeHealthServer(ready=True) as health:
-        environment["CYCLO_PROVIDER_RUNTIME_HEALTH_URL"] = health.url
-        process = subprocess.Popen(
-            agent_command(runtime, interactive=interactive),
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            wait_for(tmp_path / "pi-started")
-            assert (job / "status").read_text(encoding="utf-8").strip() == "claimed"
-            assert (job / ".agent-attempts").read_text(encoding="utf-8").strip() == "1"
-            health.boot_identity = "2" * 32
-            release_engine.touch()
-            _stdout, stderr = process.communicate(timeout=8)
-        finally:
-            if process.poll() is None:
-                stop_process_group(process)
-
-    assert process.returncode == 0, stderr
-    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
-    assert not (job / "lock").exists()
-    assert not (job / ".agent-attempts").exists()
-    assert "provider runtime was restarted or unavailable" in (
-        job / "log.md"
-    ).read_text(encoding="utf-8")
 
 
 def test_failed_agent_requeues_only_until_job_attempt_budget(tmp_path: Path) -> None:

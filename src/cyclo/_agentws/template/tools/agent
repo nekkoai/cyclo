@@ -8,7 +8,6 @@ import argparse
 import ctypes
 import fcntl
 import hashlib
-import http.client
 import json
 import os
 import re
@@ -25,7 +24,6 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlsplit
 
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -34,11 +32,6 @@ RETRYABLE_AGENT_EXIT = 75
 FATAL_AGENT_EXIT = 70
 JOB_ATTEMPTS_FILE = ".agent-attempts"
 ENGINE_STOP_SECONDS = 2.0
-PROVIDER_RUNTIME_HEALTH_ENV = "CYCLO_PROVIDER_RUNTIME_HEALTH_URL"
-PROVIDER_RUNTIME_BOOT_ID_HEADER = "X-Cyclo-Runtime-Boot-ID"
-PROVIDER_RUNTIME_BOOT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
-PROVIDER_RUNTIME_HEALTH_TIMEOUT_SECONDS = 1.0
-PROVIDER_RUNTIME_HEALTH_RETRY_SECONDS = 1.0
 PR_SET_CHILD_SUBREAPER = 36
 _SUBREAPER_ENABLED = False
 
@@ -188,82 +181,6 @@ def positive_env_int(name: str, default: int) -> int:
     if value <= 0 or value > 100:
         die(f"{name} must be an integer from 1 to 100")
     return value
-
-
-def provider_runtime_health_target() -> tuple[str, int, str] | None:
-    """Return the non-secret runtime health target injected by Cyclo."""
-
-    raw = os.environ.get(PROVIDER_RUNTIME_HEALTH_ENV)
-    if raw is None:
-        return None
-    try:
-        parsed = urlsplit(raw)
-        port = parsed.port
-    except ValueError:
-        die(f"{PROVIDER_RUNTIME_HEALTH_ENV} is not a valid URL")
-    if (
-        parsed.scheme != "http"
-        or parsed.hostname is None
-        or port is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path != "/health"
-        or parsed.query
-        or parsed.fragment
-    ):
-        die(
-            f"{PROVIDER_RUNTIME_HEALTH_ENV} must be an HTTP /health URL "
-            "with an explicit port and no credentials, query, or fragment"
-        )
-    return parsed.hostname, port, parsed.path
-
-
-def provider_runtime_health_identity(
-    target: tuple[str, int, str],
-) -> str | None:
-    """Return the current runtime process identity only for an exact health reply."""
-
-    connection = http.client.HTTPConnection(
-        target[0], target[1], timeout=PROVIDER_RUNTIME_HEALTH_TIMEOUT_SECONDS
-    )
-    try:
-        connection.request("GET", target[2], headers={"Connection": "close"})
-        response = connection.getresponse()
-        identity = response.getheader(PROVIDER_RUNTIME_BOOT_ID_HEADER)
-        if response.status != 200 or response.read(4) != b"ok\n":
-            return None
-        if identity is None or not PROVIDER_RUNTIME_BOOT_ID_RE.fullmatch(identity):
-            return None
-        return identity
-    except (OSError, http.client.HTTPException):
-        return None
-    finally:
-        connection.close()
-
-
-def wait_for_provider_runtime(
-    target: tuple[str, int, str] | None,
-) -> str | None:
-    """Wait for Cyclo's shared model runtime without touching queue state."""
-
-    if target is None:
-        return None
-    waiting = False
-    while True:
-        identity = provider_runtime_health_identity(target)
-        if identity is not None:
-            break
-        if not waiting:
-            print(
-                "warning: provider runtime is unavailable; waiting before "
-                "claiming work",
-                file=sys.stderr,
-            )
-            waiting = True
-        time.sleep(PROVIDER_RUNTIME_HEALTH_RETRY_SECONDS)
-    if waiting:
-        print("provider runtime is ready; resuming job claims", file=sys.stderr)
-    return identity
 
 
 def read_job_status(job_dir: Path) -> str:
@@ -479,79 +396,6 @@ def transition_or_fail_closed(
     return (
         force_fail_owned_job(job_dir, job_id, agent_name, fallback_message),
         True,
-    )
-
-
-def claim_job_if_runtime_ready(
-    root: Path,
-    role: str,
-    agent_name: str,
-    runtime_target: tuple[str, int, str] | None,
-) -> tuple[str, Path, str | None] | None:
-    """Claim one job, releasing it if runtime readiness raced away."""
-
-    claim = run_bin(
-        root,
-        "job-claim",
-        "-r",
-        role,
-        "--agent-id",
-        agent_name,
-    ).stdout.strip()
-    if claim == "NO_JOBS":
-        return None
-    if not claim.startswith("CLAIMED: "):
-        die(f"unexpected job-claim output: {claim}")
-
-    job_id = claim.removeprefix("CLAIMED: ").strip()
-    job_dir = root / "jobs" / job_id
-    boot_identity = (
-        provider_runtime_health_identity(runtime_target)
-        if runtime_target is not None
-        else None
-    )
-    if runtime_target is not None and boot_identity is None:
-        settled, used_fallback = transition_or_fail_closed(
-            root,
-            job_dir,
-            job_id,
-            agent_name,
-            "job-release",
-            "Provider runtime became unavailable before model launch; "
-            "releasing without consuming a retry attempt.",
-        )
-        if not settled or used_fallback:
-            die(
-                f"cannot safely release {job_id} after provider runtime "
-                "readiness was lost",
-                FATAL_AGENT_EXIT,
-            )
-        return None
-    return job_id, job_dir, boot_identity
-
-
-def provider_runtime_changed_during_failed_run(
-    target: tuple[str, int, str] | None,
-    boot_identity: str | None,
-    *,
-    process_started: bool,
-    process_status: int,
-    interrupted: bool,
-    job_dir: Path,
-) -> bool:
-    """Identify infrastructure loss without charging the job retry budget."""
-
-    if (
-        not process_started
-        or process_status == 0
-        or interrupted
-        or target is None
-        or read_job_status(job_dir) in {"done", "failed"}
-    ):
-        return False
-    return (
-        boot_identity is None
-        or provider_runtime_health_identity(target) != boot_identity
     )
 
 
@@ -827,7 +671,6 @@ def settle_job_after_process(
     attempt: int,
     maximum: int,
     interrupted: bool,
-    dependency_unavailable: bool = False,
     label: str = "Agent",
 ) -> int:
     """Settle the claimed job and return the supervisor-visible process status."""
@@ -858,33 +701,6 @@ def settle_job_after_process(
             if not settled or used_fallback:
                 return FATAL_AGENT_EXIT
         return process_status
-
-    if dependency_unavailable:
-        if job_owned_by(job_dir, agent_name):
-            try:
-                restore_job_attempt(job_dir, previous_attempts)
-            except OSError as exc:
-                print(
-                    f"warning: cannot restore retry counter for {job_id}: {exc}",
-                    file=sys.stderr,
-                )
-                return FATAL_AGENT_EXIT
-            settled, used_fallback = transition_or_fail_closed(
-                root,
-                job_dir,
-                job_id,
-                agent_name,
-                "job-release",
-                f"{label} process exited while the provider runtime was "
-                "restarted or unavailable; releasing without consuming a "
-                "retry attempt.",
-            )
-            if not settled or used_fallback:
-                return FATAL_AGENT_EXIT
-        # Dependency loss is not an agent failure. Returning success keeps the
-        # supervisor's circuit breaker untouched while the next worker waits
-        # at the pre-claim readiness gate.
-        return 0
 
     if job_owned_by(job_dir, agent_name):
         terminal_failure = attempt <= 0 or attempt >= maximum
@@ -1567,8 +1383,6 @@ def main() -> int:
     max_job_attempts = positive_env_int(
         "AGENTWS_MAX_JOB_ATTEMPTS", DEFAULT_MAX_JOB_ATTEMPTS
     )
-    runtime_health_target = provider_runtime_health_target()
-    runtime_boot_identity: str | None = None
 
     agent_dir_out = run_bin(root, "agent-new", args.agent_name, args.role).stdout.strip()
     if not agent_dir_out:
@@ -1611,18 +1425,22 @@ def main() -> int:
 
         while True:
             run_bin(root, "job-wait", "-r", args.role, capture=True)
-            runtime_boot_identity = wait_for_provider_runtime(runtime_health_target)
             defer_shutdown = True
             try:
-                claimed = claim_job_if_runtime_ready(
+                claim = run_bin(
                     root,
+                    "job-claim",
+                    "-r",
                     args.role,
+                    "--agent-id",
                     args.agent_name,
-                    runtime_health_target,
-                )
-                if claimed is not None:
-                    job_id, job_dir, runtime_boot_identity = claimed
+                ).stdout.strip()
+                if claim.startswith("CLAIMED: "):
+                    job_id = claim.removeprefix("CLAIMED: ").strip()
+                    job_dir = root / "jobs" / job_id
                     settlement_needed = True
+                elif claim != "NO_JOBS":
+                    die(f"unexpected job-claim output: {claim}")
             finally:
                 defer_shutdown = False
             if deferred_shutdown_signum:
@@ -1772,14 +1590,6 @@ def main() -> int:
                     maximum=max_job_attempts,
                 )
             else:
-                dependency_unavailable = provider_runtime_changed_during_failed_run(
-                    runtime_health_target,
-                    runtime_boot_identity,
-                    process_started=proc is not None,
-                    process_status=process_status,
-                    interrupted=interrupted,
-                    job_dir=job_dir,
-                )
                 process_status = settle_job_after_process(
                     root,
                     job_dir,
@@ -1790,7 +1600,6 @@ def main() -> int:
                     attempt=attempt,
                     maximum=max_job_attempts,
                     interrupted=interrupted,
-                    dependency_unavailable=dependency_unavailable,
                 )
         if transcript is not None:
             transcript.close()

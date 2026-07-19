@@ -55,6 +55,16 @@ def test_packaged_agentws_preserves_executable_modes() -> None:
         assert not path.stat().st_mode & stat.S_IXUSR, path
 
 
+def test_packaged_agentws_has_no_provider_runtime_policy() -> None:
+    tools = packaged_agentws_template() / "tools"
+
+    for name in ("agent", "agent-pi-interactive", "run_agentws"):
+        source = (tools / name).read_text(encoding="utf-8")
+        assert "CYCLO_PROVIDER_RUNTIME" not in source
+        assert "provider_runtime" not in source
+        assert "X-Cyclo-Runtime" not in source
+
+
 def test_packaged_agentws_materializes_as_an_executable_runtime(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     runtime_script = Path(__file__).parents[1] / "src" / "cyclo" / "container_runtime.py"

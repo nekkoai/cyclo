@@ -35,7 +35,6 @@ PROVIDER_RUNTIME_PRIVATE_SOCKET_ROOT = Path("/run/cyclo/internal")
 PROVIDER_RUNTIME_PROVIDER_SOCKET_ROOT = Path("/run/cyclo/providers")
 PROVIDER_RUNTIME_ADMIN_TOKEN = Path("/run/secrets/cyclo-runtime-admin-token")
 PROVIDER_RUNTIME_GATEWAY_TOKEN = Path("/run/secrets/cyclo-runtime-gateway-token")
-PROVIDER_RUNTIME_HEALTH_PATH = "/health"
 PROVIDER_RUNTIME_CONTROL_RELOAD = "/_cyclo/v1/control/reload"
 PROVIDER_RUNTIME_CONTROL_REFRESH_CATALOG = (
     "/_cyclo/v1/control/refresh-catalog"
@@ -168,10 +167,6 @@ def provider_runtime_container_name(state_root: Path) -> str:
 
 def provider_runtime_base_url(container: str) -> str:
     return f"http://{container}:{PROVIDER_RUNTIME_PORT}"
-
-
-def provider_runtime_health_url(container: str) -> str:
-    return provider_runtime_base_url(container) + PROVIDER_RUNTIME_HEALTH_PATH
 
 
 def provider_runtime_context_root() -> Path:

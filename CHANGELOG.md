@@ -91,9 +91,11 @@ Provider composition and runtime-isolation release.
   explicit source errors.
 - Make `cyclo doctor` actively probe both the credential gateway and provider
   runtime before trusting the runtime catalogue.
-- Gate job claims on shared-runtime health. If the runtime disappears between
-  readiness and launch, or while an engine is running, release the job without
-  consuming its attempt or incrementing the agent suspension circuit breaker.
+- Keep AgentWS provider-agnostic: model-engine failures use its bounded retry
+  contract, while Cyclo reports provider-stack health without rewriting queue
+  history or inferring failure causes from health timing.
+- End queued Pi RPC attempts on `agent_settled`, so an accepted engine failure
+  cannot leave a job claimed merely because Pi's RPC process remains alive.
 - Keep the gateway administrator capability out of Docker command arguments
   and environment values by mounting an atomically projected token file.
 - Reject malformed persisted project fields and mounts at the state boundary,
