@@ -148,7 +148,8 @@ test("turns a malformed clean stream into a Pi error terminal", async () => {
 
     assert.deepEqual(events.map(({ type }) => type), ["start", "error"]);
     assert.equal(events.at(-1).reason, "error");
-    assert.equal(events.at(-1).error.errorMessage, "Cyclo provider request failed");
+    assert.match(events.at(-1).error.errorMessage, /^Cyclo provider request failed: /u);
+    assert.notEqual(events.at(-1).error.errorMessage, "Cyclo provider request failed");
   });
 });
 
