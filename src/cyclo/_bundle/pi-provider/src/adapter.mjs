@@ -51,13 +51,19 @@ async function pump(stream, partial, client, publicId, model, context, options) 
     partial.stopReason = aborted ? "aborted" : "error";
     partial.errorMessage = aborted
       ? "Cyclo provider request aborted"
-      : "Cyclo provider request failed";
+      : `Cyclo provider request failed: ${providerErrorMessage(error)}`;
     stream.push({
       type: "error",
       reason: partial.stopReason,
       error: partial,
     });
   }
+}
+
+function providerErrorMessage(error) {
+  const raw = error instanceof Error ? error.message : String(error ?? "unknown error");
+  const safe = raw.replace(/[\u0000-\u001f\u007f]/gu, " ").replace(/\s+/gu, " ").trim();
+  return safe.slice(0, 512) || "unknown provider error";
 }
 
 async function consume(stream, partial, responses, model) {
