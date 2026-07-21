@@ -637,8 +637,9 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         return 0
     with store.locked():
         if action == "build":
-            print(proxy.build())
-            return 0
+            image = proxy.build()
+            print(image)
+            return _print_gateway_status(proxy.restart(build=False))
         if action == "start":
             return _print_gateway_status(proxy.start())
         if action == "restart":

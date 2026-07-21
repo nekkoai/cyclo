@@ -402,7 +402,7 @@ class GatewayDouble:
     (
         (("providers",), ("providers",), 0, "OpenAI API"),
         (("status",), ("status",), 0, "gateway\tready\tcurrent"),
-        (("build",), ("build",), 1, "sha256:"),
+            (("build",), ("build",), 1, "sha256:"),
         (("start",), ("start",), 1, "gateway\tready\tcurrent"),
         (("restart", "--build"), ("restart", True), 1, "gateway\tready\tcurrent"),
         (("stop",), ("stop",), 1, "stopped gateway"),
@@ -430,7 +430,7 @@ def test_gateway_actions_use_only_the_gateway_component(
     result = main(["gateway", *arguments])
 
     assert result == 0
-    assert proxy.calls == [call]
+    assert proxy.calls == ([call, ("restart", False)] if arguments == ("build",) else [call])
     assert store.lock_entries == locks
     assert output in capsys.readouterr().out
 
