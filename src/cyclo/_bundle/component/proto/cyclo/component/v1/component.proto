@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package cyclo.component.v1;
+
+// Component is the one interface every Cyclo component provides.
+// A successful RPC proves liveness; the response reports readiness.
+service Component {
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  HealthStatus status = 1;
+  string message = 2;
+}
+
+enum HealthStatus {
+  // Callers treat an unspecified status as unhealthy.
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  // The component can serve its declared interfaces.
+  HEALTH_STATUS_READY = 1;
+  // The process is reachable but cannot currently serve its interfaces.
+  HEALTH_STATUS_NOT_READY = 2;
+}

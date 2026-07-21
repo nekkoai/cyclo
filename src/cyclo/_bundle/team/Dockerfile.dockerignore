@@ -1,0 +1,15 @@
+**
+!team/package.json
+!team/package-lock.json
+!team/entrypoint.sh
+!component/package.json
+!component/package-lock.json
+!component/src/**
+!component/gen/**
+!provider/package.json
+!provider/package-lock.json
+!provider/src/**
+!provider/gen/**
+!pi-provider/package.json
+!pi-provider/package-lock.json
+!pi-provider/src/**

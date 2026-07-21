@@ -67,23 +67,18 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
-      - name: Install gateway Node dependencies for integration tests
-        working-directory: src/cyclo/credential_gateway/gateway_context
-        run: npm ci --ignore-scripts
-      - name: Install provider-runtime Node dependencies for integration tests
-        working-directory: src/cyclo/provider_runtime_context
-        run: npm ci --ignore-scripts
+      - name: Install shipped component dependencies
+        run: |
+          for component in component provider gateway passthrough pi-provider; do
+            npm ci --ignore-scripts --prefix "src/cyclo/_bundle/$component"
+          done
       - name: Run Node tests
         run: node --test tests/*.mjs
-      - name: Audit gateway Node dependencies
-        working-directory: src/cyclo/credential_gateway/gateway_context
-        run: npm audit --omit=dev --package-lock-only --audit-level=high
-      - name: Audit runtime Node dependencies
-        working-directory: src/cyclo/team_runtime_context
-        run: npm audit --omit=dev --package-lock-only --audit-level=high
-      - name: Audit provider-runtime Node dependencies
-        working-directory: src/cyclo/provider_runtime_context
-        run: npm audit --omit=dev --package-lock-only --audit-level=high
+      - name: Audit shipped component dependencies
+        run: |
+          for component in component provider gateway passthrough pi-provider; do
+            npm audit --omit=dev --package-lock-only --audit-level=high --prefix "src/cyclo/_bundle/$component"
+          done
       - name: Check POSIX shell syntax
         shell: bash
         run: |
@@ -131,30 +126,24 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - name: Build runtime image
+      - name: Build team image
         run: |
           docker build --pull \
-            --tag cyclo-runtime:ci \
-            --file src/cyclo/team_runtime_context/Dockerfile \
-            src/cyclo/team_runtime_context
+            --tag cyclo-team:ci \
+            --file src/cyclo/_bundle/team/Dockerfile \
+            src/cyclo/_bundle
       - name: Build gateway image
         run: |
           docker build --pull \
             --tag cyclo-gateway:ci \
-            --file src/cyclo/credential_gateway/gateway_context/Dockerfile \
-            src/cyclo/credential_gateway/gateway_context
-      - name: Build provider-runtime image
-        run: |
-          docker build --pull \
-            --tag cyclo-provider-runtime:ci \
-            --file src/cyclo/provider_runtime_context/Dockerfile \
-            src/cyclo/provider_runtime_context
+            --file src/cyclo/_bundle/gateway/Dockerfile \
+            src/cyclo/_bundle
       - name: Smoke-test images without credentials
         run: |
           docker run --rm --network none \
             --env CYCLO_HOST_UID=1000 \
             --env CYCLO_HOST_GID=1000 \
-            cyclo-runtime:ci sh -ceu '
+            cyclo-team:ci sh -ceu '
               python3 --version
               node --version
               npm --version
@@ -191,16 +180,4 @@ jobs:
           fi
           grep -F "Select OpenAI Codex login method" /tmp/cyclo-oauth-login
           grep -F "login failed: Login cancelled" /tmp/cyclo-oauth-login
-          printf '%s\n' image-smoke-token > /tmp/cyclo-gateway-token
-          chmod 0400 /tmp/cyclo-gateway-token
-          docker run --rm --network none --user "$(id -u):$(id -g)" \
-            --env CYCLO_GATEWAY_TOKEN_FILE=/run/secrets/cyclo-gateway-admin-token \
-            --env CYCLO_GATEWAY_AUTH_JSON=/tmp/cyclo-auth.json \
-            --env CYCLO_GATEWAY_MODELS_JSON=/tmp/cyclo-models.json \
-            --env CYCLO_GATEWAY_CLIENTS_JSON=/tmp/cyclo-clients.json \
-            --env CYCLO_GATEWAY_USAGE_JSONL=/tmp/cyclo-usage.jsonl \
-            --volume /tmp/cyclo-gateway-token:/run/secrets/cyclo-gateway-admin-token:ro \
-            --volume "$PWD/tests/fixtures/credential_gateway_image_smoke.mjs:/tmp/smoke.mjs:ro" \
-            cyclo-gateway:ci /tmp/smoke.mjs
-          docker run --rm --network none --entrypoint node \
-            cyclo-provider-runtime:ci --check /app/server.mjs
+          docker run --rm --network none cyclo-gateway:ci providers.mjs

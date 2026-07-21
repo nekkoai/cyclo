@@ -112,25 +112,25 @@ test("dashboard normalizes workspace and read-only mount lists independently", a
   assert.equal(unsupportedAliases.projectDescription, "");
 });
 
-test("dashboard keeps lifecycle state separate from runtime health", async () => {
+test("dashboard keeps lifecycle state separate from provider health", async () => {
   const { normalizeInstance, computeSummary, stateLabel } = await dashboardHelpers([
     "normalizeInstance",
     "computeSummary",
     "stateLabel",
   ]);
   const instance = normalizeInstance({
-    id: "runtime-down",
+    id: "provider-down",
     state: "running",
-    health: { state: "runtime-down", reason: "runtime container stopped" },
+    health: { state: "provider-down", reason: "fusion stopped" },
   });
 
   assert.equal(instance.state, "running");
   assert.equal(instance.displayState, "attention");
-  assert.equal(instance.health.state, "runtime-down");
-  assert.equal(instance.health.reason, "runtime container stopped");
+  assert.equal(instance.health.state, "provider-down");
+  assert.equal(instance.health.reason, "fusion stopped");
   assert.equal(stateLabel(instance), "running");
   assert.equal(computeSummary([instance]).running, 1);
-  assert.equal(computeSummary([instance]).runtimeIssues, 1);
+  assert.equal(computeSummary([instance]).providerIssues, 1);
   assert.equal(computeSummary([instance]).attention, 1);
 });
 
@@ -154,7 +154,7 @@ test("dashboard treats suspended AgentWS supervisors as instance attention", asy
   assert.equal(instance.health.state, "agents-suspended");
   assert.equal(instance.health.reason, "1 agent suspended: planner-1");
   assert.equal(stateLabel(instance), "running");
-  assert.equal(computeSummary([instance]).runtimeIssues, 0);
+  assert.equal(computeSummary([instance]).providerIssues, 0);
   assert.equal(computeSummary([instance]).attention, 1);
 
   const plannerFailure = normalizeInstance({
@@ -169,11 +169,50 @@ test("dashboard treats suspended AgentWS supervisors as instance attention", asy
   assert.equal(plannerFailure.displayState, "attention");
 });
 
+test("API v3 keeps gateway usage global and ignores per-instance attribution", async () => {
+  const { normalizeSnapshot } = await dashboardHelpers(["normalizeSnapshot"]);
+  const snapshot = normalizeSnapshot({
+    version: 3,
+    generated_at: "2026-07-21T12:00:00Z",
+    summary: {
+      running: 1,
+      provider_issues: 0,
+      attention: 0,
+      tokens: 134,
+      requests: 4,
+      errors: 0,
+    },
+    usage: {
+      totals: {
+        input_tokens: 107,
+        output_tokens: 27,
+        requests: 4,
+      },
+    },
+    instances: [{
+      id: "alpha",
+      state: "running",
+      health: { state: "ready", reason: "" },
+      usage: {
+        input_tokens: 999_999,
+        output_tokens: 999_999,
+        requests: 999_999,
+      },
+    }],
+  });
+
+  assert.equal(snapshot.summary.tokens, 134);
+  assert.equal(snapshot.summary.requests, 4);
+  assert.equal(snapshot.summary.providerIssues, 0);
+  assert.equal("usage" in snapshot.instances[0], false);
+});
+
 test("dashboard styles include keyboard, motion, and responsive affordances", async () => {
   const css = await readFile(asset("styles.css"), "utf8");
 
   assert.match(css, /:focus-visible/);
   assert.match(css, /prefers-reduced-motion/);
   assert.match(css, /@media \(max-width: 760px\)/);
+  assert.match(css, /data-state\^="provider-"/);
   assert.match(css, /data-state\^="agents-"/);
 });

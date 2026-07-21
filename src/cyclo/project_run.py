@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import secrets
 import stat
@@ -11,13 +12,7 @@ from pathlib import Path
 from .dashboard import dashboard_host_is_loopback
 from .docker import ContainerSpec, Docker, overlaps, overlaps_lexically
 from .errors import CycloError
-from .instance_lifecycle import (
-    active_instances,
-    attach_active_networks,
-    rotate_client_tokens,
-    stop_remove_instance_container,
-    token_rotation_failure,
-)
+from .instance_lifecycle import stop_remove_instance_container
 from .project import (
     ProjectDefinition,
     ProjectMount,
@@ -25,16 +20,14 @@ from .project import (
     render_project_manifest,
 )
 from .project_state import decode_instance_project, encode_project_mounts
-from .provider_service import ProviderService
-from .state import Instance, StateStore, instance_id, validate_instance_id
+from .state import Instance, StateStore, validate_instance_id
 from .team import (
     Team,
     load_team,
     require_team_repository,
-    resolve_directory,
     team_generation,
 )
-from .team_runtime_image import ensure as ensure_team_runtime_image
+from .team_runtime_image import PI_PACKAGES, ensure as ensure_team_runtime_image
 
 
 def project_instance_id(project: ProjectDefinition, team: ProjectTeam) -> str:
@@ -52,11 +45,10 @@ def new_instance(
     team: Team,
     project: Path,
     *,
-    identifier: str | None = None,
-    team_write: bool | None = None,
-    definition: ProjectDefinition | None = None,
+    identifier: str,
+    team_write: bool,
+    definition: ProjectDefinition,
 ) -> Instance:
-    identifier = identifier or instance_id(team.root, project, args.name)
     return Instance(
         id=identifier,
         team_name=team.name,
@@ -68,17 +60,15 @@ def new_instance(
         container_name=f"cyclo-{identifier}",
         network_name=f"cyclo-{identifier}-net",
         image=args.image,
-        team_write=args.team_write if team_write is None else team_write,
+        team_write=team_write,
         offline=args.offline,
         agentws_host=args.host,
         active=True,
-        project_name=definition.name if definition is not None else project.name,
-        project_file=(str(definition.path.resolve()) if definition else ""),
-        project_description=definition.description if definition else "",
-        project_generation=definition.definition_sha256 if definition else "",
-        project_mounts=(
-            encode_project_mounts(definition.mounts) if definition else []
-        ),
+        project_name=definition.name,
+        project_file=str(definition.path.resolve()),
+        project_description=definition.description,
+        project_generation=definition.definition_sha256,
+        project_mounts=encode_project_mounts(definition.mounts),
         launch_id="" if args.dry_run else secrets.token_hex(16),
     )
 
@@ -222,25 +212,7 @@ def load_project_teams(
     return tuple(result)
 
 
-def legacy_project_manifest(team: Team, project: Path, *, team_write: bool) -> str:
-    team_mode = "read-write" if team_write else "read-only"
-    return (
-        "# Cyclo project\n\n"
-        f"Name: {project.name}\n"
-        "Description: Direct TEAM PROJECT compatibility run.\n\n"
-        "The current working directory is /workspace.\n\n"
-        "## Writable workspace mounts\n\n"
-        "- /workspace (read-write)\n\n"
-        "## Read-only mounts\n\n"
-        "- none\n\n"
-        "## Team definition\n\n"
-        f"- /team ({team_mode}; {team.name})\n"
-    )
-
-
-def validate_run_options(
-    args: argparse.Namespace, *, project_file: bool, team_count: int
-) -> None:
+def validate_run_options(args: argparse.Namespace, *, team_count: int) -> None:
     if args.port < 0 or args.port > 65535:
         raise CycloError("port must be 0 or an integer from 1 to 65535")
     if args.offline and args.port:
@@ -248,20 +220,6 @@ def validate_run_options(
             "--port cannot be used with --offline because no host UI is published"
         )
     dashboard_host_is_loopback(args.host)
-    if project_file:
-        forbidden = [
-            option
-            for enabled, option in (
-                (args.name, "--name"),
-                (args.team_write, "--team-write"),
-            )
-            if enabled
-        ]
-        if forbidden:
-            raise CycloError(
-                f"{' '.join(forbidden)} cannot be used with project.cyclo; "
-                "declare team and mount modes in the project file"
-            )
     if team_count > 1 and args.port:
         raise CycloError("--port is ambiguous for a project with multiple teams")
     if team_count > 1 and args.foreground:
@@ -308,22 +266,6 @@ def project_run_bindings(
     return tuple(result)
 
 
-def legacy_run_binding(args: argparse.Namespace) -> RunBinding:
-    team = load_team(args.definition)
-    require_team_repository(team)
-    project = resolve_directory(args.project, "project")
-    instance = new_instance(args, team, project)
-    return RunBinding(
-        team=team,
-        project_root=project,
-        instance=instance,
-        manifest=legacy_project_manifest(
-            team, project, team_write=instance.team_write
-        ),
-        source_identities=capture_source_identities((team.root, project)),
-    )
-
-
 def container_spec(
     binding: RunBinding, store: StateStore, args: argparse.Namespace
 ) -> ContainerSpec:
@@ -338,6 +280,7 @@ def container_spec(
         jobs_dir=store.jobs_dir(instance.id),
         agents_dir=store.agents_dir(instance.id),
         pi_root=store.pi_root(instance.id),
+        provider_socket_dir=Path(instance.provider_socket_path).parent,
         port=args.port,
         verbose=args.verbose,
         project_mounts=binding.project_mounts,
@@ -377,12 +320,52 @@ def preflight_binding(binding: RunBinding, store: StateStore, docker: Docker) ->
     validate_running_mount_boundaries(binding, store, docker)
 
 
+def validate_team_models(team: Team, available_models: set[str]) -> None:
+    for agent in team.agents:
+        if agent.model not in available_models:
+            raise CycloError(
+                f"agent {agent.name} requests unavailable provider model "
+                f"{agent.model!r}"
+            )
+
+
+def materialize_pi_settings(
+    store: StateStore,
+    instance: Instance,
+    team: Team,
+) -> Path:
+    """Publish only Pi's local defaults; authority comes from the socket mount."""
+
+    target = store.pi_root(instance.id)
+    temporary = store.new_tree(target)
+    try:
+        agent_dir = temporary / "agent"
+        agent_dir.mkdir(mode=0o700)
+        first = team.agents[0]
+        settings = {
+            "defaultProvider": first.provider,
+            "defaultModel": first.model_id,
+            "defaultThinkingLevel": "xhigh",
+            "packages": list(PI_PACKAGES),
+        }
+        settings_path = agent_dir / "settings.json"
+        settings_path.write_text(
+            json.dumps(settings, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(settings_path, 0o600)
+        store.replace_tree(temporary, target)
+    except Exception:
+        store._remove_tree(temporary)
+        raise
+    return target
+
+
 def start_binding(
     args: argparse.Namespace,
     binding: RunBinding,
     source: Path,
     store: StateStore,
-    runtime: ProviderService,
     docker: Docker,
     *,
     build: bool,
@@ -406,19 +389,11 @@ def start_binding(
                 instance.id,
                 [mount.name for mount in binding.project_mounts if mount.read_only],
             )
-        stale: list[Instance] = []
+        materialize_pi_settings(store, instance, binding.team)
         try:
             store.save(instance)
-            running = active_instances(store, docker, candidate=instance, stale=stale)
             ensure_team_runtime_image(instance.image, build=build)
-            runtime.rotate_client_token(instance.id)
-            attach_active_networks(docker, runtime, running)
-            runtime.prepare_instance(instance, binding.team, running)
-            rotation_errors = rotate_client_tokens(
-                runtime, [item.id for item in stale]
-            )
-            if rotation_errors:
-                raise token_rotation_failure(rotation_errors)
+            docker.ensure_network(instance.network_name, offline=instance.offline)
             verify_source_identities(binding)
             validate_running_mount_boundaries(binding, store, docker)
             instance.port = docker.start(spec)
@@ -437,29 +412,6 @@ def start_binding(
             except Exception as cleanup_error:
                 cleanup_errors.append(f"inactive state rollback failed: {cleanup_error}")
             try:
-                stale = []
-                remaining = active_instances(store, docker, stale=stale)
-                network_error: Exception | None = None
-                try:
-                    attach_active_networks(docker, runtime, remaining)
-                except Exception as exc:
-                    network_error = exc
-                runtime.update_clients(remaining)
-                rotation_errors = rotate_client_tokens(
-                    runtime, [instance.id, *[item.id for item in stale]]
-                )
-                if network_error is not None:
-                    raise CycloError(
-                        "active network repair failed after capability "
-                        f"revocation: {network_error}"
-                    ) from network_error
-                if rotation_errors:
-                    cleanup_errors.append(str(token_rotation_failure(rotation_errors)))
-            except Exception as cleanup_error:
-                cleanup_errors.append(
-                    f"runtime capability rollback failed: {cleanup_error}"
-                )
-            try:
                 stop_remove_instance_container(
                     docker,
                     instance,
@@ -468,7 +420,7 @@ def start_binding(
             except Exception as cleanup_error:
                 cleanup_errors.append(f"container rollback failed: {cleanup_error}")
             try:
-                docker.remove_network(instance.network_name, runtime.container_name)
+                docker.remove_network(instance.network_name)
             except Exception as cleanup_error:
                 cleanup_errors.append(f"network rollback failed: {cleanup_error}")
             if cleanup_errors:

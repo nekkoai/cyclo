@@ -110,9 +110,9 @@
               <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M8 12h8M12 8v8" /></svg>
             </div>
             <div>
-              <span class="stat__label">Tokens</span>
+              <span class="stat__label">Gateway usage</span>
               <strong class="stat__value" id="stat-tokens">—</strong>
-              <span class="stat__detail" id="stat-tokens-detail">Across this fleet</span>
+              <span class="stat__detail" id="stat-tokens-detail">Global physical requests</span>
             </div>
           </article>
           <article class="stat stat--attention" id="attention-stat">
@@ -170,7 +170,6 @@
             <select id="sort-select" name="sort">
               <option value="activity">Recent activity</option>
               <option value="name">Team name</option>
-              <option value="tokens">Token usage</option>
               <option value="failures">Failures</option>
             </select>
           </label>
@@ -236,7 +235,7 @@
         <div class="mode-list" aria-label="Instance modes"></div>
 
         <dl class="instance-meta">
-          <div><dt>Health</dt><dd class="runtime-health"></dd></div>
+          <div><dt>Health</dt><dd class="provider-health"></dd></div>
           <div><dt>Project</dt><dd class="project-path"></dd></div>
           <div><dt>Workspaces</dt><dd class="workspace-paths"></dd></div>
           <div><dt>Read-only mounts</dt><dd class="readonly-paths"></dd></div>
@@ -259,21 +258,6 @@
             <strong class="agent-count"></strong>
             <small class="agent-detail"></small>
           </div>
-        </div>
-
-        <div class="usage-block">
-          <div class="usage-block__top">
-            <div>
-              <span>Model usage</span>
-              <strong class="token-total"></strong>
-            </div>
-            <span class="request-count"></span>
-          </div>
-          <div class="usage-meter" aria-hidden="true"><span></span></div>
-          <dl class="usage-split">
-            <div><dt>Input</dt><dd class="input-tokens"></dd></div>
-            <div><dt>Output</dt><dd class="output-tokens"></dd></div>
-          </dl>
         </div>
 
         <div class="instance-errors" hidden>

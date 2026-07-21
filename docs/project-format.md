@@ -99,6 +99,13 @@ each instance's metadata.
 `--offline`, `--host`, `--image`, `--verbose`,
 `--build`, and `--dry-run` still apply to the run.
 
+In 0.2.0, `--image` is one tag override shared by every team in the definition.
+A missing or stale selected tag, as well as `--build`, builds Cyclo's packaged
+team-runtime context into that tag; it does not discover or build a Dockerfile
+from any team repository. The accepted future per-team inheritance contract is
+documented in [Team repositories](team-repositories.md). Until that cutover,
+do not treat `--image` as a stable per-team derived-image build mechanism.
+
 An explicit `--port` and `--foreground` are accepted only when the definition
 contains one team, because either option is ambiguous for several instances.
 `--port` is also incompatible with `--offline`, which intentionally publishes

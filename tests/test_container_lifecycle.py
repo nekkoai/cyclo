@@ -111,21 +111,10 @@ def test_stop_refuses_incomplete_inventory_before_any_side_effect(
 
             return unexpected
 
-    class NoRuntimeWrites:
-        container_name = "cyclo-provider-runtime-test"
-
-        def __getattr__(self, name: str):
-            def unexpected(*_args, **_kwargs):
-                events.append(f"runtime:{name}")
-                raise AssertionError(f"unexpected runtime operation: {name}")
-
-            return unexpected
-
     with pytest.raises(CycloError, match="cannot enumerate Cyclo instance state"):
         stop_instance(
             store,
             NoDockerWrites(),  # type: ignore[arg-type]
-            NoRuntimeWrites(),  # type: ignore[arg-type]
             selected.id,
         )
 
@@ -149,19 +138,6 @@ def test_repair_does_not_revoke_or_delete_lifecycle_active_team(
     events: list[object] = []
     monkeypatch.setattr(
         docker,
-        "ensure_network",
-        lambda name, *, offline: events.append(("network", name, offline))
-        or "network-id",
-    )
-    monkeypatch.setattr(
-        docker,
-        "connect_runtime",
-        lambda network, runtime, alias: events.append(
-            ("connect", network, runtime, alias)
-        ),
-    )
-    monkeypatch.setattr(
-        docker,
         "stop_remove",
         lambda *_args, **_kwargs: pytest.fail(
             "repair must not remove a paused/restarting team"
@@ -175,31 +151,13 @@ def test_repair_does_not_revoke_or_delete_lifecycle_active_team(
         ),
     )
 
-    class Runtime:
-        container_name = "cyclo-provider-runtime-test"
-
-        @staticmethod
-        def status():
-            return SimpleNamespace(running=True, container_id="runtime-id")
-
-        @staticmethod
-        def update_clients(instances) -> None:
-            events.append(("clients", tuple(item.id for item in instances)))
-
-        @staticmethod
-        def rotate_client_token(_identifier: str) -> None:
-            pytest.fail("repair must not revoke a lifecycle-active team token")
-
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
     monkeypatch.setattr("cyclo.cli.Docker", lambda: docker)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_service", lambda _args, _store: Runtime()
-    )
 
     assert cmd_repair(SimpleNamespace()) == 0
 
     assert store.load(selected.id).active is True
-    assert ("clients", (selected.id,)) in events
+    assert events == []
 
 
 @pytest.mark.parametrize("flag", ["Paused", "Restarting"])

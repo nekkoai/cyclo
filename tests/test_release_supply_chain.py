@@ -11,9 +11,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME = ROOT / "src" / "cyclo" / "team_runtime_context"
-GATEWAY = ROOT / "src" / "cyclo" / "credential_gateway" / "gateway_context"
-PROVIDER_RUNTIME = ROOT / "src" / "cyclo" / "provider_runtime_context"
+RUNTIME = ROOT / "src" / "cyclo" / "_bundle" / "team"
+GATEWAY = ROOT / "src" / "cyclo" / "_bundle" / "gateway"
+BUNDLE = ROOT / "src" / "cyclo" / "_bundle"
 
 
 def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() -> None:
@@ -40,8 +40,9 @@ def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() ->
     for dependency in lock["packages"].values():
         resolved = dependency.get("resolved")
         if resolved:
-            assert resolved.startswith("https://registry.npmjs.org/")
-            assert dependency.get("integrity")
+            if not resolved.startswith("file:"):
+                assert resolved.startswith("https://registry.npmjs.org/")
+                assert dependency.get("integrity")
 
 
 def test_gateway_node_install_is_locked_to_the_runtime_pi_generation() -> None:
@@ -49,41 +50,33 @@ def test_gateway_node_install_is_locked_to_the_runtime_pi_generation() -> None:
     package = json.loads((GATEWAY / "package.json").read_text(encoding="utf-8"))
     lock = json.loads((GATEWAY / "package-lock.json").read_text(encoding="utf-8"))
 
-    expected = {"@earendil-works/pi-ai": "0.80.6"}
     assert "npm ci" in dockerfile
     assert "command -v flock" in dockerfile
     assert re.search(r"^FROM node:22-[^@\s]+@sha256:[0-9a-f]{64}", dockerfile)
     assert package["private"] is True
-    assert package["dependencies"] == expected
+    assert package["dependencies"]["@earendil-works/pi-ai"] == "0.80.6"
+    assert "@cyclo/component" in package["dependencies"]
+    assert "@cyclo/provider" in package["dependencies"]
     assert lock["lockfileVersion"] == 3
-    assert lock["packages"][""]["dependencies"] == expected
+    assert lock["packages"][""]["dependencies"] == package["dependencies"]
     for dependency in lock["packages"].values():
         resolved = dependency.get("resolved")
         if resolved:
-            assert resolved.startswith("https://registry.npmjs.org/")
-            assert dependency.get("integrity")
+            assert resolved.startswith(("https://registry.npmjs.org/", "file:")) or resolved.startswith("../")
+            if not dependency.get("link"):
+                assert dependency.get("integrity")
 
 
-def test_provider_runtime_is_locked_and_shares_the_safe_metadata_contract() -> None:
-    dockerfile = (PROVIDER_RUNTIME / "Dockerfile").read_text(encoding="utf-8")
-    package = json.loads(
-        (PROVIDER_RUNTIME / "package.json").read_text(encoding="utf-8")
-    )
-    lock = json.loads(
-        (PROVIDER_RUNTIME / "package-lock.json").read_text(encoding="utf-8")
-    )
-
-    assert "npm ci --omit=dev" in dockerfile
-    assert re.search(r"^FROM node:22-[^@\s]+@sha256:[0-9a-f]{64}", dockerfile)
-    assert package["private"] is True
-    assert package["dependencies"] == {}
-    assert lock["lockfileVersion"] == 3
-    assert lock["packages"][""].get("dependencies", {}) == {}
-    assert json.loads(
-        (PROVIDER_RUNTIME / "safe-model-fields.json").read_text(encoding="utf-8")
-    ) == json.loads(
-        (GATEWAY / "safe-model-fields.json").read_text(encoding="utf-8")
-    )
+def test_every_shipped_component_has_a_pinned_lock_and_declaration() -> None:
+    for name in ("component", "provider", "gateway", "passthrough", "pi-provider", "team"):
+        package = BUNDLE / name
+        lock = json.loads((package / "package-lock.json").read_text(encoding="utf-8"))
+        assert lock["lockfileVersion"] == 3
+        assert (package / "package.json").is_file()
+        if name in {"gateway", "passthrough", "team"}:
+            assert (package / "Dockerfile").is_file()
+        if name in {"gateway", "passthrough"}:
+            assert (package / "component.conf").is_file()
 
 
 def test_workflow_actions_are_pinned_to_full_commits() -> None:
@@ -145,11 +138,10 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert "tools/release-acceptance" in release
     assert "tools/runtime-write-acceptance" in release
     assert "docker build --pull" in release
-    assert "src/cyclo/provider_runtime_context" in release
-    assert "gateway providers" in release
+    assert "src/cyclo/_bundle/team" in release
+    assert "gateway" in release
     assert "cyclo gateway providers" in acceptance
-    assert "CYCLO_PROVIDER_RUNTIME_IMAGE" in acceptance
-    assert "intentionally absent provider runtime" in acceptance
+    assert "CYCLO_PROVIDER_RUNTIME_IMAGE" not in acceptance
     assert not re.search(r"\bgh\s", release)
     assert "git push" not in release
     assert "api.github.com" not in release

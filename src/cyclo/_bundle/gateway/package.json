@@ -1,0 +1,23 @@
+{
+  "name": "@cyclo/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cyclo credential gateway component",
+  "bin": {
+    "cyclo-gateway-component": "src/main.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.12.1",
+    "@connectrpc/connect": "2.1.2",
+    "@cyclo/component": "file:../component",
+    "@cyclo/provider": "file:../provider",
+    "@earendil-works/pi-ai": "0.80.6"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

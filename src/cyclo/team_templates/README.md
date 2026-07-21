@@ -31,6 +31,12 @@ generic filesystem task/job protocol, while each repository contains only its
 loop-specific roles. No external runtime installation or source checkout is
 needed.
 
+The templates also omit `Dockerfile` because they need no packages beyond the
+standard team runtime. Cyclo's accepted optional team-image contract uses a
+normal Dockerfile derived from `CYCLO_TEAM_BASE`, but automatic repository
+Dockerfile builds are not implemented in 0.2.0. See the installed Cyclo
+documentation for the full team-repository contract.
+
 ## Included loops
 
 - `plan-execute-verify`: a bounded evaluator/optimizer loop for general coding
