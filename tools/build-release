@@ -62,17 +62,18 @@ git archive --format=tar HEAD | tar -xf - -C "$source_tree"
 printf '%s\n' '==> source tests'
 (
     cd "$source_tree"
-    npm ci --ignore-scripts \
-        --prefix src/cyclo/credential_gateway/gateway_context
-    npm ci --ignore-scripts \
-        --prefix src/cyclo/provider_runtime_context
+    for package in component provider gateway passthrough pi-provider team; do
+        npm ci --ignore-scripts --prefix "src/cyclo/_bundle/$package"
+    done
     "$venv/bin/python" -m pytest -q \
         --ignore=tests/test_release_manifest.py \
         --ignore=tests/test_secret_scan.py
     GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree \
         "$venv/bin/python" -m pytest -q \
         tests/test_release_manifest.py tests/test_secret_scan.py
-    node --test tests/*.mjs
+    for package in component provider gateway passthrough pi-provider; do
+        npm test --prefix "src/cyclo/_bundle/$package"
+    done
     find . -type f -exec sh -c '
         for script do
             first=
@@ -85,12 +86,10 @@ printf '%s\n' '==> source tests'
 )
 
 printf '%s\n' '==> dependency audits'
-npm audit --package-lock-only --omit=dev --audit-level=high \
-    --prefix "$source_tree/src/cyclo/credential_gateway/gateway_context"
-npm audit --package-lock-only --omit=dev --audit-level=high \
-    --prefix "$source_tree/src/cyclo/team_runtime_context"
-npm audit --package-lock-only --omit=dev --audit-level=high \
-    --prefix "$source_tree/src/cyclo/provider_runtime_context"
+for package in component provider gateway passthrough pi-provider team; do
+    npm audit --package-lock-only --omit=dev --audit-level=high \
+        --prefix "$source_tree/src/cyclo/_bundle/$package"
+done
 
 printf '%s\n' '==> wheel-only acceptance'
 CYCLO_RELEASE_BUILD_PYTHON="$venv/bin/python" \
@@ -120,42 +119,34 @@ wheel=$dist/cyclo_agent-$version-py3-none-any.whl
 printf '%s\n' '==> packaged example teams'
 for template in adversarial-audit plan-execute-verify test-driven-repair; do
     team=$work_root/team-$template
-    project=$work_root/project-$template
-    state=$work_root/state-$template
-    mkdir -p "$project"
     HOME=$home XDG_STATE_HOME=$home/.local/state \
         "$venv/bin/cyclo" init "$team" \
         --template "$template" \
         --model openai-codex/release-verification
     HOME=$home XDG_STATE_HOME=$home/.local/state \
         "$venv/bin/cyclo" validate "$team"
-    HOME=$home XDG_STATE_HOME=$home/.local/state \
-        "$venv/bin/cyclo" --state-root "$state" run \
-        --name "release-$template" --dry-run "$team" "$project" >/dev/null
 done
 
 printf '%s\n' '==> credential-free Docker images'
 docker build --pull \
-    --tag "cyclo-runtime:release-$short_commit" \
-    --file "$source_tree/src/cyclo/team_runtime_context/Dockerfile" \
-    "$source_tree/src/cyclo/team_runtime_context"
+    --tag "cyclo-team:release-$short_commit" \
+    --file "$source_tree/src/cyclo/_bundle/team/Dockerfile" \
+    "$source_tree/src/cyclo/_bundle"
 PYTHON="$venv/bin/python" \
     "$source_tree/tools/runtime-write-acceptance" \
-    "cyclo-runtime:release-$short_commit"
+    "cyclo-team:release-$short_commit"
 docker build --pull \
     --tag "cyclo-gateway:release-$short_commit" \
-    --file "$source_tree/src/cyclo/credential_gateway/gateway_context/Dockerfile" \
-    "$source_tree/src/cyclo/credential_gateway/gateway_context"
+    --file "$source_tree/src/cyclo/_bundle/gateway/Dockerfile" \
+    "$source_tree/src/cyclo/_bundle"
 docker build --pull \
-    --tag "cyclo-provider-runtime:release-$short_commit" \
-    --file "$source_tree/src/cyclo/provider_runtime_context/Dockerfile" \
-    "$source_tree/src/cyclo/provider_runtime_context"
-docker run --rm --network none --entrypoint node \
-    "cyclo-provider-runtime:release-$short_commit" --check /app/server.mjs
+    --tag "cyclo-passthrough:release-$short_commit" \
+    --file "$source_tree/src/cyclo/_bundle/passthrough/Dockerfile" \
+    "$source_tree/src/cyclo/_bundle"
 docker run --rm --network none \
     --env CYCLO_HOST_UID=1000 \
     --env CYCLO_HOST_GID=1000 \
-    "cyclo-runtime:release-$short_commit" sh -ceu '
+    "cyclo-team:release-$short_commit" sh -ceu '
         python3 --version
         node --version
         npm --version
@@ -174,28 +165,7 @@ docker run --rm --network none \
         pi --offline --help > /tmp/pi-help
         grep -F "Extension CLI Flags" /tmp/pi-help
     '
-providers_output=$work_root/gateway-providers
-HOME=$home XDG_STATE_HOME=$home/.local/state \
-    "$venv/bin/cyclo" \
-    --gateway-image "cyclo-gateway:release-$short_commit" \
-    gateway providers > "$providers_output"
-grep -F "$(printf 'PROVIDER\tDESCRIPTION\tAUTH\tLOGIN')" \
-    "$providers_output" >/dev/null
-grep -F "cyclo gateway login anthropic" "$providers_output" >/dev/null
-grep -F "cyclo gateway login openai --api-key-stdin" \
-    "$providers_output" >/dev/null
-docker run --rm --network none \
-    "cyclo-gateway:release-$short_commit" providers.mjs >/dev/null
-oauth_output=$work_root/oauth-login
-if printf 'q\n' | docker run --rm --interactive \
-    --security-opt no-new-privileges --cap-drop ALL --pids-limit 256 \
-    --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-    --network none "cyclo-gateway:release-$short_commit" \
-    login.mjs openai-codex > "$oauth_output" 2>&1; then
-    fail "cancelled OAuth login unexpectedly succeeded"
-fi
-grep -F "Select OpenAI Codex login method" "$oauth_output" >/dev/null
-grep -F "login failed: Login cancelled" "$oauth_output" >/dev/null
+docker run --rm --network none "cyclo-gateway:release-$short_commit" providers >/dev/null
 
 [ -z "$(git status --porcelain --untracked-files=normal)" ] \
     || fail "release verification modified the committed tree"

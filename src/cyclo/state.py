@@ -82,6 +82,8 @@ class Instance:
     project_mounts: list[dict[str, str]] = field(default_factory=list)
     legacy_project_read_only: bool = False
     launch_id: str = ""
+    provider_socket_path: str = ""
+    provider_generation: str = ""
 
     @classmethod
     def from_json(cls, data: dict[str, object]) -> "Instance":
@@ -111,6 +113,8 @@ class Instance:
             "project_description",
             "project_generation",
             "launch_id",
+            "provider_socket_path",
+            "provider_generation",
         )
         for name in string_fields:
             if name in payload and not isinstance(payload[name], str):
@@ -138,6 +142,16 @@ class Instance:
             raise TypeError("port must be null or an integer from 1 to 65535")
         instance = cls(**payload)  # type: ignore[arg-type]
         validate_instance_id(instance.id)
+        if instance.provider_socket_path:
+            provider_socket = Path(instance.provider_socket_path)
+            if not provider_socket.is_absolute():
+                raise TypeError("provider_socket_path must be empty or absolute")
+            if provider_socket.name != "component.sock":
+                raise TypeError("provider_socket_path must end in component.sock")
+        if bool(instance.provider_socket_path) != bool(instance.provider_generation):
+            raise TypeError(
+                "provider_socket_path and provider_generation must be set together"
+            )
         expected_container = f"cyclo-{instance.id}"
         expected_network = f"{expected_container}-net"
         if instance.container_name != expected_container:
@@ -172,30 +186,15 @@ class StateStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = (root or default_state_root()).expanduser().resolve()
         self.instances_dir = self.root / "instances"
-        self.gateway_registry = self.root / "gateway"
-        self.provider_runtime_root = self.root / "provider-runtime"
+        self.components_root = self.root / "components"
         self.lock_path = self.root / "control.lock"
 
     def ensure(self) -> None:
-        if self.provider_runtime_root.is_symlink():
-            raise CycloError(
-                "refusing symlinked provider-runtime state root: "
-                f"{self.provider_runtime_root}"
-            )
-        if (
-            self.provider_runtime_root.exists()
-            and not self.provider_runtime_root.is_dir()
-        ):
-            raise CycloError(
-                "provider-runtime state root is not a directory: "
-                f"{self.provider_runtime_root}"
-            )
-        for path in (
-            self.root,
-            self.instances_dir,
-            self.gateway_registry,
-            self.provider_runtime_root,
-        ):
+        for path in (self.root, self.instances_dir, self.components_root):
+            if path.is_symlink():
+                raise CycloError(f"refusing symlinked Cyclo state directory: {path}")
+            if path.exists() and not path.is_dir():
+                raise CycloError(f"Cyclo state path is not a directory: {path}")
             path.mkdir(parents=True, mode=0o700, exist_ok=True)
             os.chmod(path, 0o700)
 

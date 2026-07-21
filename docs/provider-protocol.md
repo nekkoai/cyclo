@@ -29,8 +29,8 @@ There are two socket directions:
 - each component gets a different writable directory for `provider.sock`, and
   only the provider runtime receives a read-only mount of that directory.
 
-The host controller uses a third, mode-`0600` admin socket in the private socket
-root; no provider mounts that root or admin socket. Components never mount one
+The host controller uses a third, mode-`0600` control socket in the private socket
+root; no provider mounts that root or control socket. Components never mount one
 another's directories. Provider socket inodes use mode `0666` so unrelated
 unprivileged image UIDs interoperate; distinct directory mounts control
 reachability and bearer capabilities control authority. HTTP preserves
@@ -69,8 +69,9 @@ or environment values:
   and inference calls. It is bound to the component prefix and generation and
   scoped to the exact input models declared in `host.conf`.
 
-Neither token is a physical provider credential or a team bearer. Neither can
-use gateway login, administration, or usage endpoints. An explicit
+Neither token is a physical provider credential, team bearer, or gateway
+capability. Components have no transport to gateway catalogue, usage, or
+inference endpoints. An explicit
 `cyclo provider restart PREFIX` first revokes the old route and upstream
 authority, then stops the old process, rotates both token files, and only then
 publishes replacement authority.
@@ -156,7 +157,7 @@ one immutable in-memory snapshot from it, the concrete gateway catalogue,
 expected provider state, and validated recovery registrations. A component can
 see only its declared inputs, and those inputs may be concrete gateway models or
 outputs from earlier lines. The host refreshes the concrete gateway catalogue
-through its private admin Unix socket after gateway changes; it does not reload
+through its private control Unix socket after gateway changes; it does not reload
 `host.conf` or involve provider components.
 
 A missing or empty `host.conf` exposes the concrete gateway catalogue unchanged
@@ -169,7 +170,7 @@ Each normal catalogue or inference request captures the current snapshot. It
 does not reread configuration or registry files, refetch and reconstruct the
 whole catalogue, or health-probe every component. Successful registration,
 capability reload, or catalogue refresh publishes a new snapshot. Capability
-reload and catalogue refresh are separate admin operations, so revocation does
+reload and catalogue refresh are separate control operations, so revocation does
 not depend on gateway availability. Inference dispatch still verifies the
 selected component socket against its pinned device/inode.
 
@@ -181,8 +182,9 @@ before sending the control request. A changed malformed registry fails closed
 by revoking all dynamic clients and component routes until repaired. The
 watcher never reads `host.conf`; provider configuration remains restart-only.
 
-The host uses two empty-body operations on the mode-`0600` admin Unix socket and
-requires a `204` acknowledgement:
+The host authenticates a distinct control capability on the mode-`0600` control
+Unix socket. It can read the merged catalogue with `GET /providers` and use two
+empty-body operations that require a `204` acknowledgement:
 
 ```text
 POST /_cyclo/v1/control/reload
@@ -192,7 +194,8 @@ POST /_cyclo/v1/control/refresh-catalog
 `reload` reads only the mounted expected-provider and client registries.
 `refresh-catalog` reads only the concrete catalogue from the credential
 gateway. Neither operation reparses `host.conf` or health-probes every
-component. Provider and team capabilities cannot call either endpoint.
+component. The control capability is rejected on every workload/inference
+path, and provider and team capabilities cannot call control endpoints.
 If a registry reload cannot be acknowledged, the host stops the runtime so an
 old capability cannot remain live. A failed catalogue refresh instead leaves
 the preceding safe snapshot running. Gateway login or restart may therefore
@@ -288,7 +291,7 @@ request-context origin: 16 per project, 32 globally, and at most 24 nested
 bodies retained. The TCP listener permits 32 connections per team-facing
 interface and 256 globally. Every prefix has a separate UDS listener capped at
 64 connections and a prefix-local 200 request/s token bucket; team interfaces
-have a 500 request/s token bucket. Host-admin control has its own inaccessible
+have a 500 request/s token bucket. Host control has its own inaccessible
 UDS listener. A component should also bound concurrent transformations; Cyclo
 runs it with a 512 MiB memory/swap limit, two CPUs, a PID limit, a read-only
 root, and a small writable tmpfs.

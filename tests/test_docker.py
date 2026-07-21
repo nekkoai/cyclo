@@ -21,6 +21,8 @@ from cyclo.team import load_team
 
 
 def instance(team: Path, project: Path) -> Instance:
+    provider_socket_dir = project.parent / ".cyclo-provider"
+    provider_socket_dir.mkdir(exist_ok=True)
     return Instance(
         id="review-team-123",
         team_name="review-team",
@@ -34,6 +36,8 @@ def instance(team: Path, project: Path) -> Instance:
         image="cyclo-runtime:test",
         team_write=False,
         offline=True,
+        provider_socket_path=str(provider_socket_dir / "component.sock"),
+        provider_generation="provider-generation",
     )
 
 
@@ -67,6 +71,7 @@ def test_container_argv_has_only_scoped_runtime_mounts(
         jobs_dir=queue / "jobs",
         agents_dir=queue / "agents",
         pi_root=pi,
+        provider_socket_dir=Path(selected_instance.provider_socket_path).parent,
         port=0,
     )
 
@@ -78,12 +83,19 @@ def test_container_argv_has_only_scoped_runtime_mounts(
     assert "AGENTWS_TEAM_ROSTER=/team/team" in command
     assert "AGENTWS_WORKSPACE=/workspace" in command
     assert "CYCLO_PROVIDER_RUNTIME_HEALTH_URL" not in command
+    assert "CYCLO_PROVIDER_SOCKET=/run/cyclo/provider/component.sock" in command
+    assert "CYCLO_PROVIDER_TOKEN" not in rendered
+    assert "CYCLO_PROVIDER_BASE_URL" not in rendered
     assert f"type=bind,src={team_repo},dst=/team,readonly" in command
     assert f"type=bind,src={project_repo},dst=/workspace" in command
     assert f"type=bind,src={project_repo},dst=/workspace,readonly" not in command
     assert f"type=bind,src={run},dst=/agentws,readonly" in command
     assert f"type=bind,src={pi},dst=/home/cyclo/.pi" in command
     assert f"type=bind,src={pi},dst=/home/cyclo/.pi,readonly" not in command
+    assert (
+        f"type=bind,src={project_repo.parent / '.cyclo-provider'},"
+        "dst=/run/cyclo/provider,readonly"
+    ) in command
     assert f"type=bind,src={queue / 'tasks'},dst=/agentws/tasks" in command
     assert "gateway-token" not in rendered
     assert "/var/run/docker.sock" not in rendered
@@ -106,8 +118,9 @@ def test_legacy_project_mount_is_always_writable(
     pi.mkdir()
     for name in ("tasks", "jobs", "agents"):
         (queue / name).mkdir(parents=True)
+    selected_instance = instance(team_repo, project_repo)
     spec = ContainerSpec(
-        instance=instance(team_repo, project_repo),
+        instance=selected_instance,
         team=load_team(team_repo),
         project=project_repo,
         runtime_root=runtime,
@@ -115,6 +128,7 @@ def test_legacy_project_mount_is_always_writable(
         jobs_dir=queue / "jobs",
         agents_dir=queue / "agents",
         pi_root=pi,
+        provider_socket_dir=Path(selected_instance.provider_socket_path).parent,
         port=0,
     )
 
@@ -144,8 +158,9 @@ def test_named_project_mounts_use_read_only_namespace_and_explicit_modes(
         ProjectMount("source", source, "rw", 4),
         ProjectMount("docs", docs, "ro", 5),
     )
+    selected_instance = instance(team_repo, tmp_path)
     spec = ContainerSpec(
-        instance=instance(team_repo, tmp_path),
+        instance=selected_instance,
         team=load_team(team_repo),
         project=tmp_path,
         runtime_root=runtime,
@@ -153,6 +168,7 @@ def test_named_project_mounts_use_read_only_namespace_and_explicit_modes(
         jobs_dir=queue / "jobs",
         agents_dir=queue / "agents",
         pi_root=pi,
+        provider_socket_dir=Path(selected_instance.provider_socket_path).parent,
         port=0,
         project_mounts=mounts,
         workspace_layout=layout,
@@ -194,8 +210,9 @@ def test_container_command_rejects_path_like_named_mount(
         path.mkdir()
     for name in ("tasks", "jobs", "agents"):
         (queue / name).mkdir(parents=True)
+    selected_instance = instance(team_repo, tmp_path)
     spec = ContainerSpec(
-        instance=instance(team_repo, tmp_path),
+        instance=selected_instance,
         team=load_team(team_repo),
         project=tmp_path,
         runtime_root=runtime,
@@ -203,6 +220,7 @@ def test_container_command_rejects_path_like_named_mount(
         jobs_dir=queue / "jobs",
         agents_dir=queue / "agents",
         pi_root=pi,
+        provider_socket_dir=Path(selected_instance.provider_socket_path).parent,
         port=0,
         project_mounts=(ProjectMount("..", source, "rw", 1),),
         workspace_layout=layout,
@@ -406,7 +424,7 @@ def test_container_removal_rejects_foreign_label(monkeypatch) -> None:
     assert commands == []
 
 
-def test_network_removal_uses_inspected_network_and_member_ids(monkeypatch) -> None:
+def test_network_removal_refuses_attached_containers(monkeypatch) -> None:
     docker = Docker()
     commands: list[list[str]] = []
     monkeypatch.setattr(
@@ -427,21 +445,13 @@ def test_network_removal_uses_inspected_network_and_member_ids(monkeypatch) -> N
         or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
     )
 
-    docker.remove_network("cyclo-alpha-net", "cyclo-gateway-test")
+    with pytest.raises(CycloError, match="containers remain attached"):
+        docker.remove_network("cyclo-alpha-net")
 
-    assert commands == [
-        [
-            "docker",
-            "network",
-            "disconnect",
-            "verified-network-id",
-            "verified-gateway-id",
-        ],
-        ["docker", "network", "rm", "verified-network-id"],
-    ]
+    assert commands == []
 
 
-def test_runtime_connection_uses_verified_resource_ids(monkeypatch) -> None:
+def test_network_removal_uses_verified_resource_id(monkeypatch) -> None:
     docker = Docker()
     commands: list[list[str]] = []
     monkeypatch.setattr(
@@ -460,18 +470,8 @@ def test_runtime_connection_uses_verified_resource_ids(monkeypatch) -> None:
         or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
     )
 
-    docker.connect_runtime(
-        "verified-network-id", "verified-runtime-id", "cyclo-provider-runtime-test"
-    )
+    docker.remove_network("cyclo-alpha-net")
 
     assert commands == [
-        [
-            "docker",
-            "network",
-            "connect",
-            "--alias",
-            "cyclo-provider-runtime-test",
-            "verified-network-id",
-            "verified-runtime-id",
-        ]
+        ["docker", "network", "rm", "verified-network-id"]
     ]

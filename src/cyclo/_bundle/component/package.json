@@ -1,0 +1,46 @@
+{
+  "name": "@cyclo/component",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cyclo's contract-first component model",
+  "files": [
+    "gen",
+    "proto",
+    "src"
+  ],
+  "exports": {
+    "./bindings": "./src/bindings.mjs",
+    "./contract": {
+      "types": "./gen/cyclo/component/v1/component_pb.d.ts",
+      "default": "./gen/cyclo/component/v1/component_pb.js"
+    },
+    "./declaration": "./src/declaration.mjs",
+    "./health": "./src/health.mjs",
+    "./paths": "./src/paths.mjs",
+    "./schema": "./src/schema.mjs",
+    "./schema.json": "./gen/schema.json",
+    "./server": "./src/server.mjs",
+    "./transport": "./src/transport.mjs"
+  },
+  "bin": {
+    "cyclo-component-check": "src/check.mjs"
+  },
+  "scripts": {
+    "generate": "buf lint && buf generate && buf build --as-file-descriptor-set --exclude-source-info -o gen/schema.json",
+    "check": "node src/check.mjs",
+    "test": "npm run generate && node --test --test-concurrency=1"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.12.1",
+    "@connectrpc/connect": "2.1.2",
+    "@connectrpc/connect-node": "2.1.2"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "1.72.0",
+    "@bufbuild/protoc-gen-es": "2.12.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

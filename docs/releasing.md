@@ -37,22 +37,20 @@ git status --short
 Build and smoke-test all three credential-free image contexts:
 
 ```sh
-docker build --pull -t cyclo-runtime:0.2.0 \
-  -f src/cyclo/team_runtime_context/Dockerfile \
-  src/cyclo/team_runtime_context
+docker build --pull -t cyclo-team:0.2.0 \
+  -f src/cyclo/_bundle/team/Dockerfile \
+  src/cyclo/_bundle
 docker build --pull -t cyclo-gateway:0.2.0 \
-  -f src/cyclo/credential_gateway/gateway_context/Dockerfile \
-  src/cyclo/credential_gateway/gateway_context
-docker build --pull -t cyclo-provider-runtime:0.2.0 \
-  -f src/cyclo/provider_runtime_context/Dockerfile \
-  src/cyclo/provider_runtime_context
+  -f src/cyclo/_bundle/gateway/Dockerfile \
+  src/cyclo/_bundle
+docker build --pull -t cyclo-passthrough:0.2.0 \
+  -f src/cyclo/_bundle/passthrough/Dockerfile \
+  src/cyclo/_bundle
 docker run --rm --network none \
   -e CYCLO_HOST_UID=1000 -e CYCLO_HOST_GID=1000 \
-  cyclo-runtime:0.2.0 python3 --version
+  cyclo-team:0.2.0 python3 --version
 docker run --rm --network none cyclo-gateway:0.2.0 supported-providers.mjs
 docker run --rm --network none cyclo-gateway:0.2.0 providers.mjs
-docker run --rm --network none --entrypoint node \
-  cyclo-provider-runtime:0.2.0 --check /app/server.mjs
 ```
 
 The worktree must be clean and tests must pass on the exact commit before a

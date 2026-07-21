@@ -32,22 +32,22 @@ Python package, repository, and product name remain `cyclo` and Cyclo.
                            \               /
                             +------+------+
                                    v
-                    cyclo-runtime team containers
+                    cyclo-team team containers
                       one independent instance/team
                     filesystem tasks/jobs + agents
                     writable scoped Pi runtime state
                                |
-                    scoped model capability
+                    read-only provider Unix socket
                                |
                                v
-               cyclo-provider-runtime container
-               catalogue + composition + policy
+               ordered provider components
+               catalogue + composition
                          |                 |
                          |                 v
                          |       networkless provider components
                          v
                     cyclo-gateway container
-                    credentials + concrete proxy + usage
+                    credentials + root provider + usage
                          |                 |
                          v                 v
              cyclo-gateway-store     concrete model providers
@@ -120,8 +120,8 @@ three owned Docker build contexts inside the installed package:
 
 | Resource | Default name | Purpose |
 |---|---|---|
-| Team runtime image | `cyclo-runtime:0.2.0` | Pi, local tools, and the per-team loop |
-| Provider runtime image | `cyclo-provider-runtime:0.2.0` | Merged catalogue, composition policy, and virtual routing |
+| Team image | `cyclo-team:0.2.0` | Pi, local tools, and the per-team loop |
+| Provider images | `cyclo-<prefix>:0.2.0` | Ordered intermediate provider components |
 | Credential gateway image | `cyclo-gateway:0.2.0` | Login, concrete model proxying, credential substitution, and usage |
 | Gateway data volume | `cyclo-gateway-store` | Provider credentials, subscriptions, and retained usage history |
 | Host configuration | `/etc/cyclo/host.conf` | Ordered host-wide provider composition; concrete pass-through when absent or empty |
@@ -147,30 +147,15 @@ resources with `docker rm -f` / `docker network rm`, then retry. The credential
 volume is separate and is not removed by this migration.
 
 Gateway discovery/login builds its packaged image when it is missing or stale.
-Shared provider-runtime and intermediate-provider lifecycle is explicit:
-`cyclo runtime start --build` builds the runtime image on its first start, and
-`cyclo provider build PREFIX|--all` builds component images. `cyclo models`
-never builds or starts anything. `cyclo run` may build its own team-runtime
-image when needed, but never provisions a shared service or provider.
+The gateway is the fixed credential and model catalogue component. Providers
+are the ordered stack declared in `/etc/cyclo/host.conf`; `cyclo providers
+build|start|restart` manages those components. `cyclo models` only queries the
+catalogue and never builds anything. `cyclo run` builds the team image when
+needed and connects that team to the provider socket.
 
-Use `cyclo gateway restart --build`, `cyclo runtime restart --build`,
-`cyclo provider restart PREFIX --build`, or `cyclo run --build` when you
-explicitly want the corresponding rebuild. A `host.conf` edit is data, not an
-image change, and does not cause any rebuild. Apply every such edit without
-`--build`, using `cyclo runtime restart`.
-
-Names can be overridden deliberately:
-
-```sh
-cyclo --gateway-image my-cyclo-gateway:dev \
-  --store-volume my-cyclo-credentials gateway status
-cyclo --provider-runtime-image my-cyclo-provider-runtime:dev runtime start
-cyclo run --image my-cyclo-runtime:dev project.cyclo
-```
-
-The corresponding environment variables are `CYCLO_GATEWAY_IMAGE`,
-`CYCLO_PROVIDER_RUNTIME_IMAGE`, `CYCLO_GATEWAY_STORE`, and
-`CYCLO_RUNTIME_IMAGE`.
+Use `cyclo gateway restart --build` or `cyclo providers restart --build` only
+when you explicitly want an image rebuild. Editing `host.conf` takes effect on
+the next provider restart; it never silently rebuilds an image.
 
 ## Provision the gateway
 
@@ -226,6 +211,12 @@ team repositories, projects, provider components, or team containers. The
 volume also contains the append-only usage ledger used for experiment
 accounting.
 
+The long-running gateway has no unrestricted principal. Cyclo gives it two
+separate host capabilities: one can read the full concrete catalogue and one
+can read aggregate usage. Neither is accepted for inference. The provider
+runtime mounts only the catalogue capability; concrete model calls reach the
+gateway with the original scoped client/team bearer.
+
 Concrete gateway catalogue names come from provisioned accounts: by default
 the name is `PROVIDER`, and `--as NAME` overrides it independently of the
 upstream provider type. The separate provider runtime adds configured virtual
@@ -254,6 +245,20 @@ start it explicitly after the gateway with `cyclo runtime start --build` on a
 fresh installation. Runtime start fails closed if the gateway image/config is
 stale or the gateway has any extra Docker-network attachment; it never changes
 the gateway on your behalf.
+
+When upgrading from a Cyclo version with the former unrestricted gateway
+token, use this order:
+
+```sh
+cyclo gateway restart --build
+cyclo runtime restart --build
+```
+
+The successful gateway restart generates fresh, separate catalogue and usage
+capabilities and then removes only the exact legacy unrestricted-token files.
+The runtime restart replaces its old mount with the catalogue-only capability.
+This ordering is an upgrade requirement; ordinary later login/restart refreshes
+an already-current runtime without replacing it.
 
 `cyclo models` is a non-lifecycle refresh-and-query operation against the
 already-running provider runtime: it replaces the in-memory concrete-catalogue
@@ -323,6 +328,12 @@ gateway-catalogue refresh are separate authenticated snapshot updates, so a
 gateway outage cannot block capability revocation. An unacknowledged revocation
 stops the runtime fail-closed; a failed catalogue refresh retains the previous
 snapshot.
+
+Those host operations use a distinct control capability over a private
+mode-`0600` Unix socket. It authorizes only `GET /providers`,
+`POST /_cyclo/v1/control/reload`, and
+`POST /_cyclo/v1/control/refresh-catalog`; it is never accepted on inference
+paths.
 
 Client and expected-provider files are dynamic authority, unlike `host.conf`.
 Cyclo normally replaces them atomically and waits for the runtime reload's
@@ -450,6 +461,8 @@ my-team/
     implementer.md
     reviewer.md
   AGENTS.md              # optional; Cyclo's bundled protocol is the fallback
+  Dockerfile             # optional derived runtime; accepted cutover design
+  .dockerignore          # recommended when Dockerfile is present
 ```
 
 `team` is a whitespace-delimited roster with an explicit proxy model for every
@@ -475,6 +488,24 @@ hashing them on the host, and limits each definition file to 1 MiB.
 Cyclo records a team generation consisting of its Git commit and a digest of
 the live roster, role files, and optional protocol. Experiments therefore
 remain attributable when the team definition has uncommitted edits.
+
+### Optional team execution image
+
+The accepted component-system contract allows a team repository to add a
+standard Dockerfile that starts with `ARG CYCLO_TEAM_BASE` and
+`FROM ${CYCLO_TEAM_BASE}`, then installs only its additional packages and
+artifacts. A team without that file uses the standard Cyclo image. Reusable
+toolchains remain ordinary Docker inheritance layers; multi-stage builds may
+copy compiled artifacts but do not provide multiple inheritance.
+
+This automatic per-team build path is not implemented in 0.2.0. The current
+`--image` option is one global tag override for the entire run. A missing or
+stale selected tag, as well as `--build`, builds Cyclo's packaged runtime
+context rather than `TEAM/Dockerfile`. Building repository-controlled
+Dockerfiles will be an explicit trusted operation; ordinary runs and team
+self-modification will never trigger it. See
+[Team repositories](team-repositories.md) for the complete repository, image
+identity, lifecycle, composition, and security contract.
 
 ## Create a team and project
 
@@ -652,7 +683,7 @@ Cyclo does not execute container-writable queue files on the host.
 `cyclo dashboard` starts a read-only fleet view on a random loopback port by
 default and prints its URL. It shows the same separate lifecycle and provider-
 runtime states as `cyclo ps`, plus bounded queue summaries, recent task/job
-activity, and gateway token usage for every instance.
+activity, and gateway-accounted token usage for every instance.
 Queue scans are limited per refresh to 4,096 direct entries and 2 MiB of file
 data, with eight recent tasks and twelve recent activity records retained;
 truncation is reported. If the gateway is unavailable, fleet and queue data
@@ -841,7 +872,8 @@ The team container receives:
 It does **not** receive:
 
 - provider credentials or subscription files;
-- the gateway or provider-runtime administrator token, or credential volume;
+- the gateway catalogue/usage capabilities, provider-runtime control
+  capability, or credential volume;
 - the host Pi configuration directory;
 - the Docker socket;
 - the host home directory;
@@ -874,7 +906,7 @@ By default Cyclo uses:
 ```text
 $XDG_STATE_HOME/cyclo/
   control.lock
-  gateway/                    # client registry and controller capabilities
+  gateway/                    # client registry plus catalog/usage capabilities
   provider-runtime/           # registry, capabilities, registration recovery, sockets
   instances/<instance>/
     run.json                  # project, paths, modes, generation, lifecycle

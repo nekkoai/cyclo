@@ -66,8 +66,8 @@ real provider key, or a subscription session.
 | Boundary | Transport | Contract |
 |---|---|---|
 | Host controller -> Docker | Docker CLI on the host | Create, inspect, attach, stop, and remove only explicitly owned resources; no container receives the Docker socket |
-| Host controller -> provider runtime | Atomic replacement of bind-mounted registries plus authenticated HTTP/1.1 reload/ack and catalogue operations over the mode-`0600` admin Unix socket | Publish or revoke dynamic authority durably, make the runtime acknowledge the new snapshot, refresh the concrete gateway input, and read the merged catalogue |
-| Host controller -> credential gateway | Atomic replacement of the hash-only client registry, authenticated loopback HTTP for catalogue/usage, and explicit one-shot login containers | Publish concrete authorization, provision accounts, and observe usage without exposing the credential store |
+| Host controller -> provider runtime | Atomic replacement of bind-mounted registries plus authenticated HTTP/1.1 over the mode-`0600` control Unix socket | The control capability permits only `GET /providers` and the two explicit reload/refresh POSTs; it cannot invoke inference |
+| Host controller -> credential gateway | Atomic replacement of the hash-only client registry, distinct catalogue-only and usage-only loopback capabilities, and explicit one-shot login containers | Publish concrete authorization, provision accounts, and observe usage without an unrestricted gateway principal |
 | Cyclo team PID 1 -> AgentWS | Local subprocess, inherited runtime-lock file descriptor, and exit-status protocol | Recover orphaned jobs before startup, supervise the runner/viewer, and escalate an unsafe runner exit to container teardown |
 | AgentWS worker -> AgentWS queue | Filesystem state through bundled `bin/` commands and locks | Claim one role-compatible job, execute one engine attempt, and durably settle that claim |
 | AgentWS worker -> model engine | One fenced process group using standard streams, or Pi's line-delimited RPC mode | Execute an attempt and reduce engine completion to durable queue state plus a worker exit status |
@@ -240,6 +240,14 @@ Gateway login and restart refresh the concrete catalogue of a running runtime
 through a separate authenticated control operation. That operation never
 reloads `host.conf`.
 
+An upgrade from the former unrestricted gateway-token contract is deliberately
+ordered: run `cyclo gateway restart --build`, then
+`cyclo runtime restart --build`. The gateway restart creates fresh catalogue
+and usage capabilities, verifies the replacement, and only then removes the
+exact legacy unrestricted-token files. The runtime restart mounts the new
+catalogue-only capability. Ordinary later gateway login or restart can refresh
+an already-current runtime without replacing it.
+
 `cyclo provider restart PREFIX` first publishes and acknowledges removal of
 that prefix's expected state and upstream capability, then stops the old
 component. Only afterward does it publish replacement authority and launch the
@@ -264,7 +272,7 @@ calls use a separate pool charged to the originating project: 16 per origin and
 32 globally. At most 12 root bodies and 24 nested bodies are retained globally.
 Bodies remain capped at 16 MiB and must finish within 30 seconds; active
 admission is held through the complete upstream response, while body admission
-is released after upstream response headers. Host-admin control uses its
+is released after upstream response headers. Host control uses its
 separate Unix listener, so a team filling network or workload budgets cannot
 block revocation. Each provider Unix listener is separately capped at 64, and
 requests on it use a 200/s prefix-local token bucket. Team-facing TCP requests
@@ -289,9 +297,10 @@ uses it for any concrete gateway call. Consequently:
 - a component can call only the inputs declared on its own `host.conf` line;
 - nested composition does not create a provider-to-provider transport.
 
-The provider runtime may use a separate gateway-wide capability to read the
-concrete catalogue. That capability is mounted only into the trusted provider
-runtime and is never sent to a team or component.
+The provider runtime mounts the gateway's catalogue-only capability to read the
+concrete catalogue. The usage capability remains available only to the host
+controller and gateway. Neither capability is accepted for inference; concrete
+requests always use the original scoped client/team bearer.
 
 ## Networks and sockets
 
@@ -313,7 +322,7 @@ host-managed Unix-socket directions:
   component's separate read-only directory mount.
 
 Components cannot mount or scan one another's socket directories, nor can they
-mount the sibling host-admin socket. One provider exhausting its own UDS
+mount the sibling host-control socket. One provider exhausting its own UDS
 connection cap therefore cannot occupy another provider's or the controller's
 listener. The filesystem topology provides reachability; bearer capabilities
 provide authorization. HTTP retains streaming, backpressure, cancellation,
@@ -333,11 +342,23 @@ agent can still include that data in a model request.
 ## Teams, projects, and durable work
 
 A team is an ordinary Git repository containing a `team` roster, role prompts,
-and optionally `AGENTS.md`. The roster binds each agent to a role, engine, and
-exact provider/model. A generation combines the repository commit with a
-digest of the live definition, so runs remain attributable with uncommitted
-edits. The project definition has its own semantic digest over its name,
-description, ordered teams, ordered named mounts, resolved paths, and modes.
+and optionally `AGENTS.md`. It is a declarative input, not a Component or
+Provider service. The roster binds each agent to a role, engine, and exact
+provider/model. A generation combines the repository commit with a digest of
+the live definition, so runs remain attributable with uncommitted edits. The
+project definition has its own semantic digest over its name, description,
+ordered teams, ordered named mounts, resolved paths, and modes.
+
+The accepted component-system cutover also permits an optional team
+`Dockerfile` that derives from a Cyclo-compatible base through
+`ARG CYCLO_TEAM_BASE` and `FROM ${CYCLO_TEAM_BASE}`. This is a build recipe for
+extra tools, not a copy of AgentWS, Pi, or provider code. Team generation and
+image generation remain separate: the latter covers the exact base image ID
+and effective Docker build context. A successful candidate is ABI-validated
+before its tag is promoted, and instances run and record its exact image ID.
+Ordinary runs never execute a repository Dockerfile implicitly. This derived
+image path is an accepted design but is not wired into the 0.2.0 CLI; see
+[Team repositories](team-repositories.md).
 
 In normal `project.cyclo` operation, every team and mount has an explicit mode.
 A `rw` team may self-modify; a `rw` mount is a project that may be changed by
@@ -369,7 +390,7 @@ By default, controller and provider-runtime state is below
 
 ```text
 cyclo/
-  gateway/                       # gateway/runtime client records and host capabilities
+  gateway/                       # client records plus catalog/usage capabilities
   provider-runtime/              # registry, tokens, registration recovery, sockets
   instances/<instance>/
     run.json
@@ -386,12 +407,19 @@ usage ledger are not in that tree. They live in the Docker-managed
 state cleanup do not delete it. `cyclo gateway destroy-store` is the separate,
 explicit destructive operation.
 
-The gateway administrator capability remains in a mode-0600 canonical host
-file. On explicit gateway restart, Cyclo atomically copies it into a
-container-readable file beneath a mode-0700 host directory and bind-mounts
-only that exact file read-only at `/run/secrets/cyclo-gateway-admin-token`.
-The capability is never placed in Docker command arguments or container
-environment values.
+The gateway's catalogue and usage capabilities live in separate mode-`0600`
+canonical host files. On explicit gateway restart, Cyclo atomically projects
+each into its own container-readable file beneath a mode-`0700` host directory
+and bind-mounts only those projected files into the gateway, read-only. The
+provider runtime instead receives a read-only bind of the canonical catalogue
+file; it never receives the usage capability. Token bytes never appear in
+Docker arguments or environment values, and neither capability can invoke
+inference.
+
+The provider runtime has a different control capability on its private
+mode-`0600` Unix socket. It permits `GET /providers`,
+`POST /_cyclo/v1/control/reload`, and
+`POST /_cyclo/v1/control/refresh-catalog` only. Workload paths are rejected.
 
 ## Observation and host trust
 
@@ -412,3 +440,10 @@ undeclared project tree into a team container. Teams intentionally share only
 the named mounts in their common `project.cyclo`. Writable Git trees may contain
 hostile hooks or configuration and should be treated accordingly by later
 host-side commands.
+
+Selecting a team Dockerfile for a build changes its status from passive data to
+privileged build input: Docker executes its instructions through the host
+daemon. That operation requires explicit operator intent and review, receives
+no Cyclo credentials or project mounts, and is never triggered by a normal run
+or a writable team modifying itself. Container isolation cannot make an unsafe
+Dockerfile safe to build.

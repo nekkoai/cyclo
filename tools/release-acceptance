@@ -60,8 +60,7 @@ mkdir -p "$dist" "$source_tree" "$empty_home" "$project" "$documentation"
 export HOME=$empty_home
 export XDG_STATE_HOME=$empty_home/.local/state
 unset PYTHONHOME PYTHONPATH \
-    CYCLO_RUNTIME_IMAGE CYCLO_GATEWAY_IMAGE CYCLO_PROVIDER_RUNTIME_IMAGE \
-    CYCLO_GATEWAY_STORE CYCLO_STATE_ROOT \
+    CYCLO_TEAM_IMAGE CYCLO_STATE_ROOT CYCLO_HOST_CONFIG \
     PI_CODING_AGENT_DIR \
     AGENTWS_MAX_JOB_ATTEMPTS AGENTWS_MAX_CONSECUTIVE_FAILURES \
     AGENTWS_RETRY_INITIAL_SECONDS AGENTWS_RETRY_MAX_SECONDS
@@ -114,46 +113,41 @@ set -- "$dist"/cyclo_agent-*.whl
 wheel=$1
 
 printf '%s\n' '==> auditing wheel contents'
-"$venv/bin/python" - "$wheel" <<'PY'
+"$venv/bin/python" - "$wheel" "$repo_root" <<'PY'
 import sys
 import zipfile
+from pathlib import Path
 
 wheel = sys.argv[1]
+source_bundle = Path(sys.argv[2]) / "src" / "cyclo" / "_bundle"
+bundle_components = (
+    "component",
+    "provider",
+    "gateway",
+    "passthrough",
+    "pi-provider",
+    "team",
+)
 forbidden_names = {
     "cyclo/provenance.py",
     "cyclo/runtime.lock.json",
     "cyclo/_agentws/LICENSE",
     "cyclo/_agentws/UPSTREAM.json",
-    "cyclo/credential_gateway/LICENSE",
-    "cyclo/credential_gateway/ORIGIN.md",
-    "cyclo/credential_gateway/UPSTREAM.json",
 }
 required_names = {
     "cyclo/project.py",
-    "cyclo/host_config.py",
-    "cyclo/host_providers.py",
-    "cyclo/provider_runtime.py",
-    "cyclo/provider_service.py",
-    "cyclo/runtime_container.py",
-    "cyclo/credential_gateway/gateway_context/Dockerfile",
-    "cyclo/credential_gateway/gateway_context/model-metadata.mjs",
-    "cyclo/credential_gateway/gateway_context/response-redaction.mjs",
-    "cyclo/credential_gateway/gateway_context/safe-model-fields.json",
-    "cyclo/credential_gateway/gateway_context/safe-model-fields.mjs",
-    "cyclo/team_runtime_context/.dockerignore",
-    "cyclo/team_runtime_context/Dockerfile",
-    "cyclo/team_runtime_context/entrypoint.sh",
-    "cyclo/team_runtime_context/package-lock.json",
-    "cyclo/team_runtime_context/package.json",
-    "cyclo/provider_runtime_context/.dockerignore",
-    "cyclo/provider_runtime_context/Dockerfile",
-    "cyclo/provider_runtime_context/metadata.mjs",
-    "cyclo/provider_runtime_context/package-lock.json",
-    "cyclo/provider_runtime_context/package.json",
-    "cyclo/provider_runtime_context/protocol.mjs",
-    "cyclo/provider_runtime_context/safe-model-fields.json",
-    "cyclo/provider_runtime_context/server.mjs",
 }
+bundle_sources = [source_bundle / "__init__.py"]
+for component in bundle_components:
+    bundle_sources.extend((source_bundle / component).rglob("*"))
+required_names.update(
+    (Path("cyclo/_bundle") / path.relative_to(source_bundle)).as_posix()
+    for path in bundle_sources
+    if path.is_file()
+    and "node_modules" not in path.parts
+    and "__pycache__" not in path.parts
+    and path.suffix not in {".pyc", ".pyo"}
+)
 legacy_package_prefix = "cyclo/" + "vendor" + "_gateway/"
 upstream_https = b"github" + b".com/glguida/"
 upstream_ssh = b"git@" + b"github.com:glguida/"
@@ -180,6 +174,11 @@ with zipfile.ZipFile(wheel) as archive:
         f"legacy package path remains: {name}"
         for name in sorted(names)
         if name.startswith(legacy_package_prefix)
+    )
+    problems.extend(
+        f"installed dependency tree leaked into wheel: {name}"
+        for name in sorted(names)
+        if "node_modules" in Path(name).parts
     )
     for name in sorted(names):
         data = archive.read(name)
@@ -329,8 +328,8 @@ dry_run=$(
 )
 printf '%s\n' "$dry_run"
 case $dry_run in
-    *"cyclo-runtime:"*) ;;
-    *) fail "dry-run did not use the packaged Cyclo runtime image" ;;
+    *"cyclo-team:"*) ;;
+    *) fail "dry-run did not use the packaged Cyclo team image" ;;
 esac
 case $dry_run in
     *"type=bind,src=$team,dst=/team"*) ;;
@@ -353,17 +352,16 @@ cat "$doctor_log"
 
 grep -F 'ok  bundled job-loop ABI:' "$doctor_log" >/dev/null \
     || fail "doctor did not find the packaged job-loop runtime"
-grep -F 'ok  Cyclo credential gateway API:' "$doctor_log" >/dev/null \
-    || fail "doctor did not load Cyclo's packaged gateway"
+grep -F 'ok  credential gateway:' "$doctor_log" >/dev/null \
+    || fail "doctor did not load Cyclo's credential gateway"
 
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     [ "$doctor_status" -eq 1 ] \
         || fail "doctor returned $doctor_status with an intentionally absent provider runtime"
     grep -F 'ok  Docker daemon:' "$doctor_log" >/dev/null \
         || fail "doctor did not accept the Docker daemon"
-    grep -F 'no  provider runtime: provider runtime is not running; run `cyclo runtime start`' \
-        "$doctor_log" >/dev/null \
-        || fail "doctor did not diagnose the intentionally absent provider runtime"
+    grep -F 'no  provider stack:' "$doctor_log" >/dev/null \
+        || fail "doctor did not diagnose the intentionally absent provider stack"
 else
     [ "$doctor_status" -eq 1 ] \
         || fail "doctor returned $doctor_status when Docker was unavailable"

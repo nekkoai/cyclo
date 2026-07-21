@@ -42,7 +42,7 @@ Provider composition and runtime-isolation release.
   globally, request bodies, and inbound-body time while reserving host control
   admission.
 - Give every provider a distinct runtime UDS, give the host a separate private
-  admin UDS, and charge nested work to a separate pool keyed by the originating
+  control UDS, and charge nested work to a separate pool keyed by the originating
   project so composition cannot multiply one team's root quota.
 - Bind each team capability to the provider runtime's interface on that team's
   private network and drop `CAP_NET_RAW` from team containers, preventing
@@ -96,8 +96,14 @@ Provider composition and runtime-isolation release.
   history or inferring failure causes from health timing.
 - End queued Pi RPC attempts on `agent_settled`, so an accepted engine failure
   cannot leave a job claimed merely because Pi's RPC process remains alive.
-- Keep the gateway administrator capability out of Docker command arguments
-  and environment values by mounting an atomically projected token file.
+- Replace the unrestricted gateway token with distinct catalogue-only and
+  usage-only capabilities. Inference accepts only scoped client/team bearers;
+  the provider runtime mounts only the catalogue capability, and its private
+  control capability cannot access inference.
+- Generate fresh scoped capabilities on upgrade, retire only the exact legacy
+  unrestricted-token files after a successful gateway restart, and require the
+  explicit upgrade order `cyclo gateway restart --build` followed by
+  `cyclo runtime restart --build`.
 - Reject malformed persisted project fields and mounts at the state boundary,
   and make `cyclo doctor` prescribe `runtime restart` for an existing stopped
   runtime container.

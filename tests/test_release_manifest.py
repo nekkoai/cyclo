@@ -8,22 +8,34 @@ import shutil
 import subprocess
 import sys
 import tarfile
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tools" / "release-manifest"
+BUNDLE_COMPONENTS = (
+    "component",
+    "provider",
+    "gateway",
+    "passthrough",
+    "pi-provider",
+    "team",
+)
 
 
 def test_release_manifest_scans_every_owned_node_lockfile(tmp_path: Path) -> None:
     namespace = runpy.run_path(str(MANIFEST), run_name="cyclo_release_manifest_test")
     release_root = tmp_path / "release-root"
     expected_lockfiles = {
-        "src/cyclo/credential_gateway/gateway_context/package-lock.json",
-        "src/cyclo/team_runtime_context/package-lock.json",
-        "src/cyclo/provider_runtime_context/package-lock.json",
+        "src/cyclo/_bundle/component/package-lock.json",
+        "src/cyclo/_bundle/gateway/package-lock.json",
+        "src/cyclo/_bundle/passthrough/package-lock.json",
+        "src/cyclo/_bundle/pi-provider/package-lock.json",
+        "src/cyclo/_bundle/provider/package-lock.json",
+        "src/cyclo/_bundle/team/package-lock.json",
     }
     assert {
         path.as_posix() for path in namespace["NODE_LOCK_PATHS"]
@@ -94,6 +106,44 @@ def built_distributions(tmp_path_factory) -> Path:
         pytest.skip("build frontend is not installed")
     assert build.returncode == 0, build.stdout
     return dist
+
+
+def test_built_distributions_contain_the_node_bundle_without_installs(
+    built_distributions: Path,
+) -> None:
+    bundle_root = ROOT / "src" / "cyclo" / "_bundle"
+    source_files = [bundle_root / "__init__.py"]
+    for component in BUNDLE_COMPONENTS:
+        source_files.extend((bundle_root / component).rglob("*"))
+    expected = {
+        (Path("cyclo/_bundle") / path.relative_to(bundle_root)).as_posix()
+        for path in source_files
+        if path.is_file()
+        and "node_modules" not in path.parts
+        and "__pycache__" not in path.parts
+        and path.suffix not in {".pyc", ".pyo"}
+    }
+
+    wheel = next(built_distributions.glob("cyclo_agent-*.whl"))
+    with zipfile.ZipFile(wheel) as archive:
+        wheel_names = set(archive.namelist())
+    assert expected <= wheel_names
+    assert not any("node_modules" in PurePosixPath(name).parts for name in wheel_names)
+
+    sdist = next(built_distributions.glob("cyclo_agent-*.tar.gz"))
+    with tarfile.open(sdist, mode="r:gz") as archive:
+        sdist_names = {
+            "/".join(PurePosixPath(member.name).parts[2:])
+            for member in archive.getmembers()
+            if member.isfile()
+            and len(PurePosixPath(member.name).parts) >= 3
+            and PurePosixPath(member.name).parts[1] == "src"
+        }
+        archive_names = {member.name for member in archive.getmembers()}
+    assert expected <= sdist_names
+    assert not any(
+        "node_modules" in PurePosixPath(name).parts for name in archive_names
+    )
 
 
 def copy_distributions(source: Path, destination: Path) -> None:

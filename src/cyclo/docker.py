@@ -29,6 +29,8 @@ CONTAINER_TEAM = Path("/team")
 CONTAINER_WORKSPACE = Path("/workspace")
 CONTAINER_READONLY = CONTAINER_READONLY_ROOT
 CONTAINER_PI = Path("/home/cyclo/.pi")
+CONTAINER_PROVIDER_ROOT = Path("/run/cyclo/provider")
+CONTAINER_PROVIDER_SOCKET = CONTAINER_PROVIDER_ROOT / "component.sock"
 HOST_PSEUDO_FILESYSTEMS = (
     (Path("/proc"), "host process filesystem"),
     (Path("/sys"), "host system filesystem"),
@@ -218,6 +220,7 @@ class ContainerSpec:
     jobs_dir: Path
     agents_dir: Path
     pi_root: Path
+    provider_socket_dir: Path
     port: int
     verbose: bool = False
     project_mounts: tuple[ProjectMount, ...] = ()
@@ -227,6 +230,20 @@ class ContainerSpec:
 
 def container_command(spec: ContainerSpec) -> list[str]:
     instance = spec.instance
+    provider_socket_dir = spec.provider_socket_dir
+    provider_socket = provider_socket_dir / "component.sock"
+    if (
+        not provider_socket_dir.is_absolute()
+        or provider_socket_dir.is_symlink()
+        or not provider_socket_dir.is_dir()
+    ):
+        raise CycloError(
+            f"invalid Cyclo provider socket directory: {provider_socket_dir}"
+        )
+    if instance.provider_socket_path != str(provider_socket):
+        raise CycloError(
+            "Cyclo instance provider socket does not match its launch configuration"
+        )
     if spec.project_mounts and (
         spec.workspace_layout is None or spec.readonly_layout is None
     ):
@@ -310,6 +327,8 @@ def container_command(spec: ContainerSpec) -> list[str]:
             f"AGENTWS_WORKSPACE={CONTAINER_WORKSPACE}",
             "-e",
             f"CYCLO_PROJECT_MANIFEST={CONTAINER_AGENTWS / 'PROJECT.md'}",
+            "-e",
+            f"CYCLO_PROVIDER_SOCKET={CONTAINER_PROVIDER_SOCKET}",
         ]
     )
     for name in AGENTWS_RETRY_ENVIRONMENT:
@@ -328,10 +347,14 @@ def container_command(spec: ContainerSpec) -> list[str]:
             mount(spec.agents_dir, CONTAINER_AGENTWS / "agents"),
             "--mount",
             # Pi creates lock files and mutable runtime metadata beside its
-            # projected configuration. This per-instance tree contains only a
-            # provider-runtime capability scoped to provider/model names; host
-            # credentials remain inside the gateway.
+            # settings. The provider interface is a separate read-only mount;
+            # no provider credentials or bearer tokens enter this tree.
             mount(spec.pi_root, CONTAINER_PI),
+            "--mount",
+            # A read-only bind still permits connecting to the Unix socket, but
+            # prevents the team from creating or replacing socket-directory
+            # entries on the host.
+            mount(provider_socket_dir, CONTAINER_PROVIDER_ROOT, "ro"),
             "--mount",
             mount(
                 spec.team.root,
@@ -550,32 +573,6 @@ class Docker:
                 result[container_id] = value["Name"]
         return result
 
-    def connect_runtime(
-        self,
-        network_id: str,
-        runtime_container_id: str,
-        runtime_alias: str,
-    ) -> None:
-        info = self._inspect_network(network_id)
-        if info is None:
-            raise CycloError(f"Docker network disappeared before connection: {network_id}")
-        labels = info.get("Labels") or {}
-        if not isinstance(labels, dict) or not isinstance(labels.get(CYCLO_LABEL), str):
-            raise CycloError(f"refusing to connect runtime to non-Cyclo network: {network_id}")
-        if runtime_container_id in self._network_members(info):
-            return
-        self._run(
-            [
-                "docker",
-                "network",
-                "connect",
-                "--alias",
-                runtime_alias,
-                network_id,
-                runtime_container_id,
-            ]
-        )
-
     def start(self, spec: ContainerSpec) -> int | None:
         info = self._owned_container(spec.instance.container_name, spec.instance.id)
         if info is not None:
@@ -691,7 +688,7 @@ class Docker:
             self._run(["docker", "stop", "--timeout", "30", resource_id])
         self._run(["docker", "rm", resource_id])
 
-    def remove_network(self, name: str, runtime_container: str) -> None:
+    def remove_network(self, name: str) -> None:
         info = self._inspect_network(name)
         if info is None:
             return
@@ -701,12 +698,13 @@ class Docker:
         if labels.get(CYCLO_LABEL) != name:
             raise CycloError(f"refusing to remove non-Cyclo network: {name}")
         network_id = self._resource_id(info, kind="network", name=name)
-        for container_id, container_name in self._network_members(info).items():
-            if container_name == runtime_container:
-                self._run(
-                    ["docker", "network", "disconnect", network_id, container_id],
-                    check=False,
-                )
+        members = sorted(self._network_members(info).values())
+        if members:
+            raise CycloError(
+                f"refusing to remove Cyclo network {name} while containers "
+                "remain attached: "
+                + ", ".join(members)
+            )
         self._run(["docker", "network", "rm", network_id])
 
     def logs(self, container: str, *, follow: bool) -> int:

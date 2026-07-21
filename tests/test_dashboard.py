@@ -21,9 +21,18 @@ from cyclo.dashboard import (
     scan_agentws_queue,
     validate_dashboard_host,
 )
+from cyclo.component_stack import (
+    ComponentStatus,
+    DockerStatus,
+    GatewayStatus,
+    StackStatus,
+)
 from cyclo.errors import CycloError
-from cyclo.runtime_container import ProviderRuntimeStatus
 from cyclo.state import Instance, StateStore
+
+
+PROVIDER_GENERATION = "provider-generation"
+PROVIDER_SOCKET = Path("/var/lib/cyclo/providers/component.sock")
 
 
 def instance(identifier: str, *, active: bool = True, offline: bool = False) -> Instance:
@@ -42,6 +51,8 @@ def instance(identifier: str, *, active: bool = True, offline: bool = False) -> 
         offline=offline,
         active=active,
         port=4100 if not offline else None,
+        provider_socket_path=str(PROVIDER_SOCKET),
+        provider_generation=PROVIDER_GENERATION,
     )
 
 
@@ -267,30 +278,89 @@ class FakeDocker:
 class FakeUsage:
     def usage(self) -> dict[str, object]:
         return {
-            "by_client": {
-                "alpha": {"requests": 3, "input_tokens": 100, "output_tokens": 25},
-                "old": {"requests": 1, "input_tokens": 7, "output_tokens": 2},
-            }
+            "totals": {
+                "requests": 4,
+                "input_tokens": 107,
+                "output_tokens": 27,
+            },
+            "by_provider": {
+                "openai-codex": {
+                    "requests": 4,
+                    "input_tokens": 107,
+                    "output_tokens": 27,
+                }
+            },
         }
 
 
-class FakeRuntime:
-    def __init__(self, status: ProviderRuntimeStatus) -> None:
+class FakeProvider:
+    def __init__(self, status: StackStatus) -> None:
         self.selected_status = status
         self.calls = 0
-        self.probe_calls = 0
 
-    def status(self) -> ProviderRuntimeStatus:
+    def status(self) -> StackStatus:
         self.calls += 1
         return self.selected_status
 
-    def probe_operational(self, *, timeout: float) -> None:
-        assert timeout > 0
-        self.probe_calls += 1
+
+def docker_status(
+    *,
+    present: bool = True,
+    running: bool = True,
+    current: bool = True,
+    lifecycle: str | None = None,
+    engine_health: str = "healthy",
+) -> DockerStatus:
+    return DockerStatus(
+        "sha256:" + "1" * 64,
+        "1" * 64 if present else None,
+        running,
+        lifecycle or ("running" if running else "stopped"),
+        engine_health,
+        current,
+    )
 
 
-def ready_runtime() -> FakeRuntime:
-    return FakeRuntime(ProviderRuntimeStatus(True, True, True, "runtime"))
+def provider_status(
+    *,
+    gateway_docker: DockerStatus | None = None,
+    gateway_ready: bool = True,
+    component_name: str | None = None,
+    component_docker: DockerStatus | None = None,
+    component_ready: bool = True,
+) -> StackStatus:
+    gateway_docker = gateway_docker or docker_status()
+    components = ()
+    if component_name is not None:
+        selected_docker = component_docker or docker_status()
+        components = (
+            ComponentStatus(
+                component_name,
+                "passthrough",
+                True,
+                component_ready,
+                component_ready,
+                selected_docker,
+            ),
+        )
+    ready = gateway_ready and all(component.ready for component in components)
+    return StackStatus(
+        PROVIDER_GENERATION,
+        PROVIDER_SOCKET,
+        GatewayStatus(
+            Path("/var/lib/cyclo/gateway/component.sock"),
+            True,
+            gateway_ready,
+            gateway_ready,
+            gateway_docker,
+        ),
+        components,
+        ready,
+    )
+
+
+def ready_provider() -> FakeProvider:
+    return FakeProvider(provider_status())
 
 
 def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
@@ -309,19 +379,20 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     (job / "status").write_text("failed\n", encoding="utf-8")
     (alpha_queue / "agents" / "worker").mkdir()
 
-    runtime = FakeRuntime(ProviderRuntimeStatus(True, True, True, "runtime"))
+    provider = ready_provider()
+    usage = FakeUsage().usage()
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True, "cyclo-old": False}),  # type: ignore[arg-type]
         usage_reader=FakeUsage(),
-        runtime_reader=runtime,
+        provider_reader=provider,
     ).build()
 
-    assert result["version"] == 2
+    assert result["version"] == 3
     assert result["summary"] == {
         "instances": 2,
         "running": 1,
-        "runtime_issues": 0,
+        "provider_issues": 0,
         "attention": 1,
         "tasks": 1,
         "jobs": 1,
@@ -331,6 +402,7 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
         "errors": 0,
     }
     assert result["source_errors"] == []
+    assert result["usage"] == usage
     running, stopped = result["instances"]
     assert running["id"] == "alpha"
     assert running["state"] == "running"
@@ -353,19 +425,15 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
         "read_only_mounts": [],
     }
     assert "project_read_only" not in running["mode"]
-    assert running["usage"] == {
-        "input_tokens": 100,
-        "output_tokens": 25,
-        "total_tokens": 125,
-        "requests": 3,
-    }
+    assert "usage" not in running
     assert stopped["state"] == "stopped"
     assert stopped["health"] == {
         "state": "inactive",
         "reason": "not an active running Cyclo instance",
     }
     assert stopped["agentws_port"] is None
-    assert runtime.calls == 1
+    assert "usage" not in stopped
+    assert provider.calls == 1
 
 
 def test_snapshot_reports_suspended_agents_per_running_instance(
@@ -379,12 +447,12 @@ def test_snapshot_reports_suspended_agents_per_running_instance(
     (runs / "planner-1.suspended").write_text(
         "reason=fatal-agent-safety-error\n", encoding="utf-8"
     )
-    runtime = ready_runtime()
+    provider = ready_provider()
 
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True, "cyclo-beta": True}),  # type: ignore[arg-type]
-        runtime_reader=runtime,
+        provider_reader=provider,
     ).build()
 
     rows = {row["id"]: row for row in result["instances"]}
@@ -393,9 +461,9 @@ def test_snapshot_reports_suspended_agents_per_running_instance(
         "reason": "1 agent suspended: planner-1",
     }
     assert rows["beta"]["health"] == {"state": "ready", "reason": ""}
-    assert result["summary"]["runtime_issues"] == 0
+    assert result["summary"]["provider_issues"] == 0
     assert result["summary"]["attention"] == 1
-    assert runtime.calls == 1
+    assert provider.calls == 1
 
 
 def test_snapshot_reports_unresolved_planner_failure_as_attention(
@@ -413,7 +481,7 @@ def test_snapshot_reports_unresolved_planner_failure_as_attention(
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     assert result["instances"][0]["health"] == {
@@ -438,7 +506,7 @@ def test_snapshot_does_not_report_ready_when_supervisor_state_is_unreadable(
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     health = result["instances"][0]["health"]
@@ -447,7 +515,7 @@ def test_snapshot_does_not_report_ready_when_supervisor_state_is_unreadable(
     assert result["summary"]["attention"] == 1
 
 
-def test_snapshot_preserves_runtime_failure_beside_agent_suspension(
+def test_snapshot_preserves_provider_failure_beside_agent_suspension(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
@@ -461,16 +529,20 @@ def test_snapshot_preserves_runtime_failure_beside_agent_suspension(
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        runtime_reader=FakeRuntime(
-            ProviderRuntimeStatus(True, False, True, "runtime")
+        provider_reader=FakeProvider(
+            provider_status(
+                component_name="fusion",
+                component_docker=docker_status(running=False),
+                component_ready=False,
+            )
         ),
     ).build()
 
     assert result["instances"][0]["health"] == {
-        "state": "runtime-down",
-        "reason": "runtime container stopped; 1 agent suspended: planner-1",
+        "state": "provider-down",
+        "reason": "fusion stopped; 1 agent suspended: planner-1",
     }
-    assert result["summary"]["runtime_issues"] == 1
+    assert result["summary"]["provider_issues"] == 1
     assert result["summary"]["attention"] == 1
 
 
@@ -478,25 +550,35 @@ def test_snapshot_preserves_runtime_failure_beside_agent_suspension(
     ("status", "health_state", "reason"),
     [
         (
-            ProviderRuntimeStatus(False, False, False, None),
-            "runtime-down",
-            "runtime container absent",
+            provider_status(
+                gateway_docker=docker_status(present=False, running=False),
+                gateway_ready=False,
+            ),
+            "provider-down",
+            "gateway absent",
         ),
         (
-            ProviderRuntimeStatus(True, False, True, "runtime"),
-            "runtime-down",
-            "runtime container stopped",
+            provider_status(
+                component_name="fusion",
+                component_docker=docker_status(running=False),
+                component_ready=False,
+            ),
+            "provider-down",
+            "fusion stopped",
         ),
         (
-            ProviderRuntimeStatus(True, True, False, "runtime"),
-            "runtime-stale",
-            "configuration or image stale",
+            provider_status(
+                component_name="fusion",
+                component_docker=docker_status(current=False),
+            ),
+            "provider-stale",
+            "configuration or image stale: fusion",
         ),
     ],
 )
-def test_snapshot_exposes_exact_runtime_health_and_reads_it_once(
+def test_snapshot_exposes_exact_provider_health_and_reads_it_once(
     tmp_path: Path,
-    status: ProviderRuntimeStatus,
+    status: StackStatus,
     health_state: str,
     reason: str,
 ) -> None:
@@ -506,7 +588,7 @@ def test_snapshot_exposes_exact_runtime_health_and_reads_it_once(
         mark_supervisor_ready(queue(store, identifier))
     store.save(instance("stopped", active=False))
     queue(store, "stopped")
-    runtime = FakeRuntime(status)
+    provider = FakeProvider(status)
 
     result = DashboardSnapshot(
         store,
@@ -517,7 +599,7 @@ def test_snapshot_exposes_exact_runtime_health_and_reads_it_once(
                 "cyclo-stopped": False,
             }
         ),  # type: ignore[arg-type]
-        runtime_reader=runtime,
+        provider_reader=provider,
     ).build()
 
     rows = {row["id"]: row for row in result["instances"]}
@@ -529,17 +611,17 @@ def test_snapshot_exposes_exact_runtime_health_and_reads_it_once(
     assert rows["beta"]["health"] == rows["alpha"]["health"]
     assert rows["stopped"]["health"]["state"] == "inactive"
     assert result["summary"]["running"] == 2
-    assert result["summary"]["runtime_issues"] == 1
+    assert result["summary"]["provider_issues"] == 1
     assert result["summary"]["attention"] == 2
-    assert runtime.calls == 1
+    assert provider.calls == 1
 
 
-def test_snapshot_reports_runtime_status_errors_as_unknown(tmp_path: Path) -> None:
-    class BrokenRuntime:
+def test_snapshot_reports_provider_status_errors_as_unknown(tmp_path: Path) -> None:
+    class BrokenProvider:
         calls = 0
 
         @classmethod
-        def status(cls) -> ProviderRuntimeStatus:
+        def status(cls) -> StackStatus:
             cls.calls += 1
             raise CycloError("Docker socket denied")
 
@@ -550,25 +632,20 @@ def test_snapshot_reports_runtime_status_errors_as_unknown(tmp_path: Path) -> No
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        runtime_reader=BrokenRuntime(),
+        provider_reader=BrokenProvider(),
     ).build()
 
     assert result["instances"][0]["health"] == {
-        "state": "runtime-unknown",
-        "reason": "runtime status unavailable: Docker socket denied",
+        "state": "provider-unknown",
+        "reason": "provider status unavailable: Docker socket denied",
     }
-    assert result["summary"]["runtime_issues"] == 1
-    assert BrokenRuntime.calls == 1
+    assert result["summary"]["provider_issues"] == 1
+    assert BrokenProvider.calls == 1
 
 
-def test_snapshot_fails_closed_when_exact_runtime_probe_fails(
+def test_snapshot_fails_closed_when_provider_health_is_not_ready(
     tmp_path: Path,
 ) -> None:
-    class BrokenProbe(FakeRuntime):
-        def probe_operational(self, *, timeout: float) -> None:
-            assert timeout > 0
-            raise CycloError("gateway returned malformed health response")
-
     store = StateStore(tmp_path / "state")
     store.save(instance("alpha"))
     mark_supervisor_ready(queue(store, "alpha"))
@@ -576,17 +653,14 @@ def test_snapshot_fails_closed_when_exact_runtime_probe_fails(
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        runtime_reader=BrokenProbe(
-            ProviderRuntimeStatus(True, True, True, "runtime")
+        provider_reader=FakeProvider(
+            provider_status(gateway_ready=False)
         ),
     ).build()
 
     assert result["instances"][0]["health"] == {
-        "state": "runtime-down",
-        "reason": (
-            "runtime dependency health check failed: "
-            "gateway returned malformed health response"
-        ),
+        "state": "provider-down",
+        "reason": "gateway not ready",
     }
 
 
@@ -600,7 +674,7 @@ def test_snapshot_does_not_persist_an_active_team_inactive_when_not_operational(
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": False}),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     assert result["instances"][0]["state"] == "stale"
@@ -633,7 +707,7 @@ def test_snapshot_exposes_project_definition_and_named_mounts(tmp_path: Path) ->
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({configured.container_name: True}),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     assert result["instances"][0]["project"] == {
@@ -676,7 +750,7 @@ def test_snapshot_isolates_malformed_project_mount_state(tmp_path: Path) -> None
         docker=FakeDocker(
             {good.container_name: True, broken.container_name: True}
         ),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     assert {row["id"] for row in result["instances"]} == {"good", "broken"}
@@ -721,7 +795,7 @@ def test_snapshot_preserves_valid_mounts_beside_invalid_entries(
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({configured.container_name: True}),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     row = result["instances"][0]
@@ -748,7 +822,7 @@ def test_snapshot_reports_legacy_read_only_state_as_requiring_restart(
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({legacy.container_name: True}),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     row = result["instances"][0]
@@ -783,7 +857,7 @@ def test_snapshot_rejects_empty_or_non_string_project_definition_state(
         docker=FakeDocker(
             {empty.container_name: True, malformed.container_name: True}
         ),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     by_id = {row["id"]: row for row in result["instances"]}
@@ -799,7 +873,7 @@ def test_snapshot_counts_queue_errors_as_attention(tmp_path: Path) -> None:
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     assert result["summary"]["attention"] == 1
@@ -820,7 +894,7 @@ def test_snapshot_reports_bad_instance_records_without_hiding_readable_ones(
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     assert [row["id"] for row in result["instances"]] == ["alpha"]
@@ -841,7 +915,7 @@ def test_snapshot_counts_unknown_job_status_as_attention(tmp_path: Path) -> None
     result = DashboardSnapshot(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     row = result["instances"][0]
@@ -865,7 +939,7 @@ def test_snapshot_separates_gateway_source_errors_from_instance_errors(
         store,
         docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
         usage_reader=BrokenUsage(),
-        runtime_reader=ready_runtime(),
+        provider_reader=ready_provider(),
     ).build()
 
     assert result["source_errors"] == ["gateway usage unavailable: gateway stopped"]

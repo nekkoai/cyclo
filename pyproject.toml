@@ -53,16 +53,14 @@ include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["cyclo", "cyclo.*"]
+namespaces = false
 
 [tool.setuptools.package-data]
 cyclo = [
   "team_templates/*",
   "team_templates/*/*",
   "team_templates/*/roles/*",
-  "provider_runtime_context/*",
-  "provider_runtime_context/.dockerignore",
-  "team_runtime_context/*",
-  "team_runtime_context/.dockerignore",
 ]
 "cyclo._agentws" = [
   "template/*",
@@ -71,11 +69,36 @@ cyclo = [
   "template/tools/*",
   "template/tools/agentws-public/*",
 ]
-"cyclo.credential_gateway" = [
-  "gateway_context/*",
-  "gateway_context/.dockerignore",
-]
 "cyclo.dashboard_static" = ["*.html", "*.css", "*.js"]
+"cyclo._bundle" = [
+  "component/*",
+  "component/gen/**/*",
+  "component/proto/**/*",
+  "component/src/*",
+  "component/test/*",
+  "component/test/fixtures/*",
+  "provider/*",
+  "provider/gen/**/*",
+  "provider/proto/**/*",
+  "provider/src/*",
+  "provider/test/*",
+  "provider/test/fixtures/*",
+  "gateway/*",
+  "gateway/src/*",
+  "gateway/test/*",
+  "passthrough/*",
+  "passthrough/src/*",
+  "passthrough/test/*",
+  "pi-provider/*",
+  "pi-provider/src/*",
+  "pi-provider/test/*",
+  "team/*",
+  "team/Dockerfile.dockerignore",
+  "team/entrypoint.sh",
+]
+
+[tool.setuptools.exclude-package-data]
+"cyclo._bundle" = ["*/node_modules/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

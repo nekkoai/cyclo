@@ -22,16 +22,17 @@ from .docker import Docker
 from .errors import CycloError
 from .health import (
     INACTIVE_TEAM_HEALTH,
-    RuntimeHealth,
-    RuntimeStatusReader,
-    read_runtime_health,
+    ProviderHealth,
+    ProviderStatusReader,
+    instance_provider_health,
+    read_provider_status,
     team_health,
 )
 from .project_state import decode_instance_project
 from .state import DEFAULT_AGENTWS_HOST, Instance, StateStore, utc_now
 
 
-API_VERSION = 2
+API_VERSION = 3
 DEFAULT_DASHBOARD_HOST = DEFAULT_AGENTWS_HOST
 DEFAULT_DASHBOARD_PORT = 0
 
@@ -92,13 +93,13 @@ class DashboardSnapshot:
         *,
         docker: Docker | None = None,
         usage_reader: UsageReader | None = None,
-        runtime_reader: RuntimeStatusReader | None = None,
+        provider_reader: ProviderStatusReader | None = None,
         queue_limits: QueueLimits | None = None,
     ) -> None:
         self.store = store
         self.docker = docker or Docker()
         self.usage_reader = usage_reader
-        self.runtime_reader = runtime_reader
+        self.provider_reader = provider_reader
         self.queue_limits = queue_limits or QueueLimits()
 
     def _gateway_usage(self) -> tuple[dict[str, object], str | None]:
@@ -114,10 +115,9 @@ class DashboardSnapshot:
 
     def build(self) -> dict[str, object]:
         gateway_usage, usage_error = self._gateway_usage()
-        by_client_value = gateway_usage.get("by_client")
-        by_client = by_client_value if isinstance(by_client_value, dict) else {}
+        global_usage = _usage_counters(gateway_usage.get("totals"))
         rows: list[dict[str, object]] = []
-        shared_runtime_health: RuntimeHealth | None = None
+        shared_provider: tuple[ProviderHealth, object | None] | None = None
         instances, instance_state_errors = self.store.list_report()
 
         for instance in instances:
@@ -129,8 +129,11 @@ class DashboardSnapshot:
                 errors.append(f"Docker status unavailable: {exc}")
             state = _instance_state(instance, running)
             if state == "running":
-                if shared_runtime_health is None:
-                    shared_runtime_health = read_runtime_health(self.runtime_reader)
+                if shared_provider is None:
+                    shared_provider = read_provider_status(self.provider_reader)
+                provider = instance_provider_health(
+                    shared_provider[0], shared_provider[1], instance  # type: ignore[arg-type]
+                )
                 try:
                     supervisor = read_agent_supervisor_status(
                         self.store.queue_root(instance.id)
@@ -143,7 +146,7 @@ class DashboardSnapshot:
                     planner_attention_jobs = ()
                     supervisor_error = str(exc)
                 health = team_health(
-                    shared_runtime_health,
+                    provider,
                     suspended_agents,
                     supervisor_error,
                     planner_attention_jobs,
@@ -164,7 +167,6 @@ class DashboardSnapshot:
             queue_errors = queue.get("errors")
             if isinstance(queue_errors, list):
                 errors.extend(str(item) for item in queue_errors)
-            usage = _usage_counters(by_client.get(instance.id))
             agentws_port = None
             if running and not instance.offline and instance.port:
                 agentws_port = instance.port
@@ -196,7 +198,6 @@ class DashboardSnapshot:
                     "generation": instance.generation,
                     "agentws_port": agentws_port,
                     "counts": queue["counts"],
-                    "usage": usage,
                     "recent_tasks": queue["recent_tasks"],
                     "recent_activity": queue["recent_activity"],
                     "errors": list(dict.fromkeys(errors)),
@@ -212,15 +213,15 @@ class DashboardSnapshot:
         summary = {
             "instances": len(rows),
             "running": sum(1 for item in rows if item["state"] == "running"),
-            "runtime_issues": int(
-                shared_runtime_health is not None
-                and shared_runtime_health.state.startswith("runtime-")
+            "provider_issues": int(
+                shared_provider is not None
+                and shared_provider[0].state.startswith("provider-")
             ),
             "attention": sum(
                 1
                 for item in rows
                 if item["state"] in {"stale", "orphan", "unknown"}
-                or str(item["health"]["state"]).startswith("runtime-")  # type: ignore[index]
+                or str(item["health"]["state"]).startswith("provider-")  # type: ignore[index]
                 or str(item["health"]["state"]).startswith("agents-")  # type: ignore[index]
                 or item["counts"]["jobs"]["failed"] > 0  # type: ignore[index]
                 or bool(item["errors"])
@@ -228,8 +229,8 @@ class DashboardSnapshot:
             "tasks": sum(item["counts"]["tasks"]["total"] for item in rows),  # type: ignore[index]
             "jobs": sum(item["counts"]["jobs"]["total"] for item in rows),  # type: ignore[index]
             "agents": sum(item["counts"]["agents"]["total"] for item in rows),  # type: ignore[index]
-            "tokens": sum(item["usage"]["total_tokens"] for item in rows),  # type: ignore[index]
-            "requests": sum(item["usage"]["requests"] for item in rows),  # type: ignore[index]
+            "tokens": global_usage["total_tokens"],
+            "requests": global_usage["requests"],
             "errors": len(source_errors) + instance_error_count,
         }
         return {
@@ -237,6 +238,7 @@ class DashboardSnapshot:
             "generated_at": utc_now(),
             "summary": summary,
             "source_errors": source_errors,
+            "usage": gateway_usage,
             "instances": rows,
         }
 

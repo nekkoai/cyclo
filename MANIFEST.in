@@ -16,3 +16,17 @@ include docs/assets/cyclo-logo.svg
 recursive-include requirements *.in *.txt
 recursive-include template README.md team *.md
 recursive-include tests *.py *.mjs
+
+include src/cyclo/_bundle/__init__.py
+graft src/cyclo/_bundle/component
+graft src/cyclo/_bundle/provider
+graft src/cyclo/_bundle/gateway
+graft src/cyclo/_bundle/passthrough
+graft src/cyclo/_bundle/pi-provider
+graft src/cyclo/_bundle/team
+prune src/cyclo/_bundle/component/node_modules
+prune src/cyclo/_bundle/provider/node_modules
+prune src/cyclo/_bundle/gateway/node_modules
+prune src/cyclo/_bundle/passthrough/node_modules
+prune src/cyclo/_bundle/pi-provider/node_modules
+prune src/cyclo/_bundle/team/node_modules

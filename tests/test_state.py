@@ -25,6 +25,8 @@ def make_instance(identifier: str) -> Instance:
         image="cyclo-runtime:test",
         team_write=False,
         offline=False,
+        provider_socket_path="/tmp/cyclo-provider/component.sock",
+        provider_generation="provider-generation",
     )
 
 
@@ -109,6 +111,16 @@ def test_direct_instance_load_rejects_undecodable_and_symlinked_metadata(
             "project_description must be a string",
         ),
         ("project_generation", False, "project_generation must be a string"),
+        (
+            "provider_socket_path",
+            [],
+            "provider_socket_path must be a string",
+        ),
+        (
+            "provider_generation",
+            None,
+            "provider_generation must be a string",
+        ),
         (
             "legacy_project_read_only",
             "false",
@@ -232,6 +244,54 @@ def test_instance_metadata_rejects_inconsistent_persisted_project_state(
 
     with pytest.raises(CycloError, match=message):
         store.load("bad-project")
+
+
+def test_instance_metadata_rejects_relative_provider_socket(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    path = store.metadata_path("bad-provider-socket")
+    path.parent.mkdir(parents=True)
+    payload = make_instance("bad-provider-socket").as_json()
+    payload["provider_socket_path"] = "relative/component.sock"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        CycloError, match="provider_socket_path must be empty or absolute"
+    ):
+        store.load("bad-provider-socket")
+
+
+@pytest.mark.parametrize(
+    ("path_value", "generation", "message"),
+    [
+        ("/tmp/provider/not-a-socket", "generation", "must end in component.sock"),
+        (
+            "/tmp/provider/component.sock",
+            "",
+            "provider_socket_path and provider_generation must be set together",
+        ),
+        (
+            "",
+            "generation",
+            "provider_socket_path and provider_generation must be set together",
+        ),
+    ],
+)
+def test_instance_metadata_rejects_inconsistent_provider_endpoint(
+    tmp_path: Path,
+    path_value: str,
+    generation: str,
+    message: str,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    path = store.metadata_path("bad-provider-endpoint")
+    path.parent.mkdir(parents=True)
+    payload = make_instance("bad-provider-endpoint").as_json()
+    payload["provider_socket_path"] = path_value
+    payload["provider_generation"] = generation
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CycloError, match=message):
+        store.load("bad-provider-endpoint")
 
 
 def test_instance_metadata_fifo_is_rejected_without_blocking(tmp_path: Path) -> None:

@@ -221,35 +221,26 @@
       "unknown",
     ]);
     const agents = normalizeCounterGroup(counts.agents, ["total", "active"]);
-    const usageValue = asObject(raw.usage);
-    const inputTokens = asNumber(usageValue.input_tokens);
-    const outputTokens = asNumber(usageValue.output_tokens);
-    const usage = {
-      inputTokens,
-      outputTokens,
-      totalTokens: asNumber(usageValue.total_tokens, inputTokens + outputTokens),
-      requests: asNumber(usageValue.requests),
-    };
     const errors = asArray(raw.errors).map(errorMessage).filter(Boolean);
     const runtimeState = normalizeState(raw.state);
     const rawHealth = asObject(raw.health);
-    const healthState = firstString([rawHealth.state], runtimeState === "running" ? "runtime-unknown" : "inactive").toLowerCase();
+    const healthState = firstString([rawHealth.state], runtimeState === "running" ? "provider-unknown" : "inactive").toLowerCase();
     const knownHealthStates = [
       "ready",
-      "runtime-down",
-      "runtime-stale",
-      "runtime-unknown",
+      "provider-down",
+      "provider-stale",
+      "provider-unknown",
       "agents-attention",
       "agents-suspended",
       "agents-unknown",
       "inactive",
     ];
     const health = {
-      state: knownHealthStates.includes(healthState) ? healthState : "runtime-unknown",
-      reason: firstString([rawHealth.reason], raw.health ? "" : "runtime status unavailable"),
+      state: knownHealthStates.includes(healthState) ? healthState : "provider-unknown",
+      reason: firstString([rawHealth.reason], raw.health ? "" : "provider status unavailable"),
     };
     const needsAttention = runtimeState === "attention"
-      || health.state.startsWith("runtime-")
+      || health.state.startsWith("provider-")
       || health.state.startsWith("agents-")
       || errors.length > 0
       || jobs.failed > 0
@@ -277,7 +268,6 @@
       tasks,
       jobs,
       agents,
-      usage,
       errors,
       recentActivity: [],
       recentTasks: [],
@@ -320,8 +310,10 @@
     const summary = {
       ...computed,
       running: asNumber(provided.running, computed.running),
-      runtimeIssues: asNumber(provided.runtime_issues, computed.runtimeIssues),
+      providerIssues: asNumber(provided.provider_issues, computed.providerIssues),
       attention: asNumber(provided.attention, computed.attention),
+      tokens: asNumber(provided.tokens, 0),
+      requests: asNumber(provided.requests, 0),
       sourceErrors: sourceErrors.length,
     };
     summary.errors = Math.max(
@@ -343,7 +335,7 @@
     const summary = {
       total: instances.length,
       running: 0,
-      runtimeIssues: 0,
+      providerIssues: 0,
       attention: 0,
       tasks: { total: 0, open: 0, closed: 0 },
       jobs: { total: 0, active: 0, done: 0, failed: 0, unknown: 0 },
@@ -354,7 +346,7 @@
     };
     for (const instance of instances) {
       if (instance.state === "running") summary.running += 1;
-      if (instance.health.state.startsWith("runtime-")) summary.runtimeIssues = 1;
+      if (instance.health.state.startsWith("provider-")) summary.providerIssues = 1;
       if (instance.displayState === "attention") summary.attention += 1;
       summary.tasks.total += instance.tasks.total;
       summary.tasks.open += instance.tasks.open;
@@ -366,8 +358,6 @@
       summary.jobs.unknown += instance.jobs.unknown;
       summary.agents.total += instance.agents.total;
       summary.agents.active += instance.agents.active;
-      summary.tokens += instance.usage.totalTokens;
-      summary.requests += instance.usage.requests;
       summary.errors += instance.errors.length;
     }
     return summary;
@@ -489,9 +479,9 @@
     elements.statAgentsDetail.textContent = `${plural(summary.agents.total, "agent")} configured`;
     elements.statTokens.textContent = formatTokens(summary.tokens);
     elements.statTokens.title = `${formatCount(summary.tokens)} tokens`;
-    elements.statTokensDetail.textContent = `${plural(summary.requests, "request")} · input + output`;
+    elements.statTokensDetail.textContent = `${plural(summary.requests, "request")} · global gateway total`;
     elements.statAttention.textContent = formatCount(summary.attention);
-    elements.statAttentionDetail.textContent = `${plural(summary.jobs.failed, "failed job")} · ${plural(summary.runtimeIssues, "runtime issue")} · ${plural(summary.errors, "data error")}`;
+    elements.statAttentionDetail.textContent = `${plural(summary.jobs.failed, "failed job")} · ${plural(summary.providerIssues, "provider issue")} · ${plural(summary.errors, "data error")}`;
     elements.attentionStat.classList.toggle("has-attention", summary.attention > 0);
   }
 
@@ -584,12 +574,12 @@
 
     appendModeBadges(fragment.querySelector(".mode-list"), instance);
 
-    const runtimeHealth = fragment.querySelector(".runtime-health");
-    runtimeHealth.dataset.state = instance.health.state;
-    runtimeHealth.textContent = instance.health.state === "inactive"
+    const providerHealth = fragment.querySelector(".provider-health");
+    providerHealth.dataset.state = instance.health.state;
+    providerHealth.textContent = instance.health.state === "inactive"
       ? "—"
       : [instance.health.state, instance.health.reason].filter(Boolean).join(" · ");
-    runtimeHealth.title = instance.health.reason;
+    providerHealth.title = instance.health.reason;
 
     const project = fragment.querySelector(".project-path");
     project.textContent = instance.project;
@@ -628,21 +618,6 @@
     fragment.querySelector(".job-detail").textContent = jobDetails.join(" · ");
     fragment.querySelector(".agent-count").textContent = formatCount(instance.agents.active);
     fragment.querySelector(".agent-detail").textContent = `${formatCount(instance.agents.total)} configured`;
-
-    const tokenTotal = fragment.querySelector(".token-total");
-    tokenTotal.textContent = `${formatTokens(instance.usage.totalTokens)} tokens`;
-    tokenTotal.title = `${formatCount(instance.usage.totalTokens)} tokens`;
-    fragment.querySelector(".request-count").textContent = plural(instance.usage.requests, "request");
-    fragment.querySelector(".input-tokens").textContent = formatTokens(instance.usage.inputTokens);
-    fragment.querySelector(".output-tokens").textContent = formatTokens(instance.usage.outputTokens);
-    const usageMeter = fragment.querySelector(".usage-meter");
-    const share = instance.usage.totalTokens > 0
-      ? Math.max(3, Math.min(100, (instance.usage.inputTokens / instance.usage.totalTokens) * 100))
-      : 0;
-    usageMeter.style.setProperty("--input-share", `${share}%`);
-    usageMeter.title = instance.usage.totalTokens > 0
-      ? `${Math.round(share)}% input tokens · ${Math.round(100 - share)}% output tokens`
-      : "No usage recorded";
 
     renderErrors(fragment.querySelector(".instance-errors"), instance.errors);
     renderCardActivity(fragment.querySelector(".card-activity"), instance.timeline);
@@ -691,7 +666,6 @@
     const sort = elements.sortSelect.value;
     instances.sort((a, b) => {
       if (sort === "name") return a.team.localeCompare(b.team, undefined, { sensitivity: "base" });
-      if (sort === "tokens") return b.usage.totalTokens - a.usage.totalTokens || a.team.localeCompare(b.team);
       if (sort === "failures") return b.failureCount - a.failureCount || a.team.localeCompare(b.team);
       const aTime = a.lastActivity ? a.lastActivity.getTime() : 0;
       const bTime = b.lastActivity ? b.lastActivity.getTime() : 0;

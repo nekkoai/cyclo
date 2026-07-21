@@ -3,12 +3,21 @@ from __future__ import annotations
 import hashlib
 from importlib import resources
 from pathlib import Path
+from typing import Mapping
 
-from .credential_gateway import docker as docker_runner
+from .component_stack import ComponentDocker
 from .errors import CycloError
 
 
 SOURCE_FINGERPRINT_LABEL = "cyclo.source-fingerprint"
+PI_PACKAGES = (
+    "npm:pi-web-access",
+    "npm:pi-lens",
+    "npm:pi-simplify",
+    "/opt/cyclo/pi-provider",
+)
+_IMAGE_CONTEXT_MEMBERS = ("team", "component", "provider", "pi-provider")
+docker_runner = ComponentDocker()
 _IGNORED_DIRECTORIES = {
     ".git",
     ".pytest_cache",
@@ -20,10 +29,16 @@ _IGNORED_DIRECTORIES = {
 }
 
 
-def context_root() -> Path:
-    """Return Cyclo's packaged team-agent image context."""
+def build_context_root() -> Path:
+    """Return the common packaged component build context."""
 
-    return Path(str(resources.files("cyclo"))).resolve() / "team_runtime_context"
+    return Path(str(resources.files("cyclo._bundle"))).resolve()
+
+
+def context_root() -> Path:
+    """Return Cyclo's packaged team-agent files."""
+
+    return build_context_root() / "team"
 
 
 def dockerfile_path() -> Path:
@@ -31,24 +46,25 @@ def dockerfile_path() -> Path:
 
 
 def source_files(root: Path | None = None) -> tuple[Path, ...]:
-    selected = (context_root() if root is None else Path(root)).resolve()
+    selected = (build_context_root() if root is None else Path(root)).resolve()
     result: list[Path] = []
-    for path in selected.rglob("*"):
-        relative = path.relative_to(selected)
-        if any(
-            part in _IGNORED_DIRECTORIES or part.endswith(".egg-info")
-            for part in relative.parts
-        ):
-            continue
-        if path.is_file() and not path.name.endswith(".pyc"):
-            result.append(relative)
+    for member in _IMAGE_CONTEXT_MEMBERS:
+        for path in (selected / member).rglob("*"):
+            relative = path.relative_to(selected)
+            if any(
+                part in _IGNORED_DIRECTORIES or part.endswith(".egg-info")
+                for part in relative.parts
+            ):
+                continue
+            if path.is_file() and not path.name.endswith(".pyc"):
+                result.append(relative)
     return tuple(sorted(result, key=lambda item: item.as_posix()))
 
 
 def source_fingerprint(root: Path | None = None) -> str:
     """Hash the exact packaged team-agent image context."""
 
-    selected = (context_root() if root is None else Path(root)).resolve()
+    selected = (build_context_root() if root is None else Path(root)).resolve()
     digest = hashlib.sha256()
     for relative in source_files(selected):
         path = selected / relative
@@ -74,19 +90,30 @@ def build_command(image: str, fingerprint: str) -> list[str]:
         f"{SOURCE_FINGERPRINT_LABEL}={fingerprint}",
         "-f",
         str(dockerfile_path()),
-        str(context_root()),
+        str(build_context_root()),
     ]
+
+
+def image_label(info: Mapping[str, object], name: str) -> str | None:
+    config = info.get("Config")
+    labels = config.get("Labels") if isinstance(config, Mapping) else None
+    value = labels.get(name) if isinstance(labels, Mapping) else None
+    return value if isinstance(value, str) and value else None
 
 
 def ensure(image: str, *, build: bool = False) -> None:
     """Build the team-agent image only when explicitly requested or stale."""
 
     fingerprint = source_fingerprint()
-    current = (
-        docker_runner.docker_image_exists(image)
-        and docker_runner.docker_image_label(image, SOURCE_FINGERPRINT_LABEL)
-        == fingerprint
-    )
+    info = docker_runner.inspect("image", image)
+    current = info is not None and image_label(
+        info, SOURCE_FINGERPRINT_LABEL
+    ) == fingerprint
     if build or not current:
-        if docker_runner.run_command(build_command(image, fingerprint)) != 0:
+        result = docker_runner.call(
+            build_command(image, fingerprint)[1:],
+            capture=False,
+            check=False,
+        )
+        if result.returncode != 0:
             raise CycloError(f"failed to build Cyclo team runtime image: {image}")
