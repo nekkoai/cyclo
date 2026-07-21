@@ -12,7 +12,6 @@ from .errors import CycloError
 SOURCE_FINGERPRINT_LABEL = "cyclo.source-fingerprint"
 PI_PACKAGES = (
     "npm:pi-web-access",
-    "npm:pi-lens",
     "npm:pi-simplify",
     "/opt/cyclo/pi-provider",
 )
