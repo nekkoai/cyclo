@@ -107,7 +107,7 @@ export function discoverSupportedProviders({
 
 export function formatSupportedProviders(providers = discoverSupportedProviders()) {
   if (!Array.isArray(providers)) throw new TypeError("providers must be an array");
-  const lines = ["PROVIDER\tDESCRIPTION\tAUTH\tLOGIN"];
+  const rows = [];
   for (const provider of providers) {
     if (
       !provider
@@ -119,14 +119,22 @@ export function formatSupportedProviders(providers = discoverSupportedProviders(
     ) {
       throw new Error("cannot format an invalid provider description");
     }
-    lines.push(
-      `${provider.provider}\t${provider.description}\t${provider.auth}\t${provider.login}`,
-    );
+    rows.push([provider.provider, provider.description, provider.auth, provider.login]);
   }
-  lines.push(
-    "",
-    "Account/catalogue names default to PROVIDER. Add --as NAME to choose one; API-key login may always use --api-key-stdin.",
+  const widths = rows.reduce(
+    (current, row) => current.map((width, index) => Math.max(width, row[index].length)),
+    ["PROVIDER".length, "DESCRIPTION".length, "AUTH".length, "LOGIN COMMAND".length],
   );
+  const format = (row) => row.map((value, index) => value.padEnd(widths[index])).join("  ").trimEnd();
+  const lines = [
+    "Supported gateway providers (login creates an account in the credential store):",
+    format(["PROVIDER", "DESCRIPTION", "AUTH", "LOGIN COMMAND"]),
+    format(widths.map((width) => "-".repeat(width))),
+    ...rows.map(format),
+    "",
+    "Use --as NAME to give an account a distinct catalogue prefix. API-key logins read the key from --api-key-stdin.",
+    "OAuth logins open the provider's subscription flow; no login is needed to list this table.",
+  ];
   return lines.join("\n");
 }
 

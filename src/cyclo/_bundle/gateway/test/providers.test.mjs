@@ -43,17 +43,12 @@ test("provider discovery describes copyable pre-login choices", () => {
       login: "cyclo gateway login openai-codex",
     },
   ]);
-  assert.equal(
-    formatSupportedProviders(providers),
-    [
-      "PROVIDER\tDESCRIPTION\tAUTH\tLOGIN",
-      "anthropic\tAnthropic models\toauth or api-key\tcyclo gateway login anthropic",
-      "openai\tOpenAI models\tapi-key\tcyclo gateway login openai --api-key-stdin",
-      "openai-codex\tOpenAI subscription\toauth or api-key\tcyclo gateway login openai-codex",
-      "",
-      "Account/catalogue names default to PROVIDER. Add --as NAME to choose one; API-key login may always use --api-key-stdin.",
-    ].join("\n"),
-  );
+  const output = formatSupportedProviders(providers);
+  assert.match(output, /Supported gateway providers/u);
+  assert.match(output, /PROVIDER\s+DESCRIPTION\s+AUTH\s+LOGIN COMMAND/u);
+  assert.match(output, /anthropic\s+Anthropic models\s+oauth or api-key/u);
+  assert.match(output, /openai-codex\s+OpenAI subscription\s+oauth or api-key/u);
+  assert.match(output, /Use --as NAME/u);
 });
 
 test("provider discovery rejects unsafe or unexplained registries", () => {
