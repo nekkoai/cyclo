@@ -23,7 +23,7 @@ Use the template installed with Cyclo. Replace the model with an exact entry
 from `cyclo models`:
 
 ```sh
-cyclo init ~/teams/test-driven-repair \
+cyclo team init ~/teams/test-driven-repair \
   --template test-driven-repair \
   --model openai-codex/MODEL_ID
 git -C ~/teams/test-driven-repair add .
@@ -47,7 +47,7 @@ mount source ../../src/my-project rw
 ```sh
 cyclo validate ~/experiments/my-project/project.cyclo
 cyclo run ~/experiments/my-project/project.cyclo
-cyclo task my-project-test-driven-repair repair-001 /tmp/repair-001.md
+cyclo task run my-project-test-driven-repair repair-001 /tmp/repair-001.md
 cyclo logs -f my-project-test-driven-repair
 ```
 

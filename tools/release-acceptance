@@ -119,14 +119,14 @@ import zipfile
 from pathlib import Path
 
 wheel = sys.argv[1]
-source_bundle = Path(sys.argv[2]) / "src" / "cyclo" / "_bundle"
-bundle_components = (
-    "component",
-    "provider",
+component_root = Path(sys.argv[2]) / "src" / "cyclo" / "components"
+component_sources = (
+    "protocol/component",
+    "protocol/provider",
     "gateway",
     "passthrough",
     "pi-provider",
-    "team",
+    "team-runtime",
 )
 forbidden_names = {
     "cyclo/provenance.py",
@@ -137,12 +137,12 @@ forbidden_names = {
 required_names = {
     "cyclo/project.py",
 }
-bundle_sources = [source_bundle / "__init__.py"]
-for component in bundle_components:
-    bundle_sources.extend((source_bundle / component).rglob("*"))
+owned_sources = [component_root / "__init__.py"]
+for component in component_sources:
+    owned_sources.extend((component_root / component).rglob("*"))
 required_names.update(
-    (Path("cyclo/_bundle") / path.relative_to(source_bundle)).as_posix()
-    for path in bundle_sources
+    (Path("cyclo/components") / path.relative_to(component_root)).as_posix()
+    for path in owned_sources
     if path.is_file()
     and "node_modules" not in path.parts
     and "__pycache__" not in path.parts
@@ -268,7 +268,7 @@ case $destroy_help in
     *) fail "installed store-destruction help does not disclose irreversible data loss" ;;
 esac
 
-templates=$("$cyclo" templates)
+templates=$("$cyclo" team templates)
 expected_templates=$(printf '%s\n' \
     adversarial-audit \
     plan-execute-verify \
@@ -278,18 +278,17 @@ expected_templates=$(printf '%s\n' \
     fail "packaged templates are incomplete"
 }
 
-"$cyclo" init "$team" \
+"$cyclo" team init "$team" \
     --template test-driven-repair \
     --model openai-codex/release-acceptance
 "$cyclo" validate "$team"
 
-printf '%s\n' \
-    'name release-acceptance' \
-    'description Exercise packaged multi-mount project definitions.' \
-    'team ./team ro' \
-    'mount source ./project rw' \
-    'mount documentation ./documentation ro' \
-    >"$project_file"
+"$cyclo" project init "$project_file" \
+    --name release-acceptance \
+    --description 'Exercise packaged multi-mount project definitions.' \
+    --team "$team" ro \
+    --mount source "$project" rw \
+    --mount documentation "$documentation" ro
 "$cyclo" validate "$project_file"
 
 project_dry_run=$(
@@ -336,7 +335,7 @@ cat "$doctor_log"
 
 grep -F 'ok  bundled AgentWS ABI:' "$doctor_log" >/dev/null \
     || fail "doctor did not find the packaged AgentWS runtime"
-grep -F 'ok  bundled component ABI:' "$doctor_log" >/dev/null \
+grep -F 'ok  component ABI:' "$doctor_log" >/dev/null \
     || fail "doctor did not find the packaged component runtime"
 
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then

@@ -1,7 +1,7 @@
 FROM node:22-trixie-slim@sha256:e6d9a389d34ff9678438af985c9913fbd1eb6ed36e80fea56644f4b4f6dd70ba AS agent-tools
 
 WORKDIR /opt/cyclo-agent-tools/lib
-COPY team/package.json team/package-lock.json ./
+COPY team-runtime/package.json team-runtime/package-lock.json ./
 # pi-simplify 0.2.2 declares Pi 0.75 peers. The lock keeps those peer libraries
 # alongside the security-fixed Pi 0.81 CLI; --force accepts only that locked,
 # intentionally side-by-side resolution.
@@ -12,17 +12,17 @@ RUN npm ci --force --omit=dev --no-audit --no-fund \
 # source trees at stable absolute paths lets Pi load the adapter as a local
 # package without downloading or copying code when a team starts.
 WORKDIR /opt/cyclo
-COPY component/package.json component/package-lock.json ./component/
-COPY component/src ./component/src
-COPY component/gen ./component/gen
-RUN cd component \
+COPY protocol/component/package.json protocol/component/package-lock.json ./protocol/component/
+COPY protocol/component/src ./protocol/component/src
+COPY protocol/component/gen ./protocol/component/gen
+RUN cd protocol/component \
     && npm ci --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 
-COPY provider/package.json provider/package-lock.json ./provider/
-COPY provider/src ./provider/src
-COPY provider/gen ./provider/gen
-RUN cd provider \
+COPY protocol/provider/package.json protocol/provider/package-lock.json ./protocol/provider/
+COPY protocol/provider/src ./protocol/provider/src
+COPY protocol/provider/gen ./protocol/provider/gen
+RUN cd protocol/provider \
     && npm ci --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 
@@ -72,7 +72,7 @@ COPY --from=agent-tools /opt/cyclo /opt/cyclo
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
-COPY team/entrypoint.sh /usr/local/bin/cyclo-container-entrypoint
+COPY team-runtime/entrypoint.sh /usr/local/bin/cyclo-container-entrypoint
 RUN chmod 0755 /usr/local/bin/cyclo-container-entrypoint
 
 WORKDIR /workspace

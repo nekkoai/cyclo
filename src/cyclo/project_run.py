@@ -13,6 +13,7 @@ from .dashboard import dashboard_host_is_loopback
 from .docker import ContainerSpec, Docker, overlaps, overlaps_lexically
 from .errors import CycloError
 from .instance_lifecycle import stop_remove_instance_container
+from .installation import team_container_name, team_network_name
 from .project import (
     ProjectDefinition,
     ProjectMount,
@@ -46,6 +47,7 @@ def new_instance(
     project: Path,
     *,
     identifier: str,
+    system: str,
     team_write: bool,
     definition: ProjectDefinition,
 ) -> Instance:
@@ -57,8 +59,8 @@ def new_instance(
         generation=team_generation(team),
         providers=list(team.providers),
         models=sorted({agent.model for agent in team.agents}),
-        container_name=f"cyclo-{identifier}",
-        network_name=f"cyclo-{identifier}-net",
+        container_name=team_container_name(system, identifier),
+        network_name=team_network_name(system, identifier),
         image=args.image,
         team_write=team_write,
         offline=args.offline,
@@ -233,6 +235,8 @@ def project_run_bindings(
     args: argparse.Namespace,
     definition: ProjectDefinition,
     configured_teams: tuple[tuple[ProjectTeam, Team], ...],
+    *,
+    system: str,
 ) -> tuple[RunBinding, ...]:
     result: list[RunBinding] = []
     identifiers: set[str] = set()
@@ -248,6 +252,7 @@ def project_run_bindings(
             team,
             definition.path.parent,
             identifier=identifier,
+            system=system,
             team_write=selected.writable,
             definition=definition,
         )
@@ -281,6 +286,7 @@ def container_spec(
         agents_dir=store.agents_dir(instance.id),
         pi_root=store.pi_root(instance.id),
         provider_socket_dir=Path(instance.provider_socket_path).parent,
+        system=store.system,
         port=args.port,
         verbose=args.verbose,
         project_mounts=binding.project_mounts,
@@ -393,7 +399,12 @@ def start_binding(
         try:
             store.save(instance)
             ensure_team_runtime_image(instance.image, build=build)
-            docker.ensure_network(instance.network_name, offline=instance.offline)
+            docker.ensure_network(
+                instance.network_name,
+                instance.id,
+                system=store.system,
+                offline=instance.offline,
+            )
             verify_source_identities(binding)
             validate_running_mount_boundaries(binding, store, docker)
             instance.port = docker.start(spec)
@@ -415,12 +426,15 @@ def start_binding(
                 stop_remove_instance_container(
                     docker,
                     instance,
+                    system=store.system,
                     expected_launch_id=instance.launch_id or None,
                 )
             except Exception as cleanup_error:
                 cleanup_errors.append(f"container rollback failed: {cleanup_error}")
             try:
-                docker.remove_network(instance.network_name)
+                docker.remove_network(
+                    instance.network_name, instance.id, system=store.system
+                )
             except Exception as cleanup_error:
                 cleanup_errors.append(f"network rollback failed: {cleanup_error}")
             if cleanup_errors:

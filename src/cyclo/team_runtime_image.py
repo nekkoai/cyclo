@@ -17,7 +17,12 @@ PI_PACKAGES = (
     "npm:pi-simplify",
     "/opt/cyclo/pi-provider",
 )
-_IMAGE_CONTEXT_MEMBERS = ("team", "component", "provider", "pi-provider")
+_IMAGE_CONTEXT_MEMBERS = (
+    "team-runtime",
+    "protocol/component",
+    "protocol/provider",
+    "pi-provider",
+)
 docker_runner = ComponentDocker()
 _IGNORED_DIRECTORIES = {
     ".git",
@@ -33,13 +38,13 @@ _IGNORED_DIRECTORIES = {
 def build_context_root() -> Path:
     """Return the common packaged component build context."""
 
-    return Path(str(resources.files("cyclo._bundle"))).resolve()
+    return Path(str(resources.files("cyclo.components"))).resolve()
 
 
 def context_root() -> Path:
     """Return Cyclo's packaged team-agent files."""
 
-    return build_context_root() / "team"
+    return build_context_root() / "team-runtime"
 
 
 def dockerfile_path() -> Path:

@@ -21,6 +21,9 @@ from cyclo.state import Instance
 from cyclo.team import load_team
 
 
+SYSTEM = "0123456789ab"
+
+
 def instance(team: Path, project: Path) -> Instance:
     provider_socket_dir = project.parent / ".cyclo-provider"
     provider_socket_dir.mkdir(exist_ok=True)
@@ -32,8 +35,8 @@ def instance(team: Path, project: Path) -> Instance:
         generation="deadbeef-dirty-a1",
         providers=["anthropic", "openai-codex"],
         models=["anthropic/claude-test", "openai-codex/gpt-test"],
-        container_name="cyclo-review-team-123",
-        network_name="cyclo-review-team-123-net",
+        container_name=f"cyclo-{SYSTEM}-team-review-team-123",
+        network_name=f"cyclo-{SYSTEM}-team-review-team-123-net",
         image="cyclo-runtime:test",
         team_write=False,
         offline=True,
@@ -58,6 +61,7 @@ def test_launch_validation_requires_an_existing_provider_socket_directory(
         agents_dir=tmp_path / "agents",
         pi_root=tmp_path / "pi",
         provider_socket_dir=provider_dir,
+        system=SYSTEM,
         port=0,
     )
 
@@ -98,6 +102,7 @@ def test_container_argv_has_only_scoped_runtime_mounts(
         agents_dir=queue / "agents",
         pi_root=pi,
         provider_socket_dir=Path(selected_instance.provider_socket_path).parent,
+        system=SYSTEM,
         port=0,
     )
 
@@ -107,6 +112,8 @@ def test_container_argv_has_only_scoped_runtime_mounts(
     assert command[:3] == ["docker", "run", "--detach"]
     assert "--publish" not in command
     assert "AGENTWS_TEAM_ROSTER=/team/team" in command
+    assert "AGENTWS_SYSTEM_PROTOCOL=/agentws/AGENTS.md" in command
+    assert "AGENTWS_TEAM_PROTOCOL=/team/AGENTS.md" in command
     assert "AGENTWS_WORKSPACE=/workspace" in command
     assert "CYCLO_PROVIDER_RUNTIME_HEALTH_URL" not in command
     assert "CYCLO_PROVIDER_SOCKET=/run/cyclo/provider/component.sock" in command
@@ -129,6 +136,10 @@ def test_container_argv_has_only_scoped_runtime_mounts(
     assert "--security-opt" in command
     assert command[command.index("--cap-drop") + 1] == "NET_RAW"
     assert "cyclo.launch=launch-identity" in command
+    assert f"io.cyclo.system={SYSTEM}" in command
+    assert "io.cyclo.kind=team" in command
+    assert "io.cyclo.instance=review-team-123" in command
+    assert "cyclo.instance=review-team-123" not in command
     for name, value in retry_values.items():
         assert f"{name}={value}" in command
     assert "AGENTWS_UNSAFE_UNDOCUMENTED" not in rendered
@@ -155,6 +166,7 @@ def test_legacy_project_mount_is_always_writable(
         agents_dir=queue / "agents",
         pi_root=pi,
         provider_socket_dir=Path(selected_instance.provider_socket_path).parent,
+        system=SYSTEM,
         port=0,
     )
 
@@ -195,6 +207,7 @@ def test_named_project_mounts_use_read_only_namespace_and_explicit_modes(
         agents_dir=queue / "agents",
         pi_root=pi,
         provider_socket_dir=Path(selected_instance.provider_socket_path).parent,
+        system=SYSTEM,
         port=0,
         project_mounts=mounts,
         workspace_layout=layout,
@@ -247,6 +260,7 @@ def test_container_command_rejects_path_like_named_mount(
         agents_dir=queue / "agents",
         pi_root=pi,
         provider_socket_dir=Path(selected_instance.provider_socket_path).parent,
+        system=SYSTEM,
         port=0,
         project_mounts=(ProjectMount("..", source, "rw", 1),),
         workspace_layout=layout,
@@ -371,7 +385,9 @@ def test_container_removal_uses_verified_immutable_id(monkeypatch) -> None:
             "Id": "verified-container-id",
             "Config": {
                 "Labels": {
-                    "cyclo.instance": "alpha",
+                    "io.cyclo.system": SYSTEM,
+                    "io.cyclo.kind": "team",
+                    "io.cyclo.instance": "alpha",
                     "cyclo.launch": "launch-alpha",
                 }
             },
@@ -385,7 +401,12 @@ def test_container_removal_uses_verified_immutable_id(monkeypatch) -> None:
         or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
     )
 
-    docker.stop_remove("cyclo-alpha", "alpha", expected_launch="launch-alpha")
+    docker.stop_remove(
+        f"cyclo-{SYSTEM}-team-alpha",
+        "alpha",
+        expected_system=SYSTEM,
+        expected_launch="launch-alpha",
+    )
 
     assert commands == [
         ["docker", "stop", "--timeout", "30", "verified-container-id"],
@@ -403,7 +424,9 @@ def test_container_removal_rejects_reused_instance_launch(monkeypatch) -> None:
             "Id": "replacement-container-id",
             "Config": {
                 "Labels": {
-                    "cyclo.instance": "alpha",
+                    "io.cyclo.system": SYSTEM,
+                    "io.cyclo.kind": "team",
+                    "io.cyclo.instance": "alpha",
                     "cyclo.launch": "replacement-launch",
                 }
             },
@@ -419,7 +442,10 @@ def test_container_removal_rejects_reused_instance_launch(monkeypatch) -> None:
 
     with pytest.raises(CycloError, match="launch identity changed"):
         docker.stop_remove(
-            "cyclo-alpha", "alpha", expected_launch="original-launch"
+            f"cyclo-{SYSTEM}-team-alpha",
+            "alpha",
+            expected_system=SYSTEM,
+            expected_launch="original-launch",
         )
 
     assert commands == []
@@ -445,9 +471,35 @@ def test_container_removal_rejects_foreign_label(monkeypatch) -> None:
     )
 
     with pytest.raises(CycloError, match="non-Cyclo container"):
-        docker.stop_remove("cyclo-alpha", "alpha")
+        docker.stop_remove("cyclo-alpha", "alpha", expected_system=SYSTEM)
 
     assert commands == []
+
+
+def test_container_removal_rejects_another_installation(monkeypatch) -> None:
+    docker = Docker()
+    monkeypatch.setattr(
+        docker,
+        "_inspect_container",
+        lambda _name: {
+            "Id": "foreign-container-id",
+            "Config": {
+                "Labels": {
+                    "io.cyclo.system": "ba9876543210",
+                    "io.cyclo.kind": "team",
+                    "io.cyclo.instance": "alpha",
+                }
+            },
+            "State": {"Running": False},
+        },
+    )
+
+    with pytest.raises(CycloError, match="non-Cyclo container"):
+        docker.stop_remove(
+            f"cyclo-{SYSTEM}-team-alpha",
+            "alpha",
+            expected_system=SYSTEM,
+        )
 
 
 def test_network_removal_refuses_attached_containers(monkeypatch) -> None:
@@ -458,7 +510,11 @@ def test_network_removal_refuses_attached_containers(monkeypatch) -> None:
         "_inspect_network",
         lambda _name: {
             "Id": "verified-network-id",
-            "Labels": {"cyclo.instance": "cyclo-alpha-net"},
+            "Labels": {
+                "io.cyclo.system": SYSTEM,
+                "io.cyclo.kind": "team-network",
+                "io.cyclo.instance": "alpha",
+            },
             "Containers": {
                 "verified-gateway-id": {"Name": "cyclo-gateway-test"}
             },
@@ -472,9 +528,58 @@ def test_network_removal_refuses_attached_containers(monkeypatch) -> None:
     )
 
     with pytest.raises(CycloError, match="containers remain attached"):
-        docker.remove_network("cyclo-alpha-net")
+        docker.remove_network(
+            f"cyclo-{SYSTEM}-team-alpha-net", "alpha", system=SYSTEM
+        )
 
     assert commands == []
+
+
+def test_network_creation_uses_installation_identity(monkeypatch) -> None:
+    docker = Docker()
+    name = f"cyclo-{SYSTEM}-team-alpha-net"
+    commands: list[list[str]] = []
+    inspections = iter(
+        (
+            None,
+            {
+                "Id": "verified-network-id",
+                "Labels": {
+                    "io.cyclo.system": SYSTEM,
+                    "io.cyclo.kind": "team-network",
+                    "io.cyclo.instance": "alpha",
+                },
+                "Internal": True,
+                "Containers": {},
+            },
+        )
+    )
+    monkeypatch.setattr(docker, "_inspect_network", lambda _name: next(inspections))
+    monkeypatch.setattr(
+        docker,
+        "_run",
+        lambda command, **_kwargs: commands.append(list(command))
+        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    assert docker.ensure_network(name, "alpha", system=SYSTEM, offline=True) == (
+        "verified-network-id"
+    )
+    assert commands == [
+        [
+            "docker",
+            "network",
+            "create",
+            "--label",
+            f"io.cyclo.system={SYSTEM}",
+            "--label",
+            "io.cyclo.kind=team-network",
+            "--label",
+            "io.cyclo.instance=alpha",
+            "--internal",
+            name,
+        ]
+    ]
 
 
 def test_network_removal_uses_verified_resource_id(monkeypatch) -> None:
@@ -485,7 +590,11 @@ def test_network_removal_uses_verified_resource_id(monkeypatch) -> None:
         "_inspect_network",
         lambda _name: {
             "Id": "verified-network-id",
-            "Labels": {"cyclo.instance": "cyclo-alpha-net"},
+            "Labels": {
+                "io.cyclo.system": SYSTEM,
+                "io.cyclo.kind": "team-network",
+                "io.cyclo.instance": "alpha",
+            },
             "Containers": {},
         },
     )
@@ -496,7 +605,9 @@ def test_network_removal_uses_verified_resource_id(monkeypatch) -> None:
         or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
     )
 
-    docker.remove_network("cyclo-alpha-net")
+    docker.remove_network(
+        f"cyclo-{SYSTEM}-team-alpha-net", "alpha", system=SYSTEM
+    )
 
     assert commands == [
         ["docker", "network", "rm", "verified-network-id"]

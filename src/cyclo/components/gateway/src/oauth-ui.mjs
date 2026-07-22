@@ -6,11 +6,15 @@ export function createAuthInteraction({ ask, askSecret = ask, write = console.lo
   }
   return Object.freeze({
     ...(signal === undefined ? {} : { signal }),
-    prompt(prompt) {
+    async prompt(prompt) {
       if (!prompt || typeof prompt !== "object") {
         throw new Error("OAuth provider emitted an invalid prompt");
       }
-      if (prompt.type === "select") return selectOAuthOption(prompt, ask, write);
+      if (prompt.type === "select") {
+        const selected = await selectOAuthOption(prompt, ask, write);
+        if (selected === undefined) throw new Error("Login cancelled");
+        return selected;
+      }
       if (!["text", "secret", "manual_code"].includes(prompt.type)) {
         throw new Error(`OAuth provider emitted an unknown prompt type: ${prompt.type}`);
       }

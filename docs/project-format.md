@@ -23,6 +23,12 @@ cyclo validate /path/to/project.cyclo
 cyclo run /path/to/project.cyclo
 ```
 
+Or create the same validated format from the CLI:
+
+```sh
+cyclo project init /path/to/project.cyclo --team /path/to/team ro --mount source /path/to/source rw
+```
+
 Cyclo starts one independent instance for every `team` line. In the example,
 the instances are named `core-et-uart-jon-rtl` and
 `core-et-uart-rtl-auditor`. Each gets its own container, queue, model
@@ -132,15 +138,3 @@ cyclo stop /path/to/project.cyclo
 Stop uses persisted lifecycle metadata rather than reparsing the current team
 list. It therefore still stops instances removed from an edited definition and
 works when the file is temporarily invalid or has been deleted.
-
-## Compatibility form
-
-The original two-path interface remains available:
-
-```sh
-cyclo run TEAM PROJECT
-```
-
-It starts one team, mounts the team read-only and the project at `/workspace`
-read-write, and retains `--name` and `--team-write`. This is a compatibility path for scripts and quick
-one-team runs; new reusable experiments should use `project.cyclo`.

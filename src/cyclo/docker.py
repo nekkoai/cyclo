@@ -14,6 +14,16 @@ from typing import Iterable, Mapping, Sequence
 from urllib.parse import unquote, urlsplit
 
 from .errors import CycloError
+from .installation import (
+    LABEL_INSTANCE,
+    LABEL_KIND,
+    LABEL_SYSTEM,
+    TEAM_KIND,
+    TEAM_NETWORK_KIND,
+    resource_labels,
+    team_container_name,
+    team_network_name,
+)
 from .project import (
     CONTAINER_READONLY_ROOT,
     MOUNT_NAME_RE,
@@ -23,7 +33,6 @@ from .state import DEFAULT_AGENTWS_HOST, Instance
 from .team import Team
 
 
-CYCLO_LABEL = "cyclo.instance"
 CONTAINER_AGENTWS = Path("/agentws")
 CONTAINER_TEAM = Path("/team")
 CONTAINER_WORKSPACE = Path("/workspace")
@@ -221,6 +230,7 @@ class ContainerSpec:
     agents_dir: Path
     pi_root: Path
     provider_socket_dir: Path
+    system: str
     port: int
     verbose: bool = False
     project_mounts: tuple[ProjectMount, ...] = ()
@@ -229,6 +239,14 @@ class ContainerSpec:
 
 
 def validate_container_spec(spec: ContainerSpec) -> None:
+    if spec.instance.container_name != team_container_name(
+        spec.system, spec.instance.id
+    ) or spec.instance.network_name != team_network_name(
+        spec.system, spec.instance.id
+    ):
+        raise CycloError(
+            "Cyclo team resources do not match the selected installation"
+        )
     provider_socket_dir = spec.provider_socket_dir
     if (
         not provider_socket_dir.is_absolute()
@@ -258,11 +276,6 @@ def container_command(spec: ContainerSpec) -> list[str]:
         spec.workspace_layout is not None or spec.readonly_layout is not None
     ):
         raise CycloError("named layout roots require configured mounts")
-    protocol = (
-        CONTAINER_TEAM / "AGENTS.md"
-        if spec.team.protocol is not None
-        else CONTAINER_AGENTWS / "AGENTS.md"
-    )
     roster = CONTAINER_TEAM / spec.team.roster.name
     command = [
         "docker",
@@ -270,13 +283,17 @@ def container_command(spec: ContainerSpec) -> list[str]:
         "--detach",
         "--name",
         instance.container_name,
-        "--label",
-        f"{CYCLO_LABEL}={instance.id}",
-        "--label",
-        f"cyclo.team={instance.team_name}",
-        "--label",
-        f"cyclo.generation={instance.generation}",
     ]
+    for key, value in resource_labels(spec.system, TEAM_KIND, instance.id).items():
+        command.extend(["--label", f"{key}={value}"])
+    command.extend(
+        [
+            "--label",
+            f"cyclo.team={instance.team_name}",
+            "--label",
+            f"cyclo.generation={instance.generation}",
+        ]
+    )
     if instance.launch_id:
         command.extend(["--label", f"cyclo.launch={instance.launch_id}"])
     command.extend(
@@ -289,9 +306,6 @@ def container_command(spec: ContainerSpec) -> list[str]:
             "2048",
             "--security-opt",
             "no-new-privileges",
-            # The runtime binds team capabilities to its destination interface.
-            # Removing raw-packet authority prevents a root/custom team image from
-            # forging traffic for another private-network interface.
             "--cap-drop",
             "NET_RAW",
             "--network",
@@ -324,7 +338,7 @@ def container_command(spec: ContainerSpec) -> list[str]:
             "-e",
             f"AGENTWS_TEAM_ROSTER={roster}",
             "-e",
-            f"AGENTWS_TEAM_PROTOCOL={protocol}",
+            f"AGENTWS_SYSTEM_PROTOCOL={CONTAINER_AGENTWS / 'AGENTS.md'}",
             "-e",
             f"AGENTWS_TEAM_ROLES_DIR={CONTAINER_TEAM / 'roles'}",
             "-e",
@@ -335,6 +349,10 @@ def container_command(spec: ContainerSpec) -> list[str]:
             f"CYCLO_PROVIDER_SOCKET={CONTAINER_PROVIDER_SOCKET}",
         ]
     )
+    if spec.team.protocol is not None:
+        command.extend(
+            ["-e", f"AGENTWS_TEAM_PROTOCOL={CONTAINER_TEAM / 'AGENTS.md'}"]
+        )
     for name in AGENTWS_RETRY_ENVIRONMENT:
         value = os.environ.get(name)
         if value is not None:
@@ -502,14 +520,25 @@ class Docker:
         return data[0]
 
     def _owned_container(
-        self, name: str, expected_instance: str
+        self, name: str, expected_instance: str, expected_system: str
     ) -> dict[str, object] | None:
         info = self._inspect_container(name)
         if info is None:
             return None
         config = info.get("Config")
         labels = config.get("Labels") if isinstance(config, dict) else None
-        if not isinstance(labels, dict) or labels.get(CYCLO_LABEL) != expected_instance:
+        current = (
+            name == team_container_name(expected_system, expected_instance)
+            and isinstance(labels, dict)
+            and all(
+                (
+                    labels.get(LABEL_SYSTEM) == expected_system,
+                    labels.get(LABEL_KIND) == TEAM_KIND,
+                    labels.get(LABEL_INSTANCE) == expected_instance,
+                )
+            )
+        )
+        if not current:
             raise CycloError(f"refusing to use non-Cyclo container: {name}")
         return info
 
@@ -522,7 +551,7 @@ class Docker:
     def container_lifecycle_active(self, name: str) -> bool:
         return self.container_lifecycle_state(name).lifecycle_active
 
-    def container_label(self, name: str, label: str = CYCLO_LABEL) -> str | None:
+    def container_label(self, name: str, label: str = LABEL_INSTANCE) -> str | None:
         info = self._inspect_container(name)
         if info is None:
             return None
@@ -534,20 +563,42 @@ class Docker:
     def container_exists(self, name: str) -> bool:
         return self._inspect_container(name) is not None
 
-    def ensure_network(self, name: str, *, offline: bool) -> str:
+    def ensure_network(
+        self,
+        name: str,
+        expected_instance: str,
+        *,
+        system: str,
+        offline: bool,
+    ) -> str:
+        if name != team_network_name(system, expected_instance):
+            raise CycloError(
+                "Cyclo network name does not match the selected installation"
+            )
         info = self._inspect_network(name)
         if info is not None:
             labels = info.get("Labels") or {}
             internal = bool(info.get("Internal"))
             if not isinstance(labels, dict):
                 raise CycloError(f"cannot inspect existing Docker network: {name}")
-            if labels.get(CYCLO_LABEL) != name:
+            current = name == team_network_name(system, expected_instance) and all(
+                (
+                    labels.get(LABEL_SYSTEM) == system,
+                    labels.get(LABEL_KIND) == TEAM_NETWORK_KIND,
+                    labels.get(LABEL_INSTANCE) == expected_instance,
+                )
+            )
+            if not current:
                 raise CycloError(f"Docker network name is already owned outside Cyclo: {name}")
             if internal != offline:
                 mode = "offline" if internal else "egress-enabled"
                 raise CycloError(f"Docker network {name} already exists in {mode} mode")
             return self._resource_id(info, kind="network", name=name)
-        command = ["docker", "network", "create", "--label", f"{CYCLO_LABEL}={name}"]
+        command = ["docker", "network", "create"]
+        for key, value in resource_labels(
+            system, TEAM_NETWORK_KIND, expected_instance
+        ).items():
+            command.extend(["--label", f"{key}={value}"])
         if offline:
             command.append("--internal")
         command.append(name)
@@ -556,7 +607,13 @@ class Docker:
         if info is None:
             raise CycloError(f"Docker network disappeared after creation: {name}")
         labels = info.get("Labels") or {}
-        if not isinstance(labels, dict) or labels.get(CYCLO_LABEL) != name:
+        if not isinstance(labels, dict) or not all(
+            (
+                labels.get(LABEL_SYSTEM) == system,
+                labels.get(LABEL_KIND) == TEAM_NETWORK_KIND,
+                labels.get(LABEL_INSTANCE) == expected_instance,
+            )
+        ):
             raise CycloError(f"created Docker network has unexpected ownership: {name}")
         return self._resource_id(info, kind="network", name=name)
 
@@ -578,7 +635,9 @@ class Docker:
         return result
 
     def start(self, spec: ContainerSpec) -> int | None:
-        info = self._owned_container(spec.instance.container_name, spec.instance.id)
+        info = self._owned_container(
+            spec.instance.container_name, spec.instance.id, spec.system
+        )
         if info is not None:
             state = docker_container_state(
                 info, name=spec.instance.container_name
@@ -594,7 +653,9 @@ class Docker:
             self._run(["docker", "rm", resource_id])
         validate_container_spec(spec)
         self._run(container_command(spec))
-        info = self._owned_container(spec.instance.container_name, spec.instance.id)
+        info = self._owned_container(
+            spec.instance.container_name, spec.instance.id, spec.system
+        )
         if info is None:
             raise CycloError(
                 f"Cyclo container disappeared after start: {spec.instance.container_name}"
@@ -668,11 +729,14 @@ class Docker:
         self,
         container: str,
         expected_instance: str | None = None,
+        expected_system: str | None = None,
         expected_launch: str | None = None,
     ) -> None:
         if expected_instance is None:
             raise CycloError("expected Cyclo instance ID is required for container removal")
-        info = self._owned_container(container, expected_instance)
+        if expected_system is None:
+            raise CycloError("expected Cyclo installation ID is required for container removal")
+        info = self._owned_container(container, expected_instance, expected_system)
         if info is None:
             return
         if expected_launch is not None:
@@ -693,14 +757,23 @@ class Docker:
             self._run(["docker", "stop", "--timeout", "30", resource_id])
         self._run(["docker", "rm", resource_id])
 
-    def remove_network(self, name: str) -> None:
+    def remove_network(
+        self, name: str, expected_instance: str, *, system: str
+    ) -> None:
         info = self._inspect_network(name)
         if info is None:
             return
         labels = info.get("Labels") or {}
         if not isinstance(labels, dict):
             raise CycloError(f"cannot inspect Docker network before removal: {name}")
-        if labels.get(CYCLO_LABEL) != name:
+        current = name == team_network_name(system, expected_instance) and all(
+            (
+                labels.get(LABEL_SYSTEM) == system,
+                labels.get(LABEL_KIND) == TEAM_NETWORK_KIND,
+                labels.get(LABEL_INSTANCE) == expected_instance,
+            )
+        )
+        if not current:
             raise CycloError(f"refusing to remove non-Cyclo network: {name}")
         network_id = self._resource_id(info, kind="network", name=name)
         members = sorted(self._network_members(info).values())

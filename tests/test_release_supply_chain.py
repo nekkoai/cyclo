@@ -11,9 +11,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME = ROOT / "src" / "cyclo" / "_bundle" / "team"
-GATEWAY = ROOT / "src" / "cyclo" / "_bundle" / "gateway"
-BUNDLE = ROOT / "src" / "cyclo" / "_bundle"
+RUNTIME = ROOT / "src" / "cyclo" / "components" / "team-runtime"
+GATEWAY = ROOT / "src" / "cyclo" / "components" / "gateway"
+COMPONENTS = ROOT / "src" / "cyclo" / "components"
 
 
 def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() -> None:
@@ -68,15 +68,44 @@ def test_gateway_node_install_is_locked_to_the_runtime_pi_generation() -> None:
 
 
 def test_every_shipped_component_has_a_pinned_lock_and_declaration() -> None:
-    for name in ("component", "provider", "gateway", "passthrough", "pi-provider", "team"):
-        package = BUNDLE / name
+    for name in (
+        "protocol/component",
+        "protocol/provider",
+        "gateway",
+        "passthrough",
+        "pi-provider",
+        "team-runtime",
+    ):
+        package = COMPONENTS / name
         lock = json.loads((package / "package-lock.json").read_text(encoding="utf-8"))
         assert lock["lockfileVersion"] == 3
         assert (package / "package.json").is_file()
-        if name in {"gateway", "passthrough", "team"}:
+        if name in {"gateway", "passthrough", "team-runtime"}:
             assert (package / "Dockerfile").is_file()
         if name in {"gateway", "passthrough"}:
             assert (package / "component.conf").is_file()
+
+
+def test_local_protocol_dependencies_match_source_and_image_layouts() -> None:
+    expected_dependencies = {
+        "@cyclo/component": "file:../protocol/component",
+        "@cyclo/provider": "file:../protocol/provider",
+    }
+    for name in ("gateway", "passthrough", "pi-provider"):
+        package = json.loads(
+            (COMPONENTS / name / "package.json").read_text(encoding="utf-8")
+        )
+        assert {
+            dependency: package["dependencies"][dependency]
+            for dependency in expected_dependencies
+        } == expected_dependencies
+
+    for name in ("gateway", "passthrough", "team-runtime"):
+        dockerfile = (COMPONENTS / name / "Dockerfile").read_text(encoding="utf-8")
+        assert "protocol/component/package.json" in dockerfile
+        assert "./protocol/component/" in dockerfile
+        assert "protocol/provider/package.json" in dockerfile
+        assert "./protocol/provider/" in dockerfile
 
 
 def test_workflow_actions_are_pinned_to_full_commits() -> None:
@@ -96,6 +125,24 @@ def test_workflow_actions_are_pinned_to_full_commits() -> None:
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "python -m build --no-isolation" in ci
     assert "python tools/normalize-distributions dist" in ci
+
+
+def test_ci_uses_and_tests_the_current_component_layout() -> None:
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "src/cyclo/_bundle" not in ci
+    assert (
+        "for package in protocol/component protocol/provider gateway passthrough "
+        "pi-provider; do"
+    ) in ci
+    assert 'npm test --prefix "src/cyclo/components/$package"' in ci
+    assert (
+        "protocol/component protocol/provider gateway passthrough pi-provider "
+        "team-runtime"
+    ) in ci
+    for component in ("team-runtime", "gateway", "passthrough"):
+        assert f"src/cyclo/components/{component}/Dockerfile" in ci
+    assert ci.count("src/cyclo/components\n") >= 3
 
 
 def test_build_backend_dependencies_are_available_in_test_and_release_envs() -> None:
@@ -137,9 +184,9 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert 'sh -n "$script" || exit 1' in release
     assert "tools/release-acceptance" in release
     assert "tools/runtime-write-acceptance" in release
-    assert "npm ci --force --ignore-scripts --prefix src/cyclo/_bundle/team" in release
+    assert "npm ci --force --ignore-scripts --prefix src/cyclo/components/team-runtime" in release
     assert "docker build --pull" in release
-    assert "src/cyclo/_bundle/team" in release
+    assert "src/cyclo/components/team-runtime" in release
     assert "gateway" in release
     assert "cyclo gateway providers" in acceptance
     assert "CYCLO_PROVIDER_RUNTIME_IMAGE" not in acceptance

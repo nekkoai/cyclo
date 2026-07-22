@@ -54,7 +54,7 @@ transport outcome.
 
 ## Build and test
 
-From `src/cyclo/_bundle`:
+From `src/cyclo/components`:
 
 ```sh
 npm --prefix component ci

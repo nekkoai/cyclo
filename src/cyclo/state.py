@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterator
 
 from .errors import CycloError
+from .installation import installation_id, team_container_name, team_network_name
 
 
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -80,7 +81,6 @@ class Instance:
     project_description: str = ""
     project_generation: str = ""
     project_mounts: list[dict[str, str]] = field(default_factory=list)
-    legacy_project_read_only: bool = False
     launch_id: str = ""
     provider_socket_path: str = ""
     provider_generation: str = ""
@@ -88,14 +88,6 @@ class Instance:
     @classmethod
     def from_json(cls, data: dict[str, object]) -> "Instance":
         payload = dict(data)
-        # Cyclo 0.1 persisted project_read_only. Retain it until the operator
-        # restarts that instance with the writable-project behavior.
-        legacy_read_only = payload.pop("project_read_only", False)
-        if legacy_read_only is True:
-            payload["legacy_project_read_only"] = True
-        else:
-            payload.setdefault("legacy_project_read_only", legacy_read_only)
-
         string_fields = (
             "id",
             "team_name",
@@ -123,7 +115,6 @@ class Instance:
             "team_write",
             "offline",
             "active",
-            "legacy_project_read_only",
         ):
             if name in payload and type(payload[name]) is not bool:
                 raise TypeError(f"{name} must be a boolean")
@@ -152,34 +143,30 @@ class Instance:
             raise TypeError(
                 "provider_socket_path and provider_generation must be set together"
             )
-        expected_container = f"cyclo-{instance.id}"
-        expected_network = f"{expected_container}-net"
-        if instance.container_name != expected_container:
+        namespaced = re.fullmatch(
+            rf"cyclo-[0-9a-f]{{12}}-team-{re.escape(instance.id)}",
+            instance.container_name,
+        )
+        if namespaced is None:
             raise TypeError(
-                f"container_name must be {expected_container!r} for instance "
+                "container_name must be a Cyclo team resource for instance "
                 f"{instance.id!r}"
             )
-        if instance.network_name != expected_network:
+        if instance.network_name != f"{instance.container_name}-net":
             raise TypeError(
-                f"network_name must be {expected_network!r} for instance "
+                "network_name must match the Cyclo team container for instance "
                 f"{instance.id!r}"
             )
         # Keep the persistence boundary and every project-state consumer on
-        # the same decoder.  The local import avoids a state/project_state
-        # module cycle while preserving the v0.1 read-only migration marker.
+        # the same decoder. The local import avoids a state/project_state
+        # module cycle.
         from .project_state import decode_instance_project
 
-        decode_instance_project(instance).require_persistable()
+        decode_instance_project(instance).require_valid()
         return instance
 
     def as_json(self) -> dict[str, object]:
-        payload = asdict(self)
-        legacy_read_only = payload.pop("legacy_project_read_only")
-        if legacy_read_only:
-            # Preserve the shipped v0.1 field on disk; the clearer internal name
-            # must not create a second compatibility format.
-            payload["project_read_only"] = True
-        return payload
+        return asdict(self)
 
 
 class StateStore:
@@ -188,6 +175,26 @@ class StateStore:
         self.instances_dir = self.root / "instances"
         self.components_root = self.root / "components"
         self.lock_path = self.root / "control.lock"
+
+    @property
+    def system(self) -> str:
+        """Stable installation identity derived from the canonical state root."""
+
+        # Gateway and provider resources have always used the component-state
+        # root as their namespace input. Reuse it so every Docker resource in
+        # this installation carries one identity without renaming those stores.
+        return installation_id(self.components_root)
+
+    def _validate_resource_namespace(self, instance: Instance) -> None:
+        expected = (
+            team_container_name(self.system, instance.id),
+            team_network_name(self.system, instance.id),
+        )
+        actual = (instance.container_name, instance.network_name)
+        if actual != expected:
+            raise CycloError(
+                f"instance {instance.id!r} belongs to another Cyclo installation"
+            )
 
     def ensure(self) -> None:
         for path in (self.root, self.instances_dir, self.components_root):
@@ -256,6 +263,7 @@ class StateStore:
             raise CycloError(f"cannot read Cyclo instance {path}: {exc}") from exc
         try:
             instance = Instance.from_json(data)
+            self._validate_resource_namespace(instance)
         except (TypeError, CycloError) as exc:
             raise CycloError(f"invalid Cyclo instance metadata {path}: {exc}") from exc
         if instance.id != identifier:
@@ -328,6 +336,7 @@ class StateStore:
                     raise CycloError("instance state entry is not a directory")
                 data = self._read_metadata(path)
                 instance = Instance.from_json(data)
+                self._validate_resource_namespace(instance)
                 validate_instance_id(instance.id)
                 if instance.id != path.parent.name:
                     raise CycloError(
@@ -353,6 +362,7 @@ class StateStore:
         # reader would reject on the next command.
         try:
             Instance.from_json(payload)
+            self._validate_resource_namespace(instance)
         except (TypeError, CycloError) as exc:
             raise CycloError(
                 f"invalid Cyclo instance metadata for {instance.id!r}: {exc}"

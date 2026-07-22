@@ -21,7 +21,7 @@ Use the template installed with Cyclo. Replace the model with an exact entry
 from `cyclo models`:
 
 ```sh
-cyclo init ~/teams/adversarial-audit \
+cyclo team init ~/teams/adversarial-audit \
   --template adversarial-audit \
   --model openai-codex/MODEL_ID
 git -C ~/teams/adversarial-audit add .
@@ -43,7 +43,7 @@ mount source-snapshot ../../src/my-project ro
 ```sh
 cyclo validate ~/experiments/my-project/project.cyclo
 cyclo run --offline ~/experiments/my-project/project.cyclo
-cyclo task my-project-adversarial-audit audit-001 /tmp/audit-001.md
+cyclo task run my-project-adversarial-audit audit-001 /tmp/audit-001.md
 cyclo logs -f my-project-adversarial-audit
 ```
 

@@ -62,6 +62,18 @@ test("OAuth interaction implements the pi-ai selection prompt", async () => {
   }), "two");
 });
 
+test("OAuth interaction stops before Pi dispatch when selection is cancelled", async () => {
+  const interaction = createAuthInteraction({
+    ask: async () => "q",
+    write() {},
+  });
+  await assert.rejects(interaction.prompt({
+    type: "select",
+    message: "Choose account",
+    options: [{ id: "one", label: "One" }],
+  }), /Login cancelled/u);
+});
+
 test("OAuth login delegates to the selected Pi provider and stores its credential", async () => {
   const directory = await mkdtemp(join(tmpdir(), "cyclo-gateway-oauth-login-"));
   const path = join(directory, "auth.json");

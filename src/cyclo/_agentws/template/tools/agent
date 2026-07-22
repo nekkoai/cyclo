@@ -79,16 +79,36 @@ def configured_workspace(root: Path) -> Path:
 
 
 def load_team_context(root: Path, role: str):
-    protocol_file = configured_team_path(root, "AGENTWS_TEAM_PROTOCOL", root / "AGENTS.md")
+    protocol_file = configured_team_path(
+        root, "AGENTWS_SYSTEM_PROTOCOL", root / "AGENTS.md"
+    )
+    team_protocol_value = os.environ.get("AGENTWS_TEAM_PROTOCOL")
+    team_protocol_file = (
+        configured_team_path(root, "AGENTWS_TEAM_PROTOCOL", root / "AGENTS.md")
+        if team_protocol_value
+        else None
+    )
     roles_dir = configured_team_path(root, "AGENTWS_TEAM_ROLES_DIR", root / "roles")
     role_file = (roles_dir / f"{role}.md").resolve()
     if not protocol_file.is_file():
-        die(f"team protocol not found: {protocol_file}")
+        die(f"system protocol not found: {protocol_file}")
+    if team_protocol_file is not None and not team_protocol_file.is_file():
+        die(f"team protocol not found: {team_protocol_file}")
     if not roles_dir.is_dir():
         die(f"team roles directory not found: {roles_dir}")
     if not role_file.is_file():
         die(f"role file not found: {role_file}")
     protocol_text = protocol_file.read_text(encoding="utf-8", errors="replace")
+    if team_protocol_file is not None and team_protocol_file != protocol_file:
+        team_protocol_text = team_protocol_file.read_text(
+            encoding="utf-8", errors="replace"
+        )
+        protocol_text = (
+            protocol_text.rstrip()
+            + f"\n\n# Team-specific additions\n\n"
+            + f"Source: {team_protocol_file}\n\n"
+            + team_protocol_text.lstrip()
+        )
     role_text = role_file.read_text(encoding="utf-8", errors="replace")
     return protocol_file, role_file, protocol_text, role_text
 
@@ -137,7 +157,7 @@ to inspect and manage tasks, jobs, and agents, and dispatch work when asked.
 AgentWS runtime root: {runtime_root}
 Workspace namespace (current working directory): {workspace}
 Cyclo project manifest: {project_source}
-Team protocol source: {protocol_file}
+System protocol source: {protocol_file}
 Role instruction source: {role_file}
 {mode_text}
 Run AgentWS queue and state commands from the runtime root above. Use the

@@ -28,6 +28,7 @@ from cyclo.component_stack import (
     StackStatus,
 )
 from cyclo.errors import CycloError
+from cyclo.installation import team_container_name, team_network_name
 from cyclo.state import Instance, StateStore
 
 
@@ -61,6 +62,12 @@ def queue(store: StateStore, identifier: str) -> Path:
     for name in ("tasks", "jobs", "agents"):
         (root / name).mkdir(parents=True, exist_ok=True)
     return root
+
+
+def persist(store: StateStore, selected: Instance) -> None:
+    selected.container_name = team_container_name(store.system, selected.id)
+    selected.network_name = team_network_name(store.system, selected.id)
+    store.save(selected)
 
 
 class InMemoryInstanceStore(StateStore):
@@ -272,7 +279,10 @@ class FakeDocker:
         self.running = running
 
     def container_running(self, name: str) -> bool:
-        return self.running[name]
+        if name in self.running:
+            return self.running[name]
+        logical = name.split("-team-", 1)[-1]
+        return self.running[f"cyclo-{logical}"]
 
 
 class FakeUsage:
@@ -367,8 +377,8 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     alpha = instance("alpha")
     old = instance("old", active=False, offline=True)
-    store.save(alpha)
-    store.save(old)
+    persist(store, alpha)
+    persist(store, old)
     alpha_queue = queue(store, "alpha")
     queue(store, "old")
     mark_supervisor_ready(alpha_queue)
@@ -441,7 +451,7 @@ def test_snapshot_reports_suspended_agents_per_running_instance(
 ) -> None:
     store = StateStore(tmp_path / "state")
     for identifier in ("alpha", "beta"):
-        store.save(instance(identifier))
+        persist(store, instance(identifier))
         mark_supervisor_ready(queue(store, identifier))
     runs = store.agents_dir("alpha") / ".team-runs"
     (runs / "planner-1.suspended").write_text(
@@ -470,7 +480,7 @@ def test_snapshot_reports_unresolved_planner_failure_as_attention(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    store.save(instance("alpha"))
+    persist(store, instance("alpha"))
     root = queue(store, "alpha")
     mark_supervisor_ready(root)
     job = root / "jobs" / "uart-plan"
@@ -495,7 +505,7 @@ def test_snapshot_does_not_report_ready_when_supervisor_state_is_unreadable(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    store.save(instance("alpha"))
+    persist(store, instance("alpha"))
     root = queue(store, "alpha")
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -519,7 +529,7 @@ def test_snapshot_preserves_provider_failure_beside_agent_suspension(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    store.save(instance("alpha"))
+    persist(store, instance("alpha"))
     root = queue(store, "alpha")
     runs = root / "agents" / ".team-runs"
     runs.mkdir()
@@ -584,9 +594,9 @@ def test_snapshot_exposes_exact_provider_health_and_reads_it_once(
 ) -> None:
     store = StateStore(tmp_path / "state")
     for identifier in ("alpha", "beta"):
-        store.save(instance(identifier))
+        persist(store, instance(identifier))
         mark_supervisor_ready(queue(store, identifier))
-    store.save(instance("stopped", active=False))
+    persist(store, instance("stopped", active=False))
     queue(store, "stopped")
     provider = FakeProvider(status)
 
@@ -626,7 +636,7 @@ def test_snapshot_reports_provider_status_errors_as_unknown(tmp_path: Path) -> N
             raise CycloError("Docker socket denied")
 
     store = StateStore(tmp_path / "state")
-    store.save(instance("alpha"))
+    persist(store, instance("alpha"))
     mark_supervisor_ready(queue(store, "alpha"))
 
     result = DashboardSnapshot(
@@ -647,7 +657,7 @@ def test_snapshot_fails_closed_when_provider_health_is_not_ready(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    store.save(instance("alpha"))
+    persist(store, instance("alpha"))
     mark_supervisor_ready(queue(store, "alpha"))
 
     result = DashboardSnapshot(
@@ -669,7 +679,7 @@ def test_snapshot_does_not_persist_an_active_team_inactive_when_not_operational(
 ) -> None:
     store = StateStore(tmp_path / "state")
     selected = instance("alpha")
-    store.save(selected)
+    persist(store, selected)
 
     result = DashboardSnapshot(
         store,
@@ -701,7 +711,7 @@ def test_snapshot_exposes_project_definition_and_named_mounts(tmp_path: Path) ->
             "mode": "ro",
         },
     ]
-    store.save(configured)
+    persist(store, configured)
     mark_supervisor_ready(queue(store, configured.id))
 
     result = DashboardSnapshot(
@@ -810,34 +820,6 @@ def test_snapshot_preserves_valid_mounts_beside_invalid_entries(
     assert any("project_mounts[2] has an invalid mode" in error for error in row["errors"])
 
 
-def test_snapshot_reports_legacy_read_only_state_as_requiring_restart(
-    tmp_path: Path,
-) -> None:
-    store = StateStore(tmp_path / "state")
-    legacy = instance("legacy")
-    legacy.legacy_project_read_only = True
-    store.save(legacy)
-    mark_supervisor_ready(queue(store, legacy.id))
-
-    result = DashboardSnapshot(
-        store,
-        docker=FakeDocker({legacy.container_name: True}),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
-    ).build()
-
-    row = result["instances"][0]
-    assert row["project"]["workspaces"] == []
-    assert row["project"]["read_only_mounts"] == [
-        {
-            "name": "legacy",
-            "path": "/projects/legacy",
-            "container_path": "/workspace",
-        }
-    ]
-    assert any("stop and rerun" in error for error in row["errors"])
-    assert result["summary"]["attention"] == 1
-
-
 def test_snapshot_rejects_empty_or_non_string_project_definition_state(
     tmp_path: Path,
 ) -> None:
@@ -868,7 +850,7 @@ def test_snapshot_rejects_empty_or_non_string_project_definition_state(
 
 def test_snapshot_counts_queue_errors_as_attention(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
-    store.save(instance("alpha"))
+    persist(store, instance("alpha"))
 
     result = DashboardSnapshot(
         store,
@@ -885,7 +867,7 @@ def test_snapshot_reports_bad_instance_records_without_hiding_readable_ones(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    store.save(instance("alpha"))
+    persist(store, instance("alpha"))
     mark_supervisor_ready(queue(store, "alpha"))
     broken = store.metadata_path("broken")
     broken.parent.mkdir(parents=True)
@@ -906,7 +888,7 @@ def test_snapshot_reports_bad_instance_records_without_hiding_readable_ones(
 
 def test_snapshot_counts_unknown_job_status_as_attention(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
-    store.save(instance("alpha"))
+    persist(store, instance("alpha"))
     root = queue(store, "alpha")
     mark_supervisor_ready(root)
     job = root / "jobs" / "job-without-status"
@@ -932,7 +914,7 @@ def test_snapshot_separates_gateway_source_errors_from_instance_errors(
             raise RuntimeError("gateway stopped")
 
     store = StateStore(tmp_path / "state")
-    store.save(instance("alpha"))
+    persist(store, instance("alpha"))
     mark_supervisor_ready(queue(store, "alpha"))
 
     result = DashboardSnapshot(

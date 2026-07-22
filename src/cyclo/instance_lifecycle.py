@@ -37,6 +37,7 @@ def stop_remove_instance_container(
     docker: Docker,
     instance: Instance,
     *,
+    system: str,
     expected_launch_id: str | None = None,
 ) -> None:
     """Remove exactly one launch-pinned team container."""
@@ -44,6 +45,7 @@ def stop_remove_instance_container(
     docker.stop_remove(
         instance.container_name,
         instance.id,
+        expected_system=system,
         expected_launch=expected_launch_id,
     )
 
@@ -88,9 +90,12 @@ def stop_instance(
             stop_remove_instance_container(
                 docker,
                 instance,
+                system=store.system,
                 expected_launch_id=expected_launch_id,
             )
-            docker.remove_network(instance.network_name)
+            docker.remove_network(
+                instance.network_name, instance.id, system=store.system
+            )
         except Exception as exc:
             raise CycloError(
                 f"instance stopped in metadata but Docker cleanup failed: {exc}"

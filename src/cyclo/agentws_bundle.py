@@ -46,13 +46,13 @@ def packaged_agentws_template() -> Path:
 
 
 def packaged_default_team() -> Path:
-    """Return the bundled default roster used by ``cyclo init``."""
+    """Return the bundled default roster used by ``cyclo team init``."""
 
     return _filesystem_resource("template", "default.team", kind="file")
 
 
 def packaged_default_roles() -> Path:
-    """Return the bundled default role definitions used by ``cyclo init``."""
+    """Return the bundled default role definitions used by ``cyclo team init``."""
 
     return _filesystem_resource("template", "roles", kind="directory")
 

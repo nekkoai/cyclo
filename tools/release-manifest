@@ -21,12 +21,12 @@ from urllib.parse import quote
 ROOT = Path(__file__).resolve().parent.parent
 
 NODE_LOCK_PATHS = (
-    Path("src/cyclo/_bundle/component/package-lock.json"),
-    Path("src/cyclo/_bundle/gateway/package-lock.json"),
-    Path("src/cyclo/_bundle/passthrough/package-lock.json"),
-    Path("src/cyclo/_bundle/pi-provider/package-lock.json"),
-    Path("src/cyclo/_bundle/provider/package-lock.json"),
-    Path("src/cyclo/_bundle/team/package-lock.json"),
+    Path("src/cyclo/components/protocol/component/package-lock.json"),
+    Path("src/cyclo/components/gateway/package-lock.json"),
+    Path("src/cyclo/components/passthrough/package-lock.json"),
+    Path("src/cyclo/components/pi-provider/package-lock.json"),
+    Path("src/cyclo/components/protocol/provider/package-lock.json"),
+    Path("src/cyclo/components/team-runtime/package-lock.json"),
 )
 
 

@@ -16,13 +16,13 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tools" / "release-manifest"
-BUNDLE_COMPONENTS = (
-    "component",
-    "provider",
+COMPONENT_SOURCES = (
+    "protocol/component",
+    "protocol/provider",
     "gateway",
     "passthrough",
     "pi-provider",
-    "team",
+    "team-runtime",
 )
 
 
@@ -30,12 +30,12 @@ def test_release_manifest_scans_every_owned_node_lockfile(tmp_path: Path) -> Non
     namespace = runpy.run_path(str(MANIFEST), run_name="cyclo_release_manifest_test")
     release_root = tmp_path / "release-root"
     expected_lockfiles = {
-        "src/cyclo/_bundle/component/package-lock.json",
-        "src/cyclo/_bundle/gateway/package-lock.json",
-        "src/cyclo/_bundle/passthrough/package-lock.json",
-        "src/cyclo/_bundle/pi-provider/package-lock.json",
-        "src/cyclo/_bundle/provider/package-lock.json",
-        "src/cyclo/_bundle/team/package-lock.json",
+        "src/cyclo/components/protocol/component/package-lock.json",
+        "src/cyclo/components/gateway/package-lock.json",
+        "src/cyclo/components/passthrough/package-lock.json",
+        "src/cyclo/components/pi-provider/package-lock.json",
+        "src/cyclo/components/protocol/provider/package-lock.json",
+        "src/cyclo/components/team-runtime/package-lock.json",
     }
     assert {
         path.as_posix() for path in namespace["NODE_LOCK_PATHS"]
@@ -108,15 +108,15 @@ def built_distributions(tmp_path_factory) -> Path:
     return dist
 
 
-def test_built_distributions_contain_the_node_bundle_without_installs(
+def test_built_distributions_contain_component_sources_without_installs(
     built_distributions: Path,
 ) -> None:
-    bundle_root = ROOT / "src" / "cyclo" / "_bundle"
-    source_files = [bundle_root / "__init__.py"]
-    for component in BUNDLE_COMPONENTS:
-        source_files.extend((bundle_root / component).rglob("*"))
+    component_root = ROOT / "src" / "cyclo" / "components"
+    source_files = [component_root / "__init__.py"]
+    for component in COMPONENT_SOURCES:
+        source_files.extend((component_root / component).rglob("*"))
     expected = {
-        (Path("cyclo/_bundle") / path.relative_to(bundle_root)).as_posix()
+        (Path("cyclo/components") / path.relative_to(component_root)).as_posix()
         for path in source_files
         if path.is_file()
         and "node_modules" not in path.parts

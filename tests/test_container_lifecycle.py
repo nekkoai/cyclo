@@ -9,6 +9,7 @@ from cyclo.cli import cmd_repair
 from cyclo.docker import Docker, DockerContainerState
 from cyclo.errors import CycloError
 from cyclo.instance_lifecycle import active_instances, stop_instance
+from cyclo.installation import team_container_name, team_network_name
 from cyclo.project import ProjectMount
 from cyclo.project_run import (
     RunBinding,
@@ -46,6 +47,12 @@ def _lifecycle_info(flag: str) -> dict[str, object]:
     return {"State": {"Running": True, flag: True}}
 
 
+def _persist(store: StateStore, selected: Instance) -> None:
+    selected.container_name = team_container_name(store.system, selected.id)
+    selected.network_name = team_network_name(store.system, selected.id)
+    store.save(selected)
+
+
 @pytest.mark.parametrize(
     ("flag", "expected"),
     [
@@ -76,7 +83,7 @@ def test_active_instances_preserves_temporary_lifecycle_states(
 ) -> None:
     store = StateStore(tmp_path / "state")
     selected = _instance("team", tmp_path / "team", tmp_path / "project")
-    store.save(selected)
+    _persist(store, selected)
     docker = Docker()
     monkeypatch.setattr(
         docker, "_inspect_container", lambda _name: _lifecycle_info(flag)
@@ -96,7 +103,7 @@ def test_stop_refuses_incomplete_inventory_before_any_side_effect(
     store = StateStore(tmp_path / "state")
     selected = _instance("team", tmp_path / "team", tmp_path / "project")
     selected.port = 4137
-    store.save(selected)
+    _persist(store, selected)
     metadata_before = store.metadata_path(selected.id).read_bytes()
     broken = store.metadata_path("broken")
     broken.parent.mkdir(parents=True)
@@ -130,7 +137,7 @@ def test_repair_does_not_revoke_or_delete_lifecycle_active_team(
 ) -> None:
     store = StateStore(tmp_path / "state")
     selected = _instance("team", tmp_path / "team", tmp_path / "project")
-    store.save(selected)
+    _persist(store, selected)
     docker = Docker()
     monkeypatch.setattr(
         docker, "_inspect_container", lambda _name: _lifecycle_info(flag)
@@ -198,7 +205,7 @@ def test_mount_preflight_includes_lifecycle_active_containers(
     active_team.mkdir()
     nested_project.mkdir(parents=True)
     running = _instance("running", active_team, active_project)
-    store.save(running)
+    _persist(store, running)
     binding = RunBinding(
         team=load_team(team_repo),
         project_root=nested_project,

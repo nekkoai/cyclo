@@ -91,7 +91,8 @@ done
 
 TEAM_ROOT="${AGENTWS_TEAM_ROOT:-$AGENTWS_ROOT}"
 TEAM_FILE="${1:-${AGENTWS_TEAM_ROSTER:-$TEAM_ROOT/default.team}}"
-PROTOCOL_FILE="${AGENTWS_TEAM_PROTOCOL:-$TEAM_ROOT/AGENTS.md}"
+SYSTEM_PROTOCOL_FILE="${AGENTWS_SYSTEM_PROTOCOL:-$AGENTWS_ROOT/AGENTS.md}"
+TEAM_PROTOCOL_FILE="${AGENTWS_TEAM_PROTOCOL:-}"
 ROLES_DIR="${AGENTWS_TEAM_ROLES_DIR:-$TEAM_ROOT/roles}"
 CONSOLE_ROLE="${AGENTWS_TEAM_CONSOLE_ROLE:-console}"
 WORKSPACE="${AGENTWS_WORKSPACE:-$AGENTWS_ROOT}"
@@ -106,7 +107,10 @@ case "$TEAM_FILE" in
 esac
 
 [ -f "$TEAM_FILE" ] || die "team file not found: $TEAM_FILE"
-[ -f "$PROTOCOL_FILE" ] || die "team protocol not found: $PROTOCOL_FILE"
+[ -f "$SYSTEM_PROTOCOL_FILE" ] || die "system protocol not found: $SYSTEM_PROTOCOL_FILE"
+if [ -n "$TEAM_PROTOCOL_FILE" ]; then
+    [ -f "$TEAM_PROTOCOL_FILE" ] || die "team protocol not found: $TEAM_PROTOCOL_FILE"
+fi
 [ -d "$ROLES_DIR" ] || die "team roles directory not found: $ROLES_DIR"
 [ -d "$WORKSPACE" ] || die "agent workspace directory not found: $WORKSPACE"
 command -v ps >/dev/null 2>&1 || die "required command not found: ps"
@@ -125,7 +129,12 @@ require_positive_integer "AGENTWS_RETRY_MAX_SECONDS" "$RETRY_MAX_SECONDS"
 
 export AGENTWS_TEAM_ROOT="$TEAM_ROOT"
 export AGENTWS_TEAM_ROSTER="$TEAM_FILE"
-export AGENTWS_TEAM_PROTOCOL="$PROTOCOL_FILE"
+export AGENTWS_SYSTEM_PROTOCOL="$SYSTEM_PROTOCOL_FILE"
+if [ -n "$TEAM_PROTOCOL_FILE" ]; then
+    export AGENTWS_TEAM_PROTOCOL="$TEAM_PROTOCOL_FILE"
+else
+    unset AGENTWS_TEAM_PROTOCOL
+fi
 export AGENTWS_TEAM_ROLES_DIR="$ROLES_DIR"
 export AGENTWS_TEAM_CONSOLE_ROLE="$CONSOLE_ROLE"
 export AGENTWS_WORKSPACE="$WORKSPACE"
