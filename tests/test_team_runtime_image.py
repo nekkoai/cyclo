@@ -15,6 +15,7 @@ def test_packaged_team_image_uses_common_component_context() -> None:
     assert (root / "entrypoint.sh").is_file()
     assert (root / "package-lock.json").is_file()
     assert (root.parent / "pi-provider" / "src" / "extension.mjs").is_file()
+    assert "npm:pi-lens" in team_runtime_image.PI_PACKAGES
     assert team_runtime_image.PI_PACKAGES[-1] == "/opt/cyclo/pi-provider"
     files = {path.as_posix() for path in team_runtime_image.source_files()}
     assert "team/Dockerfile" in files

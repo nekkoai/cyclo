@@ -73,7 +73,7 @@ test("rejects unsupported controls and malformed history before dispatch", () =>
   );
 });
 
-test("accepts only the portable schema, image, and identifier subset", () => {
+test("preserves Pi tool schemas while validating the portable envelope", () => {
   const request = {
     model: "work/gpt-test",
     tools: [{
@@ -107,13 +107,22 @@ test("accepts only the portable schema, image, and identifier subset", () => {
       inputSchema: jsonStruct({ type: "object" }),
     }],
   }, /tool names/u);
-  assertInvalid({
+  const lensSchema = {
+    type: "object",
+    properties: {
+      refreshRunners: {
+        anyOf: [
+          { type: "boolean" },
+          { type: "string", enum: ["cached", "cheap", "all", "none"] },
+        ],
+      },
+    },
+  };
+  const lens = prepareInference({
     ...baseRequest(),
-    tools: [{
-      name: "lookup",
-      inputSchema: jsonStruct({ type: "object", oneOf: [{ type: "object" }] }),
-    }],
-  }, /unsupported keyword oneOf/u);
+    tools: [{ name: "lens_diagnostics", inputSchema: jsonStruct(lensSchema) }],
+  }, route());
+  assert.deepEqual(lens.context.tools[0].parameters, lensSchema);
   assertInvalid({
     model: "work/gpt-test",
     input: [{ item: { case: "message", value: {
