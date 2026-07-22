@@ -16,22 +16,6 @@ const IMAGE_MEDIA_TYPES = new Set([
   "image/png",
   "image/webp",
 ]);
-const SCHEMA_TYPES = new Set(["array", "boolean", "integer", "number", "object", "string"]);
-const SCHEMA_KEYS = new Set([
-  "additionalProperties",
-  "description",
-  "enum",
-  "items",
-  "maximum",
-  "maxItems",
-  "maxLength",
-  "minimum",
-  "minItems",
-  "minLength",
-  "properties",
-  "required",
-  "type",
-]);
 
 // Validate the complete portable request before the adapter opens an upstream
 // stream. pi-ai is then only a native protocol adapter, never a validator for
@@ -294,120 +278,37 @@ function structJson(value, label) {
   return result;
 }
 
-// This intentionally small JSON Schema dialect is carried unchanged by every
-// native adapter exposed by the gateway. Anything outside it is rejected here
-// instead of being dropped by an adapter or rejected after dispatch.
+// Pi owns tool-schema semantics. Cyclo's RPC binding only verifies that the
+// schema is bounded JSON that can cross the component boundary unchanged.
+// Provider-specific schema support belongs to Pi's native provider adapter.
 function validateToolSchema(root, label) {
   let nodes = 0;
 
-  function visit(schema, path, depth) {
-    if (!isObject(schema)) invalid(`${path} must be an object`);
+  function visit(value, path, depth) {
     if (depth > 16 || ++nodes > 256) invalid(`${label} is too complex`);
-    for (const key of Object.keys(schema)) {
-      if (!SCHEMA_KEYS.has(key)) invalid(`${path} uses unsupported keyword ${key}`);
-    }
-    if (!SCHEMA_TYPES.has(schema.type)) invalid(`${path} has an unsupported type`);
-    if (schema.description !== undefined && typeof schema.description !== "string") {
-      invalid(`${path} has an invalid description`);
-    }
-
-    if (schema.enum !== undefined) {
-      if (
-        !Array.isArray(schema.enum)
-        || schema.enum.length === 0
-        || schema.enum.some((value) => !matchesSchemaType(value, schema.type))
-        || new Set(schema.enum.map((value) => JSON.stringify(value))).size !== schema.enum.length
-      ) {
-        invalid(`${path} has an invalid enum`);
-      }
-    }
-
-    if (schema.type === "object") {
-      if (schema.properties !== undefined && !isObject(schema.properties)) {
-        invalid(`${path} has invalid properties`);
-      }
-      const properties = schema.properties ?? {};
-      for (const [name, child] of Object.entries(properties)) {
-        if (!validPropertyName(name)) invalid(`${path} has an invalid property name`);
-        visit(child, `${path}.properties.${name}`, depth + 1);
-      }
-      if (
-        schema.required !== undefined
-        && (!Array.isArray(schema.required)
-          || schema.required.some((name) => typeof name !== "string" || !Object.hasOwn(properties, name))
-          || new Set(schema.required).size !== schema.required.length)
-      ) {
-        invalid(`${path} has an invalid required list`);
-      }
-      if (
-        schema.additionalProperties !== undefined
-        && typeof schema.additionalProperties !== "boolean"
-      ) {
-        invalid(`${path} has invalid additionalProperties`);
-      }
-      rejectPresent(schema, path, ["items", "minimum", "maximum", "minItems", "maxItems", "minLength", "maxLength"]);
+    if (value === null || typeof value === "boolean" || typeof value === "string") return;
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) invalid(`${path} contains a non-finite number`);
       return;
     }
-
-    rejectPresent(schema, path, ["properties", "required", "additionalProperties"]);
-    if (schema.type === "array") {
-      if (schema.items === undefined) invalid(`${path} requires items`);
-      visit(schema.items, `${path}.items`, depth + 1);
-      validateBounds(schema, path, "minItems", "maxItems", true);
-      rejectPresent(schema, path, ["minimum", "maximum", "minLength", "maxLength"]);
+    if (Array.isArray(value)) {
+      if (value.length > 128) invalid(`${path} has too many entries`);
+      value.forEach((child, index) => visit(child, `${path}[${index}]`, depth + 1));
       return;
     }
-
-    rejectPresent(schema, path, ["items", "minItems", "maxItems"]);
-    if (schema.type === "string") {
-      validateBounds(schema, path, "minLength", "maxLength", true);
-      rejectPresent(schema, path, ["minimum", "maximum"]);
-    } else if (schema.type === "number" || schema.type === "integer") {
-      validateBounds(schema, path, "minimum", "maximum", false);
-      rejectPresent(schema, path, ["minLength", "maxLength"]);
-    } else {
-      rejectPresent(schema, path, ["minimum", "maximum", "minLength", "maxLength"]);
+    if (!isObject(value)) invalid(`${path} is not JSON data`);
+    const entries = Object.entries(value);
+    if (entries.length > 128) invalid(`${path} has too many members`);
+    for (const [name, child] of entries) {
+      if (!name || name.length > 256 || /[\u0000-\u001f\u007f]/u.test(name)) {
+        invalid(`${path} has an invalid member name`);
+      }
+      visit(child, `${path}.${name}`, depth + 1);
     }
   }
 
+  if (!isObject(root)) invalid(`${label} must be an object`);
   visit(root, label, 0);
-  if (root.type !== "object") invalid(`${label} must describe an object`);
-}
-
-function validateBounds(schema, path, minimum, maximum, integer) {
-  for (const name of [minimum, maximum]) {
-    if (
-      schema[name] !== undefined
-      && (typeof schema[name] !== "number"
-        || !Number.isFinite(schema[name])
-        || (integer && (!Number.isInteger(schema[name]) || schema[name] < 0)))
-    ) {
-      invalid(`${path} has an invalid ${name}`);
-    }
-  }
-  if (schema[minimum] !== undefined && schema[maximum] !== undefined && schema[minimum] > schema[maximum]) {
-    invalid(`${path} has inverted ${minimum}/${maximum}`);
-  }
-}
-
-function rejectPresent(schema, path, names) {
-  const name = names.find((candidate) => schema[candidate] !== undefined);
-  if (name) invalid(`${path} cannot use ${name} with type ${schema.type}`);
-}
-
-function matchesSchemaType(value, type) {
-  if (type === "string") return typeof value === "string";
-  if (type === "boolean") return typeof value === "boolean";
-  if (type === "integer") return Number.isSafeInteger(value);
-  if (type === "number") return typeof value === "number" && Number.isFinite(value);
-  return false;
-}
-
-function validPropertyName(value) {
-  return typeof value === "string"
-    && value.length > 0
-    && value.length <= 128
-    && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function hasImageSignature(mediaType, data) {
