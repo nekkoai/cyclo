@@ -95,7 +95,8 @@ runtime image also installs packages from the live Debian index and is not
 claimed to be byte-identical across rebuild dates.
 
 The SPDX SBOM enumerates locked Node dependencies from the team runtime,
-credential gateway, and provider runtime package locks.
+credential gateway, component interfaces, Provider interface, Pi extension,
+and bundled example components.
 
 `tools/build-release` does not inspect, contact, mutate, tag, push to, or
 publish through any Git remote or hosting service. Publication is deliberately
@@ -114,33 +115,34 @@ python3 -m venv /tmp/cyclo-release
 python -m pip install ./cyclo_agent-0.2.0-py3-none-any.whl
 cyclo --version
 cyclo templates
-cyclo gateway providers
-cyclo runtime status
+cyclo gateway status
+cyclo providers status
 ```
 
-At this point the provider runtime is deliberately absent. `cyclo doctor` is a
-diagnostic and must not build or start it, so a nonzero result that explicitly
-reports the absent runtime is expected. `tools/release-acceptance` exercises
-that clean installed-wheel state while checking the packaged runtime resources
-and Docker daemon independently.
+At this point all components are deliberately absent. `cyclo doctor` is a
+diagnostic and must not build or start them, so a nonzero result that explicitly
+reports the absent gateway is expected. `tools/release-acceptance` exercises
+that clean installed-wheel state while checking packaged resources and Docker
+independently.
 
 For a complete operational check, provision a disposable provider account and
 operate shared services in dependency order:
 
 ```sh
 sudo install -d -m 0755 /etc/cyclo
+cyclo gateway build
+cyclo gateway providers
 cyclo gateway login PROVIDER
 cyclo gateway restart
-cyclo runtime start --build
-cyclo provider build --all   # when /etc/cyclo/host.conf defines providers
-cyclo provider start --all   # when /etc/cyclo/host.conf defines providers
+cyclo providers check
+cyclo providers restart --build
 cyclo doctor
 cyclo models
 ```
 
-The order is intentional: credential gateway, provider runtime, configured
-provider components, then `doctor`. None of `doctor`, `models`, or `run` starts
-or rebuilds these shared services.
+The order is intentional: credential gateway, configured provider components,
+then `doctor`. None of `doctor`, `models`, or `run` starts or rebuilds these
+shared components.
 
 Initialize one packaged team, run `cyclo validate`, and perform a `run
 --dry-run` against a disposable project. Compare the copied wheel against

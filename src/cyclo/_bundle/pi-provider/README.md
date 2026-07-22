@@ -1,30 +1,34 @@
-# Cyclo Provider extension for Pi
+# Cyclo provider extension for Pi
 
-This package is the consumer edge between Pi and Cyclo's portable Provider
-interface. It is an embedded Pi extension, not a component and not a service.
+This embedded Pi extension is the team-side endpoint of Cyclo's provider
+transport. It is not a component and owns no credentials.
 
-At Pi startup it connects to the Unix socket in `CYCLO_PROVIDER_SOCKET`, calls
-`Provider.ListModels`, splits each public `PROVIDER/MODEL` name at the first
-slash, and registers the resulting providers and models with Pi. Its custom
-`streamSimple` implementation translates Pi context and tool calls to
-`Provider.Infer`, then translates the validated response stream back to Pi
-events.
+At startup it calls `Provider.ListModels` on `CYCLO_PROVIDER_SOCKET`, checks the
+advertised Pi inference-format version, and registers the returned
+`PROVIDER/MODEL` entries with Pi.
 
-The socket mount is the authority. The extension sends no bearer token,
-authorization header, API key, URL, or caller metadata. The `apiKey` marker in
-the Pi registration only satisfies Pi's local model-availability check; it is
-never placed on the Provider RPC.
+For inference it serializes exactly one call frame:
 
-The adapter fails closed when a model or event needs a capability Pi cannot
-represent, including typed extensions, output media, signed native history,
-and content-filter/refusal terminal reasons. Costs remain zero in Pi because
-the portable catalogue does not publish prices; the gateway retains the
-authoritative usage audit.
+```json
+{"context": {"messages": []}, "options": {}}
+```
+
+The `context` is Pi's context object. `options` contains every JSON inference
+option supplied by Pi. Local process values (`signal`), credential controls
+(`apiKey`, `headers`, `env`), injected clients, and callback functions do not
+enter the payload. Cancellation and deadlines use ConnectRPC call options.
+
+Each streamed response payload is parsed once and pushed directly into Pi's
+`AssistantMessageEventStream`. The extension does not validate messages, tool
+schemas, signatures, reasoning content, tool arguments, event types, or future
+Pi fields. Transport failures become a terminal Pi error event because that is
+the contract of Pi's local stream API.
 
 ```sh
 npm ci
 npm test
 ```
 
-This package is intentionally not copied into Cyclo's current team image and
-does not modify the public CLI yet.
+The tests use a real Unix-socket ConnectRPC server and prove that signed
+history, unknown fields, and unrestricted JSON Schema constructs such as
+`anyOf` cross the boundary unchanged.

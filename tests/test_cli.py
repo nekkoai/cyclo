@@ -142,6 +142,8 @@ class RecordingStore:
 class RunStack:
     def __init__(self, socket_path: Path) -> None:
         self.status_value = stack_status(socket_path)
+        self.provider_socket_path = socket_path
+        self.assembly = SimpleNamespace(generation="provider-generation")
         self.calls: list[str] = []
 
     def require_ready(self):
@@ -251,7 +253,7 @@ def test_project_dry_run_expands_team_and_mount_authority_without_state(
 
     output = capsys.readouterr().out
     assert result == 0
-    assert stack.calls == ["require_ready", "models_document"]
+    assert stack.calls == []
     assert output.count("docker run --detach") == 2
     assert output.count(f"src={project_repo.resolve()},dst=/workspace/source") == 2
     assert output.count("dst=/readonly/documentation,readonly") == 2
@@ -360,6 +362,7 @@ class GatewayDouble:
     def __init__(self) -> None:
         self.calls: list[tuple[object, ...]] = []
         self.status_value = gateway_status()
+        self.store_volume = "cyclo-gateway-state"
 
     def providers(self) -> str:
         self.calls.append(("providers",))
@@ -406,7 +409,12 @@ class GatewayDouble:
         (("start",), ("start",), 1, "gateway\tready\tcurrent"),
         (("restart", "--build"), ("restart", True), 1, "gateway\tready\tcurrent"),
         (("stop",), ("stop",), 1, "stopped gateway"),
-        (("destroy-store",), ("destroy_store",), 1, "destroyed gateway store"),
+        (
+            ("destroy-store", "--confirm", "cyclo-gateway-state"),
+            ("destroy_store",),
+            1,
+            "destroyed gateway store",
+        ),
     ),
 )
 def test_gateway_actions_use_only_the_gateway_component(
@@ -432,7 +440,51 @@ def test_gateway_actions_use_only_the_gateway_component(
     assert result == 0
     assert proxy.calls == ([call, ("restart", False)] if arguments == ("build",) else [call])
     assert store.lock_entries == locks
-    assert output in capsys.readouterr().out
+    rendered = capsys.readouterr().out
+    assert output in rendered
+    if arguments[0] in {"build", "start", "restart", "status"}:
+        assert "store\tcyclo-gateway-state" in rendered
+
+
+def test_destroy_store_requires_the_exact_volume_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = RecordingStore(tmp_path / "state")
+    proxy = GatewayDouble()
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: proxy)
+
+    result = main(["gateway", "destroy-store", "--confirm", "wrong-volume"])
+
+    assert result == 1
+    assert proxy.calls == []
+    assert store.lock_entries == 1
+    assert "--confirm must equal cyclo-gateway-state" in capsys.readouterr().err
+
+
+def test_gateway_help_describes_store_and_credential_free_discovery() -> None:
+    parser = build_parser()
+    root_action = next(
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    )
+    gateway = root_action.choices["gateway"]
+    gateway_action = next(
+        action for action in gateway._actions if isinstance(action, argparse._SubParsersAction)
+    )
+
+    assert "credentials, subscriptions, and retained usage history" in gateway.format_help()
+    providers_help = " ".join(gateway_action.choices["providers"].format_help().split())
+    assert "Providers are upstream AI services" in providers_help
+    assert "does not read or mount the gateway credential store" in providers_help
+    login_help = " ".join(gateway_action.choices["login"].format_help().split())
+    assert "catalogue provider/account name" in login_help
+    assert "default: PROVIDER" in login_help
+    destroy_help = " ".join(gateway_action.choices["destroy-store"].format_help().split())
+    assert "--confirm VOLUME" in destroy_help
+    assert "credentials, subscriptions, and retained usage history" in destroy_help
+    assert "irreversibly" in destroy_help
 
 
 def test_gateway_login_forwards_only_explicit_login_arguments(

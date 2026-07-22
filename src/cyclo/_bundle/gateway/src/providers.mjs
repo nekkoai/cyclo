@@ -1,10 +1,5 @@
-import { getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import {
-  getBuiltinModels,
-  getBuiltinProviders,
-} from "@earendil-works/pi-ai/providers/all";
-
 import { EXPOSED_APIS } from "./catalogue.mjs";
+import { getPiProviders, validatePiProviders } from "./pi-registry.mjs";
 
 const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]*$/u;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/u;
@@ -51,56 +46,48 @@ const PROVIDER_DESCRIPTIONS = Object.freeze({
 });
 
 export function discoverSupportedProviders({
-  builtinProviders = getBuiltinProviders(),
-  builtinModels = getBuiltinModels,
-  oauthProviders = getOAuthProviders(),
+  providers = getPiProviders(),
   descriptions = PROVIDER_DESCRIPTIONS,
   exposedApis = EXPOSED_APIS,
 } = {}) {
-  validateProviderIds(builtinProviders, "built-in");
-  if (typeof builtinModels !== "function") {
-    throw new TypeError("built-in model registry must be a function");
-  }
+  validatePiProviders(providers);
   if (!(exposedApis instanceof Set) || [...exposedApis].some(
     (api) => typeof api !== "string" || !api,
   )) {
     throw new TypeError("exposed APIs must be a set of non-empty strings");
   }
-  if (
-    !Array.isArray(oauthProviders)
-    || oauthProviders.some(
-      (provider) => !provider || typeof provider !== "object" || typeof provider.id !== "string",
-    )
-  ) {
-    throw new Error("pi-ai returned an invalid OAuth provider registry");
-  }
-  const oauthIds = oauthProviders.map(({ id }) => id);
-  validateProviderIds(oauthIds, "OAuth", { allowEmpty: true });
   if (!descriptions || typeof descriptions !== "object" || Array.isArray(descriptions)) {
     throw new TypeError("provider descriptions must be an object");
   }
 
-  const oauth = new Set(oauthIds);
-  const supported = builtinProviders.filter((provider) => {
-    const models = builtinModels(provider);
+  const supported = providers.filter((provider) => {
+    const models = provider.getModels();
     if (
       !Array.isArray(models)
       || models.some((model) => !model || typeof model !== "object")
     ) {
-      throw new Error(`pi-ai returned invalid models for provider ${provider}`);
+      throw new Error(`pi-ai returned invalid models for provider ${provider.id}`);
     }
     return models.some(({ api }) => exposedApis.has(api));
   });
-  return Object.freeze(supported.sort().map((provider) => {
-    const description = providerDescription(provider, descriptions);
-    const supportsOAuth = oauth.has(provider);
+  return Object.freeze(supported.sort((left, right) => left.id.localeCompare(right.id)).map((provider) => {
+    const description = providerDescription(provider.id, descriptions);
+    const supportsOAuth = provider.auth.oauth !== undefined;
+    const supportsApiKey = provider.auth.apiKey !== undefined;
+    if (!supportsOAuth && !supportsApiKey) {
+      throw new Error(`built-in provider ${provider.id} has no supported authentication`);
+    }
     return Object.freeze({
-      provider,
+      provider: provider.id,
       description,
-      auth: supportsOAuth ? "oauth or api-key" : "api-key",
+      auth: supportsOAuth && supportsApiKey
+        ? "oauth or api-key"
+        : supportsOAuth
+          ? "oauth"
+          : "api-key",
       login: supportsOAuth
-        ? `cyclo gateway login ${provider}`
-        : `cyclo gateway login ${provider} --api-key-stdin`,
+        ? `cyclo gateway login ${provider.id}`
+        : `cyclo gateway login ${provider.id} --api-key-stdin`,
     });
   }));
 }
@@ -136,17 +123,6 @@ export function formatSupportedProviders(providers = discoverSupportedProviders(
     "OAuth logins open the provider's subscription flow; no login is needed to list this table.",
   ];
   return lines.join("\n");
-}
-
-function validateProviderIds(values, label, { allowEmpty = false } = {}) {
-  if (
-    !Array.isArray(values)
-    || (!allowEmpty && values.length === 0)
-    || values.some((value) => typeof value !== "string" || !PROVIDER_ID.test(value))
-    || new Set(values).size !== values.length
-  ) {
-    throw new Error(`pi-ai returned an invalid ${label} provider registry`);
-  }
 }
 
 function providerDescription(provider, descriptions) {

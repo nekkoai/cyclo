@@ -1,8 +1,21 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 from cyclo import team_runtime_image
+
+
+def test_source_files_prunes_installed_dependencies(tmp_path: Path) -> None:
+    source = tmp_path / "team" / "src"
+    source.mkdir(parents=True)
+    (source / "owned.mjs").write_text("export {};\n", encoding="utf-8")
+    installed = tmp_path / "team" / "node_modules" / "package"
+    installed.mkdir(parents=True)
+    (installed / "ignored.mjs").write_text("throw new Error();\n", encoding="utf-8")
+    (installed / "broken").symlink_to(tmp_path / "missing")
+
+    assert team_runtime_image.source_files(tmp_path) == (Path("team/src/owned.mjs"),)
 
 
 def test_packaged_team_image_uses_common_component_context() -> None:

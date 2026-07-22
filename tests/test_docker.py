@@ -12,6 +12,7 @@ from cyclo.docker import (
     docker_socket_paths,
     validate_mount_collection,
     validate_mount_boundaries,
+    validate_container_spec,
     mount,
 )
 from cyclo.errors import CycloError
@@ -39,6 +40,31 @@ def instance(team: Path, project: Path) -> Instance:
         provider_socket_path=str(provider_socket_dir / "component.sock"),
         provider_generation="provider-generation",
     )
+
+
+def test_launch_validation_requires_an_existing_provider_socket_directory(
+    tmp_path: Path, team_repo: Path
+) -> None:
+    selected_instance = instance(team_repo, tmp_path)
+    provider_dir = Path(selected_instance.provider_socket_path).parent
+    provider_dir.rmdir()
+    spec = ContainerSpec(
+        instance=selected_instance,
+        team=load_team(team_repo),
+        project=tmp_path,
+        runtime_root=tmp_path / "runtime",
+        tasks_dir=tmp_path / "tasks",
+        jobs_dir=tmp_path / "jobs",
+        agents_dir=tmp_path / "agents",
+        pi_root=tmp_path / "pi",
+        provider_socket_dir=provider_dir,
+        port=0,
+    )
+
+    with pytest.raises(CycloError, match="invalid Cyclo provider socket directory"):
+        validate_container_spec(spec)
+
+    assert "docker" in container_command(spec)
 
 
 def test_container_argv_has_only_scoped_runtime_mounts(

@@ -3,13 +3,13 @@
 /* eslint-disable */
 
 import { enumDesc, fileDesc, messageDesc, serviceDesc, tsEnum } from "@bufbuild/protobuf/codegenv2";
-import { file_google_protobuf_any, file_google_protobuf_struct } from "@bufbuild/protobuf/wkt";
+import { file_google_protobuf_any } from "@bufbuild/protobuf/wkt";
 
 /**
  * Describes the file cyclo/provider/v1/provider.proto.
  */
 export const file_cyclo_provider_v1_provider = /*@__PURE__*/
-  fileDesc("CiBjeWNsby9wcm92aWRlci92MS9wcm92aWRlci5wcm90bxIRY3ljbG8ucHJvdmlkZXIudjEiEwoRTGlzdE1vZGVsc1JlcXVlc3QiPgoSTGlzdE1vZGVsc1Jlc3BvbnNlEigKBm1vZGVscxgBIAMoCzIYLmN5Y2xvLnByb3ZpZGVyLnYxLk1vZGVsIoMCCgVNb2RlbBIKCgJpZBgBIAEoCRIUCgxkaXNwbGF5X25hbWUYAiABKAkSOgoMY2FwYWJpbGl0aWVzGAMgASgLMiQuY3ljbG8ucHJvdmlkZXIudjEuTW9kZWxDYXBhYmlsaXRpZXMSIgoVY29udGV4dF93aW5kb3dfdG9rZW5zGAQgASgESACIAQESHgoRbWF4X291dHB1dF90b2tlbnMYBSABKARIAYgBARIoCgpleHRlbnNpb25zGAYgAygLMhQuZ29vZ2xlLnByb3RvYnVmLkFueUIYChZfY29udGV4dF93aW5kb3dfdG9rZW5zQhQKEl9tYXhfb3V0cHV0X3Rva2VucyKpAgoRTW9kZWxDYXBhYmlsaXRpZXMSNQoQaW5wdXRfbW9kYWxpdGllcxgBIAMoDjIbLmN5Y2xvLnByb3ZpZGVyLnYxLk1vZGFsaXR5EjYKEW91dHB1dF9tb2RhbGl0aWVzGAIgAygOMhsuY3ljbG8ucHJvdmlkZXIudjEuTW9kYWxpdHkSFgoOZnVuY3Rpb25fdG9vbHMYAyABKAgSGwoTcGFyYWxsZWxfdG9vbF9jYWxscxgEIAEoCBIbChNyZWFzb25pbmdfc3VtbWFyaWVzGAUgASgIEhMKC3RlbXBlcmF0dXJlGAYgASgIEg0KBXRvcF9wGAcgASgIEhYKDnN0b3Bfc2VxdWVuY2VzGAggASgIEhcKD2V4dGVuc2lvbl90eXBlcxgJIAMoCSLrAQoMSW5mZXJSZXF1ZXN0Eg0KBW1vZGVsGAEgASgJEhQKDGluc3RydWN0aW9ucxgCIAEoCRIrCgVpbnB1dBgDIAMoCzIcLmN5Y2xvLnByb3ZpZGVyLnYxLklucHV0SXRlbRImCgV0b29scxgEIAMoCzIXLmN5Y2xvLnByb3ZpZGVyLnYxLlRvb2wSNwoKZ2VuZXJhdGlvbhgFIAEoCzIjLmN5Y2xvLnByb3ZpZGVyLnYxLkdlbmVyYXRpb25Db25maWcSKAoKZXh0ZW5zaW9ucxgGIAMoCzIULmdvb2dsZS5wcm90b2J1Zi5BbnkiwQIKCUlucHV0SXRlbRItCgdtZXNzYWdlGAEgASgLMhouY3ljbG8ucHJvdmlkZXIudjEuTWVzc2FnZUgAEjAKCXRvb2xfY2FsbBgCIAEoCzIbLmN5Y2xvLnByb3ZpZGVyLnYxLlRvb2xDYWxsSAASNAoLdG9vbF9yZXN1bHQYAyABKAsyHS5jeWNsby5wcm92aWRlci52MS5Ub29sUmVzdWx0SAASQAoRcmVhc29uaW5nX3N1bW1hcnkYBCABKAsyIy5jeWNsby5wcm92aWRlci52MS5SZWFzb25pbmdTdW1tYXJ5SAASKQoJZXh0ZW5zaW9uGAUgASgLMhQuZ29vZ2xlLnByb3RvYnVmLkFueUgAEigKCmV4dGVuc2lvbnMYBiADKAsyFC5nb29nbGUucHJvdG9idWYuQW55QgYKBGl0ZW0iaAoHTWVzc2FnZRIsCgRyb2xlGAEgASgOMh4uY3ljbG8ucHJvdmlkZXIudjEuTWVzc2FnZVJvbGUSLwoHY29udGVudBgCIAMoCzIeLmN5Y2xvLnByb3ZpZGVyLnYxLkNvbnRlbnRQYXJ0IlMKC0NvbnRlbnRQYXJ0Eg4KBHRleHQYASABKAlIABIpCgVtZWRpYRgCIAEoCzIYLmN5Y2xvLnByb3ZpZGVyLnYxLk1lZGlhSABCCQoHY29udGVudCIpCgVNZWRpYRISCgptZWRpYV90eXBlGAEgASgJEgwKBGRhdGEYAiABKAwiWAoEVG9vbBIMCgRuYW1lGAEgASgJEhMKC2Rlc2NyaXB0aW9uGAIgASgJEi0KDGlucHV0X3NjaGVtYRgDIAEoCzIXLmdvb2dsZS5wcm90b2J1Zi5TdHJ1Y3QiUAoIVG9vbENhbGwSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIqCglhcmd1bWVudHMYAyABKAsyFy5nb29nbGUucHJvdG9idWYuU3RydWN0ImAKClRvb2xSZXN1bHQSDwoHY2FsbF9pZBgBIAEoCRIvCgdjb250ZW50GAIgAygLMh4uY3ljbG8ucHJvdmlkZXIudjEuQ29udGVudFBhcnQSEAoIaXNfZXJyb3IYAyABKAgiIAoQUmVhc29uaW5nU3VtbWFyeRIMCgR0ZXh0GAEgASgJItwBChBHZW5lcmF0aW9uQ29uZmlnEh4KEW1heF9vdXRwdXRfdG9rZW5zGAEgASgESACIAQESGAoLdGVtcGVyYXR1cmUYAiABKAFIAYgBARISCgV0b3BfcBgDIAEoAUgCiAEBEhYKDnN0b3Bfc2VxdWVuY2VzGAQgAygJEjIKC3Rvb2xfY2hvaWNlGAUgASgLMh0uY3ljbG8ucHJvdmlkZXIudjEuVG9vbENob2ljZUIUChJfbWF4X291dHB1dF90b2tlbnNCDgoMX3RlbXBlcmF0dXJlQggKBl90b3BfcCJQCgpUb29sQ2hvaWNlEi8KBG1vZGUYASABKA4yIS5jeWNsby5wcm92aWRlci52MS5Ub29sQ2hvaWNlTW9kZRIRCgl0b29sX25hbWUYAiABKAkingIKDUluZmVyUmVzcG9uc2USLQoHc3RhcnRlZBgBIAEoCzIaLmN5Y2xvLnByb3ZpZGVyLnYxLlN0YXJ0ZWRIABI2CgxpdGVtX3N0YXJ0ZWQYAiABKAsyHi5jeWNsby5wcm92aWRlci52MS5JdGVtU3RhcnRlZEgAEjIKCml0ZW1fZGVsdGEYAyABKAsyHC5jeWNsby5wcm92aWRlci52MS5JdGVtRGVsdGFIABI4Cg1pdGVtX2ZpbmlzaGVkGAQgASgLMh8uY3ljbG8ucHJvdmlkZXIudjEuSXRlbUZpbmlzaGVkSAASLwoIZmluaXNoZWQYBSABKAsyGy5jeWNsby5wcm92aWRlci52MS5GaW5pc2hlZEgAQgcKBWV2ZW50IlcKB1N0YXJ0ZWQSEwoLcmVzcG9uc2VfaWQYASABKAkSDQoFbW9kZWwYAiABKAkSKAoKZXh0ZW5zaW9ucxgDIAMoCzIULmdvb2dsZS5wcm90b2J1Zi5BbnkiswIKC0l0ZW1TdGFydGVkEg0KBWluZGV4GAEgASgNEi4KBHRleHQYAiABKAsyHi5jeWNsby5wcm92aWRlci52MS5UZXh0U3RhcnRlZEgAEkcKEXJlYXNvbmluZ19zdW1tYXJ5GAMgASgLMiouY3ljbG8ucHJvdmlkZXIudjEuUmVhc29uaW5nU3VtbWFyeVN0YXJ0ZWRIABI3Cgl0b29sX2NhbGwYBCABKAsyIi5jeWNsby5wcm92aWRlci52MS5Ub29sQ2FsbFN0YXJ0ZWRIABIwCgVtZWRpYRgFIAEoCzIfLmN5Y2xvLnByb3ZpZGVyLnYxLk1lZGlhU3RhcnRlZEgAEikKCWV4dGVuc2lvbhgGIAEoCzIULmdvb2dsZS5wcm90b2J1Zi5BbnlIAEIGCgRpdGVtIg0KC1RleHRTdGFydGVkIhkKF1JlYXNvbmluZ1N1bW1hcnlTdGFydGVkIisKD1Rvb2xDYWxsU3RhcnRlZBIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJIiIKDE1lZGlhU3RhcnRlZBISCgptZWRpYV90eXBlGAEgASgJImMKCUl0ZW1EZWx0YRINCgVpbmRleBgBIAEoDRIOCgR0ZXh0GAIgASgJSAASHQoTdG9vbF9hcmd1bWVudHNfanNvbhgDIAEoCUgAEg8KBW1lZGlhGAQgASgMSABCBwoFZGVsdGEieAoMSXRlbUZpbmlzaGVkEg0KBWluZGV4GAEgASgNEi8KDnRvb2xfYXJndW1lbnRzGAIgASgLMhcuZ29vZ2xlLnByb3RvYnVmLlN0cnVjdBIoCgpleHRlbnNpb25zGAMgAygLMhQuZ29vZ2xlLnByb3RvYnVmLkFueSL7AQoFVXNhZ2USGQoMaW5wdXRfdG9rZW5zGAEgASgESACIAQESGgoNb3V0cHV0X3Rva2VucxgCIAEoBEgBiAEBEhkKDHRvdGFsX3Rva2VucxgDIAEoBEgCiAEBEiAKE2NhY2hlZF9pbnB1dF90b2tlbnMYBCABKARIA4gBARIdChByZWFzb25pbmdfdG9rZW5zGAUgASgESASIAQFCDwoNX2lucHV0X3Rva2Vuc0IQCg5fb3V0cHV0X3Rva2Vuc0IPCg1fdG90YWxfdG9rZW5zQhYKFF9jYWNoZWRfaW5wdXRfdG9rZW5zQhMKEV9yZWFzb25pbmdfdG9rZW5zIrwBCghGaW5pc2hlZBIvCgZyZWFzb24YASABKA4yHy5jeWNsby5wcm92aWRlci52MS5GaW5pc2hSZWFzb24SGgoNc3RvcF9zZXF1ZW5jZRgCIAEoCUgAiAEBEicKBXVzYWdlGAMgASgLMhguY3ljbG8ucHJvdmlkZXIudjEuVXNhZ2USKAoKZXh0ZW5zaW9ucxgEIAMoCzIULmdvb2dsZS5wcm90b2J1Zi5BbnlCEAoOX3N0b3Bfc2VxdWVuY2UqdgoITW9kYWxpdHkSGAoUTU9EQUxJVFlfVU5TUEVDSUZJRUQQABIRCg1NT0RBTElUWV9URVhUEAESEgoOTU9EQUxJVFlfSU1BR0UQAhISCg5NT0RBTElUWV9BVURJTxADEhUKEU1PREFMSVRZX0RPQ1VNRU5UEAQqXgoLTWVzc2FnZVJvbGUSHAoYTUVTU0FHRV9ST0xFX1VOU1BFQ0lGSUVEEAASFQoRTUVTU0FHRV9ST0xFX1VTRVIQARIaChZNRVNTQUdFX1JPTEVfQVNTSVNUQU5UEAIqpgEKDlRvb2xDaG9pY2VNb2RlEiAKHFRPT0xfQ0hPSUNFX01PREVfVU5TUEVDSUZJRUQQABIZChVUT09MX0NIT0lDRV9NT0RFX0FVVE8QARIZChVUT09MX0NIT0lDRV9NT0RFX05PTkUQAhIdChlUT09MX0NIT0lDRV9NT0RFX1JFUVVJUkVEEAMSHQoZVE9PTF9DSE9JQ0VfTU9ERV9TUEVDSUZJQxAEKv8BCgxGaW5pc2hSZWFzb24SHQoZRklOSVNIX1JFQVNPTl9VTlNQRUNJRklFRBAAEhYKEkZJTklTSF9SRUFTT05fU1RPUBABEh8KG0ZJTklTSF9SRUFTT05fU1RPUF9TRVFVRU5DRRACEiMKH0ZJTklTSF9SRUFTT05fTUFYX09VVFBVVF9UT0tFTlMQAxIcChhGSU5JU0hfUkVBU09OX1RPT0xfQ0FMTFMQBBIgChxGSU5JU0hfUkVBU09OX0NPTlRFTlRfRklMVEVSEAUSGQoVRklOSVNIX1JFQVNPTl9SRUZVU0FMEAYSFwoTRklOSVNIX1JFQVNPTl9PVEhFUhAHMrMBCghQcm92aWRlchJZCgpMaXN0TW9kZWxzEiQuY3ljbG8ucHJvdmlkZXIudjEuTGlzdE1vZGVsc1JlcXVlc3QaJS5jeWNsby5wcm92aWRlci52MS5MaXN0TW9kZWxzUmVzcG9uc2USTAoFSW5mZXISHy5jeWNsby5wcm92aWRlci52MS5JbmZlclJlcXVlc3QaIC5jeWNsby5wcm92aWRlci52MS5JbmZlclJlc3BvbnNlMAFiBnByb3RvMw", [file_google_protobuf_any, file_google_protobuf_struct]);
+  fileDesc("CiBjeWNsby9wcm92aWRlci92MS9wcm92aWRlci5wcm90bxIRY3ljbG8ucHJvdmlkZXIudjEiEwoRTGlzdE1vZGVsc1JlcXVlc3QiPgoSTGlzdE1vZGVsc1Jlc3BvbnNlEigKBm1vZGVscxgBIAMoCzIYLmN5Y2xvLnByb3ZpZGVyLnYxLk1vZGVsIp0CCgVNb2RlbBIKCgJpZBgBIAEoCRIUCgxkaXNwbGF5X25hbWUYAiABKAkSOgoMY2FwYWJpbGl0aWVzGAMgASgLMiQuY3ljbG8ucHJvdmlkZXIudjEuTW9kZWxDYXBhYmlsaXRpZXMSIgoVY29udGV4dF93aW5kb3dfdG9rZW5zGAQgASgESACIAQESHgoRbWF4X291dHB1dF90b2tlbnMYBSABKARIAYgBARIoCgpleHRlbnNpb25zGAYgAygLMhQuZ29vZ2xlLnByb3RvYnVmLkFueRIYChBpbmZlcmVuY2VfZm9ybWF0GAcgASgJQhgKFl9jb250ZXh0X3dpbmRvd190b2tlbnNCFAoSX21heF9vdXRwdXRfdG9rZW5zIrwCChFNb2RlbENhcGFiaWxpdGllcxI1ChBpbnB1dF9tb2RhbGl0aWVzGAEgAygOMhsuY3ljbG8ucHJvdmlkZXIudjEuTW9kYWxpdHkSNgoRb3V0cHV0X21vZGFsaXRpZXMYAiADKA4yGy5jeWNsby5wcm92aWRlci52MS5Nb2RhbGl0eRIWCg5mdW5jdGlvbl90b29scxgDIAEoCBIbChNwYXJhbGxlbF90b29sX2NhbGxzGAQgASgIEhsKE3JlYXNvbmluZ19zdW1tYXJpZXMYBSABKAgSEwoLdGVtcGVyYXR1cmUYBiABKAgSDQoFdG9wX3AYByABKAgSFgoOc3RvcF9zZXF1ZW5jZXMYCCABKAgSFwoPZXh0ZW5zaW9uX3R5cGVzGAkgAygJEhEKCXJlYXNvbmluZxgKIAEoCCIuCgxJbmZlclJlcXVlc3QSDQoFbW9kZWwYASABKAkSDwoHcGF5bG9hZBgCIAEoCSIgCg1JbmZlclJlc3BvbnNlEg8KB3BheWxvYWQYASABKAkqdgoITW9kYWxpdHkSGAoUTU9EQUxJVFlfVU5TUEVDSUZJRUQQABIRCg1NT0RBTElUWV9URVhUEAESEgoOTU9EQUxJVFlfSU1BR0UQAhISCg5NT0RBTElUWV9BVURJTxADEhUKEU1PREFMSVRZX0RPQ1VNRU5UEAQyswEKCFByb3ZpZGVyElkKCkxpc3RNb2RlbHMSJC5jeWNsby5wcm92aWRlci52MS5MaXN0TW9kZWxzUmVxdWVzdBolLmN5Y2xvLnByb3ZpZGVyLnYxLkxpc3RNb2RlbHNSZXNwb25zZRJMCgVJbmZlchIfLmN5Y2xvLnByb3ZpZGVyLnYxLkluZmVyUmVxdWVzdBogLmN5Y2xvLnByb3ZpZGVyLnYxLkluZmVyUmVzcG9uc2UwAWIGcHJvdG8z", [file_google_protobuf_any]);
 
 /**
  * Describes the message cyclo.provider.v1.ListModelsRequest.
@@ -47,151 +47,11 @@ export const InferRequestSchema = /*@__PURE__*/
   messageDesc(file_cyclo_provider_v1_provider, 4);
 
 /**
- * Describes the message cyclo.provider.v1.InputItem.
- * Use `create(InputItemSchema)` to create a new message.
- */
-export const InputItemSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 5);
-
-/**
- * Describes the message cyclo.provider.v1.Message.
- * Use `create(MessageSchema)` to create a new message.
- */
-export const MessageSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 6);
-
-/**
- * Describes the message cyclo.provider.v1.ContentPart.
- * Use `create(ContentPartSchema)` to create a new message.
- */
-export const ContentPartSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 7);
-
-/**
- * Describes the message cyclo.provider.v1.Media.
- * Use `create(MediaSchema)` to create a new message.
- */
-export const MediaSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 8);
-
-/**
- * Describes the message cyclo.provider.v1.Tool.
- * Use `create(ToolSchema)` to create a new message.
- */
-export const ToolSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 9);
-
-/**
- * Describes the message cyclo.provider.v1.ToolCall.
- * Use `create(ToolCallSchema)` to create a new message.
- */
-export const ToolCallSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 10);
-
-/**
- * Describes the message cyclo.provider.v1.ToolResult.
- * Use `create(ToolResultSchema)` to create a new message.
- */
-export const ToolResultSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 11);
-
-/**
- * Describes the message cyclo.provider.v1.ReasoningSummary.
- * Use `create(ReasoningSummarySchema)` to create a new message.
- */
-export const ReasoningSummarySchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 12);
-
-/**
- * Describes the message cyclo.provider.v1.GenerationConfig.
- * Use `create(GenerationConfigSchema)` to create a new message.
- */
-export const GenerationConfigSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 13);
-
-/**
- * Describes the message cyclo.provider.v1.ToolChoice.
- * Use `create(ToolChoiceSchema)` to create a new message.
- */
-export const ToolChoiceSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 14);
-
-/**
  * Describes the message cyclo.provider.v1.InferResponse.
  * Use `create(InferResponseSchema)` to create a new message.
  */
 export const InferResponseSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 15);
-
-/**
- * Describes the message cyclo.provider.v1.Started.
- * Use `create(StartedSchema)` to create a new message.
- */
-export const StartedSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 16);
-
-/**
- * Describes the message cyclo.provider.v1.ItemStarted.
- * Use `create(ItemStartedSchema)` to create a new message.
- */
-export const ItemStartedSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 17);
-
-/**
- * Describes the message cyclo.provider.v1.TextStarted.
- * Use `create(TextStartedSchema)` to create a new message.
- */
-export const TextStartedSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 18);
-
-/**
- * Describes the message cyclo.provider.v1.ReasoningSummaryStarted.
- * Use `create(ReasoningSummaryStartedSchema)` to create a new message.
- */
-export const ReasoningSummaryStartedSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 19);
-
-/**
- * Describes the message cyclo.provider.v1.ToolCallStarted.
- * Use `create(ToolCallStartedSchema)` to create a new message.
- */
-export const ToolCallStartedSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 20);
-
-/**
- * Describes the message cyclo.provider.v1.MediaStarted.
- * Use `create(MediaStartedSchema)` to create a new message.
- */
-export const MediaStartedSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 21);
-
-/**
- * Describes the message cyclo.provider.v1.ItemDelta.
- * Use `create(ItemDeltaSchema)` to create a new message.
- */
-export const ItemDeltaSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 22);
-
-/**
- * Describes the message cyclo.provider.v1.ItemFinished.
- * Use `create(ItemFinishedSchema)` to create a new message.
- */
-export const ItemFinishedSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 23);
-
-/**
- * Describes the message cyclo.provider.v1.Usage.
- * Use `create(UsageSchema)` to create a new message.
- */
-export const UsageSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 24);
-
-/**
- * Describes the message cyclo.provider.v1.Finished.
- * Use `create(FinishedSchema)` to create a new message.
- */
-export const FinishedSchema = /*@__PURE__*/
-  messageDesc(file_cyclo_provider_v1_provider, 25);
+  messageDesc(file_cyclo_provider_v1_provider, 5);
 
 /**
  * Describes the enum cyclo.provider.v1.Modality.
@@ -206,50 +66,12 @@ export const Modality = /*@__PURE__*/
   tsEnum(ModalitySchema);
 
 /**
- * Describes the enum cyclo.provider.v1.MessageRole.
- */
-export const MessageRoleSchema = /*@__PURE__*/
-  enumDesc(file_cyclo_provider_v1_provider, 1);
-
-/**
- * @generated from enum cyclo.provider.v1.MessageRole
- */
-export const MessageRole = /*@__PURE__*/
-  tsEnum(MessageRoleSchema);
-
-/**
- * Describes the enum cyclo.provider.v1.ToolChoiceMode.
- */
-export const ToolChoiceModeSchema = /*@__PURE__*/
-  enumDesc(file_cyclo_provider_v1_provider, 2);
-
-/**
- * @generated from enum cyclo.provider.v1.ToolChoiceMode
- */
-export const ToolChoiceMode = /*@__PURE__*/
-  tsEnum(ToolChoiceModeSchema);
-
-/**
- * Describes the enum cyclo.provider.v1.FinishReason.
- */
-export const FinishReasonSchema = /*@__PURE__*/
-  enumDesc(file_cyclo_provider_v1_provider, 3);
-
-/**
- * @generated from enum cyclo.provider.v1.FinishReason
- */
-export const FinishReason = /*@__PURE__*/
-  tsEnum(FinishReasonSchema);
-
-/**
- * Provider is Cyclo's portable model-catalogue and inference interface.
+ * Provider has a typed control plane and an opaque inference data plane.
  *
- * Implementations translate this contract at their native API boundary. They
- * must not tunnel native HTTP paths, headers, credentials, or request bodies
- * through this interface. Unknown models return NOT_FOUND. Malformed requests
- * and unadvertised capabilities return INVALID_ARGUMENT before Started.
- * Dependency failures return UNAVAILABLE. Cancellation and deadlines must be
- * propagated to every upstream call.
+ * ListModels is understood by Cyclo because it is used to construct routes.
+ * Infer carries Pi's JSON representation without interpreting its contents.
+ * Provider relays forward payload strings unchanged; only a provider endpoint
+ * that actually invokes Pi may decode them.
  *
  * @generated from service cyclo.provider.v1.Provider
  */

@@ -1,35 +1,53 @@
 const CONTROL = /[\u0000-\u001f\u007f]/u;
 
-export function createOAuthLoginCallbacks({ ask, write = console.log }) {
-  if (typeof ask !== "function" || typeof write !== "function") {
-    throw new TypeError("OAuth callbacks require ask and write functions");
+export function createAuthInteraction({ ask, askSecret = ask, write = console.log, signal }) {
+  if (typeof ask !== "function" || typeof askSecret !== "function" || typeof write !== "function") {
+    throw new TypeError("OAuth interaction requires ask, askSecret, and write functions");
   }
   return Object.freeze({
-    onAuth(info) {
-      const url = display(info?.url, "authorization URL");
-      write(`\nOpen this URL to authorize the gateway:\n  ${url}`);
-      if (info.instructions) write(display(info.instructions, "authorization instructions"));
-      write("Paste the authorization code or full redirect URL here if the browser cannot return to this machine.");
-    },
-    onDeviceCode(info) {
-      write(`\nOpen this URL:\n  ${display(info?.verificationUri, "device-code URL")}`);
-      write(`Enter code: ${display(info?.userCode, "device code")}`);
-    },
-    onPrompt(prompt) {
-      const message = display(prompt?.message, "prompt message");
-      const placeholder = prompt?.placeholder
+    ...(signal === undefined ? {} : { signal }),
+    prompt(prompt) {
+      if (!prompt || typeof prompt !== "object") {
+        throw new Error("OAuth provider emitted an invalid prompt");
+      }
+      if (prompt.type === "select") return selectOAuthOption(prompt, ask, write);
+      if (!["text", "secret", "manual_code"].includes(prompt.type)) {
+        throw new Error(`OAuth provider emitted an unknown prompt type: ${prompt.type}`);
+      }
+      const message = display(prompt.message, "prompt message");
+      const placeholder = prompt.placeholder
         ? ` (${display(prompt.placeholder, "prompt placeholder")})`
         : "";
-      return ask(`${message}${placeholder} `);
+      const question = `${message}${placeholder} `;
+      return prompt.type === "secret" ? askSecret(question) : ask(question);
     },
-    onSelect(prompt) {
-      return selectOAuthOption(prompt, ask, write);
-    },
-    onProgress(message) {
-      write(display(message, "progress message"));
-    },
-    onManualCodeInput() {
-      return ask("Paste the authorization code or full redirect URL: ");
+    notify(event) {
+      if (!event || typeof event !== "object") {
+        throw new Error("OAuth provider emitted an invalid event");
+      }
+      if (event.type === "info") {
+        write(display(event.message, "information message"));
+        for (const link of event.links ?? []) {
+          const label = link.label ? `${display(link.label, "link label")}: ` : "";
+          write(`${label}${display(link.url, "information URL")}`);
+        }
+        return;
+      }
+      if (event.type === "auth_url") {
+        write(`\nOpen this URL to authorize the gateway:\n  ${display(event.url, "authorization URL")}`);
+        if (event.instructions) write(display(event.instructions, "authorization instructions"));
+        return;
+      }
+      if (event.type === "device_code") {
+        write(`\nOpen this URL:\n  ${display(event.verificationUri, "device-code URL")}`);
+        write(`Enter code: ${display(event.userCode, "device code")}`);
+        return;
+      }
+      if (event.type === "progress") {
+        write(display(event.message, "progress message"));
+        return;
+      }
+      throw new Error(`OAuth provider emitted an unknown event type: ${event.type}`);
     },
   });
 }

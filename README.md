@@ -14,14 +14,13 @@ this repository—there are no `agentws` or `multiagent` checkouts at runtime.
 Requirements: Linux, Python 3.10+, Git, and Docker.
 
 ```sh
-python3 -m venv .venv
-. .venv/bin/activate
 python -m pip install .
 cyclo gateway build
-cyclo gateway start
 cyclo gateway providers
 cyclo gateway login openai-codex --as codex-work
-cyclo providers start --all
+cyclo gateway restart
+cyclo providers check
+cyclo providers restart --build
 cyclo models
 cyclo doctor
 ```
@@ -35,15 +34,16 @@ keys in its Docker-managed state volume; they are never mounted into teams.
 `/etc/cyclo/host.conf` is an ordered, line-oriented configuration:
 
 ```text
-provider fusion ./providers/fusion codex-work/gpt-5 mode=balanced
+provider trace ./providers/passthrough upstream=gateway -- label=first
+provider outer ./providers/passthrough upstream=trace
 ```
 
-The first field is the output prefix, the second is a provider directory (or
-component reference), following fields are input model IDs, and `key=value`
-fields are provider parameters. Inputs may refer to gateway models or models
-produced by an earlier line. Relative paths resolve beside `host.conf`. An
-empty file means “use the gateway catalogue unchanged”. Edit the file, then
-run `cyclo providers restart`; Cyclo does not rebuild images implicitly.
+The first field is a host-local component instance and the second is its source
+directory. Named requirements from that repository's `component.conf` bind to
+`gateway` or an earlier instance. Words after `--` become separate component
+arguments. Relative paths resolve beside `host.conf`. An empty file means “use
+the gateway directly”. Edit the file, then run `cyclo providers restart`;
+Cyclo rebuilds only when `--build` is explicit.
 
 Providers are independent components using the ConnectRPC provider protocol
 over Unix-domain sockets. The gateway is the fixed root provider and catalogue
@@ -56,31 +56,31 @@ A project directory contains a `project.cyclo` file and one or more team
 repositories:
 
 ```text
-name: rtl-work
-description: RTL design experiment
-team jon-rtl ./teams/jon-rtl
-mount source ~/openhw/core-et rw
+name rtl-work
+description RTL design experiment
+team ./teams/jon-rtl ro
+mount source /home/user/openhw/core-et rw
 mount docs ./docs ro
 ```
 
 `rw` mounts are workspaces at `/workspace/<name>`; `ro` mounts are supporting
 inputs at `/readonly/<name>`. Teams cannot write read-only mounts. A team
-repository contains `roles.md`, its agent roster, `AGENTS.md`, and optional
-Docker build additions. Cyclo supplies the common AgentWS job loop and the
-provider socket; the team supplies data and prompts.
+repository contains a `team` roster, `roles/*.md`, and optional `AGENTS.md`.
+Cyclo supplies the common AgentWS job loop and the provider socket; the team
+supplies data and prompts.
 
 Run and inspect work:
 
 ```sh
 cyclo run project.cyclo
-cyclo task project.cyclo "Implement and verify a UART IP"
 cyclo ps
+cyclo task <instance> uart-ip ./uart-task.md
 cyclo logs <instance>
-cyclo dashboard --bind 127.0.0.1
+cyclo dashboard --host 127.0.0.1
 ```
 
 The dashboard is read-only and shows team/job state, provider health, and
-global provider usage. Use `--bind 0.0.0.0` only when exposing it deliberately;
+global provider usage. Use `--host 0.0.0.0` only when exposing it deliberately;
 the browser link uses the host that served the page, not the bind wildcard.
 
 ## Documentation

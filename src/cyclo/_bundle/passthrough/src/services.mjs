@@ -1,5 +1,4 @@
 import { HealthStatus } from "@cyclo/component/contract";
-import { validateInferStream } from "@cyclo/provider/protocol";
 
 export function createPassthroughServices({ upstream, healthTimeoutMs = 1_000 } = {}) {
   if (!upstream?.client || typeof upstream.callOptions !== "function") {
@@ -35,12 +34,9 @@ export function createPassthroughServices({ upstream, healthTimeoutMs = 1_000 } 
       },
 
       async *infer(request, context) {
-        yield* validateInferStream(
-          upstream.client.infer(
-            request,
-            upstream.callOptions(context.signal),
-          ),
-          { model: request.model },
+        yield* upstream.client.infer(
+          request,
+          upstream.callOptions(context.signal),
         );
       },
     }),

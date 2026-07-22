@@ -62,9 +62,12 @@ git archive --format=tar HEAD | tar -xf - -C "$source_tree"
 printf '%s\n' '==> source tests'
 (
     cd "$source_tree"
-    for package in component provider gateway passthrough pi-provider team; do
+    for package in component provider gateway passthrough pi-provider; do
         npm ci --ignore-scripts --prefix "src/cyclo/_bundle/$package"
     done
+    # This is the same intentional, lockfile-bounded peer override used by the
+    # team Dockerfile for pi-simplify 0.2.2 against Pi 0.81.
+    npm ci --force --ignore-scripts --prefix src/cyclo/_bundle/team
     "$venv/bin/python" -m pytest -q \
         --ignore=tests/test_release_manifest.py \
         --ignore=tests/test_secret_scan.py

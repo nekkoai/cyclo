@@ -6,6 +6,17 @@ import test from "node:test";
 
 import { createCredentialResolver } from "../src/credentials.mjs";
 
+function providerWithOAuth(oauth) {
+  return {
+    auth: {
+      oauth: {
+        login() {},
+        ...oauth,
+      },
+    },
+  };
+}
+
 async function credentialFixture(t, store) {
   const root = await mkdtemp(join(tmpdir(), "cyclo-gateway-credentials-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -18,18 +29,17 @@ test("API keys are read dynamically and legacy records remain compatible", async
   const authPath = await credentialFixture(t, {
     openai: { type: "api_key", key: "first-secret" },
   });
-  const resolver = createCredentialResolver({ authPath, getOAuthProvider: () => undefined });
+  const resolver = createCredentialResolver({ authPath, getProvider: () => undefined });
   const route = { account: "openai", provider: "openai" };
   const first = await resolver.resolve(route);
-  assert.equal(first.apiKey, "first-secret");
-  assert.deepEqual(first.sensitiveValues, ["first-secret", "Bearer first-secret"]);
+  assert.deepEqual(first, { apiKey: "first-secret" });
 
   await writeFile(authPath, JSON.stringify({
     openai: { type: "api_key", key: "second-secret" },
   }));
   const second = await resolver.resolve(route);
-  assert.equal(second.apiKey, "second-secret");
-  assert.equal(Object.isFrozen(second.sensitiveValues), true);
+  assert.deepEqual(second, { apiKey: "second-secret" });
+  assert.equal(Object.isFrozen(second), true);
 });
 
 test("separate resolvers serialize OAuth refresh and reuse the winner", async (t) => {
@@ -45,7 +55,7 @@ test("separate resolvers serialize OAuth refresh and reuse the winner", async (t
   });
   let refreshes = 0;
   const oauth = {
-    async refreshToken() {
+    async refresh() {
       refreshes += 1;
       await new Promise((resolve) => setTimeout(resolve, 50));
       return {
@@ -54,13 +64,15 @@ test("separate resolvers serialize OAuth refresh and reuse the winner", async (t
         expires: Date.now() + 3_600_000,
       };
     },
-    getApiKey(credential) {
-      return `api:${credential.access}`;
+    toAuth(credential) {
+      return { apiKey: `api:${credential.access}` };
     },
   };
   const make = () => createCredentialResolver({
     authPath,
-    getOAuthProvider: (provider) => provider === "openai-codex" ? oauth : undefined,
+    getProvider: (provider) => provider === "openai-codex"
+      ? providerWithOAuth(oauth)
+      : undefined,
   });
   const route = { account: "work", provider: "openai-codex" };
   const [left, right] = await Promise.all([make().resolve(route), make().resolve(route)]);
@@ -68,8 +80,6 @@ test("separate resolvers serialize OAuth refresh and reuse the winner", async (t
   assert.equal(refreshes, 1);
   assert.equal(left.apiKey, "api:fresh-access");
   assert.equal(right.apiKey, "api:fresh-access");
-  assert.ok(left.sensitiveValues.includes("fresh-access"));
-  assert.ok(left.sensitiveValues.includes("fresh-refresh"));
   const stored = JSON.parse(await readFile(authPath, "utf8"));
   assert.equal(stored.work.retained, "value");
   assert.equal(stored.work.provider, "openai-codex");
@@ -80,7 +90,7 @@ test("a route cannot consume an account that changed provider", async (t) => {
   const authPath = await credentialFixture(t, {
     work: { type: "api_key", provider: "anthropic", key: "secret" },
   });
-  const { resolve } = createCredentialResolver({ authPath, getOAuthProvider: () => undefined });
+  const { resolve } = createCredentialResolver({ authPath, getProvider: () => undefined });
   await assert.rejects(
     resolve({ account: "work", provider: "openai" }),
     /no longer belongs/u,
@@ -95,8 +105,11 @@ test("partial OAuth records fail health checks and resolution", async (t) => {
       access: "access-without-refresh-or-expiry",
     },
   });
-  const oauth = { refreshToken() {}, getApiKey() {} };
-  const resolver = createCredentialResolver({ authPath, getOAuthProvider: () => oauth });
+  const oauth = { refresh() {}, toAuth() {} };
+  const resolver = createCredentialResolver({
+    authPath,
+    getProvider: () => providerWithOAuth(oauth),
+  });
   const route = { account: "work", provider: "openai-codex" };
   assert.throws(() => resolver.check([route]), /complete OAuth credential/u);
   await assert.rejects(resolver.resolve(route), /complete OAuth credential/u);
@@ -113,15 +126,16 @@ test("OAuth may derive an account-specific native model route", async (t) => {
     },
   });
   const oauth = {
-    getApiKey: ({ access }) => access,
-    modifyModels: ([model]) => [{
-      ...model,
+    refresh() {},
+    toAuth: ({ access }) => ({
+      apiKey: access,
       baseUrl: "https://api.account.example/v1",
-    }],
+      headers: { "x-account": "copilot" },
+    }),
   };
   const resolver = createCredentialResolver({
     authPath,
-    getOAuthProvider: () => oauth,
+    getProvider: () => providerWithOAuth(oauth),
   });
   const resolved = await resolver.resolve({
     account: "copilot",
@@ -134,4 +148,6 @@ test("OAuth may derive an account-specific native model route", async (t) => {
     },
   });
   assert.equal(resolved.effectiveModel.baseUrl, "https://api.account.example/v1");
+  assert.equal(resolved.effectiveModel.headers["x-account"], "copilot");
+  assert.equal(resolved.apiKey, "fresh-access");
 });

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from importlib import resources
 from pathlib import Path
 from typing import Mapping
@@ -49,15 +50,18 @@ def source_files(root: Path | None = None) -> tuple[Path, ...]:
     selected = (build_context_root() if root is None else Path(root)).resolve()
     result: list[Path] = []
     for member in _IMAGE_CONTEXT_MEMBERS:
-        for path in (selected / member).rglob("*"):
-            relative = path.relative_to(selected)
-            if any(
-                part in _IGNORED_DIRECTORIES or part.endswith(".egg-info")
-                for part in relative.parts
-            ):
-                continue
-            if path.is_file() and not path.name.endswith(".pyc"):
-                result.append(relative)
+        for directory, directories, filenames in os.walk(selected / member):
+            directories[:] = sorted(
+                name
+                for name in directories
+                if name not in _IGNORED_DIRECTORIES and not name.endswith(".egg-info")
+            )
+            for name in sorted(filenames):
+                if name.endswith(".pyc"):
+                    continue
+                path = Path(directory) / name
+                if path.is_file():
+                    result.append(path.relative_to(selected))
     return tuple(sorted(result, key=lambda item: item.as_posix()))
 
 
