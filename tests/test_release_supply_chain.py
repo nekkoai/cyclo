@@ -28,7 +28,7 @@ def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() ->
     assert re.search(r"^FROM python:3\.12-[^@\s]+@sha256:[0-9a-f]{64}", dockerfile, re.M)
 
     expected = {
-        "@earendil-works/pi-coding-agent": "0.80.6",
+        "@earendil-works/pi-coding-agent": "0.81.1",
         "pi-lens": "3.8.68",
         "pi-simplify": "0.2.2",
         "pi-web-access": "0.13.0",
@@ -54,7 +54,7 @@ def test_gateway_node_install_is_locked_to_the_runtime_pi_generation() -> None:
     assert "command -v flock" in dockerfile
     assert re.search(r"^FROM node:22-[^@\s]+@sha256:[0-9a-f]{64}", dockerfile)
     assert package["private"] is True
-    assert package["dependencies"]["@earendil-works/pi-ai"] == "0.80.6"
+    assert package["dependencies"]["@earendil-works/pi-ai"] == "0.81.1"
     assert "@cyclo/component" in package["dependencies"]
     assert "@cyclo/provider" in package["dependencies"]
     assert lock["lockfileVersion"] == 3
@@ -137,6 +137,7 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert 'sh -n "$script" || exit 1' in release
     assert "tools/release-acceptance" in release
     assert "tools/runtime-write-acceptance" in release
+    assert "npm ci --force --ignore-scripts --prefix src/cyclo/_bundle/team" in release
     assert "docker build --pull" in release
     assert "src/cyclo/_bundle/team" in release
     assert "gateway" in release

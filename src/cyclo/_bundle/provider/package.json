@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Cyclo's portable model provider interface",
+  "description": "Cyclo's typed provider control plane and opaque Pi transport",
   "files": [
     "gen",
     "proto",

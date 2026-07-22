@@ -237,19 +237,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     bindings = project_run_bindings(args, definition, configured_teams)
 
     stack = provider_stack(args, store)
+    if args.dry_run:
+        for binding in bindings:
+            binding.instance.provider_socket_path = str(stack.provider_socket_path)
+            binding.instance.provider_generation = stack.assembly.generation
+            if len(bindings) > 1:
+                print(f"# instance {binding.instance.id}")
+            print(shlex.join(container_command(container_spec(binding, store, args))))
+        return 0
+
     status = stack.require_ready()
     available_models = _catalogue_ids(stack.models_document())
     for binding in bindings:
         validate_team_models(binding.team, available_models)
         binding.instance.provider_socket_path = str(status.provider_socket_path)
         binding.instance.provider_generation = status.generation
-
-    if args.dry_run:
-        for binding in bindings:
-            if len(bindings) > 1:
-                print(f"# instance {binding.instance.id}")
-            print(shlex.join(container_command(container_spec(binding, store, args))))
-        return 0
 
     for binding in bindings:
         preflight_binding(binding, store, docker)
@@ -607,10 +609,11 @@ def cmd_providers(args: argparse.Namespace) -> int:
     return 0 if status.ready else 1
 
 
-def _print_gateway_status(status: object) -> int:
+def _print_gateway_status(status: object, store_volume: str) -> int:
     state = _component_state(status)
     freshness = "current" if status.docker.current else "stale"
     print(f"gateway\t{state}\t{freshness}")
+    print(f"store\t{store_volume}")
     return 0 if status.ready else 1
 
 
@@ -622,7 +625,7 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         print(proxy.providers())
         return 0
     if action == "status":
-        return _print_gateway_status(proxy.status())
+        return _print_gateway_status(proxy.status(), proxy.store_volume)
     if action == "login":
         login_args = [args.provider]
         if args.account:
@@ -639,15 +642,19 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         if action == "build":
             image = proxy.build()
             print(image)
-            return _print_gateway_status(proxy.restart(build=False))
+            return _print_gateway_status(proxy.restart(build=False), proxy.store_volume)
         if action == "start":
-            return _print_gateway_status(proxy.start())
+            return _print_gateway_status(proxy.start(), proxy.store_volume)
         if action == "restart":
-            return _print_gateway_status(proxy.restart(build=args.build))
+            return _print_gateway_status(proxy.restart(build=args.build), proxy.store_volume)
         if action == "stop":
             print("stopped gateway" if proxy.stop() else "gateway was not running")
             return 0
         if action == "destroy-store":
+            if args.confirm != proxy.store_volume:
+                raise CycloError(
+                    f"refusing to destroy gateway store; --confirm must equal {proxy.store_volume}"
+                )
             print("destroyed gateway store" if proxy.destroy_store() else "gateway store was absent")
             return 0
     raise CycloError(f"unknown gateway action: {action}")
@@ -845,22 +852,61 @@ def build_parser() -> argparse.ArgumentParser:
 
     gateway_parser = commands.add_parser(
         "gateway",
-        help="manage the isolated credential gateway",
+        help=(
+            "manage the isolated gateway store for credentials, subscriptions, "
+            "and retained usage history"
+        ),
         description=(
-            "The gateway owns credentials and exposes the root Component and Provider "
-            "Unix socket. It does not read host.conf or project files."
+            "The gateway owns credentials, subscriptions, and retained usage history. "
+            "It exposes the root Component and Provider Unix socket, and does not read "
+            "host.conf or project files."
         ),
     )
     gateway_commands = gateway_parser.add_subparsers(dest="gateway_action", required=True)
-    for action in ("providers", "build", "start", "stop", "status", "destroy-store"):
-        selected = gateway_commands.add_parser(action)
+    provider_catalogue = gateway_commands.add_parser(
+        "providers",
+        help="list providers available for login",
+        description=(
+            "Providers are upstream AI services supported by the gateway. This command "
+            "does not read or mount the gateway credential store."
+        ),
+    )
+    provider_catalogue.set_defaults(func=cmd_gateway)
+    for action in ("build", "start", "stop", "status"):
+        selected = gateway_commands.add_parser(action, help=f"{action} the gateway")
         selected.set_defaults(func=cmd_gateway)
-    gateway_restart = gateway_commands.add_parser("restart")
+    destroy = gateway_commands.add_parser(
+        "destroy-store",
+        help="irreversibly delete the gateway store",
+        description=(
+            "This irreversibly deletes gateway credentials, subscriptions, and retained usage "
+            "history. Confirmation must exactly match the Docker volume name."
+        ),
+    )
+    destroy.add_argument(
+        "--confirm",
+        metavar="VOLUME",
+        required=True,
+        help="exact gateway Docker volume name",
+    )
+    destroy.set_defaults(func=cmd_gateway)
+    gateway_restart = gateway_commands.add_parser("restart", help="restart the gateway")
     gateway_restart.add_argument("--build", action="store_true")
     gateway_restart.set_defaults(func=cmd_gateway)
-    login = gateway_commands.add_parser("login")
-    login.add_argument("provider")
-    login.add_argument("--as", dest="account")
+    login = gateway_commands.add_parser(
+        "login",
+        help="store credentials for a provider account",
+        description=(
+            "Authenticate a catalogue provider/account name. The account name becomes "
+            "the model prefix (default: PROVIDER)."
+        ),
+    )
+    login.add_argument("provider", help="gateway provider ID")
+    login.add_argument(
+        "--as",
+        dest="account",
+        help="catalogue provider/account name (default: PROVIDER)",
+    )
     key = login.add_mutually_exclusive_group()
     key.add_argument("--api-key-env")
     key.add_argument("--api-key-stdin", action="store_true")

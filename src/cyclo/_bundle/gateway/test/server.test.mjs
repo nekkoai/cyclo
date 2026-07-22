@@ -14,7 +14,7 @@ import {
   listenComponentServer,
 } from "@cyclo/component/server";
 import { createUnixTransport } from "@cyclo/component/transport";
-import { FinishReason, Provider } from "@cyclo/provider/contract";
+import { Provider } from "@cyclo/provider/contract";
 
 import { checkGatewayHealth } from "../src/healthcheck.mjs";
 import { runGateway } from "../src/main.mjs";
@@ -31,11 +31,11 @@ test("serves Component and Provider over one HTTP/1.1 Unix socket", async () => 
     assert.equal((await component.health({})).status, HealthStatus.READY);
     assert.deepEqual((await provider.listModels({})).models, []);
 
-    const events = [];
-    for await (const response of provider.infer({ model: "test-model" })) {
-      events.push(response.event.case);
+    const payloads = [];
+    for await (const response of provider.infer({ model: "test-model", payload: "request" })) {
+      payloads.push(response.payload);
     }
-    assert.deepEqual(events, ["started", "finished"]);
+    assert.deepEqual(payloads, ["start", "done"]);
 
     assert.equal(await checkGatewayHealth({ socketPath }), true);
     assert.equal(await healthcheckExit(socketPath), 0);
@@ -59,8 +59,8 @@ for (const signalName of ["SIGTERM", "SIGINT"]) {
     try {
       await waitForSocket(socketPath);
       const provider = createClient(Provider, gatewayTransport(socketPath));
-      const iterator = provider.infer({ model: "test-model" })[Symbol.asyncIterator]();
-      assert.equal((await iterator.next()).value.event.case, "started");
+      const iterator = provider.infer({ model: "test-model", payload: "request" })[Symbol.asyncIterator]();
+      assert.equal((await iterator.next()).value.payload, "start");
 
       signalSource.emit(signalName);
       await assert.rejects(
@@ -104,22 +104,12 @@ function fakeServices({ waitForCancellation = false } = {}) {
         return { models: [] };
       },
       async *infer(request, context) {
-        yield {
-          event: {
-            case: "started",
-            value: { responseId: "response", model: request.model },
-          },
-        };
+        yield { payload: "start" };
         if (waitForCancellation) {
           await aborted(context.signal);
           throw context.signal.reason;
         }
-        yield {
-          event: {
-            case: "finished",
-            value: { reason: FinishReason.STOP },
-          },
-        };
+        yield { payload: "done" };
       },
     },
   };

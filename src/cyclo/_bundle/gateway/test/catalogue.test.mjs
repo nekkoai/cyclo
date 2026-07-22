@@ -15,10 +15,20 @@ const apiProviders = new Map(
 
 function dependencies(overrides = {}) {
   return {
-    getBuiltinProviders: () => [],
-    getBuiltinModels: () => [],
+    providers: [piProvider("openai", [])],
     getApiProvider: (api) => apiProviders.get(api),
     ...overrides,
+  };
+}
+
+function piProvider(id, models, options = {}) {
+  return {
+    id,
+    baseUrl: options.baseUrl,
+    auth: options.auth ?? { apiKey: {} },
+    getModels: () => models,
+    ...(options.filterModels ? { filterModels: options.filterModels } : {}),
+    streamSimple() {},
   };
 }
 
@@ -120,15 +130,13 @@ test("legacy credentials default their provider type to the account name", async
   const catalogue = buildCatalogue({
     ...paths,
     ...dependencies({
-      getBuiltinProviders: () => ["openai"],
-      getBuiltinModels: () => [{
-        id: "gpt",
-        name: "GPT",
-        api: "openai-responses",
-        baseUrl: "https://api.openai.invalid/v1",
-        reasoning: false,
-        input: ["text"],
-      }],
+      providers: [piProvider("openai", [{
+          id: "gpt",
+          name: "GPT",
+          api: "openai-responses",
+          reasoning: false,
+          input: ["text"],
+        }], { baseUrl: "https://api.openai.invalid/v1" })],
     }),
   });
   assert.equal(catalogue.models[0].id, "openai/gpt");
@@ -187,7 +195,7 @@ test("malformed configuration and missing API implementations fail closed", asyn
   );
 });
 
-test("OAuth catalogue modifiers filter and specialize account models", async (t) => {
+test("provider-owned OAuth filtering limits an account's model catalogue", async (t) => {
   const paths = await fixture(t, {
     copilot: {
       type: "oauth",
@@ -201,29 +209,25 @@ test("OAuth catalogue modifiers filter and specialize account models", async (t)
   const catalogue = buildCatalogue({
     ...paths,
     ...dependencies({
-      getBuiltinProviders: () => ["github-copilot"],
-      getBuiltinModels: () => [
+      providers: [piProvider("github-copilot", [
         {
           id: "kept",
           api: "openai-responses",
-          baseUrl: "https://default.invalid/v1",
           input: ["text"],
         },
         {
           id: "hidden",
           api: "openai-responses",
-          baseUrl: "https://default.invalid/v1",
           input: ["text"],
         },
-      ],
-      getOAuthProvider: () => ({
-        modifyModels: (models, credential) => models
-          .filter(({ id }) => credential.availableModelIds.includes(id))
-          .map((model) => ({ ...model, baseUrl: "https://account.invalid/v1" })),
-      }),
+      ], {
+        baseUrl: "https://default.invalid/v1",
+        auth: { oauth: {} },
+        filterModels: (models, credential) => models
+          .filter(({ id }) => credential.availableModelIds.includes(id)),
+      })],
     }),
   });
   assert.deepEqual(catalogue.models.map(({ id }) => id), ["copilot/kept"]);
-  assert.equal(catalogue.routes["copilot/kept"].rawModel.baseUrl, "https://account.invalid/v1");
-  assert.equal(catalogue.routes["copilot/kept"].sourceModel.baseUrl, "https://default.invalid/v1");
+  assert.equal(catalogue.routes["copilot/kept"].rawModel.baseUrl, "https://default.invalid/v1");
 });

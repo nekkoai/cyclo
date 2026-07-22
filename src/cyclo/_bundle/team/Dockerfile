@@ -3,7 +3,7 @@ FROM node:22-trixie-slim@sha256:e6d9a389d34ff9678438af985c9913fbd1eb6ed36e80fea5
 WORKDIR /opt/cyclo-agent-tools/lib
 COPY team/package.json team/package-lock.json ./
 # pi-simplify 0.2.2 declares Pi 0.75 peers. The lock keeps those peer libraries
-# alongside the security-fixed Pi 0.80 CLI; --force accepts only that locked,
+# alongside the security-fixed Pi 0.81 CLI; --force accepts only that locked,
 # intentionally side-by-side resolution.
 RUN npm ci --force --omit=dev --no-audit --no-fund \
     && npm cache clean --force

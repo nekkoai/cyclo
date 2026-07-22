@@ -12,13 +12,25 @@ const DESCRIPTIONS = Object.freeze({
   "openai-codex": "OpenAI subscription",
 });
 
+function piProvider(id, api, { apiKey = true, oauth = false } = {}) {
+  return {
+    id,
+    auth: {
+      ...(apiKey ? { apiKey: {} } : {}),
+      ...(oauth ? { oauth: {} } : {}),
+    },
+    getModels: () => [{ api }],
+    streamSimple() {},
+  };
+}
+
 test("provider discovery describes copyable pre-login choices", () => {
   const providers = discoverSupportedProviders({
-    builtinProviders: ["openai-codex", "openai", "anthropic"],
-    builtinModels: (provider) => [{
-      api: provider === "anthropic" ? "anthropic-messages" : "openai-responses",
-    }],
-    oauthProviders: [{ id: "anthropic" }, { id: "openai-codex" }],
+    providers: [
+      piProvider("openai-codex", "openai-responses", { apiKey: false, oauth: true }),
+      piProvider("openai", "openai-responses"),
+      piProvider("anthropic", "anthropic-messages", { oauth: true }),
+    ],
     descriptions: DESCRIPTIONS,
     exposedApis: new Set(["anthropic-messages", "openai-responses"]),
   });
@@ -39,7 +51,7 @@ test("provider discovery describes copyable pre-login choices", () => {
     {
       provider: "openai-codex",
       description: "OpenAI subscription",
-      auth: "oauth or api-key",
+      auth: "oauth",
       login: "cyclo gateway login openai-codex",
     },
   ]);
@@ -47,44 +59,30 @@ test("provider discovery describes copyable pre-login choices", () => {
   assert.match(output, /Supported gateway providers/u);
   assert.match(output, /PROVIDER\s+DESCRIPTION\s+AUTH\s+LOGIN COMMAND/u);
   assert.match(output, /anthropic\s+Anthropic models\s+oauth or api-key/u);
-  assert.match(output, /openai-codex\s+OpenAI subscription\s+oauth or api-key/u);
+  assert.match(output, /openai-codex\s+OpenAI subscription\s+oauth/u);
   assert.match(output, /Use --as NAME/u);
 });
 
 test("provider discovery rejects unsafe or unexplained registries", () => {
-  for (const builtinProviders of [
+  for (const providers of [
     [],
-    ["openai", "openai"],
-    ["bad.provider"],
-    ["bad\tprovider"],
+    [piProvider("openai", "openai-responses"), piProvider("openai", "openai-responses")],
+    [piProvider("bad.provider", "openai-responses")],
+    [piProvider("bad\tprovider", "openai-responses")],
     [42],
   ]) {
     assert.throws(
       () => discoverSupportedProviders({
-        builtinProviders,
-        builtinModels: () => [{ api: "openai-responses" }],
-        oauthProviders: [],
+        providers,
         descriptions: DESCRIPTIONS,
         exposedApis: new Set(["openai-responses"]),
       }),
-      /invalid built-in provider registry/u,
+      /invalid provider registry/u,
     );
   }
   assert.throws(
     () => discoverSupportedProviders({
-      builtinProviders: ["openai"],
-      builtinModels: () => [{ api: "openai-responses" }],
-      oauthProviders: [{ id: "openai" }, { id: "openai" }],
-      descriptions: DESCRIPTIONS,
-      exposedApis: new Set(["openai-responses"]),
-    }),
-    /invalid OAuth provider registry/u,
-  );
-  assert.throws(
-    () => discoverSupportedProviders({
-      builtinProviders: ["future-provider"],
-      builtinModels: () => [{ api: "openai-responses" }],
-      oauthProviders: [],
+      providers: [piProvider("future-provider", "openai-responses")],
       descriptions: DESCRIPTIONS,
       exposedApis: new Set(["openai-responses"]),
     }),
@@ -92,9 +90,7 @@ test("provider discovery rejects unsafe or unexplained registries", () => {
   );
   assert.throws(
     () => discoverSupportedProviders({
-      builtinProviders: ["openai"],
-      builtinModels: () => [{ api: "openai-responses" }],
-      oauthProviders: [],
+      providers: [piProvider("openai", "openai-responses")],
       descriptions: { openai: "unsafe\tdescription" },
       exposedApis: new Set(["openai-responses"]),
     }),
@@ -112,11 +108,10 @@ test("the pinned pi-ai provider registry is fully described", () => {
 
 test("provider discovery omits providers with no gateway-supported native API", () => {
   const providers = discoverSupportedProviders({
-    builtinProviders: ["openai", "google"],
-    builtinModels: (provider) => [{
-      api: provider === "openai" ? "openai-responses" : "google-generative-ai",
-    }],
-    oauthProviders: [],
+    providers: [
+      piProvider("openai", "openai-responses"),
+      piProvider("google", "google-generative-ai"),
+    ],
     descriptions: { openai: "OpenAI", google: "Google" },
     exposedApis: new Set(["openai-responses"]),
   });

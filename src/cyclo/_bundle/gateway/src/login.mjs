@@ -3,10 +3,8 @@ import { stdin, stdout } from "node:process";
 import { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
-import { getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
-
-import { createOAuthLoginCallbacks } from "./oauth-ui.mjs";
+import { createAuthInteraction } from "./oauth-ui.mjs";
+import { getPiProvider, getPiProviders } from "./pi-registry.mjs";
 import { readJson, withFileLock, writeJsonAtomic } from "./store.mjs";
 
 const ROUTE = /^[a-z0-9_-]+$/u;
@@ -16,11 +14,13 @@ export async function login(argv, options = {}) {
   const env = options.env ?? process.env;
   const input = options.input ?? stdin;
   const output = options.output ?? stdout;
+  const providerLookup = options.getProvider ?? getPiProvider;
+  const providers = options.providers ?? getPiProviders();
   const parsed = parseLoginArgs(argv);
   const key = await resolveApiKey(parsed, { env, input, output });
   const account = parsed.account ?? parsed.provider;
   const credential = key === undefined
-    ? await oauthLogin(parsed.provider, { input, output })
+    ? await oauthLogin(parsed.provider, { input, output, providerLookup, providers })
     : { type: "api_key", key };
   const authPath = env.CYCLO_GATEWAY_AUTH_JSON ?? "/var/lib/cyclo-gateway/auth.json";
   await storeCredential(authPath, account, {
@@ -80,22 +80,28 @@ async function resolveApiKey(parsed, { env, input, output }) {
   return value;
 }
 
-async function oauthLogin(provider, { input, output }) {
-  const oauth = getOAuthProvider(provider);
+async function oauthLogin(provider, { input, output, providerLookup, providers }) {
+  const selected = providerLookup(provider);
+  const oauth = selected?.auth?.oauth;
   if (!oauth) {
-    if (getBuiltinProviders().includes(provider)) {
+    if (selected) {
       throw new Error(`provider ${provider} requires an API key`);
     }
-    const choices = getOAuthProviders().map(({ id }) => id).join(", ");
+    const choices = providers.filter((item) => item.auth?.oauth).map(({ id }) => id).join(", ");
     throw new Error(`unknown provider ${provider}; OAuth providers: ${choices}`);
   }
+  const credential = await oauth.login(createAuthInteraction({
+    ask: (question) => visibleQuestion(input, output, question),
+    askSecret: (question) => hiddenQuestion(input, output, question),
+    write: (message) => output.write(`${message}\n`),
+  }));
+  return { ...credential, type: "oauth" };
+}
+
+async function visibleQuestion(input, output, prompt) {
   const terminal = createInterface({ input, output });
   try {
-    const credential = await oauth.login(createOAuthLoginCallbacks({
-      ask: (question) => terminal.question(question),
-      write: (message) => output.write(`${message}\n`),
-    }));
-    return { ...credential, type: "oauth" };
+    return await terminal.question(prompt);
   } finally {
     terminal.close();
   }

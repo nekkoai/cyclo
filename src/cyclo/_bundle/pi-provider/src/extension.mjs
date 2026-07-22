@@ -36,18 +36,17 @@ export async function registerCycloProviders(pi, {
     const route = routes.get(routeKey(model?.provider, model?.id));
     if (!route) throw new Error("Pi selected a model outside the Cyclo catalogue");
     return streamProvider(client, route.publicId, {
-      api: "cyclo-provider-v1",
+      api: "cyclo-pi",
       provider: model.provider,
       id: model.id,
       maxTokens: route.model.maxTokens,
-      capabilities: route.capabilities,
     }, context, options);
   };
 
   for (const [provider, group] of groups) {
     pi.registerProvider(provider, {
       name: `Cyclo ${provider}`,
-      api: "cyclo-provider-v1",
+      api: "cyclo-pi",
       baseUrl: "http://cyclo.invalid",
       apiKey: "socket",
       authHeader: false,

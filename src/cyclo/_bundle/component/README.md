@@ -89,6 +89,7 @@ emits `gen/schema.json` for language-neutral declaration validation. The tests
 also make a real generated Connect call over a Unix-domain socket.
 
 This package deliberately owns only the common Component interface. Cyclo's
-portable Provider interface lives in the sibling `../provider` package. It
+Provider control plane and opaque Pi transport live in the sibling
+`../provider` package. It
 defines catalogue and inference semantics explicitly rather than disguising a
 native model API as `path + headers + bytes` inside Protobuf.

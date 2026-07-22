@@ -228,10 +228,8 @@ class ContainerSpec:
     readonly_layout: Path | None = None
 
 
-def container_command(spec: ContainerSpec) -> list[str]:
-    instance = spec.instance
+def validate_container_spec(spec: ContainerSpec) -> None:
     provider_socket_dir = spec.provider_socket_dir
-    provider_socket = provider_socket_dir / "component.sock"
     if (
         not provider_socket_dir.is_absolute()
         or provider_socket_dir.is_symlink()
@@ -240,6 +238,12 @@ def container_command(spec: ContainerSpec) -> list[str]:
         raise CycloError(
             f"invalid Cyclo provider socket directory: {provider_socket_dir}"
         )
+
+
+def container_command(spec: ContainerSpec) -> list[str]:
+    instance = spec.instance
+    provider_socket_dir = spec.provider_socket_dir
+    provider_socket = provider_socket_dir / "component.sock"
     if instance.provider_socket_path != str(provider_socket):
         raise CycloError(
             "Cyclo instance provider socket does not match its launch configuration"
@@ -588,6 +592,7 @@ class Docker:
                 info, kind="container", name=spec.instance.container_name
             )
             self._run(["docker", "rm", resource_id])
+        validate_container_spec(spec)
         self._run(container_command(spec))
         info = self._owned_container(spec.instance.container_name, spec.instance.id)
         if info is None:

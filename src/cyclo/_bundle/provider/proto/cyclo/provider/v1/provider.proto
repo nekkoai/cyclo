@@ -3,16 +3,13 @@ syntax = "proto3";
 package cyclo.provider.v1;
 
 import "google/protobuf/any.proto";
-import "google/protobuf/struct.proto";
 
-// Provider is Cyclo's portable model-catalogue and inference interface.
+// Provider has a typed control plane and an opaque inference data plane.
 //
-// Implementations translate this contract at their native API boundary. They
-// must not tunnel native HTTP paths, headers, credentials, or request bodies
-// through this interface. Unknown models return NOT_FOUND. Malformed requests
-// and unadvertised capabilities return INVALID_ARGUMENT before Started.
-// Dependency failures return UNAVAILABLE. Cancellation and deadlines must be
-// propagated to every upstream call.
+// ListModels is understood by Cyclo because it is used to construct routes.
+// Infer carries Pi's JSON representation without interpreting its contents.
+// Provider relays forward payload strings unchanged; only a provider endpoint
+// that actually invokes Pi may decode them.
 service Provider {
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   rpc Infer(InferRequest) returns (stream InferResponse);
@@ -25,17 +22,18 @@ message ListModelsResponse {
 }
 
 // A model ID is opaque, provider-local, and unique within one catalogue.
-// Callers must send it back unchanged in InferRequest.model.
+// Callers send it back unchanged in InferRequest.model.
 message Model {
   string id = 1;
   string display_name = 2;
   ModelCapabilities capabilities = 3;
   optional uint64 context_window_tokens = 4;
   optional uint64 max_output_tokens = 5;
-
-  // Typed catalogue metadata. Every emitted type must be advertised by its
-  // fully-qualified Protobuf message name in capabilities.extension_types.
   repeated google.protobuf.Any extensions = 6;
+
+  // Identifies the payload ABI accepted by Infer. Components must not connect
+  // models whose inference_format they do not implement.
+  string inference_format = 7;
 }
 
 message ModelCapabilities {
@@ -47,13 +45,8 @@ message ModelCapabilities {
   bool temperature = 6;
   bool top_p = 7;
   bool stop_sequences = 8;
-
-  // Fully-qualified Protobuf message names accepted or emitted through Any.
-  // The name must equal the final path segment of Any.type_url. Each extension
-  // contract defines its legal direction and attachment points; advertising a
-  // type means supporting that complete contract. Wrong placement or an
-  // unsupported request extension is an INVALID_ARGUMENT error.
   repeated string extension_types = 9;
+  bool reasoning = 10;
 }
 
 enum Modality {
@@ -64,218 +57,16 @@ enum Modality {
   MODALITY_DOCUMENT = 4;
 }
 
+// payload is a JSON string containing the Pi call frame. Cyclo routes on model
+// and otherwise treats payload as an opaque sequence of Unicode characters.
 message InferRequest {
   string model = 1;
-  string instructions = 2;
-  repeated InputItem input = 3;
-  repeated Tool tools = 4;
-  GenerationConfig generation = 5;
-
-  // Typed provider settings that the selected model advertises explicitly.
-  repeated google.protobuf.Any extensions = 6;
+  string payload = 2;
 }
 
-// Input is an ordered sequence. Tool calls and results remain first-class
-// items instead of being hidden inside provider-specific message roles.
-message InputItem {
-  oneof item {
-    Message message = 1;
-    ToolCall tool_call = 2;
-    ToolResult tool_result = 3;
-    ReasoningSummary reasoning_summary = 4;
-
-    // Typed state required to continue a provider-native conversation, such
-    // as a signed reasoning block. The model must advertise its type.
-    google.protobuf.Any extension = 5;
-  }
-
-  // Metadata attached to this exact history item. A caller copies compatible
-  // ItemFinished extensions here when it reconstructs the next request.
-  repeated google.protobuf.Any extensions = 6;
-}
-
-message Message {
-  MessageRole role = 1;
-  repeated ContentPart content = 2;
-}
-
-enum MessageRole {
-  MESSAGE_ROLE_UNSPECIFIED = 0;
-  MESSAGE_ROLE_USER = 1;
-  MESSAGE_ROLE_ASSISTANT = 2;
-}
-
-message ContentPart {
-  oneof content {
-    string text = 1;
-    Media media = 2;
-  }
-}
-
-// Media is inline so the protocol never asks a provider to fetch an arbitrary
-// caller-controlled URL. media_type is an IANA media type such as image/png.
-message Media {
-  string media_type = 1;
-  bytes data = 2;
-}
-
-// Tool describes a caller-executed function. Provider-hosted tools are not
-// part of the portable core and require a typed extension.
-message Tool {
-  string name = 1;
-  string description = 2;
-  google.protobuf.Struct input_schema = 3;
-}
-
-message ToolCall {
-  string id = 1;
-  string name = 2;
-  google.protobuf.Struct arguments = 3;
-}
-
-message ToolResult {
-  string call_id = 1;
-  repeated ContentPart content = 2;
-  bool is_error = 3;
-}
-
-// A provider-approved summary returned in an earlier turn. It remains
-// distinct from ordinary assistant text when the conversation is continued.
-message ReasoningSummary {
-  string text = 1;
-}
-
-message GenerationConfig {
-  optional uint64 max_output_tokens = 1;
-
-  // The portable range is 0.0 through 1.0. Provider-specific ranges belong
-  // in typed extensions.
-  optional double temperature = 2;
-  optional double top_p = 3;
-  repeated string stop_sequences = 4;
-  ToolChoice tool_choice = 5;
-}
-
-message ToolChoice {
-  // An absent ToolChoice lets the provider use AUTO. If this message is
-  // present, UNSPECIFIED is invalid.
-  ToolChoiceMode mode = 1;
-
-  // Required only for TOOL_CHOICE_MODE_SPECIFIC; otherwise it must be empty.
-  string tool_name = 2;
-}
-
-enum ToolChoiceMode {
-  TOOL_CHOICE_MODE_UNSPECIFIED = 0;
-  TOOL_CHOICE_MODE_AUTO = 1;
-  TOOL_CHOICE_MODE_NONE = 2;
-  TOOL_CHOICE_MODE_REQUIRED = 3;
-  TOOL_CHOICE_MODE_SPECIFIC = 4;
-}
-
-// InferResponse contains exactly one event. A successful stream starts with
-// Started and ends with Finished. EOF without Finished is failure. Operational
-// failures use Connect errors; there is deliberately no in-band error event.
+// Each response contains the JSON string for exactly one native Pi
+// AssistantMessageEvent. Stream order and termination are Pi semantics, not
+// additional Cyclo semantics.
 message InferResponse {
-  oneof event {
-    Started started = 1;
-    ItemStarted item_started = 2;
-    ItemDelta item_delta = 3;
-    ItemFinished item_finished = 4;
-    Finished finished = 5;
-  }
-}
-
-message Started {
-  string response_id = 1;
-
-  // This is the requested provider-local model ID. A multiplexer reports its
-  // own public model here, not the selected upstream route.
-  string model = 2;
-  repeated google.protobuf.Any extensions = 3;
-}
-
-// Item indexes start at zero and increase by one for each new item. Deltas for
-// open items may interleave, which preserves parallel native tool calls.
-message ItemStarted {
-  uint32 index = 1;
-
-  oneof item {
-    TextStarted text = 2;
-    ReasoningSummaryStarted reasoning_summary = 3;
-    ToolCallStarted tool_call = 4;
-    MediaStarted media = 5;
-
-    // A typed provider-native item. It is atomic; streamed extension deltas do
-    // not exist. The model must advertise its type.
-    google.protobuf.Any extension = 6;
-  }
-}
-
-message TextStarted {}
-
-// This represents a provider-approved summary, never hidden chain-of-thought.
-message ReasoningSummaryStarted {}
-
-message ToolCallStarted {
-  string id = 1;
-  string name = 2;
-}
-
-message MediaStarted {
-  string media_type = 1;
-}
-
-message ItemDelta {
-  uint32 index = 1;
-
-  oneof delta {
-    // Used by text and reasoning-summary items.
-    string text = 2;
-
-    // An ordered fragment of one JSON object for a tool-call item. Deltas are
-    // a latency hint; ItemFinished.tool_arguments is authoritative.
-    string tool_arguments_json = 3;
-    bytes media = 4;
-  }
-}
-
-message ItemFinished {
-  uint32 index = 1;
-
-  // Present only for tool-call items. It is the authoritative parsed object.
-  google.protobuf.Struct tool_arguments = 2;
-
-  // Item-bound provider state, such as a native reasoning signature.
-  repeated google.protobuf.Any extensions = 3;
-}
-
-message Usage {
-  // output_tokens includes reasoning tokens when they are reported;
-  // reasoning_tokens is an optional subset. cached_input_tokens is likewise an
-  // optional subset of input_tokens. When total_tokens is present it equals
-  // input_tokens + output_tokens, which must then also be present.
-  optional uint64 input_tokens = 1;
-  optional uint64 output_tokens = 2;
-  optional uint64 total_tokens = 3;
-  optional uint64 cached_input_tokens = 4;
-  optional uint64 reasoning_tokens = 5;
-}
-
-message Finished {
-  FinishReason reason = 1;
-  optional string stop_sequence = 2;
-  Usage usage = 3;
-  repeated google.protobuf.Any extensions = 4;
-}
-
-enum FinishReason {
-  FINISH_REASON_UNSPECIFIED = 0;
-  FINISH_REASON_STOP = 1;
-  FINISH_REASON_STOP_SEQUENCE = 2;
-  FINISH_REASON_MAX_OUTPUT_TOKENS = 3;
-  FINISH_REASON_TOOL_CALLS = 4;
-  FINISH_REASON_CONTENT_FILTER = 5;
-  FINISH_REASON_REFUSAL = 6;
-  FINISH_REASON_OTHER = 7;
+  string payload = 1;
 }

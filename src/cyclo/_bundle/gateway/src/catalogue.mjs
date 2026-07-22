@@ -1,3 +1,6 @@
+import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
+
+import { getPiProviders, validatePiProviders } from "./pi-registry.mjs";
 import { readJson } from "./store.mjs";
 
 const ACCOUNT_NAME = /^[a-z0-9_-]+$/u;
@@ -103,18 +106,6 @@ function credentialAccounts(authPath) {
   return Object.freeze(accounts);
 }
 
-function builtinProviderSet(getBuiltinProviders) {
-  const values = getBuiltinProviders();
-  if (
-    !Array.isArray(values)
-    || values.some((value) => typeof value !== "string" || !ACCOUNT_NAME.test(value))
-    || new Set(values).size !== values.length
-  ) {
-    throw new Error("built-in provider registry is malformed");
-  }
-  return new Set(values);
-}
-
 function cloneAndFreeze(value) {
   if (!value || typeof value !== "object") return value;
   const clone = structuredClone(value);
@@ -162,12 +153,14 @@ function publicModel(account, model) {
     topP: false,
     stopSequences: false,
     extensionTypes: Object.freeze([]),
+    reasoning: model.reasoning === true,
   });
   const result = {
     id: `${account}/${model.id}`,
     displayName: typeof model.name === "string" && model.name ? model.name : model.id,
     capabilities,
     extensions: Object.freeze([]),
+    inferenceFormat: PI_INFERENCE_FORMAT,
   };
   if (Number.isSafeInteger(model.contextWindow) && model.contextWindow > 0) {
     result.contextWindowTokens = BigInt(model.contextWindow);
@@ -181,27 +174,21 @@ function publicModel(account, model) {
 export function buildCatalogue({
   authPath,
   modelsPath,
-  getBuiltinProviders,
-  getBuiltinModels,
+  providers = getPiProviders(),
   getApiProvider,
-  getOAuthProvider,
 }) {
   for (const [name, value] of Object.entries({
     authPath,
     modelsPath,
-    getBuiltinProviders,
-    getBuiltinModels,
     getApiProvider,
   })) {
     const valid = name.endsWith("Path") ? typeof value === "string" && value : typeof value === "function";
     if (!valid) throw new TypeError(`${name} is required`);
   }
-  if (getOAuthProvider !== undefined && typeof getOAuthProvider !== "function") {
-    throw new TypeError("getOAuthProvider must be a function");
-  }
-
   const custom = customProviders(modelsPath);
-  const builtins = builtinProviderSet(getBuiltinProviders);
+  const builtins = new Map(
+    validatePiProviders(providers).map((provider) => [provider.id, provider]),
+  );
   const models = [];
   const routes = Object.create(null);
 
@@ -213,10 +200,12 @@ export function buildCatalogue({
       ({ models: rawModels, ...defaults } = custom[provider]);
       customModels = true;
     } else if (builtins.has(provider)) {
-      rawModels = getBuiltinModels(provider);
+      const builtin = builtins.get(provider);
+      rawModels = builtin.getModels();
       if (!Array.isArray(rawModels)) {
         throw new Error(`built-in provider ${provider} returned a malformed model list`);
       }
+      defaults = { baseUrl: builtin.baseUrl };
     } else {
       throw new Error(`account ${account} names unknown provider ${provider}`);
     }
@@ -232,19 +221,19 @@ export function buildCatalogue({
       if (sourceIds.has(model.id)) throw new Error(`provider ${provider} repeats model ${model.id}`);
       sourceIds.add(model.id);
     }
-    const sourceModels = new Map(candidates.map((model) => [model.id, model]));
     const originals = new Map(candidates.map((model) => [model.id, model.api]));
-    if (credential.type === "oauth" && typeof getOAuthProvider === "function") {
-      const oauth = getOAuthProvider(provider);
-      if (oauth?.modifyModels) {
-        const modified = oauth.modifyModels(candidates.map((model) => structuredClone(model)), credential);
-        if (!Array.isArray(modified)) {
-          throw new Error(`OAuth provider ${provider} returned a malformed model list`);
-        }
-        candidates = modified.map((raw) => effectiveModel(provider, raw, defaults));
-        if (candidates.some((model) => originals.get(model.id) !== model.api)) {
-          throw new Error(`OAuth provider ${provider} changed a model identity`);
-        }
+    const filterModels = builtins.get(provider)?.filterModels;
+    if (credential.type === "oauth" && typeof filterModels === "function") {
+      const modified = filterModels(
+        candidates.map((model) => structuredClone(model)),
+        credential,
+      );
+      if (!Array.isArray(modified)) {
+        throw new Error(`provider ${provider} returned a malformed filtered model list`);
+      }
+      candidates = modified.map((raw) => effectiveModel(provider, raw, defaults));
+      if (candidates.some((model) => originals.get(model.id) !== model.api)) {
+        throw new Error(`provider ${provider} changed a model identity while filtering`);
       }
     }
 
@@ -274,7 +263,6 @@ export function buildCatalogue({
         baseUrl: model.baseUrl,
         publicModel: published,
         rawModel: model,
-        sourceModel: sourceModels.get(model.id),
         apiProvider,
       });
     }

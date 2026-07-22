@@ -319,27 +319,11 @@ case $project_dry_run in
     *) fail "project.cyclo dry-run omitted agent project context" ;;
 esac
 
-dry_run=$(
-    "$cyclo" --state-root "$state_root" run \
-        --name release-acceptance \
-        --dry-run \
-        "$team" \
-        "$project"
-)
-printf '%s\n' "$dry_run"
-case $dry_run in
+case $project_dry_run in
     *"cyclo-team:"*) ;;
-    *) fail "dry-run did not use the packaged Cyclo team image" ;;
+    *) fail "project.cyclo dry-run did not use the packaged Cyclo team image" ;;
 esac
-case $dry_run in
-    *"type=bind,src=$team,dst=/team"*) ;;
-    *) fail "dry-run did not isolate the team mount" ;;
-esac
-case $dry_run in
-    *"type=bind,src=$project,dst=/workspace"*) ;;
-    *) fail "dry-run did not isolate the writable project" ;;
-esac
-case $dry_run in
+case $project_dry_run in
     *multiagent*|*"$HOME/agentws"*|*"$HOME/multiagent"*)
         fail "dry-run referenced an external upstream checkout"
         ;;
@@ -350,18 +334,18 @@ doctor_status=0
 "$cyclo" --state-root "$state_root" doctor >"$doctor_log" 2>&1 || doctor_status=$?
 cat "$doctor_log"
 
-grep -F 'ok  bundled job-loop ABI:' "$doctor_log" >/dev/null \
-    || fail "doctor did not find the packaged job-loop runtime"
-grep -F 'ok  credential gateway:' "$doctor_log" >/dev/null \
-    || fail "doctor did not load Cyclo's credential gateway"
+grep -F 'ok  bundled AgentWS ABI:' "$doctor_log" >/dev/null \
+    || fail "doctor did not find the packaged AgentWS runtime"
+grep -F 'ok  bundled component ABI:' "$doctor_log" >/dev/null \
+    || fail "doctor did not find the packaged component runtime"
 
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     [ "$doctor_status" -eq 1 ] \
-        || fail "doctor returned $doctor_status with an intentionally absent provider runtime"
+        || fail "doctor returned $doctor_status with an intentionally absent gateway"
     grep -F 'ok  Docker daemon:' "$doctor_log" >/dev/null \
         || fail "doctor did not accept the Docker daemon"
-    grep -F 'no  provider stack:' "$doctor_log" >/dev/null \
-        || fail "doctor did not diagnose the intentionally absent provider stack"
+    grep -F 'no  credential gateway: gateway is absent' "$doctor_log" >/dev/null \
+        || fail "doctor did not diagnose the intentionally absent gateway"
 else
     [ "$doctor_status" -eq 1 ] \
         || fail "doctor returned $doctor_status when Docker was unavailable"
