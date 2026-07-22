@@ -7,7 +7,7 @@ runs it with the system-owned team runtime.
 
 ## Implementation status
 
-Cyclo 0.2.0 implements the roster, roles, optional protocol, Git generation,
+Cyclo 0.2.0 implements the roster, roles, optional policy, Git generation,
 `project.cyclo` selection, and `/team` mount described below.
 
 The optional derived team image described in this document is the accepted
@@ -68,11 +68,11 @@ The intended prompt composition is:
 3. optional team-wide policy from `AGENTS.md`; and
 4. the selected `roles/<role>.md`.
 
-In 0.2.0, a repository `AGENTS.md` replaces the bundled protocol instead of
-being layered after it. Built-in templates omit that file and therefore use
-the bundled protocol. Additive composition is part of the accepted cutover
-contract so a team never needs to copy Cyclo's generic filesystem and job-loop
-rules merely to add local policy.
+The system-owned protocol is always included. A repository `AGENTS.md` is
+layered after it as team-specific policy, so a team never needs to copy
+Cyclo's generic filesystem and job-loop rules merely to add local behavior.
+For a writable team, changes to `/team/AGENTS.md` affect subsequently launched
+agents without modifying the system protocol.
 
 ## Ownership and interaction
 

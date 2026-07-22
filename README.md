@@ -13,6 +13,10 @@ this repository—there are no `agentws` or `multiagent` checkouts at runtime.
 
 Requirements: Linux, Python 3.10+, Git, and Docker.
 
+Cyclo 0.2 uses a new persisted-state and Docker-resource layout. It does not
+perform an in-place migration from 0.1: install it with a fresh state root and
+newly built gateway, provider, and team resources.
+
 ```sh
 python -m pip install .
 cyclo gateway build
@@ -55,6 +59,13 @@ checks gateway, provider components, Docker image identity, and health.
 A project directory contains a `project.cyclo` file and one or more team
 repositories:
 
+```sh
+cyclo team init ./teams/jon-rtl --template plan-execute-verify --model PROVIDER/MODEL
+cyclo project init ./project.cyclo --team ./teams/jon-rtl ro --mount source /home/user/openhw/core-et rw
+```
+
+The generated project file uses the same small line-oriented format:
+
 ```text
 name rtl-work
 description RTL design experiment
@@ -74,14 +85,33 @@ Run and inspect work:
 ```sh
 cyclo run project.cyclo
 cyclo ps
-cyclo task <instance> uart-ip ./uart-task.md
+cyclo inspect <instance>
+cyclo task run <instance> uart-ip ./uart-task.md
+cyclo task list <instance>
+cyclo task show <instance> uart-ip
 cyclo logs <instance>
 cyclo dashboard --host 127.0.0.1
+cyclo refresh                       # rebuild runtimes and restart active projects
 ```
 
 The dashboard is read-only and shows team/job state, provider health, and
 global provider usage. Use `--host 0.0.0.0` only when exposing it deliberately;
 the browser link uses the host that served the page, not the bind wildcard.
+
+## Multiple installations
+
+One installed `cyclo` command can operate several independent installations on
+the same Docker host. Give each one a distinct state root and host configuration:
+
+```sh
+CYCLO_STATE_ROOT=~/.local/state/cyclo-work CYCLO_HOST_CONFIG=/etc/cyclo/work.conf cyclo doctor
+CYCLO_STATE_ROOT=~/.local/state/cyclo-lab CYCLO_HOST_CONFIG=/etc/cyclo/lab.conf cyclo doctor
+```
+
+The canonical state root defines the installation identity. Cyclo includes it
+in gateway and provider resources, team containers and networks, the default
+team image, and ownership labels, so equal project/team names do not collide.
+An explicitly supplied `--image` remains an intentional shared Docker image.
 
 ## Documentation
 
@@ -91,6 +121,8 @@ the browser link uses the host that served the page, not the bind wildcard.
 - [Operations guide](docs/guide.md)
 - [Release checklist](docs/releasing.md)
 
-The source tree is self-contained under `src/cyclo/_bundle`. The Python CLI is
-the public interface; Node is used inside component images and by maintainer
-tests, not as a host installation requirement.
+The component system is self-contained under `src/cyclo/components`: shared
+ConnectRPC contracts live in `protocol/`, independently runnable components
+live beside them, and the agent image is explicit as `team-runtime/`. The
+Python CLI is the public interface; Node is used inside component images and by
+maintainer tests, not as a host installation requirement.

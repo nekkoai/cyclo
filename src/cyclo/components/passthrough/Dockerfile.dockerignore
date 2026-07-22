@@ -1,0 +1,13 @@
+**
+!protocol/component/package.json
+!protocol/component/package-lock.json
+!protocol/component/src/**
+!protocol/component/gen/**
+!protocol/provider/package.json
+!protocol/provider/package-lock.json
+!protocol/provider/src/**
+!protocol/provider/gen/**
+!passthrough/package.json
+!passthrough/package-lock.json
+!passthrough/component.conf
+!passthrough/src/**

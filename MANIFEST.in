@@ -17,16 +17,17 @@ recursive-include requirements *.in *.txt
 recursive-include template README.md team *.md
 recursive-include tests *.py *.mjs
 
-include src/cyclo/_bundle/__init__.py
-graft src/cyclo/_bundle/component
-graft src/cyclo/_bundle/provider
-graft src/cyclo/_bundle/gateway
-graft src/cyclo/_bundle/passthrough
-graft src/cyclo/_bundle/pi-provider
-graft src/cyclo/_bundle/team
-prune src/cyclo/_bundle/component/node_modules
-prune src/cyclo/_bundle/provider/node_modules
-prune src/cyclo/_bundle/gateway/node_modules
-prune src/cyclo/_bundle/passthrough/node_modules
-prune src/cyclo/_bundle/pi-provider/node_modules
-prune src/cyclo/_bundle/team/node_modules
+include src/cyclo/components/__init__.py
+include src/cyclo/components/README.md
+graft src/cyclo/components/protocol/component
+graft src/cyclo/components/protocol/provider
+graft src/cyclo/components/gateway
+graft src/cyclo/components/passthrough
+graft src/cyclo/components/pi-provider
+graft src/cyclo/components/team-runtime
+prune src/cyclo/components/protocol/component/node_modules
+prune src/cyclo/components/protocol/provider/node_modules
+prune src/cyclo/components/gateway/node_modules
+prune src/cyclo/components/passthrough/node_modules
+prune src/cyclo/components/pi-provider/node_modules
+prune src/cyclo/components/team-runtime/node_modules

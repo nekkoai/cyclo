@@ -400,8 +400,17 @@ def verify_agentws_abi(root: Path) -> None:
     if missing:
         raise CycloError("Cyclo's bundled job-loop runtime is incomplete: " + ", ".join(missing))
     seams = {
-        template / "tools" / "run_agentws": ("AGENTWS_TEAM_ROLES_DIR", "AGENTWS_WORKSPACE"),
-        template / "tools" / "agent": ("AGENTWS_TEAM_PROTOCOL", "AGENTWS_WORKSPACE"),
+        template / "tools" / "run_agentws": (
+            "AGENTWS_SYSTEM_PROTOCOL",
+            "AGENTWS_TEAM_PROTOCOL",
+            "AGENTWS_TEAM_ROLES_DIR",
+            "AGENTWS_WORKSPACE",
+        ),
+        template / "tools" / "agent": (
+            "AGENTWS_SYSTEM_PROTOCOL",
+            "AGENTWS_TEAM_PROTOCOL",
+            "AGENTWS_WORKSPACE",
+        ),
         template / "tools" / "agentws": ("--pin-root", "--read-only"),
         template / "bin" / "agent-new": ("AGENTWS_TEAM_ROLES_DIR",),
         template / "bin" / "job-reset-orphans": (
@@ -451,7 +460,6 @@ def init_team(
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary.mkdir(mode=0o700)
         if template_name is None:
-            shutil.copy2(template / "AGENTS.md", temporary / "AGENTS.md")
             shutil.copytree(template / "roles", temporary / "roles")
             roster_source = template / "default.team"
         else:

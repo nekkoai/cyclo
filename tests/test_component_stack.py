@@ -228,8 +228,8 @@ def _deployment() -> Deployment:
         component_type="passthrough",
         source=Path("/component/pass"),
         build_context=Path("/component"),
-        image="cyclo-0123456789ab-pass:latest",
-        container="cyclo-0123456789ab-pass",
+        image="cyclo-0123456789ab-provider-pass:latest",
+        container="cyclo-0123456789ab-provider-pass",
         system="0123456789ab",
         arguments=("mode=plain",),
         mounts=(
@@ -477,8 +477,8 @@ def test_provider_stop_is_reverse_order_then_owned_stray_cleanup(tmp_path: Path)
             self.events.append(("stop", deployment.instance))
             return True
 
-        def stop_system(self, system: str, **options: object) -> tuple[str, ...]:
-            self.events.append(("stop_system", system, options))
+        def stop_providers(self, system: str, **options: object) -> tuple[str, ...]:
+            self.events.append(("stop_providers", system, options))
             return ("orphan",)
 
     docker = Docker()
@@ -495,9 +495,30 @@ def test_provider_stop_is_reverse_order_then_owned_stray_cleanup(tmp_path: Path)
 
     assert stack.stop() == ("second", "first", "orphan")
     assert docker.events[0:2] == [("stop", "second"), ("stop", "first")]
-    assert docker.events[2][2] == {
-        "lifecycle": "provider",
-    }
+    assert docker.events[2] == ("stop_providers", stack.system, {})
+
+
+def test_owned_provider_cleanup_accepts_the_namespaced_provider_name() -> None:
+    class Docker(ComponentDocker):
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def inspect(self, kind: str, reference: str, *, missing: bool = True):
+            assert kind == "container"
+            assert reference == CONTAINER_ID
+            return _container()
+
+        def call(self, arguments, **_options):
+            command = list(arguments)
+            self.calls.append(command)
+            output = f"{CONTAINER_ID}\n" if command[:2] == ["container", "ls"] else ""
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+    docker = Docker()
+
+    assert docker.stop_providers(_deployment().system) == ("pass",)
+    assert ["stop", "--timeout", "10", CONTAINER_ID] in docker.calls
+    assert ["rm", "--volumes", CONTAINER_ID] in docker.calls
 
 
 def test_gateway_usage_mounts_the_credential_volume_read_only(tmp_path: Path) -> None:

@@ -153,13 +153,13 @@ not understand prompts, history, tools, JSON Schema, or events. See
 List installed templates:
 
 ```sh
-cyclo templates
+cyclo team templates
 ```
 
 Create a team repository using an exact model from `cyclo models`:
 
 ```sh
-cyclo init ./teams/my-team --template software --model codex-work/MODEL_ID
+cyclo team init ./teams/my-team --template plan-execute-verify --model codex-work/MODEL_ID
 ```
 
 The repository contains:
@@ -189,7 +189,27 @@ data: roster, prompts, and optional instructions. Validate it with:
 cyclo validate ./teams/my-team
 ```
 
+After upgrading Cyclo or changing installed component source, rebuild the
+gateway, provider components, and team runtime and restart every active
+`project.cyclo` run with one command:
+
+```sh
+cyclo refresh
+```
+
+Queue state is preserved. Every active instance must retain its `project.cyclo`
+path so Cyclo can reproducibly recreate the same mount and team authority.
+
 ## Define a project
+
+Create a validated one-team project definition directly:
+
+```sh
+cyclo project init ./project.cyclo --team ./teams/jon-rtl ro --mount source /home/user/openhw/core-et rw
+```
+
+Add further `--team PATH MODE` or `--mount NAME PATH MODE` options as needed.
+Alternatively, write the same format by hand:
 
 Create `project.cyclo`:
 
@@ -245,6 +265,7 @@ Inspect instances:
 
 ```sh
 cyclo ps
+cyclo inspect INSTANCE
 cyclo logs INSTANCE
 cyclo logs -f INSTANCE
 cyclo path INSTANCE
@@ -253,11 +274,26 @@ cyclo path INSTANCE
 Submit a Markdown task specification:
 
 ```sh
-cyclo task INSTANCE uart-ip ./uart-task.md
+cyclo task run INSTANCE uart-ip ./uart-task.md
+cyclo task list INSTANCE
+cyclo task show INSTANCE uart-ip
 ```
 
-The task command prints the project definition and logical writable/read-only
-mount paths so the operator can verify where the team will work.
+`task` is an instance-scoped command group:
+
+```text
+cyclo task list INSTANCE
+cyclo task show INSTANCE TASK
+cyclo task run INSTANCE TASK SPEC.md
+cyclo task comment INSTANCE TASK MESSAGE...
+cyclo task complete INSTANCE TASK [-m MESSAGE]
+cyclo task reopen INSTANCE TASK [-m MESSAGE]
+```
+
+`task run` atomically creates the AgentWS task and its initial planner job, then
+prints the project definition and logical writable/read-only mounts seen by the
+team. The other commands expose the task lifecycle without requiring operators
+to know the container name or invoke AgentWS directly.
 
 Stop one instance or every persisted instance belonging to a project:
 
@@ -321,10 +357,51 @@ cyclo repair
 The state root is `$XDG_STATE_HOME/cyclo` or `~/.local/state/cyclo` by default.
 Override it with `--state-root` or `CYCLO_STATE_ROOT`.
 
+### Multiple installations on one host
+
+An installation is identified by its canonical state-root path. Cyclo derives
+a stable 12-hex-character installation ID from that path and uses it in every
+Docker resource it creates: the gateway and provider containers/images, gateway
+credential volume, team containers and networks, the bundled team image, and
+ownership labels. Two installations may therefore use the same project name,
+team name, and instance ID without Docker name or mutable-tag collisions.
+
+Give each installation both its own state root and its own provider assembly:
+
+```sh
+CYCLO_STATE_ROOT=~/.local/state/cyclo-work CYCLO_HOST_CONFIG=/etc/cyclo/work.conf cyclo gateway build
+CYCLO_STATE_ROOT=~/.local/state/cyclo-lab CYCLO_HOST_CONFIG=/etc/cyclo/lab.conf cyclo gateway build
+```
+
+Use those same two settings on every command for that installation. Shell
+wrappers or environment files are convenient, but Cyclo needs no second binary
+installation. The equivalent explicit form is:
+
+```sh
+cyclo --state-root ~/.local/state/cyclo-work --host-config /etc/cyclo/work.conf ps
+```
+
+The state root owns the gateway credential store, usage data, queues, sockets,
+and Docker namespace. The host configuration owns only the optional provider
+assembly; do not point two supposedly independent installations at the same
+state root. `cyclo gateway status`, `cyclo providers status`, `cyclo ps`, and
+`cyclo doctor` inspect only the selected installation.
+
+`--image IMAGE` and `CYCLO_TEAM_IMAGE` deliberately override the namespaced
+default team image. Use that override only when sharing one image between
+installations is intended.
+
+Cyclo 0.2 is a fresh-install boundary. It does not adopt or migrate 0.1 state,
+containers, networks, images, or provider-runtime configuration. Use a new
+state root, build the 0.2 resources, and recreate projects from their
+`project.cyclo` files. A different state root keeps an old installation
+separate if it must remain available during the transition.
+
 ```text
 instances/INSTANCE/
   runtime/          materialized read-only AgentWS runtime
-  tasks/ jobs/ agents/
+  agentws-state/
+    tasks/ jobs/ agents/
   pi/               writable Pi settings and runtime metadata
   workspace/        inert named writable layout
   readonly/         inert named read-only layout
@@ -332,11 +409,16 @@ gateway/socket/             root gateway socket
 sockets/COMPONENT/          intermediate component sockets
 ```
 
-The gateway credential and usage store is a separately labelled Docker volume
-whose name includes a stable digest of the state root. Cyclo verifies ownership
-labels before adopting, mounting, or deleting Docker resources.
+The gateway credential and usage store is a separately labelled Docker volume.
+Cyclo verifies installation, resource-kind, and instance ownership before
+adopting, mounting, or deleting Docker resources.
 
 ## Security model
+
+Cyclo's trusted-host threat model, resource-capability semantics, and extension
+points are defined in [Security architecture](architecture.md#security-architecture).
+In particular, the host is the administrative security domain while agent code
+inside a team container is treated as potentially hostile.
 
 - Only the gateway mounts physical credentials.
 - Teams and intermediate components receive no Docker socket.
@@ -356,11 +438,11 @@ From the source tree:
 
 ```sh
 pytest -q
-npm --prefix src/cyclo/_bundle/component test
-npm --prefix src/cyclo/_bundle/provider test
-npm --prefix src/cyclo/_bundle/gateway test
-npm --prefix src/cyclo/_bundle/passthrough test
-npm --prefix src/cyclo/_bundle/pi-provider test
+npm --prefix src/cyclo/components/protocol/component test
+npm --prefix src/cyclo/components/protocol/provider test
+npm --prefix src/cyclo/components/gateway test
+npm --prefix src/cyclo/components/passthrough test
+npm --prefix src/cyclo/components/pi-provider test
 tools/build-release
 tools/release-acceptance dist
 ```

@@ -69,15 +69,20 @@ jobs:
           node-version: "22"
       - name: Install shipped component dependencies
         run: |
-          for component in component provider gateway passthrough pi-provider; do
-            npm ci --ignore-scripts --prefix "src/cyclo/_bundle/$component"
+          for package in protocol/component protocol/provider gateway passthrough pi-provider; do
+            npm ci --ignore-scripts --prefix "src/cyclo/components/$package"
           done
+          npm ci --force --ignore-scripts --prefix src/cyclo/components/team-runtime
       - name: Run Node tests
-        run: node --test tests/*.mjs
+        run: |
+          node --test tests/*.mjs
+          for package in protocol/component protocol/provider gateway passthrough pi-provider; do
+            npm test --prefix "src/cyclo/components/$package"
+          done
       - name: Audit shipped component dependencies
         run: |
-          for component in component provider gateway passthrough pi-provider; do
-            npm audit --omit=dev --package-lock-only --audit-level=high --prefix "src/cyclo/_bundle/$component"
+          for package in protocol/component protocol/provider gateway passthrough pi-provider team-runtime; do
+            npm audit --omit=dev --package-lock-only --audit-level=high --prefix "src/cyclo/components/$package"
           done
       - name: Check POSIX shell syntax
         shell: bash
@@ -130,14 +135,20 @@ jobs:
         run: |
           docker build --pull \
             --tag cyclo-team:ci \
-            --file src/cyclo/_bundle/team/Dockerfile \
-            src/cyclo/_bundle
+            --file src/cyclo/components/team-runtime/Dockerfile \
+            src/cyclo/components
       - name: Build gateway image
         run: |
           docker build --pull \
             --tag cyclo-gateway:ci \
-            --file src/cyclo/_bundle/gateway/Dockerfile \
-            src/cyclo/_bundle
+            --file src/cyclo/components/gateway/Dockerfile \
+            src/cyclo/components
+      - name: Build passthrough provider image
+        run: |
+          docker build --pull \
+            --tag cyclo-passthrough:ci \
+            --file src/cyclo/components/passthrough/Dockerfile \
+            src/cyclo/components
       - name: Smoke-test images without credentials
         run: |
           docker run --rm --network none \
@@ -165,19 +176,20 @@ jobs:
               grep -F "Extension CLI Flags" /tmp/pi-help
             '
           docker run --rm --network none \
-            cyclo-gateway:ci supported-providers.mjs > /tmp/cyclo-providers
-          grep -F "$(printf 'PROVIDER\tDESCRIPTION\tAUTH\tLOGIN')" /tmp/cyclo-providers
+            cyclo-gateway:ci providers > /tmp/cyclo-providers
+          grep -F "Supported gateway providers" /tmp/cyclo-providers
+          grep -F "LOGIN COMMAND" /tmp/cyclo-providers
           grep -F "cyclo gateway login anthropic" /tmp/cyclo-providers
           grep -F "cyclo gateway login openai --api-key-stdin" /tmp/cyclo-providers
-          docker run --rm --network none cyclo-gateway:ci providers.mjs
+          docker run --rm --network none cyclo-gateway:ci providers
           if printf 'q\n' | docker run --rm --interactive \
             --security-opt no-new-privileges --cap-drop ALL --pids-limit 256 \
             --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-            --network none cyclo-gateway:ci login.mjs openai-codex \
+            --network none cyclo-gateway:ci login openai-codex \
             > /tmp/cyclo-oauth-login 2>&1; then
             echo "cancelled OAuth login unexpectedly succeeded" >&2
             exit 1
           fi
           grep -F "Select OpenAI Codex login method" /tmp/cyclo-oauth-login
-          grep -F "login failed: Login cancelled" /tmp/cyclo-oauth-login
-          docker run --rm --network none cyclo-gateway:ci providers.mjs
+          grep -F "Login cancelled" /tmp/cyclo-oauth-login
+          docker run --rm --network none cyclo-gateway:ci providers

@@ -18,7 +18,7 @@ from .component_stack import (
     Gateway,
     ProviderStack,
     StackStatus,
-    bundle_root,
+    component_sources_root,
     parse_declaration,
 )
 from .dashboard import (
@@ -38,25 +38,27 @@ from .health import (
     team_health,
 )
 from .instance_lifecycle import active_instances, stop_instance as stop_managed_instance
+from .installation import team_image_name
 from .project import ProjectDefinition, ProjectTeam, load_project
 from .project_run import (
     RunBinding,
     container_spec,
     load_project_teams,
     preflight_binding,
+    project_instance_id,
     project_run_bindings,
     start_binding,
     validate_run_options,
     validate_team_models,
 )
 from .project_state import decode_instance_project
-from .state import Instance, StateStore, validate_instance_id
+from .state import Instance, StateStore, slug, validate_instance_id
 from .team import Team, init_team, load_team, require_team_repository, team_generation, verify_agentws_abi
 from .team_templates import bundled_team_template_names
+from .team_runtime_image import ensure as ensure_team_runtime_image
 
 
 DEFAULT_HOST_CONFIG = Path("/etc/cyclo/host.conf")
-DEFAULT_TEAM_IMAGE = f"cyclo-team:{__version__}"
 
 
 def state_store(args: argparse.Namespace) -> StateStore:
@@ -91,7 +93,7 @@ def agentws_root() -> Path:
     return root
 
 
-def cmd_init(args: argparse.Namespace) -> int:
+def cmd_team_init(args: argparse.Namespace) -> int:
     destination = init_team(
         Path(args.team),
         args.model,
@@ -108,7 +110,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 def _trusted_mount_roots(source: Path, host_config: Path) -> tuple[tuple[Path, str], ...]:
     return (
         (source, "bundled AgentWS runtime"),
-        (bundle_root(), "bundled Cyclo components"),
+        (component_sources_root(), "Cyclo component sources"),
         (host_config, "host provider configuration"),
         (Path(__file__).resolve().parents[2], "installed Cyclo controller"),
     )
@@ -177,9 +179,78 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_templates(_args: argparse.Namespace) -> int:
+def cmd_team_templates(_args: argparse.Namespace) -> int:
     for name in bundled_team_template_names():
         print(name)
+    return 0
+
+
+def _project_init_path(value: str) -> Path:
+    selected = Path(value).expanduser()
+    if not selected.is_absolute():
+        selected = Path.cwd() / selected
+    selected = Path(os.path.abspath(selected))
+    if selected.name != "project.cyclo" and selected.suffix != ".cyclo":
+        raise CycloError("project definition must be named project.cyclo or end in .cyclo")
+    return selected
+
+
+def cmd_project_init(args: argparse.Namespace) -> int:
+    destination = _project_init_path(args.definition)
+    name = args.name or slug(
+        destination.parent.name if destination.name == "project.cyclo" else destination.stem,
+        64,
+    )
+    description = args.description or f"Cyclo project {name}."
+    lines = [
+        f"name {name}",
+        f"description {description}",
+        "",
+    ]
+    for path, mode in args.team:
+        if mode not in {"ro", "rw"}:
+            raise CycloError(f"invalid team access mode {mode!r}; expected ro or rw")
+        lines.append(f"team {path} {mode}")
+    lines.append("")
+    for mount_name, path, mode in args.mount:
+        if mode not in {"ro", "rw"}:
+            raise CycloError(f"invalid mount access mode {mode!r}; expected ro or rw")
+        lines.append(f"mount {mount_name} {path} {mode}")
+    content = "\n".join(lines) + "\n"
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.init-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o644,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            initialized = load_project(temporary)
+            load_project_teams(initialized)
+        except CycloError as exc:
+            raise CycloError(str(exc).replace(str(temporary), str(destination))) from exc
+        try:
+            os.link(temporary, destination, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise CycloError(f"refusing to overwrite project definition: {destination}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+    print(f"initialized Cyclo project: {destination}")
+    print(f"next: cyclo validate {destination}")
+    print(f"then: cyclo run {destination}")
     return 0
 
 
@@ -209,7 +280,10 @@ def _announce_binding(binding: RunBinding, store: StateStore) -> None:
             f"{project_mount.path} -> {project_mount.container_path}"
         )
     if instance.port is not None:
-        print(f"AgentWS: http://{instance.agentws_host}:{instance.port}")
+        if instance.agentws_host in {"0.0.0.0", "::"}:
+            print(f"AgentWS listening on {instance.agentws_host}:{instance.port}")
+        else:
+            print(f"AgentWS: http://{instance.agentws_host}:{instance.port}")
         if not dashboard_host_is_loopback(instance.agentws_host):
             print(
                 "WARNING: AgentWS has no authentication and is exposed on a "
@@ -223,6 +297,8 @@ def _announce_binding(binding: RunBinding, store: StateStore) -> None:
 def cmd_run(args: argparse.Namespace) -> int:
     source = agentws_root()
     store = state_store(args)
+    if args.image is None:
+        args.image = team_image_name(store.system, __version__)
     docker = Docker()
     definition = load_project(args.project)
     configured_teams = load_project_teams(definition)
@@ -234,7 +310,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         source,
         Path(args.host_config),
     )
-    bindings = project_run_bindings(args, definition, configured_teams)
+    bindings = project_run_bindings(
+        args, definition, configured_teams, system=store.system
+    )
 
     stack = provider_stack(args, store)
     if args.dry_run:
@@ -317,6 +395,132 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refresh_projects(
+    args: argparse.Namespace,
+    instances: list[Instance],
+) -> list[argparse.Namespace]:
+    grouped: dict[Path, list[Instance]] = {}
+    legacy: list[str] = []
+    for instance in instances:
+        project = decode_instance_project(instance).require_valid()
+        if not project.configured or project.definition is None:
+            legacy.append(instance.id)
+            continue
+        definition = Path(os.path.abspath(project.definition.expanduser()))
+        grouped.setdefault(definition, []).append(instance)
+    if legacy:
+        raise CycloError(
+            "cannot refresh legacy instances without project.cyclo: "
+            + ", ".join(sorted(legacy))
+            + "; stop them and recreate them from project.cyclo"
+        )
+
+    result: list[argparse.Namespace] = []
+    for path, selected in sorted(grouped.items(), key=lambda item: str(item[0])):
+        definition = load_project(path)
+        expected_ids = {
+            project_instance_id(definition, team) for team in definition.teams
+        }
+        active_ids = {instance.id for instance in selected}
+        if active_ids != expected_ids:
+            missing = sorted(expected_ids - active_ids)
+            unexpected = sorted(active_ids - expected_ids)
+            details = []
+            if missing:
+                details.append("inactive: " + ", ".join(missing))
+            if unexpected:
+                details.append("no longer configured: " + ", ".join(unexpected))
+            raise CycloError(
+                f"cannot refresh partially active project {path}: "
+                + "; ".join(details)
+            )
+        launch_settings = {
+            (instance.image, instance.offline, instance.agentws_host)
+            for instance in selected
+        }
+        if len(launch_settings) != 1:
+            raise CycloError(
+                f"active instances for {path} have inconsistent launch settings"
+            )
+        image, offline, host = launch_settings.pop()
+        port = (
+            selected[0].port or 0
+            if len(definition.teams) == 1 and len(selected) == 1
+            else 0
+        )
+        result.append(
+            argparse.Namespace(
+                state_root=args.state_root,
+                host_config=args.host_config,
+                project=str(path),
+                image=image,
+                offline=offline,
+                host=host,
+                port=port,
+                verbose=False,
+                foreground=False,
+                build=False,
+                dry_run=False,
+            )
+        )
+    return result
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+    """Rebuild installed runtimes and restart the previously active system."""
+
+    store = state_store(args)
+    docker = Docker()
+    with store.locked():
+        instances = active_instances(store, docker)
+    projects = _refresh_projects(args, instances)
+
+    proxy = gateway(args, store)
+    stack = provider_stack(args, store)
+    print("building gateway")
+    proxy.build()
+    print("building provider components")
+    stack.build()
+    images = {
+        team_image_name(store.system, __version__),
+        *(project.image for project in projects),
+    }
+    for image in sorted(images):
+        print(f"building team runtime: {image}")
+        ensure_team_runtime_image(image, build=True)
+
+    stop_failures: list[str] = []
+    for instance in instances:
+        try:
+            stop_instance(args, store, instance.id)
+        except Exception as exc:
+            stop_failures.append(f"{instance.id}: {exc}")
+        else:
+            print(f"stopped Cyclo instance: {instance.id}")
+    if stop_failures:
+        raise CycloError(
+            "refresh could not stop the active fleet: " + "; ".join(stop_failures)
+        )
+
+    print("restarting gateway")
+    proxy.restart(build=False)
+    print("restarting provider components")
+    stack.restart(build=False)
+
+    start_failures: list[str] = []
+    for project_args in projects:
+        try:
+            cmd_run(project_args)
+        except Exception as exc:
+            start_failures.append(f"{project_args.project}: {exc}")
+    if start_failures:
+        raise CycloError(
+            "refresh could not restart every project: " + "; ".join(start_failures)
+        )
+    print("Cyclo refresh complete")
+    return 0
+
+
 def stop_instance(
     _args: argparse.Namespace,
     store: StateStore,
@@ -375,36 +579,42 @@ def _shared_provider_health(
     return read_provider_status(provider_stack(args, store))
 
 
+def _instance_lifecycle_state(instance: Instance, docker: Docker) -> str:
+    running = docker.container_running(instance.container_name)
+    if running:
+        return "running" if instance.active else "orphan"
+    return "stale" if instance.active else "stopped"
+
+
+def _running_instance_health(
+    store: StateStore,
+    instance: Instance,
+    provider: ProviderHealth,
+) -> str:
+    try:
+        supervisor = read_agent_supervisor_status(store.queue_root(instance.id))
+        return team_health(
+            provider,
+            supervisor.suspended_agents,
+            supervisor.error,
+            supervisor.planner_attention_jobs,
+        ).label()
+    except Exception as exc:
+        return team_health(provider, supervisor_error=str(exc)).label()
+
+
 def cmd_ps(args: argparse.Namespace) -> int:
     store = state_store(args)
     docker = Docker()
     rows = []
     shared: tuple[ProviderHealth, StackStatus | None] | None = None
     for instance in store.list():
-        running = docker.container_running(instance.container_name)
-        state = (
-            "running"
-            if running and instance.active
-            else "orphan"
-            if running
-            else "stale"
-            if instance.active
-            else "stopped"
-        )
+        state = _instance_lifecycle_state(instance, docker)
         if state == "running":
             if shared is None:
                 shared = _shared_provider_health(args, store)
             provider = instance_provider_health(shared[0], shared[1], instance)
-            try:
-                supervisor = read_agent_supervisor_status(store.queue_root(instance.id))
-                health = team_health(
-                    provider,
-                    supervisor.suspended_agents,
-                    supervisor.error,
-                    supervisor.planner_attention_jobs,
-                ).label()
-            except Exception as exc:
-                health = team_health(provider, supervisor_error=str(exc)).label()
+            health = _running_instance_health(store, instance, provider)
         else:
             health = INACTIVE_TEAM_HEALTH.label()
         rows.append(
@@ -425,6 +635,49 @@ def cmd_ps(args: argparse.Namespace) -> int:
     print("  ".join(value.ljust(widths[index]) for index, value in enumerate(header)))
     for row in rows:
         print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+    return 0
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    store = state_store(args)
+    instance = store.load(args.instance)
+    docker = Docker()
+    state = _instance_lifecycle_state(instance, docker)
+    health = INACTIVE_TEAM_HEALTH.label()
+    if state == "running":
+        shared = _shared_provider_health(args, store)
+        provider = instance_provider_health(shared[0], shared[1], instance)
+        health = _running_instance_health(store, instance, provider)
+
+    print(f"instance: {instance.id}")
+    print(f"state: {state}")
+    print(f"health: {health}")
+    print(f"team: {instance.team_name}")
+    print(f"team repository: {instance.team_path}")
+    print(f"team definition: {'writable' if instance.team_write else 'read-only'}")
+    print(f"project: {instance.project_name or Path(instance.project_path).name}")
+    print(f"project definition: {instance.project_file or 'legacy/unavailable'}")
+    print(f"image: {instance.image}")
+    print(f"models: {', '.join(instance.models) or 'none'}")
+    print(f"providers: {', '.join(instance.providers) or 'none'}")
+    print(f"network: {'offline' if instance.offline else 'online'}")
+    if instance.port is None:
+        print("AgentWS: not published")
+    elif instance.agentws_host in {"0.0.0.0", "::"}:
+        print(f"AgentWS listening on {instance.agentws_host}:{instance.port}")
+    else:
+        print(f"AgentWS: http://{instance.agentws_host}:{instance.port}")
+    print(f"queue: {store.queue_root(instance.id)}")
+    if instance.project_mounts:
+        print("mounts:")
+        for mount in instance.project_mounts:
+            name = str(mount.get("name", ""))
+            path = str(mount.get("path", ""))
+            mode = str(mount.get("mode", ""))
+            destination = f"/workspace/{name}" if mode == "rw" else f"/readonly/{name}"
+            print(f"  {name} ({mode}): {path} -> {destination}")
+    else:
+        print("mounts: unavailable")
     return 0
 
 
@@ -452,7 +705,10 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     )
     host = str(server.server_address[0])
     port = int(server.server_address[1])
-    print(f"Cyclo dashboard: http://{host}:{port}/", flush=True)
+    if host in {"0.0.0.0", "::"}:
+        print(f"Cyclo dashboard listening on {host}:{port}", flush=True)
+    else:
+        print(f"Cyclo dashboard: http://{host}:{port}/", flush=True)
     if not dashboard_host_is_loopback(host):
         print(
             "WARNING: dashboard has no authentication and is exposed on a non-loopback address.",
@@ -491,20 +747,51 @@ def _task_project_summary(instance: Instance) -> tuple[str, ...]:
     )
 
 
-def cmd_task(args: argparse.Namespace) -> int:
+def _task_target(args: argparse.Namespace) -> tuple[Instance, Docker]:
     store = state_store(args)
     instance = store.load(args.instance)
-    if args.task_id in {".", ".."} or not args.task_id or any(
-        char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
-        for char in args.task_id
-    ):
-        raise CycloError("task ID may use only letters, numbers, dot, underscore, and hyphen")
-    spec = Path(args.spec).expanduser().resolve()
-    if not spec.is_file():
-        raise CycloError(f"task specification not found: {spec}")
     docker = Docker()
     if not docker.container_running(instance.container_name):
         raise CycloError(f"Cyclo instance is not running: {instance.id}")
+    return instance, docker
+
+
+def _validate_task_id(task_id: str) -> None:
+    if (
+        not task_id
+        or not task_id[0].isalnum()
+        or any(
+            char
+            not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+            for char in task_id
+        )
+    ):
+        raise CycloError(
+            "task ID must start with a letter or number and contain only "
+            "letters, numbers, dot, underscore, and hyphen"
+        )
+
+
+def _exec_task_command(args: argparse.Namespace, command: list[str]) -> int:
+    instance, docker = _task_target(args)
+    return docker.exec(instance.container_name, command, check=False)
+
+
+def cmd_task_list(args: argparse.Namespace) -> int:
+    return _exec_task_command(args, ["/agentws/bin/task-list"])
+
+
+def cmd_task_show(args: argparse.Namespace) -> int:
+    _validate_task_id(args.task_id)
+    return _exec_task_command(args, ["/agentws/bin/task-show", args.task_id])
+
+
+def cmd_task_run(args: argparse.Namespace) -> int:
+    _validate_task_id(args.task_id)
+    spec = Path(args.spec).expanduser().resolve()
+    if not spec.is_file():
+        raise CycloError(f"task specification not found: {spec}")
+    instance, docker = _task_target(args)
     container_spec_path = f"/tmp/cyclo-task-{args.task_id}-{secrets.token_hex(8)}.md"
     docker.copy_to(instance.container_name, spec, container_spec_path)
     try:
@@ -525,6 +812,22 @@ def cmd_task(args: argparse.Namespace) -> int:
     for line in _task_project_summary(instance):
         print(line)
     return 0
+
+
+def cmd_task_comment(args: argparse.Namespace) -> int:
+    _validate_task_id(args.task_id)
+    return _exec_task_command(
+        args,
+        ["/agentws/bin/task-comment", args.task_id, " ".join(args.message)],
+    )
+
+
+def cmd_task_state(args: argparse.Namespace) -> int:
+    _validate_task_id(args.task_id)
+    command = ["/agentws/bin/task-state", args.task_id, args.task_state]
+    if args.message:
+        command.extend(["-m", args.message])
+    return _exec_task_command(args, command)
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
@@ -611,8 +914,7 @@ def cmd_providers(args: argparse.Namespace) -> int:
 
 def _print_gateway_status(status: object, store_volume: str) -> int:
     state = _component_state(status)
-    freshness = "current" if status.docker.current else "stale"
-    print(f"gateway\t{state}\t{freshness}")
+    print(f"gateway\t{state}")
     print(f"store\t{store_volume}")
     return 0 if status.ready else 1
 
@@ -673,9 +975,15 @@ def cmd_repair(args: argparse.Namespace) -> int:
             if instance.active:
                 continue
             if docker.container_exists(instance.container_name):
-                docker.stop_remove(instance.container_name, instance.id)
+                docker.stop_remove(
+                    instance.container_name,
+                    instance.id,
+                    expected_system=store.system,
+                )
                 removed += 1
-            docker.remove_network(instance.network_name)
+            docker.remove_network(
+                instance.network_name, instance.id, system=store.system
+            )
     print(f"repaired {repaired} stale record(s); removed {removed} inactive container(s)")
     return 0
 
@@ -690,11 +998,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         failures += 1
         print(f"no  bundled AgentWS ABI: {exc}")
     try:
-        bundle = bundle_root()
-        gateway_declaration = parse_declaration(bundle / "gateway" / "component.conf")
+        components = component_sources_root()
+        gateway_declaration = parse_declaration(
+            components / "gateway" / "component.conf"
+        )
         if set(gateway_declaration.provides) != {COMPONENT_INTERFACE, PROVIDER_INTERFACE}:
             raise CycloError("gateway declaration does not provide Component and Provider")
-        print(f"ok  bundled component ABI: {bundle}")
+        print(f"ok  component ABI: {components}")
     except CycloError as exc:
         failures += 1
         print(f"no  bundled component ABI: {exc}")
@@ -767,27 +1077,90 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cyclo",
         description="Run Git-defined agent teams through composable model providers",
+        epilog=(
+            "Everyday:  validate, run, stop, ps, inspect, logs, task, dashboard\n"
+            "Authoring: team, project\n"
+            "Host:      models, usage, gateway, providers, doctor, refresh, repair"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"cyclo {__version__}")
     add_common_options(parser)
     commands = parser.add_subparsers(required=True)
 
-    init = commands.add_parser("init", help="create a team repository")
-    init.add_argument("team")
-    init.add_argument("--model", required=True, help="initial provider/model")
-    init.add_argument("--template", choices=bundled_team_template_names())
-    init.add_argument("--no-git", action="store_true")
-    init.set_defaults(func=cmd_init)
+    team = commands.add_parser("team", help="create team repositories from templates")
+    team_commands = team.add_subparsers(dest="team_action", required=True)
+    team_init = team_commands.add_parser("init", help="create a team repository")
+    team_init.add_argument("team", help="new team-repository directory")
+    team_init.add_argument("--model", required=True, help="initial provider/model")
+    team_init.add_argument(
+        "--template",
+        choices=bundled_team_template_names(),
+        help="bundled team template",
+    )
+    team_init.add_argument(
+        "--no-git",
+        action="store_true",
+        help="do not initialize the destination as a Git repository",
+    )
+    team_init.set_defaults(func=cmd_team_init)
+
+    team_templates = team_commands.add_parser(
+        "templates", help="list bundled team templates"
+    )
+    team_templates.set_defaults(func=cmd_team_templates)
+
+    project = commands.add_parser("project", help="create project definitions")
+    project_commands = project.add_subparsers(dest="project_action", required=True)
+    project_init = project_commands.add_parser(
+        "init",
+        help="create a project.cyclo from existing teams and mounts",
+        description=(
+            "Create a project definition from one or more --team PATH MODE and "
+            "--mount NAME PATH MODE declarations. MODE is ro or rw."
+        ),
+    )
+    project_init.add_argument("definition", help="new project.cyclo path")
+    project_init.add_argument("--name", help="project name (default: derived from path)")
+    project_init.add_argument(
+        "--description",
+        help="project description (default: derived from name)",
+    )
+    project_init.add_argument(
+        "--team",
+        action="append",
+        nargs=2,
+        required=True,
+        metavar=("PATH", "MODE"),
+        help="team repository and ro/rw access; repeatable",
+    )
+    project_init.add_argument(
+        "--mount",
+        action="append",
+        nargs=3,
+        required=True,
+        metavar=("NAME", "PATH", "MODE"),
+        help="named project/input mount and ro/rw access; repeatable",
+    )
+    project_init.set_defaults(func=cmd_project_init)
 
     validate = commands.add_parser("validate", help="validate a team or project.cyclo")
-    validate.add_argument("definition")
+    validate.add_argument("definition", help="team directory or project.cyclo")
     validate.set_defaults(func=cmd_validate)
-    templates = commands.add_parser("templates", help="list bundled team templates")
-    templates.set_defaults(func=cmd_templates)
+
+    refresh = commands.add_parser(
+        "refresh",
+        help="rebuild installed runtimes and restart the active Cyclo system",
+    )
+    refresh.set_defaults(func=cmd_refresh)
 
     run = commands.add_parser("run", help="start every team in project.cyclo")
     run.add_argument("project", help="project.cyclo")
-    run.add_argument("--image", default=os.environ.get("CYCLO_TEAM_IMAGE", DEFAULT_TEAM_IMAGE))
+    run.add_argument(
+        "--image",
+        default=os.environ.get("CYCLO_TEAM_IMAGE"),
+        help="team runtime image (default: installation-scoped bundled image)",
+    )
     run.add_argument(
         "--offline",
         action="store_true",
@@ -806,23 +1179,51 @@ def build_parser() -> argparse.ArgumentParser:
     stop.set_defaults(func=cmd_stop)
     ps = commands.add_parser("ps", help="list team instances")
     ps.set_defaults(func=cmd_ps)
+    inspect = commands.add_parser("inspect", help="show one instance in detail")
+    inspect.add_argument("instance", help="instance ID from cyclo ps")
+    inspect.set_defaults(func=cmd_inspect)
 
     dashboard = commands.add_parser("dashboard", help="serve the read-only fleet dashboard")
     dashboard.add_argument("--host", default=DEFAULT_DASHBOARD_HOST)
     dashboard.add_argument("--port", type=int, default=0)
     dashboard.set_defaults(func=cmd_dashboard)
 
-    task = commands.add_parser("task", help="create an AgentWS task")
-    task.add_argument("instance")
-    task.add_argument("task_id")
-    task.add_argument("spec")
-    task.set_defaults(func=cmd_task)
+    task = commands.add_parser("task", help="inspect and control tasks in an instance")
+    task_commands = task.add_subparsers(dest="task_action", required=True)
+
+    task_list = task_commands.add_parser("list", help="list tasks")
+    task_list.add_argument("instance", help="instance ID from cyclo ps")
+    task_list.set_defaults(func=cmd_task_list)
+
+    task_show = task_commands.add_parser("show", help="show a task, its log, and its result")
+    task_show.add_argument("instance", help="instance ID from cyclo ps")
+    task_show.add_argument("task_id", help="task ID")
+    task_show.set_defaults(func=cmd_task_show)
+
+    task_run = task_commands.add_parser("run", help="create a task and enqueue its planner")
+    task_run.add_argument("instance", help="instance ID from cyclo ps")
+    task_run.add_argument("task_id", help="new task ID")
+    task_run.add_argument("spec", help="task specification file")
+    task_run.set_defaults(func=cmd_task_run)
+
+    task_comment = task_commands.add_parser("comment", help="append a task comment")
+    task_comment.add_argument("instance", help="instance ID from cyclo ps")
+    task_comment.add_argument("task_id", help="task ID")
+    task_comment.add_argument("message", nargs="+", help="comment text")
+    task_comment.set_defaults(func=cmd_task_comment)
+
+    for action, state in (("complete", "done"), ("reopen", "open")):
+        task_state = task_commands.add_parser(action, help=f"{action} a task")
+        task_state.add_argument("instance", help="instance ID from cyclo ps")
+        task_state.add_argument("task_id", help="task ID")
+        task_state.add_argument("-m", "--message", help="state-change note")
+        task_state.set_defaults(func=cmd_task_state, task_state=state)
     logs = commands.add_parser("logs", help="show team-container logs")
-    logs.add_argument("-f", "--follow", action="store_true")
-    logs.add_argument("instance")
+    logs.add_argument("-f", "--follow", action="store_true", help="follow new output")
+    logs.add_argument("instance", help="instance ID from cyclo ps")
     logs.set_defaults(func=cmd_logs)
     path = commands.add_parser("path", help="print an instance's AgentWS state path")
-    path.add_argument("instance")
+    path.add_argument("instance", help="instance ID from cyclo ps")
     path.set_defaults(func=cmd_path)
 
     usage = commands.add_parser("usage", help="show global gateway usage by provider and model")
@@ -831,7 +1232,14 @@ def build_parser() -> argparse.ArgumentParser:
     models.epilog = "Before login, use `cyclo gateway providers` to see available providers."
     models.set_defaults(func=cmd_models)
 
-    repair = commands.add_parser("repair", help="clean interrupted team-container stops")
+    repair = commands.add_parser(
+        "repair",
+        help="clean interrupted team-container stops",
+        description=(
+            "Mark stale active records stopped and remove inactive Cyclo containers "
+            "and networks. Durable task and job state is preserved."
+        ),
+    )
     repair.set_defaults(func=cmd_repair)
 
     providers = commands.add_parser(
@@ -843,11 +1251,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     provider_commands = providers.add_subparsers(dest="providers_action", required=True)
-    for action in ("check", "build", "start", "stop", "status"):
-        selected = provider_commands.add_parser(action)
+    provider_help = {
+        "check": "validate host.conf and component declarations",
+        "build": "build every configured provider image without restarting",
+        "start": "start configured providers; the gateway must already be ready",
+        "stop": "stop provider components without stopping the gateway",
+        "status": "show gateway dependency and provider readiness",
+    }
+    for action, help_text in provider_help.items():
+        selected = provider_commands.add_parser(action, help=help_text)
         selected.set_defaults(func=cmd_providers)
-    restart = provider_commands.add_parser("restart")
-    restart.add_argument("--build", action="store_true")
+    restart = provider_commands.add_parser("restart", help="restart provider components")
+    restart.add_argument("--build", action="store_true", help="build before restarting")
     restart.set_defaults(func=cmd_providers)
 
     gateway_parser = commands.add_parser(
@@ -872,8 +1287,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     provider_catalogue.set_defaults(func=cmd_gateway)
-    for action in ("build", "start", "stop", "status"):
-        selected = gateway_commands.add_parser(action, help=f"{action} the gateway")
+    gateway_help = {
+        "build": "build and restart the gateway",
+        "start": "start the current gateway image",
+        "stop": "stop the gateway without deleting its credential store",
+        "status": "show gateway readiness, image freshness, and store volume",
+    }
+    for action, help_text in gateway_help.items():
+        selected = gateway_commands.add_parser(action, help=help_text)
         selected.set_defaults(func=cmd_gateway)
     destroy = gateway_commands.add_parser(
         "destroy-store",
@@ -891,7 +1312,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     destroy.set_defaults(func=cmd_gateway)
     gateway_restart = gateway_commands.add_parser("restart", help="restart the gateway")
-    gateway_restart.add_argument("--build", action="store_true")
+    gateway_restart.add_argument("--build", action="store_true", help="build before restarting")
     gateway_restart.set_defaults(func=cmd_gateway)
     login = gateway_commands.add_parser(
         "login",
@@ -917,9 +1338,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalize_global_options(argv: list[str]) -> list[str]:
+    """Permit root options before or after a subcommand, up to ``--``."""
+
+    global_options: list[str] = []
+    remaining: list[str] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--":
+            remaining.extend(argv[index:])
+            break
+        if argument in {"--state-root", "--host-config"}:
+            global_options.append(argument)
+            index += 1
+            if index >= len(argv):
+                break
+            global_options.append(argv[index])
+        elif argument.startswith("--state-root=") or argument.startswith("--host-config="):
+            global_options.append(argument)
+        else:
+            remaining.append(argument)
+        index += 1
+    return [*global_options, *remaining]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    selected_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(_normalize_global_options(selected_argv))
     try:
         return int(args.func(args))
     except CycloError as exc:

@@ -8,10 +8,11 @@ import pytest
 
 from cyclo.agentws_bundle import packaged_agentws_template
 from cyclo.errors import CycloError
+from cyclo.installation import team_container_name, team_network_name
 from cyclo.state import Instance, StateStore, instance_id
 
 
-def make_instance(identifier: str) -> Instance:
+def make_instance(identifier: str, store: StateStore) -> Instance:
     return Instance(
         id=identifier,
         team_name="team",
@@ -20,8 +21,8 @@ def make_instance(identifier: str) -> Instance:
         generation="abc",
         providers=["openai-codex"],
         models=["openai-codex/gpt-test"],
-        container_name=f"cyclo-{identifier}",
-        network_name=f"cyclo-{identifier}-net",
+        container_name=team_container_name(store.system, identifier),
+        network_name=team_network_name(store.system, identifier),
         image="cyclo-runtime:test",
         team_write=False,
         offline=False,
@@ -41,7 +42,7 @@ def test_instance_id_is_stable_and_path_specific(tmp_path: Path) -> None:
 
 def test_metadata_round_trip_has_no_token(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
-    instance = make_instance("alpha")
+    instance = make_instance("alpha", store)
     instance.active = True
     store.save(instance)
 
@@ -52,11 +53,41 @@ def test_metadata_round_trip_has_no_token(tmp_path: Path) -> None:
     assert store.metadata_path("alpha").stat().st_mode & 0o777 == 0o600
 
 
+def test_state_rejects_namespaced_resources_from_another_installation(
+    tmp_path: Path,
+) -> None:
+    first = StateStore(tmp_path / "first")
+    second = StateStore(tmp_path / "second")
+    selected = make_instance("alpha", first)
+    selected.container_name = team_container_name(first.system, selected.id)
+    selected.network_name = team_network_name(first.system, selected.id)
+
+    with pytest.raises(CycloError, match="belongs to another Cyclo installation"):
+        second.save(selected)
+
+    first.save(selected)
+    assert first.load("alpha").container_name == selected.container_name
+
+
+def test_state_rejects_pre_0_2_team_resource_names(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    payload = selected.as_json()
+    payload["container_name"] = "cyclo-alpha"
+    payload["network_name"] = "cyclo-alpha-net"
+    path = store.metadata_path("alpha")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CycloError, match="container_name must be a Cyclo team resource"):
+        store.load("alpha")
+
+
 def test_instance_enumeration_reports_bad_records_and_strict_list_refuses_them(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    store.save(make_instance("alpha"))
+    store.save(make_instance("alpha", store))
     broken = store.metadata_path("broken")
     broken.parent.mkdir(parents=True)
     broken.write_text("{not-json\n", encoding="utf-8")
@@ -87,7 +118,9 @@ def test_direct_instance_load_rejects_undecodable_and_symlinked_metadata(
         store.load("undecodable")
 
     outside = tmp_path / "outside.json"
-    outside.write_text(json.dumps(make_instance("linked").as_json()), encoding="utf-8")
+    outside.write_text(
+        json.dumps(make_instance("linked", store).as_json()), encoding="utf-8"
+    )
     linked = store.metadata_path("linked")
     linked.parent.mkdir(parents=True)
     linked.symlink_to(outside)
@@ -122,19 +155,14 @@ def test_direct_instance_load_rejects_undecodable_and_symlinked_metadata(
             "provider_generation must be a string",
         ),
         (
-            "legacy_project_read_only",
-            "false",
-            "legacy_project_read_only must be a boolean",
-        ),
-        (
             "container_name",
             "cyclo-someone-else",
-            "container_name must be 'cyclo-wrong-type'",
+            "container_name must be a Cyclo team resource",
         ),
         (
             "network_name",
             "cyclo-someone-else-net",
-            "network_name must be 'cyclo-wrong-type-net'",
+            "network_name must match the Cyclo team container",
         ),
     ],
 )
@@ -147,7 +175,7 @@ def test_instance_metadata_rejects_wrong_field_types(
     store = StateStore(tmp_path / "state")
     path = store.metadata_path("wrong-type")
     path.parent.mkdir(parents=True)
-    payload = make_instance("wrong-type").as_json()
+    payload = make_instance("wrong-type", store).as_json()
     payload[field] = value
     path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -186,7 +214,7 @@ def test_instance_metadata_rejects_invalid_persisted_project_mounts(
     store = StateStore(tmp_path / "state")
     path = store.metadata_path("invalid-mounts")
     path.parent.mkdir(parents=True)
-    payload = make_instance("invalid-mounts").as_json()
+    payload = make_instance("invalid-mounts", store).as_json()
     payload.update(
         {
             "project_name": "project",
@@ -227,7 +255,7 @@ def test_instance_metadata_rejects_inconsistent_persisted_project_state(
     store = StateStore(tmp_path / "state")
     path = store.metadata_path("bad-project")
     path.parent.mkdir(parents=True)
-    payload = make_instance("bad-project").as_json()
+    payload = make_instance("bad-project", store).as_json()
     payload.update(
         {
             "project_name": "project",
@@ -250,7 +278,7 @@ def test_instance_metadata_rejects_relative_provider_socket(tmp_path: Path) -> N
     store = StateStore(tmp_path / "state")
     path = store.metadata_path("bad-provider-socket")
     path.parent.mkdir(parents=True)
-    payload = make_instance("bad-provider-socket").as_json()
+    payload = make_instance("bad-provider-socket", store).as_json()
     payload["provider_socket_path"] = "relative/component.sock"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -285,7 +313,7 @@ def test_instance_metadata_rejects_inconsistent_provider_endpoint(
     store = StateStore(tmp_path / "state")
     path = store.metadata_path("bad-provider-endpoint")
     path.parent.mkdir(parents=True)
-    payload = make_instance("bad-provider-endpoint").as_json()
+    payload = make_instance("bad-provider-endpoint", store).as_json()
     payload["provider_socket_path"] = path_value
     payload["provider_generation"] = generation
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -329,15 +357,15 @@ def test_deeply_nested_instance_metadata_is_reported_not_raised(
 
 def test_save_refuses_state_that_strict_reader_would_reject(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
-    instance = make_instance("alpha")
+    instance = make_instance("alpha", store)
     instance.network_name = "cyclo-another-instance-net"
 
-    with pytest.raises(CycloError, match="network_name must be 'cyclo-alpha-net'"):
+    with pytest.raises(CycloError, match="network_name must match the Cyclo team container"):
         store.save(instance)
 
     assert not store.metadata_path("alpha").exists()
 
-    instance = make_instance("bad-id")
+    instance = make_instance("bad-id", store)
     instance.id = 3  # type: ignore[assignment]
     with pytest.raises(CycloError, match="invalid Cyclo instance ID 3"):
         store.save(instance)
@@ -404,35 +432,6 @@ def test_workspace_layout_rejects_path_like_mount_names(tmp_path: Path) -> None:
     assert not (store.instance_dir("alpha") / "escape").exists()
 
 
-def test_old_instance_metadata_loads_with_empty_project_definition_fields(
-    tmp_path: Path,
-) -> None:
-    store = StateStore(tmp_path / "state")
-    instance = make_instance("legacy")
-    payload = instance.as_json()
-    payload["project_read_only"] = True
-    for key in (
-        "project_name",
-        "project_file",
-        "project_description",
-        "project_generation",
-        "project_mounts",
-        "launch_id",
-    ):
-        payload.pop(key)
-    path = store.metadata_path("legacy")
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-    loaded = store.load("legacy")
-
-    assert loaded.project_file == ""
-    assert loaded.project_mounts == []
-    assert loaded.legacy_project_read_only is True
-    assert loaded.as_json()["project_read_only"] is True
-    assert "legacy_project_read_only" not in loaded.as_json()
-
-
 def test_instance_paths_reject_traversal(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
 
@@ -453,7 +452,7 @@ def test_save_rejects_symlinked_instance_directory(tmp_path: Path) -> None:
     (store.instances_dir / "alpha").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(CycloError, match="symlinked Cyclo instance directory"):
-        store.save(make_instance("alpha"))
+        store.save(make_instance("alpha", store))
 
     assert not (outside / "run.json").exists()
 

@@ -4,109 +4,98 @@ All notable changes to Cyclo are documented in this file.
 
 ## [0.2.0] - 2026-07-18
 
-Provider composition and runtime-isolation release.
+Composable providers, explicit project authority, and a redesigned operator
+interface.
 
-- Add strict, line-oriented `project.cyclo` definitions with a name,
-  description, one or more Git-defined teams, and one or more named `ro`/`rw`
-  mounts. Writable mounts are projects; read-only mounts are supporting inputs.
-  Paths resolve relative to the definition, and unsupported or
-  unknown directives—including the reserved `mcp` directive—fail closed.
-- Start one isolated instance per project team, expose writable projects at
-  `/workspace/<name>` and read-only inputs at `/readonly/<name>`, and generate a
-  host-path-free `/agentws/PROJECT.md`
-  manifest for every agent. Multi-team starts preflight the complete definition
-  and roll back instances started by a failed invocation. Bind-source identity,
-  running-instance overlap, and per-launch rollback checks prevent path
-  substitution or concurrent instance reuse from crossing that boundary.
-- Retain `cyclo run TEAM PROJECT` and `--team-write` as a compatibility
-  interface while making `cyclo run project.cyclo` the normal reusable path.
-- Separate the credential gateway from the provider runtime: the gateway owns
-  credentials, concrete upstream traffic, and usage, while the provider runtime
-  owns composition, policy, routing, and team capabilities.
-- Default gateway account names to the login provider ID and optionally choose
-  another with `cyclo gateway login PROVIDER --as NAME`.
-- Compose ordered host providers declared as
-  `provider PREFIX PATH INPUT_MODEL... [KEY=VALUE ...]` in
-  `/etc/cyclo/host.conf`. A separate provider runtime parses that exact
-  read-only file bind once at startup and serves normal requests from an
-  immutable in-memory snapshot. Every edit takes effect through
-  `cyclo runtime restart` without an image rebuild; a missing or empty file
-  passes the gateway's concrete catalogue through unchanged.
-- Keep normal runtime requests free of configuration reads, gateway-catalogue
-  fetches, and global component probes. Separate acknowledged capability reload
-  from gateway-catalogue refresh so revocation does not depend on the gateway.
-- Watch only dynamic client/provider authority outside the request path, closing
-  the controller-crash revocation gap on a 500 ms polling cadence and failing
-  closed on a malformed changed registry; `host.conf` remains restart-only.
-- Bound shared-runtime TCP/UDS connections, active work per principal and
-  globally, request bodies, and inbound-body time while reserving host control
-  admission.
-- Give every provider a distinct runtime UDS, give the host a separate private
-  control UDS, and charge nested work to a separate pool keyed by the originating
-  project so composition cannot multiply one team's root quota.
-- Bind each team capability to the provider runtime's interface on that team's
-  private network and drop `CAP_NET_RAW` from team containers, preventing
-  cross-team bearer replay even from custom/root images.
-- Run each intermediate provider in a networkless container with private
-  HTTP/1.1 Unix-socket transport to the provider runtime, two scoped
-  capabilities, registration/recovery health verification, durable sanitized
-  recovery records, in-memory active routes, and per-dispatch socket-identity
-  checks. Provider components never register with or connect to the credential
-  gateway.
-- Bound registration metadata and durable rewrite frequency, make exact
-  re-registration a throttled disk-free lease barrier, rate-limit authenticated
-  attempts before reading their bodies, reject concrete/component prefix
-  collisions locally, and revoke an old provider before replacement authority
-  is published.
-- Preserve physical usage attribution by keeping the original team bearer in
-  provider-runtime request context and forwarding it to the credential gateway
-  for concrete calls; components see only ingress, upstream, and request-context
-  capabilities.
-- Make shared lifecycle explicit with `cyclo runtime start|stop|restart|status`
-  and `cyclo provider build|start|restart|stop|status PREFIX|--all`.
-  `provider start` never builds, while `cyclo models` and `cyclo run` never
-  start or build shared services or provider containers.
-- Recreate the shared gateway without deleting credentials or restarting teams
-  with `cyclo gateway restart`.
-- Keep `cyclo gateway status` observational with respect to gateway images: it
-  validates the existing image and refuses to build or pull one implicitly.
-- Scrub exact credential reflections from upstream response headers and
-  streaming bodies at the gateway boundary.
-- Split the owned team-runtime image from the credential-gateway package and
-  package the provider runtime and protocol as first-class Cyclo resources.
-- Reap detached engine descendants through per-worker Linux subreapers, treat
-  unclean worker exits as team-container failures, use Docker teardown as the
-  outer process-tree fence, and capability-gate startup queue recovery with an
-  exclusive runtime lifetime lock.
-- Report team-container lifecycle separately from shared provider-runtime
-  status in `cyclo ps` and the dashboard, including explicit down, stale, and
-  uninspectable states.
-- Serialize task comments, state transitions, and result publication with a
-  persistent per-task mutex while retaining atomic task and file publication.
-- On a terminal automatic worker failure, publish one deterministic,
-  idempotent planner recovery job before failing the source job; planner
-  failures do not recursively create recovery work.
-- Refuse control operations when any persisted instance record is corrupt or
-  unreadable, while letting the dashboard show readable instances alongside
-  explicit source errors.
-- Make `cyclo doctor` actively probe both the credential gateway and provider
-  runtime before trusting the runtime catalogue.
-- Keep AgentWS provider-agnostic: model-engine failures use its bounded retry
-  contract, while Cyclo reports provider-stack health without rewriting queue
-  history or inferring failure causes from health timing.
-- End queued Pi RPC attempts on `agent_settled`, so an accepted engine failure
-  cannot leave a job claimed merely because Pi's RPC process remains alive.
-- Replace the unrestricted gateway token with distinct catalogue-only and
-  usage-only capabilities. Inference accepts only scoped client/team bearers;
-  the provider runtime mounts only the catalogue capability, and its private
-  control capability cannot access inference.
-- Generate fresh scoped capabilities on upgrade, retire only the exact legacy
-  unrestricted-token files after a successful gateway restart, and require the
-  explicit upgrade order `cyclo gateway restart --build` followed by
-  `cyclo runtime restart --build`.
-- Reject malformed persisted project fields and mounts at the state boundary,
-  and make `cyclo doctor` prescribe `runtime restart` for an existing stopped
-  runtime container.
+### Architecture
+
+- Define a small component model around declared interfaces and ConnectRPC over
+  Unix sockets. Every component provides health; provider components also
+  provide model discovery and opaque streaming inference.
+- Keep `cyclo` on the host as the control plane. It assembles and inspects the
+  Docker graph but is not a service in the inference data path.
+- Make the credential gateway the fixed root provider. It alone owns the
+  credential volume, OAuth refresh, native model calls, the concrete catalogue,
+  and usage history.
+- Add ordered intermediate providers through `/etc/cyclo/host.conf`. Each
+  component receives only its declared upstream socket; an empty configuration
+  exposes the gateway directly.
+- Transport Pi's native JSON request and event payloads opaquely. Intermediate
+  providers do not interpret, validate, or reserialize inference contents.
+
+### Projects and teams
+
+- Add strict, line-oriented `project.cyclo` files containing a project name,
+  description, one or more team repositories, and named `ro`/`rw` mounts.
+  Relative paths resolve beside the project file and unknown directives fail.
+- Start one container per selected team. Writable mounts appear below
+  `/workspace`, read-only supporting material below `/readonly`, and team
+  repositories remain independently selectable as read-only or writable.
+- Generate a host-path-free `/agentws/PROJECT.md` so every agent receives the
+  same concise description of its logical filesystem and project authority.
+- Keep team repositories data-only: a roster, role prompts, and optional common
+  `AGENTS.md`. Cyclo supplies the AgentWS runtime and Pi provider extension.
+- Preserve AgentWS's durable task, job, comment, result, retry, and planner
+  recovery loop without coupling queue state to provider health.
+
+### Lifecycle and isolation
+
+- Build component images under candidate tags and promote the official tag only
+  after validation. Readiness verifies the exact image ID, ownership, launch
+  configuration, mounts, running state, dependency readiness, and the component
+  health RPC.
+- Run intermediate providers without a network, Docker socket, or Linux
+  capabilities, using read-only roots, private namespaces, bounded process and
+  file-descriptor counts, and only the Unix sockets declared by their interface.
+- Keep credentials outside all team and intermediate-provider mounts. A mounted
+  provider socket is the authority to use the configured model catalogue; no
+  internal bearer or administrator token is used.
+- Validate real, non-overlapping mount trees and recheck bind-source identity at
+  launch. Multi-team runs preflight the full project and roll back only the
+  containers started by a failed invocation.
+- Add `--offline` to remove ordinary team network egress while retaining access
+  to the provider socket.
+- Harden persisted state with strict parsing, no-follow file access, atomic
+  replacement, serialized queue mutations, bounded scans, and explicit handling
+  of corrupt or incomplete instance records.
+- Keep configuration restart-applied: lifecycle and diagnostic commands report
+  stale, down, unhealthy, and uninspectable states without silently rebuilding
+  or repairing the system.
+- Scope gateway, provider, and team Docker resources to the canonical state
+  root, allowing several independent Cyclo installations on one trusted host.
+  Team ownership records the installation, resource kind, and logical instance.
+
+### Command line and operations
+
+- Organize authoring under `cyclo team` and `cyclo project`, task operations
+  under `cyclo task`, and the two independent host lifecycles under
+  `cyclo gateway` and `cyclo providers`.
+- Add project-wide `run` and `stop`, detailed `inspect`, read-only fleet and
+  AgentWS dashboards, provider-aware `models`, retained `usage`, and an
+  observational full-system `doctor`.
+- Add `cyclo refresh` to rebuild installed gateway, provider, and team images,
+  then restart active projects from their persisted definitions.
+- Keep gateway login limited to updating the private store; an explicit gateway
+  restart publishes catalogue changes while preserving the separately owned
+  credential and usage volume.
+- Keep wildcard dashboard binds as listening addresses only; generated browser
+  links derive their host from the incoming request.
+
+### Distribution
+
+- Establish 0.2 as a fresh-install boundary. Cyclo does not adopt or migrate
+  0.1 state or Docker resources.
+- Organize shipped component sources by architectural role under
+  `src/cyclo/components`: shared contracts in `protocol/`, runnable providers
+  beside them, and an explicit `team-runtime` image context. Remove the retired
+  gateway and provider-runtime source trees.
+- Ship a self-contained Python package with the AgentWS runtime, dashboard,
+  component protocol, gateway and team build contexts, and built-in team
+  templates. Cyclo no longer depends on external `agentws` or `multiagent`
+  checkouts.
+- Pin image bases and npm dependencies, verify release manifests and supply-chain
+  metadata, scan the Git history for secrets, and build local wheel/source
+  release bundles without publishing them.
 
 ## [0.1.0] - 2026-07-14
 

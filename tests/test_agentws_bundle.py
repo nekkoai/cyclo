@@ -124,7 +124,7 @@ def test_packaged_agentws_initializes_a_team_without_a_checkout(tmp_path: Path) 
     team = load_team(destination)
     assert len(team.agents) == 5
     assert {agent.model for agent in team.agents} == {"openai-codex/test-model"}
-    assert (destination / "AGENTS.md").is_file()
+    assert not (destination / "AGENTS.md").exists()
     assert (destination / "roles" / "planner.md").is_file()
 
 

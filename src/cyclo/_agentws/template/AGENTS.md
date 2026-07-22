@@ -19,8 +19,8 @@ mounted directory and states whether it is read-only or read/write; this
 project context remains authoritative even when the team has its own
 `AGENTS.md`.
 
-- `/workspace` — writable project checkouts only. Named projects appear at
-  `/workspace/<name>`; a legacy single-project run uses `/workspace` directly.
+- `/workspace` — writable project checkouts only, mounted at
+  `/workspace/<name>`.
 - `/readonly` — named read-only inputs such as documentation and specifications.
 - `/team` — the team definition: protocol, roster, and roles; normally read-only.
 - `/agentws` — AgentWS protocol and runtime state: tasks, jobs, agents, and tools.

@@ -24,7 +24,7 @@ Use the template installed with Cyclo. Replace the model with an exact entry
 from `cyclo models`:
 
 ```sh
-cyclo init ~/teams/plan-execute-verify \
+cyclo team init ~/teams/plan-execute-verify \
   --template plan-execute-verify \
   --model openai-codex/MODEL_ID
 git -C ~/teams/plan-execute-verify add .
@@ -46,7 +46,7 @@ mount source ../../src/my-project rw
 ```sh
 cyclo validate ~/experiments/my-project/project.cyclo
 cyclo run ~/experiments/my-project/project.cyclo
-cyclo task my-project-plan-execute-verify change-001 /tmp/change-001.md
+cyclo task run my-project-plan-execute-verify change-001 /tmp/change-001.md
 cyclo logs -f my-project-plan-execute-verify
 ```
 

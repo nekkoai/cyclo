@@ -19,6 +19,13 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from .errors import CycloError
+from .installation import (
+    LABEL_INSTANCE,
+    LABEL_SYSTEM,
+    gateway_name,
+    installation_id,
+    provider_name,
+)
 
 
 COMPONENT_INTERFACE = "cyclo.component.v1.Component"
@@ -30,8 +37,6 @@ MAX_CONFIG_BYTES = 1024 * 1024
 MAX_RPC_BYTES = 16 * 1024 * 1024
 
 LABEL_OWNED = "io.cyclo.component"
-LABEL_SYSTEM = "io.cyclo.system"
-LABEL_INSTANCE = "io.cyclo.instance"
 LABEL_TYPE = "io.cyclo.component-type"
 LABEL_LIFECYCLE = "io.cyclo.lifecycle"
 
@@ -46,14 +51,10 @@ _ENVIRONMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _METHOD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def bundle_root() -> Path:
-    """Return the single package-owned Docker build root."""
+def component_sources_root() -> Path:
+    """Return Cyclo's package-owned component source root."""
 
-    return Path(str(resources.files("cyclo"))).resolve() / "_bundle"
-
-
-def installation_id(state_root: Path) -> str:
-    return hashlib.sha256(str(state_root.resolve()).encode("utf-8")).hexdigest()[:12]
+    return Path(str(resources.files("cyclo"))).resolve() / "components"
 
 
 def _regular_file(path: Path, label: str) -> Path:
@@ -1011,11 +1012,10 @@ class ComponentDocker:
         self.call(command)
         return True
 
-    def stop_system(
+    def stop_providers(
         self,
         system: str,
         *,
-        lifecycle: str = "provider",
         excluding: Iterable[str] = (),
     ) -> tuple[str, ...]:
         skipped = set(excluding)
@@ -1031,7 +1031,7 @@ class ComponentDocker:
                 "--filter",
                 f"label={LABEL_SYSTEM}={system}",
                 "--filter",
-                f"label={LABEL_LIFECYCLE}={lifecycle}",
+                f"label={LABEL_LIFECYCLE}=provider",
             ]
         )
         stopped: list[str] = []
@@ -1050,10 +1050,10 @@ class ComponentDocker:
             if (
                 labels.get(LABEL_OWNED) != "1"
                 or labels.get(LABEL_SYSTEM) != system
-                or labels.get(LABEL_LIFECYCLE) != lifecycle
+                or labels.get(LABEL_LIFECYCLE) != "provider"
                 or not isinstance(instance, str)
                 or not _INSTANCE_RE.fullmatch(instance)
-                or name != f"cyclo-{system}-{instance}"
+                or name != provider_name(system, instance)
             ):
                 raise CycloError(f"invalid Cyclo ownership labels on container {identifier}")
             if instance in skipped:
@@ -1075,9 +1075,11 @@ class ComponentDocker:
         return ((result.stdout or "") + (result.stderr or "")).strip()
 
 
-def _deployment_names(state_root: Path, instance: str) -> tuple[str, str, str]:
+def _deployment_names(
+    state_root: Path, instance: str, *, gateway: bool = False
+) -> tuple[str, str, str]:
     system = installation_id(state_root)
-    stem = f"cyclo-{system}-{instance}"
+    stem = gateway_name(system) if gateway else provider_name(system, instance)
     return system, f"{stem}:latest", stem
 
 
@@ -1097,14 +1099,16 @@ class Gateway:
         self.config_dir = self.root / "config"
         self.socket_dir = self.root / "socket"
         self.socket_path = self.socket_dir / COMPONENT_SOCKET
-        source = bundle_root() / "gateway"
-        system, image, container = _deployment_names(self.state_root, "gateway")
+        source = component_sources_root() / "gateway"
+        system, image, container = _deployment_names(
+            self.state_root, "gateway", gateway=True
+        )
         self.store_volume = f"{container}-state"
         self.deployment = Deployment(
             "gateway",
             "gateway",
             source,
-            bundle_root(),
+            component_sources_root(),
             image,
             container,
             system,
@@ -1598,10 +1602,7 @@ class ProviderStack:
         for deployment in reversed(self.deployments):
             if self.docker.stop(deployment):
                 stopped.append(deployment.instance)
-        for instance in self.docker.stop_system(
-            self.system,
-            lifecycle="provider",
-        ):
+        for instance in self.docker.stop_providers(self.system):
             if instance not in stopped:
                 stopped.append(instance)
         return tuple(stopped)

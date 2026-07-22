@@ -9,12 +9,6 @@ from .project import MOUNT_NAME_RE, ProjectMount
 from .state import Instance
 
 
-LEGACY_READ_ONLY_PROJECT_ERROR = (
-    "legacy read-only project state: stop and rerun it to use "
-    "a writable /workspace project"
-)
-
-
 @dataclass(frozen=True)
 class InstanceProject:
     """One normalized view of the project fields persisted for an instance."""
@@ -27,7 +21,6 @@ class InstanceProject:
     generation: str
     mounts: tuple[ProjectMount, ...]
     configured: bool
-    legacy_read_only: bool
     errors: tuple[str, ...]
 
     def require_valid(self) -> "InstanceProject":
@@ -35,21 +28,6 @@ class InstanceProject:
             raise CycloError(
                 f"invalid project metadata for Cyclo instance {self.instance_id!r}: "
                 + "; ".join(self.errors)
-            )
-        return self
-
-    def require_persistable(self) -> "InstanceProject":
-        """Reject corrupt state while retaining the supported v0.1 marker."""
-
-        errors = tuple(
-            error
-            for error in self.errors
-            if error != LEGACY_READ_ONLY_PROJECT_ERROR
-        )
-        if errors:
-            raise CycloError(
-                f"invalid project metadata for Cyclo instance {self.instance_id!r}: "
-                + "; ".join(errors)
             )
         return self
 
@@ -69,7 +47,7 @@ class InstanceProject:
                 "path": str(self.path),
                 "container_path": "/workspace",
             }
-            (read_only if self.legacy_read_only else workspaces).append(direct)
+            workspaces.append(direct)
         return {
             "name": self.name,
             "path": str(self.path) if self.path is not None else "",
@@ -171,13 +149,6 @@ def decode_instance_project(instance: Instance) -> InstanceProject:
             ProjectMount(mount_name, Path(mount_path), mode)  # type: ignore[arg-type]
         )
 
-    legacy_read_only = instance.legacy_project_read_only
-    if not isinstance(legacy_read_only, bool):
-        errors.append("legacy_project_read_only must be a boolean")
-        legacy_read_only = False
-    if legacy_read_only and not configured:
-        errors.append(LEGACY_READ_ONLY_PROJECT_ERROR)
-
     return InstanceProject(
         instance_id=instance.id,
         name=name or (path.name if path is not None else ""),
@@ -187,6 +158,5 @@ def decode_instance_project(instance: Instance) -> InstanceProject:
         generation=generation,
         mounts=tuple(mounts),
         configured=configured,
-        legacy_read_only=legacy_read_only,
         errors=tuple(errors),
     )

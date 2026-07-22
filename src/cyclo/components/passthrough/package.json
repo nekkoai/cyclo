@@ -12,8 +12,8 @@
   },
   "dependencies": {
     "@connectrpc/connect": "2.1.2",
-    "@cyclo/component": "file:../component",
-    "@cyclo/provider": "file:../provider"
+    "@cyclo/component": "file:../protocol/component",
+    "@cyclo/provider": "file:../protocol/provider"
   },
   "engines": {
     "node": ">=22.19.0"

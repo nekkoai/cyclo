@@ -62,20 +62,20 @@ git archive --format=tar HEAD | tar -xf - -C "$source_tree"
 printf '%s\n' '==> source tests'
 (
     cd "$source_tree"
-    for package in component provider gateway passthrough pi-provider; do
-        npm ci --ignore-scripts --prefix "src/cyclo/_bundle/$package"
+    for package in protocol/component protocol/provider gateway passthrough pi-provider; do
+        npm ci --ignore-scripts --prefix "src/cyclo/components/$package"
     done
     # This is the same intentional, lockfile-bounded peer override used by the
     # team Dockerfile for pi-simplify 0.2.2 against Pi 0.81.
-    npm ci --force --ignore-scripts --prefix src/cyclo/_bundle/team
+    npm ci --force --ignore-scripts --prefix src/cyclo/components/team-runtime
     "$venv/bin/python" -m pytest -q \
         --ignore=tests/test_release_manifest.py \
         --ignore=tests/test_secret_scan.py
     GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree \
         "$venv/bin/python" -m pytest -q \
         tests/test_release_manifest.py tests/test_secret_scan.py
-    for package in component provider gateway passthrough pi-provider; do
-        npm test --prefix "src/cyclo/_bundle/$package"
+    for package in protocol/component protocol/provider gateway passthrough pi-provider; do
+        npm test --prefix "src/cyclo/components/$package"
     done
     find . -type f -exec sh -c '
         for script do
@@ -89,9 +89,9 @@ printf '%s\n' '==> source tests'
 )
 
 printf '%s\n' '==> dependency audits'
-for package in component provider gateway passthrough pi-provider team; do
+for package in protocol/component protocol/provider gateway passthrough pi-provider team-runtime; do
     npm audit --package-lock-only --omit=dev --audit-level=high \
-        --prefix "$source_tree/src/cyclo/_bundle/$package"
+        --prefix "$source_tree/src/cyclo/components/$package"
 done
 
 printf '%s\n' '==> wheel-only acceptance'
@@ -123,7 +123,7 @@ printf '%s\n' '==> packaged example teams'
 for template in adversarial-audit plan-execute-verify test-driven-repair; do
     team=$work_root/team-$template
     HOME=$home XDG_STATE_HOME=$home/.local/state \
-        "$venv/bin/cyclo" init "$team" \
+        "$venv/bin/cyclo" team init "$team" \
         --template "$template" \
         --model openai-codex/release-verification
     HOME=$home XDG_STATE_HOME=$home/.local/state \
@@ -133,19 +133,19 @@ done
 printf '%s\n' '==> credential-free Docker images'
 docker build --pull \
     --tag "cyclo-team:release-$short_commit" \
-    --file "$source_tree/src/cyclo/_bundle/team/Dockerfile" \
-    "$source_tree/src/cyclo/_bundle"
+    --file "$source_tree/src/cyclo/components/team-runtime/Dockerfile" \
+    "$source_tree/src/cyclo/components"
 PYTHON="$venv/bin/python" \
     "$source_tree/tools/runtime-write-acceptance" \
     "cyclo-team:release-$short_commit"
 docker build --pull \
     --tag "cyclo-gateway:release-$short_commit" \
-    --file "$source_tree/src/cyclo/_bundle/gateway/Dockerfile" \
-    "$source_tree/src/cyclo/_bundle"
+    --file "$source_tree/src/cyclo/components/gateway/Dockerfile" \
+    "$source_tree/src/cyclo/components"
 docker build --pull \
     --tag "cyclo-passthrough:release-$short_commit" \
-    --file "$source_tree/src/cyclo/_bundle/passthrough/Dockerfile" \
-    "$source_tree/src/cyclo/_bundle"
+    --file "$source_tree/src/cyclo/components/passthrough/Dockerfile" \
+    "$source_tree/src/cyclo/components"
 docker run --rm --network none \
     --env CYCLO_HOST_UID=1000 \
     --env CYCLO_HOST_GID=1000 \

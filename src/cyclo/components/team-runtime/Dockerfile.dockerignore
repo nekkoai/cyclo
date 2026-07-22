@@ -1,0 +1,15 @@
+**
+!team-runtime/package.json
+!team-runtime/package-lock.json
+!team-runtime/entrypoint.sh
+!protocol/component/package.json
+!protocol/component/package-lock.json
+!protocol/component/src/**
+!protocol/component/gen/**
+!protocol/provider/package.json
+!protocol/provider/package-lock.json
+!protocol/provider/src/**
+!protocol/provider/gen/**
+!pi-provider/package.json
+!pi-provider/package-lock.json
+!pi-provider/src/**

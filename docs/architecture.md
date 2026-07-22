@@ -33,6 +33,105 @@ external model service
 The host `cyclo` command constructs this graph and manages Docker lifecycle. It
 is not a service in the data path.
 
+## Security architecture
+
+### Trust domain and threat model
+
+A Cyclo installation is one host security domain. The host operating system,
+Docker daemon, `cyclo` controller, operator-approved configuration, and
+operator-approved image build inputs are trusted. This is deliberate: each can
+create containers, select images, or change mounts and therefore necessarily
+defines the isolation policy it enforces. Compromise of that administrative
+domain is not treated as a failure that containers inside the same domain can
+contain.
+
+The untrusted workload is agent-controlled code inside a team container. Prompt
+injection is assumed capable of arbitrary execution there. Against that
+workload, Cyclo's boundary is intended to prevent access to physical provider
+credentials, the Docker control plane, undeclared host paths, intermediate
+component sockets, and other teams' private AgentWS state. Access deliberately
+granted by `project.cyclo`—including shared writable project trees—is authority,
+not an isolation failure.
+
+The gateway is trusted with credentials and native upstream traffic. An
+operator-installed provider component is trusted with the inference stream and
+upstream socket explicitly assigned to it: by definition it can observe,
+modify, suppress, or synthesize that traffic. It still receives neither gateway
+credentials nor unrelated component sockets. External model providers can see
+the data deliberately sent to their models and are outside Cyclo's
+confidentiality boundary.
+
+The trusted-host assumption establishes the deployment boundary; it does not
+prevent stronger deployment isolation. Mutually distrustful installations can
+run under separate operating-system or virtual-machine boundaries. Distinct
+Cyclo state roots and host configurations provide independent installations
+when several are operated in one trusted administrative domain.
+
+The canonical state-root path is the installation identity. Cyclo hashes that
+path to a stable 12-hex-character ID and scopes all owned Docker resources with
+it: gateway/provider containers and images, the credential volume, team
+containers and networks, the default team image, and ownership labels. The
+state root also contains that installation's queues and Unix sockets. Therefore
+two installations can reuse logical project, team, provider, and instance names
+without sharing mutable Docker names. A user-selected custom image is explicit
+shared authority and is not renamed.
+
+The host configuration is selected independently because it describes the
+installation's provider graph, not its identity. Operationally, a deployment
+must consistently pair one state root with one host configuration. Status and
+lifecycle commands discover resources from that pair and refuse resources
+labelled for a different installation. This is namespace separation inside one
+trusted Docker host, not a claim of protection from that host's administrator;
+mutually distrustful administrators still require separate OS/VM boundaries.
+
+### Capability model
+
+Cyclo conveys authority through concrete resources rather than a global
+administrator credential:
+
+- a project or supporting tree is accessible only when explicitly mounted, at
+  its declared `rw` or `ro` mode;
+- a Provider edge exists only when the consumer receives that producer's Unix
+  socket directory;
+- the outer Provider socket authorizes use of its advertised model catalogue;
+- the gateway credential volume is mounted only into the gateway; and
+- Docker authority remains on the trusted host and is never mounted into a
+  team or provider component.
+
+Consequently, possession of a Provider socket is the capability. Cyclo does not
+add an ambient bearer or administrator token inside the component graph. The
+current outer socket is catalogue-wide rather than a per-model or per-team
+identity. A policy requiring distinct principals must therefore issue distinct
+socket endpoints or place those principals in separate Cyclo installations;
+it must not infer identity from untrusted request metadata.
+
+### Policy composition
+
+The core supplies isolation mechanisms and a transparent inference path. It is
+not the single mandatory location for every deployment policy. Additional
+controls compose at the boundary that owns the relevant authority:
+
+| Required control | Composition point |
+| --- | --- |
+| Host or tenant isolation | Separate operating-system or virtual-machine boundary, optionally with a separate Cyclo installation |
+| Direct team egress policy | `--offline` today; host/container network policy or a dedicated network boundary for filtered egress |
+| Model allowlists, request policy, quotas, or inference audit | An outer Provider component; distinct socket endpoints when policy differs by principal |
+| Authentication, TLS, or remote access policy for read-only dashboards | Host firewall or trusted reverse proxy |
+| Provider credentials and native upstream authentication | Gateway only |
+| CPU, memory, process, filesystem, or storage ceilings | Container and host resource policy |
+
+Because inference payloads are opaque, a relay can remain independent of Pi's
+message schema. A security component that needs semantic inspection explicitly
+terminates and implements the Pi payload ABI; that decision is local to the
+component instead of silently expanding the trusted computing base of every
+request.
+
+This separation is also the extensibility criterion for the architecture. A
+control is architecturally compatible when it can be added at one of these
+boundaries without moving credentials into teams, granting Docker authority to
+containers, or changing the transparent Provider transport. Such compatibility
+does not imply that the control is already implemented or enabled by default.
+
 ## Components and ownership
 
 | Part | Owns | Does not own |
@@ -47,6 +146,23 @@ is not a service in the data path.
 | Dashboard/viewer | Read-only bounded observations | Queue or lifecycle mutation |
 
 ## Component model
+
+The source layout mirrors the component model:
+
+```text
+src/cyclo/components/
+  protocol/component/  base health and declaration interface
+  protocol/provider/   provider catalogue and inference interface
+  gateway/             root credential-owning component
+  passthrough/         example intermediate component
+  pi-provider/         team-side provider adapter
+  team-runtime/        common agent workload image
+```
+
+Protocol packages define interfaces and do not run independently. The gateway
+and intermediate providers are runnable components. The Pi adapter and team
+runtime are consumers of the outer Provider interface, not provider-stack
+components.
 
 Every component provides the base health interface:
 
@@ -221,7 +337,11 @@ Persistent state defaults to `$XDG_STATE_HOME/cyclo` or
 `~/.local/state/cyclo`:
 
 ```text
-instances/INSTANCE/       queue, Pi state, generated runtime, metadata
+instances/INSTANCE/
+  agentws-state/          tasks, jobs, agents, comments, and results
+  pi/                     Pi settings and runtime metadata
+  runtime/                generated read-only AgentWS runtime
+  run.json                persisted instance metadata
 sockets/gateway/          root component socket
 sockets/COMPONENT/        intermediate component sockets
 ```
@@ -230,6 +350,12 @@ Physical credentials and the usage ledger live instead in a separately owned
 Docker volume. `cyclo gateway status` prints its installation-specific name.
 Ordinary stop/restart operations do not delete it; `cyclo gateway
 destroy-store --confirm VOLUME` is the explicit destructive operation.
+
+New team resources use `cyclo-SYSTEM-team-INSTANCE` containers,
+`cyclo-SYSTEM-team-INSTANCE-net` networks, and the
+`cyclo-SYSTEM-team:VERSION` default image. `SYSTEM` is derived from the state
+root. Labels record the same system, resource kind, and logical instance, so a
+name alone is never sufficient authority for lifecycle operations.
 
 ## Failure model
 

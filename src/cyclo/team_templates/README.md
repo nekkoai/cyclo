@@ -7,13 +7,13 @@ runtime dependency on the installed template.
 List the available loops:
 
 ```sh
-cyclo templates
+cyclo team templates
 ```
 
 Create one and assign an initial model to every roster entry:
 
 ```sh
-cyclo init ~/teams/plan-execute-verify \
+cyclo team init ~/teams/plan-execute-verify \
   --template plan-execute-verify \
   --model openai-codex/MODEL_ID
 git -C ~/teams/plan-execute-verify add .
@@ -21,7 +21,7 @@ git -C ~/teams/plan-execute-verify commit -m "Define Cyclo team"
 cyclo validate ~/teams/plan-execute-verify
 ```
 
-`cyclo init` initializes Git automatically and refuses to overwrite a non-empty
+`cyclo team init` initializes Git automatically and refuses to overwrite a non-empty
 destination. Run `cyclo models` first, then replace the example model with an
 available `provider/model`. After creation, edit individual roster entries if
 agents should use different models or providers.

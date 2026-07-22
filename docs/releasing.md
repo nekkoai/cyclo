@@ -5,6 +5,10 @@ numbers below `1.0.0` do not imply an alpha or preview build. The Python
 distribution is `cyclo-agent`, while the command, import package, repository,
 and Docker images retain the `cyclo` name.
 
+Version 0.2 is a fresh-install boundary. Release verification does not test or
+claim migration of 0.1 state or Docker resources; a 0.2 installation starts
+with a new state root and newly built resources.
+
 ## Prepare the release commit
 
 Update the version in `pyproject.toml` and `src/cyclo/__init__.py`, image tags
@@ -38,19 +42,18 @@ Build and smoke-test all three credential-free image contexts:
 
 ```sh
 docker build --pull -t cyclo-team:0.2.0 \
-  -f src/cyclo/_bundle/team/Dockerfile \
-  src/cyclo/_bundle
+  -f src/cyclo/components/team-runtime/Dockerfile \
+  src/cyclo/components
 docker build --pull -t cyclo-gateway:0.2.0 \
-  -f src/cyclo/_bundle/gateway/Dockerfile \
-  src/cyclo/_bundle
+  -f src/cyclo/components/gateway/Dockerfile \
+  src/cyclo/components
 docker build --pull -t cyclo-passthrough:0.2.0 \
-  -f src/cyclo/_bundle/passthrough/Dockerfile \
-  src/cyclo/_bundle
+  -f src/cyclo/components/passthrough/Dockerfile \
+  src/cyclo/components
 docker run --rm --network none \
   -e CYCLO_HOST_UID=1000 -e CYCLO_HOST_GID=1000 \
   cyclo-team:0.2.0 python3 --version
-docker run --rm --network none cyclo-gateway:0.2.0 supported-providers.mjs
-docker run --rm --network none cyclo-gateway:0.2.0 providers.mjs
+docker run --rm --network none cyclo-gateway:0.2.0 providers
 ```
 
 The worktree must be clean and tests must pass on the exact commit before a
@@ -114,7 +117,7 @@ python3 -m venv /tmp/cyclo-release
 . /tmp/cyclo-release/bin/activate
 python -m pip install ./cyclo_agent-0.2.0-py3-none-any.whl
 cyclo --version
-cyclo templates
+cyclo team templates
 cyclo gateway status
 cyclo providers status
 ```

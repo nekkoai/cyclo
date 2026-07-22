@@ -70,19 +70,20 @@ cyclo = [
   "template/tools/agentws-public/*",
 ]
 "cyclo.dashboard_static" = ["*.html", "*.css", "*.js"]
-"cyclo._bundle" = [
-  "component/*",
-  "component/gen/**/*",
-  "component/proto/**/*",
-  "component/src/*",
-  "component/test/*",
-  "component/test/fixtures/*",
-  "provider/*",
-  "provider/gen/**/*",
-  "provider/proto/**/*",
-  "provider/src/*",
-  "provider/test/*",
-  "provider/test/fixtures/*",
+"cyclo.components" = [
+  "README.md",
+  "protocol/component/*",
+  "protocol/component/gen/**/*",
+  "protocol/component/proto/**/*",
+  "protocol/component/src/*",
+  "protocol/component/test/*",
+  "protocol/component/test/fixtures/*",
+  "protocol/provider/*",
+  "protocol/provider/gen/**/*",
+  "protocol/provider/proto/**/*",
+  "protocol/provider/src/*",
+  "protocol/provider/test/*",
+  "protocol/provider/test/fixtures/*",
   "gateway/*",
   "gateway/src/*",
   "gateway/test/*",
@@ -92,13 +93,13 @@ cyclo = [
   "pi-provider/*",
   "pi-provider/src/*",
   "pi-provider/test/*",
-  "team/*",
-  "team/Dockerfile.dockerignore",
-  "team/entrypoint.sh",
+  "team-runtime/*",
+  "team-runtime/Dockerfile.dockerignore",
+  "team-runtime/entrypoint.sh",
 ]
 
 [tool.setuptools.exclude-package-data]
-"cyclo._bundle" = ["*/node_modules/*"]
+"cyclo.components" = ["**/node_modules/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

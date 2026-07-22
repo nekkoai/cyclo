@@ -71,6 +71,36 @@ def test_agent_prompt_always_includes_project_mounts_beside_custom_team_protocol
     assert prompt.count(manifest.strip()) == 1
 
 
+def test_team_protocol_is_layered_after_system_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, _workspace = copy_runtime(tmp_path)
+    team = tmp_path / "team"
+    roles = team / "roles"
+    roles.mkdir(parents=True)
+    (roles / "designer.md").write_text("Design RTL.\n", encoding="utf-8")
+    team_protocol = team / "AGENTS.md"
+    team_protocol.write_text("Use the team lint rules.\n", encoding="utf-8")
+    monkeypatch.setenv("AGENTWS_SYSTEM_PROTOCOL", str(runtime / "AGENTS.md"))
+    monkeypatch.setenv("AGENTWS_TEAM_PROTOCOL", str(team_protocol))
+    monkeypatch.setenv("AGENTWS_TEAM_ROLES_DIR", str(roles))
+
+    agent_script = runtime / "tools" / "agent"
+    load_team_context = runpy.run_path(str(agent_script))["load_team_context"]
+    protocol_file, _role_file, protocol_text, _role_text = load_team_context(
+        runtime, "designer"
+    )
+
+    assert protocol_file == runtime / "AGENTS.md"
+    assert "You are an AgentWS role agent" in protocol_text
+    assert "# Team-specific additions" in protocol_text
+    assert f"Source: {team_protocol}" in protocol_text
+    assert "Use the team lint rules." in protocol_text
+    assert protocol_text.index("You are an AgentWS role agent") < protocol_text.index(
+        "Use the team lint rules."
+    )
+
+
 def test_interactive_agent_prompt_includes_configured_project_manifest(
     tmp_path: Path,
 ) -> None:
