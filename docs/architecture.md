@@ -70,11 +70,11 @@ when several are operated in one trusted administrative domain.
 The canonical state-root path is the installation identity. Cyclo hashes that
 path to a stable 12-hex-character ID and scopes all owned Docker resources with
 it: gateway/provider containers and images, the credential volume, team
-containers and networks, the default team image, and ownership labels. The
-state root also contains that installation's queues and Unix sockets. Therefore
-two installations can reuse logical project, team, provider, and instance names
-without sharing mutable Docker names. A user-selected custom image is explicit
-shared authority and is not renamed.
+containers and networks, common and derived team images, and ownership labels.
+The state root also contains that installation's queues and Unix sockets.
+Therefore two installations can reuse logical project, team, provider, and
+instance names without sharing mutable Docker names. A user-selected custom
+image is explicit shared authority and is not renamed.
 
 The host configuration is selected independently because it describes the
 installation's provider graph, not its identity. Operationally, a deployment
@@ -300,12 +300,14 @@ mount, provider-stack readiness, and bind-source identity. A partial multi-team
 startup rolls back only containers created by that invocation. Queue history
 remains under the state root.
 
-A team repository contains only its data:
+A team repository contains its behavioral definition and optional execution
+delta:
 
 ```text
 team
 roles/*.md
 AGENTS.md          # optional
+Dockerfile         # optional; ARG/FROM the Cyclo team-runtime base
 ```
 
 The roster line format is:
@@ -317,6 +319,13 @@ AGENT ROLE ENGINE PROVIDER/MODEL
 Cyclo supplies the common AgentWS runtime and Pi extension in the team image.
 It generates `/agentws/PROJECT.md` with logical mount paths and requires agents
 to read it. The host paths never need to be embedded in team prompts.
+
+A repository Dockerfile must declare `ARG CYCLO_TEAM_BASE` before its first
+`FROM`; its final stage must inherit that exact base. Earlier builder stages
+may use other images. Cyclo labels the derived image with the exact base image
+ID, builds under a candidate tag, validates the inherited runtime entrypoint,
+and promotes the team tag only after success. Teams without a Dockerfile use
+the common image directly.
 
 ## Team isolation and state
 
@@ -351,11 +360,12 @@ Docker volume. `cyclo gateway status` prints its installation-specific name.
 Ordinary stop/restart operations do not delete it; `cyclo gateway
 destroy-store --confirm VOLUME` is the explicit destructive operation.
 
-New team resources use `cyclo-SYSTEM-team-INSTANCE` containers,
-`cyclo-SYSTEM-team-INSTANCE-net` networks, and the
-`cyclo-SYSTEM-team:VERSION` default image. `SYSTEM` is derived from the state
-root. Labels record the same system, resource kind, and logical instance, so a
-name alone is never sufficient authority for lifecycle operations.
+New team resources use `cyclo-SYSTEM-team-INSTANCE` containers and
+`cyclo-SYSTEM-team-INSTANCE-net` networks. The common image is
+`cyclo-SYSTEM-team:VERSION`; derived images add a team name and repository-path
+digest. `SYSTEM` is derived from the state root. Labels record the same system,
+resource kind, and logical instance, so a name alone is never sufficient
+authority for lifecycle operations.
 
 ## Failure model
 

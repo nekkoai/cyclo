@@ -45,6 +45,7 @@ class Team:
     roster: Path
     roles_dir: Path
     protocol: Path | None
+    dockerfile: Path | None
     agents: tuple[Agent, ...]
 
     @property
@@ -325,6 +326,60 @@ def _parse_roster(snapshot: _TeamSnapshot) -> tuple[Agent, ...]:
     return tuple(agents)
 
 
+def team_dockerfile(root: Path) -> Path | None:
+    """Validate and return a team's optional derived-image Dockerfile."""
+
+    root_fd = _open_team_root(root)
+    try:
+        if not _directory_entry_exists(root_fd, "Dockerfile"):
+            return None
+        path = root / "Dockerfile"
+        content = _decode_team_file(
+            _read_regular_file_at(root_fd, "Dockerfile", path, "Dockerfile"),
+            path,
+            "Dockerfile",
+        )
+    finally:
+        os.close(root_fd)
+
+    directives = [
+        line.strip()
+        for line in content.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    from_directives = [
+        (index, line)
+        for index, line in enumerate(directives)
+        if line.split(None, 1)[0].upper() == "FROM"
+    ]
+    if not from_directives:
+        raise CycloError(f"team Dockerfile has no FROM directive: {path}")
+    first_from = from_directives[0][0]
+    arguments = {
+        line.split(None, 1)[1].split("=", 1)[0].strip()
+        for line in directives[:first_from]
+        if len(line.split(None, 1)) == 2
+        and line.split(None, 1)[0].upper() == "ARG"
+    }
+    if "CYCLO_TEAM_BASE" not in arguments:
+        raise CycloError(
+            f"team Dockerfile must declare ARG CYCLO_TEAM_BASE before FROM: {path}"
+        )
+    from_fields = from_directives[-1][1].split()
+    image_index = (
+        2 if len(from_fields) > 1 and from_fields[1].startswith("--") else 1
+    )
+    if (
+        len(from_fields) <= image_index
+        or from_fields[image_index] not in {"${CYCLO_TEAM_BASE}", "$CYCLO_TEAM_BASE"}
+    ):
+        raise CycloError(
+            f"team Dockerfile's final stage must use FROM "
+            f"${{CYCLO_TEAM_BASE}}: {path}"
+        )
+    return path
+
+
 def load_team(value: str | os.PathLike[str]) -> Team:
     root = resolve_directory(value, "team")
     snapshot = _read_team_snapshot(root)
@@ -334,6 +389,7 @@ def load_team(value: str | os.PathLike[str]) -> Team:
         roster=snapshot.roster,
         roles_dir=snapshot.roles_dir,
         protocol=snapshot.protocol,
+        dockerfile=team_dockerfile(root),
         agents=agents,
     )
 

@@ -55,7 +55,11 @@ from .project_state import decode_instance_project
 from .state import Instance, StateStore, slug, validate_instance_id
 from .team import Team, init_team, load_team, require_team_repository, team_generation, verify_agentws_abi
 from .team_templates import bundled_team_template_names
-from .team_runtime_image import ensure as ensure_team_runtime_image
+from .team_runtime_image import (
+    ensure as ensure_team_runtime_image,
+    ensure_derived as ensure_derived_team_image,
+    require as require_team_runtime_image,
+)
 
 
 DEFAULT_HOST_CONFIG = Path("/etc/cyclo/host.conf")
@@ -294,11 +298,53 @@ def _announce_binding(binding: RunBinding, store: StateStore) -> None:
     print(f"state: {store.queue_root(instance.id)}")
 
 
+def _prepare_team_images(
+    bindings: tuple[RunBinding, ...],
+    *,
+    base_image: str,
+    build: bool,
+    base_image_id: str | None = None,
+) -> str | None:
+    """Make every selected team image ready before any team container starts."""
+
+    overrides = {binding.instance.image_override for binding in bindings}
+    if len(overrides) != 1:
+        raise CycloError("project teams have inconsistent image overrides")
+    override = overrides.pop()
+    if override:
+        selected = require_team_runtime_image(override)
+        for binding in bindings:
+            binding.instance.image = selected
+        return base_image_id
+
+    selected_base = base_image_id or ensure_team_runtime_image(
+        base_image,
+        build=build,
+    )
+    prepared: dict[str, str] = {}
+    for binding in bindings:
+        dockerfile = binding.team.dockerfile
+        if dockerfile is None:
+            binding.instance.image = selected_base
+            continue
+        tag = binding.instance.image
+        if tag in prepared:
+            binding.instance.image = prepared[tag]
+            continue
+        binding.instance.image = ensure_derived_team_image(
+            tag,
+            binding.team.root,
+            selected_base,
+            build=build,
+        )
+        prepared[tag] = binding.instance.image
+    return selected_base
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     source = agentws_root()
     store = state_store(args)
-    if args.image is None:
-        args.image = team_image_name(store.system, __version__)
+    base_image = team_image_name(store.system, __version__)
     docker = Docker()
     definition = load_project(args.project)
     configured_teams = load_project_teams(definition)
@@ -311,7 +357,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         Path(args.host_config),
     )
     bindings = project_run_bindings(
-        args, definition, configured_teams, system=store.system
+        args,
+        definition,
+        configured_teams,
+        system=store.system,
+        base_image=base_image,
+        version=__version__,
     )
 
     stack = provider_stack(args, store)
@@ -334,10 +385,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     for binding in bindings:
         preflight_binding(binding, store, docker)
 
+    with store.locked():
+        _prepare_team_images(
+            bindings,
+            base_image=base_image,
+            build=args.build,
+        )
+
     started: list[RunBinding] = []
     current: RunBinding | None = None
     try:
-        for index, binding in enumerate(bindings):
+        for binding in bindings:
             current = binding
             start_binding(
                 args,
@@ -345,7 +403,6 @@ def cmd_run(args: argparse.Namespace) -> int:
                 source,
                 store,
                 docker,
-                build=args.build and index == 0,
             )
             started.append(binding)
             current = None
@@ -435,7 +492,11 @@ def _refresh_projects(
                 + "; ".join(details)
             )
         launch_settings = {
-            (instance.image, instance.offline, instance.agentws_host)
+            (
+                instance.image_override or None,
+                instance.offline,
+                instance.agentws_host,
+            )
             for instance in selected
         }
         if len(launch_settings) != 1:
@@ -481,13 +542,27 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     proxy.build()
     print("building provider components")
     stack.build()
-    images = {
-        team_image_name(store.system, __version__),
-        *(project.image for project in projects),
-    }
-    for image in sorted(images):
-        print(f"building team runtime: {image}")
-        ensure_team_runtime_image(image, build=True)
+    base_image = team_image_name(store.system, __version__)
+    print(f"building team runtime: {base_image}")
+    with store.locked():
+        base_image_id = ensure_team_runtime_image(base_image, build=True)
+        for project_args in projects:
+            definition = load_project(project_args.project)
+            configured_teams = load_project_teams(definition)
+            bindings = project_run_bindings(
+                project_args,
+                definition,
+                configured_teams,
+                system=store.system,
+                base_image=base_image,
+                version=__version__,
+            )
+            _prepare_team_images(
+                bindings,
+                base_image=base_image,
+                base_image_id=base_image_id,
+                build=True,
+            )
 
     stop_failures: list[str] = []
     for instance in instances:
@@ -1159,7 +1234,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--image",
         default=os.environ.get("CYCLO_TEAM_IMAGE"),
-        help="team runtime image (default: installation-scoped bundled image)",
+        help="operator-supplied image for every team; bypasses team Dockerfiles",
     )
     run.add_argument(
         "--offline",
@@ -1170,7 +1245,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--port", type=int, default=0, help="AgentWS port; 0 chooses a free port")
     run.add_argument("--verbose", action="store_true")
     run.add_argument("--foreground", action="store_true")
-    run.add_argument("--build", action="store_true", help="rebuild the bundled team image")
+    run.add_argument(
+        "--build",
+        action="store_true",
+        help="rebuild the common runtime and selected derived team images",
+    )
     run.add_argument("--dry-run", action="store_true", help="print the team Docker command")
     run.set_defaults(func=cmd_run)
 

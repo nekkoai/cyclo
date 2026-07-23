@@ -17,7 +17,72 @@ def test_loads_plain_agentws_roster(team_repo: Path) -> None:
     assert [agent.name for agent in team.agents] == ["planner-1", "reviewer-1"]
     assert team.agents[0].model == "openai-codex/gpt-test"
     assert team.providers == ("anthropic", "openai-codex")
+    assert team.dockerfile is None
     require_team_repository(team)
+
+
+def test_loads_team_dockerfile_derived_from_cyclo_base(team_repo: Path) -> None:
+    dockerfile = team_repo / "Dockerfile"
+    dockerfile.write_text(
+        "# syntax=docker/dockerfile:1\n"
+        "ARG CYCLO_TEAM_BASE\n"
+        "FROM ${CYCLO_TEAM_BASE}\n"
+        "RUN apt-get update && apt-get install -y verilator\n",
+        encoding="utf-8",
+    )
+
+    assert load_team(team_repo).dockerfile == dockerfile
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "FROM debian:stable\n",
+        "ARG OTHER\nFROM ${OTHER}\n",
+        "FROM ${CYCLO_TEAM_BASE}\nARG CYCLO_TEAM_BASE\n",
+        (
+            "ARG CYCLO_TEAM_BASE\n"
+            "FROM ${CYCLO_TEAM_BASE} AS runtime\n"
+            "FROM debian:stable\n"
+        ),
+    ],
+)
+def test_rejects_team_dockerfile_not_derived_from_cyclo_base(
+    team_repo: Path,
+    content: str,
+) -> None:
+    (team_repo / "Dockerfile").write_text(content, encoding="utf-8")
+
+    with pytest.raises(CycloError, match="CYCLO_TEAM_BASE"):
+        load_team(team_repo)
+
+
+def test_accepts_builder_stage_before_final_cyclo_base(
+    team_repo: Path,
+) -> None:
+    dockerfile = team_repo / "Dockerfile"
+    dockerfile.write_text(
+        "ARG CYCLO_TEAM_BASE\n"
+        "FROM debian:stable AS builder\n"
+        "RUN printf tool > /tool\n"
+        "FROM ${CYCLO_TEAM_BASE}\n"
+        "COPY --from=builder /tool /tool\n",
+        encoding="utf-8",
+    )
+
+    assert load_team(team_repo).dockerfile == dockerfile
+
+
+def test_rejects_team_dockerfile_symlink(team_repo: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "Dockerfile"
+    outside.write_text(
+        "ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n",
+        encoding="utf-8",
+    )
+    (team_repo / "Dockerfile").symlink_to(outside)
+
+    with pytest.raises(CycloError, match="Dockerfile.*symlink"):
+        load_team(team_repo)
 
 
 def test_requires_explicit_proxy_model(team_repo: Path) -> None:

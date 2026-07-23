@@ -59,6 +59,22 @@ def team_image_name(system: str, version: str) -> str:
     return f"cyclo-{system}-team:{version}"
 
 
+def derived_team_image_name(
+    system: str,
+    version: str,
+    team_root: Path,
+    team_name: str,
+) -> str:
+    """Return the stable installation-local image tag for one team repository."""
+
+    validate_installation_id(system)
+    identity = hashlib.sha256(
+        str(team_root.expanduser().resolve()).encode("utf-8")
+    ).hexdigest()[:12]
+    name = re.sub(r"[^a-z0-9_.-]+", "-", team_name.lower()).strip("-._")
+    return f"cyclo-{system}-team-{(name or 'team')[:28]}-{identity}:{version}"
+
+
 def resource_labels(system: str, kind: str, instance: str) -> dict[str, str]:
     validate_installation_id(system)
     return {

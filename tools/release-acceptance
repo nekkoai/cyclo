@@ -297,6 +297,11 @@ project_dry_run=$(
         "$project_file"
 )
 printf '%s\n' "$project_dry_run"
+expected_team_image=$(
+    "$venv/bin/python" -c \
+        'import pathlib, sys; from cyclo.installation import team_image_name; from cyclo.state import StateStore; print(team_image_name(StateStore(pathlib.Path(sys.argv[1])).system, "0.2.0"))' \
+        "$state_root"
+)
 case $project_dry_run in
     *"dst=/workspace,readonly"*) ;;
     *) fail "project.cyclo dry-run did not make the workspace namespace read-only" ;;
@@ -319,7 +324,7 @@ case $project_dry_run in
 esac
 
 case $project_dry_run in
-    *"cyclo-team:"*) ;;
+    *" $expected_team_image python3 /agentws/.cyclo-runtime.py"*) ;;
     *) fail "project.cyclo dry-run did not use the packaged Cyclo team image" ;;
 esac
 case $project_dry_run in

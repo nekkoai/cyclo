@@ -135,6 +135,14 @@ docker build --pull \
     --tag "cyclo-team:release-$short_commit" \
     --file "$source_tree/src/cyclo/components/team-runtime/Dockerfile" \
     "$source_tree/src/cyclo/components"
+"$venv/bin/python" -c \
+    'import pathlib, sys; from cyclo.team_runtime_image import docker_runner, ensure_derived, image_id; base = docker_runner.inspect("image", sys.argv[1], missing=False); assert base is not None; root = pathlib.Path(sys.argv[2]); ensure_derived(sys.argv[3], root, image_id(base), build=True)' \
+    "cyclo-team:release-$short_commit" \
+    "$source_tree/tests/fixtures/derived-team" \
+    "cyclo-derived-team:release-$short_commit"
+docker run --rm --network none --entrypoint /bin/sh \
+    "cyclo-derived-team:release-$short_commit" -ceu \
+    'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
 PYTHON="$venv/bin/python" \
     "$source_tree/tools/runtime-write-acceptance" \
     "cyclo-team:release-$short_commit"
