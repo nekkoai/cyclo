@@ -44,6 +44,13 @@ def test_packaged_examples_match_source_examples() -> None:
         assert packaged_files == source_files
 
 
+def test_packaged_template_index_matches_source_index() -> None:
+    source = Path(__file__).parents[1] / "template" / "README.md"
+    packaged = packaged_team_templates_root() / "README.md"
+
+    assert packaged.read_bytes() == source.read_bytes()
+
+
 @pytest.mark.parametrize("name", ["../escape", ".", "missing"])
 def test_packaged_template_name_is_confined(name: str) -> None:
     with pytest.raises(CycloError):
