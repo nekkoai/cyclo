@@ -67,8 +67,8 @@ export async function main(argv = process.argv.slice(2), options = {}) {
   const env = options.env ?? process.env;
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
-  const command = argv[0] ?? "serve";
-  if (command === "serve" && argv.length <= 1) {
+  const command = argv[0];
+  if (command === undefined) {
     await (options.runGateway ?? runGateway)({ env });
     return;
   }
@@ -89,7 +89,7 @@ export async function main(argv = process.argv.slice(2), options = {}) {
     return;
   }
   throw new Error(
-    "usage: cyclo-gateway-component serve | providers | usage | login PROVIDER [OPTIONS]",
+    "usage: cyclo-gateway-component [providers | usage | login PROVIDER [OPTIONS]]",
   );
 }
 

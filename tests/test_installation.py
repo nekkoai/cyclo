@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from cyclo.component_stack import Gateway, ProviderStack
 from cyclo.errors import CycloError
+from cyclo.gateway import Gateway
 from cyclo.installation import (
     derived_team_image_name,
     gateway_name,
@@ -15,6 +15,7 @@ from cyclo.installation import (
     team_network_name,
 )
 from cyclo.state import StateStore
+from cyclo.providers import ProviderSystem
 
 
 def test_state_root_defines_stable_independent_resource_namespace(
@@ -54,14 +55,14 @@ def test_gateway_providers_and_teams_share_one_installation_identity(
 ) -> None:
     store = StateStore(tmp_path / "state")
     gateway = Gateway(store.components_root)
-    providers = ProviderStack(
+    providers = ProviderSystem(
         store.components_root,
         tmp_path / "host.conf",
         gateway=gateway,
         load_config=False,
     )
 
-    assert store.system == gateway.deployment.system == providers.system
+    assert store.system == gateway.component.system == providers.system
 
 
 def test_resource_identity_rejects_untrusted_installation_id() -> None:

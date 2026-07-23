@@ -17,16 +17,19 @@ require upstream cyclo.provider.v1.Provider
 ```
 
 `provide` declares services implemented by the component. `require` declares a
-named input. `/etc/cyclo/host.conf` binds each requirement to `gateway` or an
-earlier component:
+named input. The installation's `host.conf` binds each requirement to `gateway`
+or an earlier component:
 
 ```text
-provider trace ./providers/pass upstream=gateway -- label=first
-provider outer ./providers/pass upstream=trace
+provider first ./providers/pass upstream=gateway
+provider second ./providers/pass upstream=first
 ```
 
-The gateway is always the root Provider. An empty `host.conf` makes its socket
-the final stack output. Otherwise the final declared component is the output.
+The gateway is always the root Provider. An empty `host.conf` selects its
+socket directly. Otherwise Cyclo selects the last working component whose
+declared inputs are also working. A build or startup failure leaves an earlier
+working provider selected—possibly the gateway—while status exposes the failed
+component.
 
 Cyclo builds and starts components in declaration order. Each component gets a
 writable output socket directory at `/run/cyclo` and one read-only producer

@@ -57,9 +57,8 @@ export async function runPassthrough({
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const command = argv[0] ?? "serve";
-  if (command !== "serve" || argv.length > 1) {
-    throw new Error("usage: cyclo-passthrough-component serve");
+  if (argv.length !== 0) {
+    throw new Error("usage: cyclo-passthrough-component");
   }
   await runPassthrough();
 }

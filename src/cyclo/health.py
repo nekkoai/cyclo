@@ -4,12 +4,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
-from .component_stack import StackStatus
+from .component import ComponentStatus
+from .providers import ProviderConnection
 from .state import Instance
 
 
 class ProviderStatusReader(Protocol):
-    def status(self) -> StackStatus: ...
+    def statuses(self) -> tuple[ComponentStatus, ...]: ...
+
+    def connection(
+        self,
+        statuses: tuple[ComponentStatus, ...] | None = None,
+    ) -> ProviderConnection: ...
 
 
 @dataclass(frozen=True)
@@ -43,42 +49,64 @@ def _error_summary(exc: Exception) -> str:
     return detail if len(detail) <= 160 else detail[:157] + "..."
 
 
-def provider_health(status: StackStatus) -> ProviderHealth:
-    desired = (("gateway", status.gateway.docker, status.gateway.ready),) + tuple(
-        (component.instance, component.docker, component.ready)
-        for component in status.components
+def provider_health(
+    components: tuple[ComponentStatus, ...],
+) -> ProviderHealth:
+    gateway = next(
+        (component for component in components if component.name == "gateway"),
+        None,
     )
-    stale = [name for name, docker, _ready in desired if docker.container_id and not docker.current]
-    if stale:
+    if gateway is None:
+        return ProviderHealth("provider-down", "gateway missing from inventory")
+    if gateway.container_id and not gateway.current:
         return ProviderHealth(
             "provider-stale",
-            "configuration or image stale: " + ", ".join(stale),
+            "configuration or image stale: gateway",
         )
-    unavailable = []
-    for name, docker, ready in desired:
-        if ready:
-            continue
-        if not docker.container_id:
+    if not gateway.works:
+        if not gateway.container_id:
             state = "absent"
-        elif not docker.running:
-            state = docker.lifecycle
-        elif docker.engine_health == "unhealthy":
+        elif not gateway.running:
+            state = gateway.container_state
+        elif gateway.engine_health == "unhealthy":
             state = "unhealthy"
         else:
             state = "not ready"
-        unavailable.append(f"{name} {state}")
+        if gateway.error:
+            state += f": {gateway.error}"
+        return ProviderHealth("provider-down", f"gateway {state}")
+    unavailable = []
+    for component in components:
+        if component.name == "gateway" or component.works:
+            continue
+        if component.container_id and not component.current:
+            state = "stale"
+        elif not component.container_id:
+            state = "absent"
+        elif not component.running:
+            state = component.container_state
+        elif component.engine_health == "unhealthy":
+            state = "unhealthy"
+        else:
+            state = "not ready"
+        if component.error:
+            state += f": {component.error}"
+        unavailable.append(f"{component.name} {state}")
     if unavailable:
-        return ProviderHealth("provider-down", ", ".join(unavailable))
+        return ProviderHealth(
+            "ready",
+            "ignored unavailable optional components: " + ", ".join(unavailable),
+        )
     return ProviderHealth("ready")
 
 
 def read_provider_status(
     reader: ProviderStatusReader | None,
-) -> tuple[ProviderHealth, StackStatus | None]:
+) -> tuple[ProviderHealth, ProviderConnection | None]:
     if reader is None:
         return ProviderHealth("provider-unknown", "provider status unavailable"), None
     try:
-        status = reader.status()
+        components = reader.statuses()
     except Exception as exc:
         return (
             ProviderHealth(
@@ -87,24 +115,38 @@ def read_provider_status(
             ),
             None,
         )
-    return provider_health(status), status
+    health = provider_health(components)
+    if health.state != "ready":
+        return health, None
+    try:
+        connection = reader.connection(components)
+    except Exception as exc:
+        return (
+            ProviderHealth(
+                "provider-unknown",
+                f"provider route unavailable: {_error_summary(exc)}",
+            ),
+            None,
+        )
+    return health, connection
 
 
 def instance_provider_health(
     shared: ProviderHealth,
-    status: StackStatus | None,
+    connection: ProviderConnection | None,
     instance: Instance,
 ) -> ProviderHealth:
-    if status is None or shared.state != "ready":
+    if connection is None or shared.state != "ready":
         return shared
     if (
-        instance.provider_generation != status.generation
+        instance.provider_generation != connection.generation
         or not instance.provider_socket_path
-        or Path(instance.provider_socket_path) != status.provider_socket_path
+        or Path(instance.provider_socket_path) != connection.socket_path
     ):
         return ProviderHealth(
             "provider-stale",
-            "team was launched against a different provider assembly; restart the project",
+            "team was launched against a different provider configuration; "
+            "restart the project",
         )
     return shared
 
@@ -115,7 +157,7 @@ def team_health(
     supervisor_error: str = "",
     planner_attention_jobs: tuple[str, ...] = (),
 ) -> ProviderHealth:
-    """Combine provider-stack health with one team's supervisor state."""
+    """Combine provider health with one team's supervisor state."""
 
     agents = tuple(sorted(set(suspended_agents)))
     attention = tuple(sorted(set(planner_attention_jobs)))
@@ -142,7 +184,10 @@ def team_health(
         agent_health = ProviderHealth("agents-attention", "; ".join(details))
     else:
         return provider
-    if provider.state == "ready":
+    if provider.state == "ready" and not provider.reason:
         return agent_health
     reasons = [reason for reason in (provider.reason, agent_health.reason) if reason]
-    return ProviderHealth(provider.state, "; ".join(reasons))
+    return ProviderHealth(
+        agent_health.state if provider.state == "ready" else provider.state,
+        "; ".join(reasons),
+    )

@@ -11,16 +11,14 @@ from pathlib import Path
 from . import __version__
 from .agentws_bundle import packaged_agentws_root
 from .agentws_queue import read_agent_supervisor_status
-from .component_stack import (
+from .component import (
     COMPONENT_INTERFACE,
     PROVIDER_INTERFACE,
-    ComponentDocker,
-    Gateway,
-    ProviderStack,
-    StackStatus,
+    ComponentStatus,
     component_sources_root,
     parse_declaration,
 )
+from .component_runtime import ComponentController
 from .dashboard import (
     DEFAULT_DASHBOARD_HOST,
     DashboardSnapshot,
@@ -30,6 +28,7 @@ from .dashboard import (
 )
 from .docker import Docker, container_command, validate_mount_collection
 from .errors import CycloError
+from .gateway import Gateway
 from .health import (
     INACTIVE_TEAM_HEALTH,
     ProviderHealth,
@@ -52,6 +51,7 @@ from .project_run import (
     validate_team_models,
 )
 from .project_state import decode_instance_project
+from .providers import ProviderConnection, ProviderSystem
 from .state import Instance, StateStore, slug, validate_instance_id
 from .team import Team, init_team, load_team, require_team_repository, team_generation, verify_agentws_abi
 from .team_templates import bundled_team_template_names
@@ -70,23 +70,32 @@ def state_store(args: argparse.Namespace) -> StateStore:
     return StateStore(root)
 
 
+def host_config(args: argparse.Namespace, store: StateStore) -> Path:
+    """Select provider configuration from the installation identity."""
+
+    return store.root / "host.conf" if args.state_root else DEFAULT_HOST_CONFIG
+
+
 def gateway(args: argparse.Namespace, store: StateStore) -> Gateway:
-    return Gateway(store.components_root, docker=ComponentDocker())
+    return Gateway(
+        store.components_root,
+        controller=ComponentController(),
+    )
 
 
-def provider_stack(
+def provider_system(
     args: argparse.Namespace,
     store: StateStore,
     *,
     load_config: bool = True,
-) -> ProviderStack:
-    docker = ComponentDocker()
-    proxy = Gateway(store.components_root, docker=docker)
-    return ProviderStack(
+) -> ProviderSystem:
+    controller = ComponentController()
+    proxy = Gateway(store.components_root, controller=controller)
+    return ProviderSystem(
         store.components_root,
-        Path(args.host_config),
+        host_config(args, store),
         gateway=proxy,
-        docker=docker,
+        controller=controller,
         load_config=load_config,
     )
 
@@ -153,7 +162,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         source = agentws_root()
         store = state_store(args)
         _validate_project_mounts(
-            definition, teams, store, source, Path(args.host_config)
+            definition, teams, store, source, host_config(args, store)
         )
         print(f"project: {definition.name}")
         print(f"description: {definition.description}")
@@ -261,12 +270,14 @@ def cmd_project_init(args: argparse.Namespace) -> int:
 def _catalogue_ids(document: dict[str, object]) -> set[str]:
     raw_models = document.get("models")
     if not isinstance(raw_models, list):
-        raise CycloError("provider stack returned an invalid model catalogue")
+        raise CycloError("provider system returned an invalid model catalogue")
     result: set[str] = set()
     for raw in raw_models:
         model = raw.get("id") if isinstance(raw, dict) else None
         if not isinstance(model, str) or not model or model in result:
-            raise CycloError("provider stack returned an invalid or duplicate model ID")
+            raise CycloError(
+                "provider system returned an invalid or duplicate model ID"
+            )
         result.add(model)
     return result
 
@@ -302,7 +313,6 @@ def _prepare_team_images(
     bindings: tuple[RunBinding, ...],
     *,
     base_image: str,
-    build: bool,
     base_image_id: str | None = None,
 ) -> str | None:
     """Make every selected team image ready before any team container starts."""
@@ -317,10 +327,7 @@ def _prepare_team_images(
             binding.instance.image = selected
         return base_image_id
 
-    selected_base = base_image_id or ensure_team_runtime_image(
-        base_image,
-        build=build,
-    )
+    selected_base = base_image_id or ensure_team_runtime_image(base_image)
     prepared: dict[str, str] = {}
     for binding in bindings:
         dockerfile = binding.team.dockerfile
@@ -335,7 +342,6 @@ def _prepare_team_images(
             tag,
             binding.team.root,
             selected_base,
-            build=build,
         )
         prepared[tag] = binding.instance.image
     return selected_base
@@ -354,7 +360,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         configured_teams,
         store,
         source,
-        Path(args.host_config),
+        host_config(args, store),
     )
     bindings = project_run_bindings(
         args,
@@ -365,22 +371,30 @@ def cmd_run(args: argparse.Namespace) -> int:
         version=__version__,
     )
 
-    stack = provider_stack(args, store)
+    providers = provider_system(args, store)
     if args.dry_run:
         for binding in bindings:
-            binding.instance.provider_socket_path = str(stack.provider_socket_path)
-            binding.instance.provider_generation = stack.assembly.generation
+            binding.instance.provider_socket_path = str(
+                providers.configured_socket_path
+            )
+            binding.instance.provider_generation = (
+                providers.configuration.generation
+            )
             if len(bindings) > 1:
                 print(f"# instance {binding.instance.id}")
             print(shlex.join(container_command(container_spec(binding, store, args))))
         return 0
 
-    status = stack.require_ready()
-    available_models = _catalogue_ids(stack.models_document())
+    with store.locked():
+        connection = providers.start()
+        _warn_unavailable_providers(connection, providers.gateway.socket_path)
+        available_models = _catalogue_ids(
+            providers.models_document(connection)
+        )
     for binding in bindings:
         validate_team_models(binding.team, available_models)
-        binding.instance.provider_socket_path = str(status.provider_socket_path)
-        binding.instance.provider_generation = status.generation
+        binding.instance.provider_socket_path = str(connection.socket_path)
+        binding.instance.provider_generation = connection.generation
 
     for binding in bindings:
         preflight_binding(binding, store, docker)
@@ -389,7 +403,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         _prepare_team_images(
             bindings,
             base_image=base_image,
-            build=args.build,
         )
 
     started: list[RunBinding] = []
@@ -512,7 +525,6 @@ def _refresh_projects(
         result.append(
             argparse.Namespace(
                 state_root=args.state_root,
-                host_config=args.host_config,
                 project=str(path),
                 image=image,
                 offline=offline,
@@ -520,7 +532,6 @@ def _refresh_projects(
                 port=port,
                 verbose=False,
                 foreground=False,
-                build=False,
                 dry_run=False,
             )
         )
@@ -528,7 +539,7 @@ def _refresh_projects(
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
-    """Rebuild installed runtimes and restart the previously active system."""
+    """Restart the active system, rebuilding changed images through Docker."""
 
     store = state_store(args)
     docker = Docker()
@@ -536,34 +547,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         instances = active_instances(store, docker)
     projects = _refresh_projects(args, instances)
 
-    proxy = gateway(args, store)
-    stack = provider_stack(args, store)
-    print("building gateway")
-    proxy.build()
-    print("building provider components")
-    stack.build()
-    base_image = team_image_name(store.system, __version__)
-    print(f"building team runtime: {base_image}")
-    with store.locked():
-        base_image_id = ensure_team_runtime_image(base_image, build=True)
-        for project_args in projects:
-            definition = load_project(project_args.project)
-            configured_teams = load_project_teams(definition)
-            bindings = project_run_bindings(
-                project_args,
-                definition,
-                configured_teams,
-                system=store.system,
-                base_image=base_image,
-                version=__version__,
-            )
-            _prepare_team_images(
-                bindings,
-                base_image=base_image,
-                base_image_id=base_image_id,
-                build=True,
-            )
-
+    providers = provider_system(args, store)
     stop_failures: list[str] = []
     for instance in instances:
         try:
@@ -577,10 +561,9 @@ def cmd_refresh(args: argparse.Namespace) -> int:
             "refresh could not stop the active fleet: " + "; ".join(stop_failures)
         )
 
-    print("restarting gateway")
-    proxy.restart(build=False)
-    print("restarting provider components")
-    stack.restart(build=False)
+    print("rebuilding and restarting provider system")
+    with store.locked():
+        providers.restart()
 
     start_failures: list[str] = []
     for project_args in projects:
@@ -650,8 +633,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
 def _shared_provider_health(
     args: argparse.Namespace,
     store: StateStore,
-) -> tuple[ProviderHealth, StackStatus | None]:
-    return read_provider_status(provider_stack(args, store))
+) -> tuple[ProviderHealth, ProviderConnection | None]:
+    return read_provider_status(provider_system(args, store))
 
 
 def _instance_lifecycle_state(instance: Instance, docker: Docker) -> str:
@@ -682,7 +665,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
     store = state_store(args)
     docker = Docker()
     rows = []
-    shared: tuple[ProviderHealth, StackStatus | None] | None = None
+    shared: tuple[ProviderHealth, ProviderConnection | None] | None = None
     for instance in store.list():
         state = _instance_lifecycle_state(instance, docker)
         if state == "running":
@@ -770,7 +753,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         store,
         docker=Docker(),
         usage_reader=_GatewayUsageReader(gateway(args, store)),
-        provider_reader=provider_stack(args, store),
+        provider_reader=provider_system(args, store),
     )
     server = make_dashboard_server(
         snapshot.build,
@@ -923,75 +906,212 @@ def cmd_usage(args: argparse.Namespace) -> int:
 
 
 def cmd_models(args: argparse.Namespace) -> int:
-    models = provider_stack(args, state_store(args)).model_ids()
+    store = state_store(args)
+    providers = provider_system(args, store)
+    with store.locked():
+        connection = providers.start()
+        _warn_unavailable_providers(
+            connection,
+            providers.gateway.socket_path,
+        )
+        models = providers.model_ids(connection)
     if not models:
         raise CycloError(
-            "provider stack returned no models; run `cyclo gateway providers` and log in"
+            "provider system returned no models; run "
+            "`cyclo gateway providers` and log in"
         )
     for model in models:
         print(model)
     return 0
 
 
-def _component_state(status: object) -> str:
-    ready = bool(getattr(status, "ready", False))
-    docker = getattr(status, "docker")
-    if ready:
+def _component_state(status: ComponentStatus) -> str:
+    if status.works:
         return "ready"
-    if not docker.container_id:
+    if not status.container_id:
         return "absent"
-    if not docker.current:
+    if not status.current:
         return "stale"
-    if not docker.running:
-        return docker.lifecycle
+    if not status.running:
+        return status.container_state
+    if status.engine_health == "unhealthy":
+        return "unhealthy"
     return "not-ready"
 
 
-def _print_stack_status(status: StackStatus) -> None:
-    print(f"gateway\t{_component_state(status.gateway)}")
-    for component in status.components:
-        print(f"{component.instance}\t{_component_state(component)}")
+def _print_component_statuses(
+    statuses: tuple[ComponentStatus, ...],
+) -> None:
+    def short_image(status: ComponentStatus) -> str:
+        return (
+            status.image_id[:19]
+            if status.image_id is not None
+            else "-"
+        )
+
+    rows = [
+        (
+            status.name,
+            status.kind,
+            _component_state(status),
+            short_image(status),
+            status.engine_health,
+            status.health,
+            " ".join(status.error.split()),
+        )
+        for status in statuses
+    ]
+    header = (
+        "NAME",
+        "TYPE",
+        "STATE",
+        "IMAGE",
+        "ENGINE",
+        "HEALTH",
+        "ERROR",
+    )
+    widths = [
+        max(len(row[index]) for row in [header, *rows])
+        for index in range(len(header))
+    ]
+    print(
+        "  ".join(
+            value.ljust(widths[index])
+            for index, value in enumerate(header)
+        )
+    )
+    for row in rows:
+        print(
+            "  ".join(
+                value.ljust(widths[index])
+                for index, value in enumerate(row)
+            ).rstrip()
+        )
+
+
+def _warn_unavailable_providers(
+    connection: ProviderConnection,
+    gateway_socket: Path,
+) -> None:
+    unavailable = [
+        component.name
+        for component in connection.components
+        if component.name != "gateway" and not component.works
+    ]
+    if unavailable:
+        selected = (
+            "using the gateway provider"
+            if connection.socket_path == gateway_socket
+            else "continuing with the last working provider"
+        )
+        print(
+            "warning: ignoring unavailable provider component(s): "
+            + ", ".join(unavailable)
+            + f"; {selected}",
+            file=sys.stderr,
+        )
 
 
 def cmd_providers(args: argparse.Namespace) -> int:
     store = state_store(args)
     if args.providers_action == "stop":
-        stack = provider_stack(args, store, load_config=False)
+        providers = provider_system(args, store, load_config=False)
         with store.locked():
-            stopped = stack.stop()
+            stopped = providers.stop()
         print("stopped: " + (", ".join(stopped) if stopped else "nothing running"))
         return 0
 
-    stack = provider_stack(args, store)
+    providers = provider_system(args, store)
     if args.providers_action == "check":
-        print(f"ok: {stack.check()} provider component(s)")
+        print(f"ok: {providers.check()} provider component(s)")
         return 0
     if args.providers_action == "build":
         with store.locked():
-            built = stack.build()
-        for instance, image_id in built:
-            print(f"{instance}\t{image_id}")
+            built = providers.build()
+        for name, image_id in built:
+            print(f"{name}\t{image_id}")
         return 0
     if args.providers_action == "status":
-        status = stack.status()
-        _print_stack_status(status)
-        return 0 if status.ready else 1
+        statuses = providers.statuses()
+        _print_component_statuses(statuses)
+        return 0 if all(status.works for status in statuses) else 1
     with store.locked():
         if args.providers_action == "start":
-            status = stack.start()
+            connection = providers.start()
         elif args.providers_action == "restart":
-            status = stack.restart(build=args.build)
+            connection = providers.restart()
         else:
             raise CycloError(f"unknown providers action: {args.providers_action}")
-    _print_stack_status(status)
-    return 0 if status.ready else 1
+    _print_component_statuses(connection.components)
+    return 0 if all(item.works for item in connection.components) else 1
 
 
-def _print_gateway_status(status: object, store_volume: str) -> int:
+def _print_gateway_status(
+    status: ComponentStatus,
+    store_volume: str,
+) -> int:
     state = _component_state(status)
     print(f"gateway\t{state}")
+    print(f"image\t{status.image_id or '-'}")
     print(f"store\t{store_volume}")
-    return 0 if status.ready else 1
+    if status.error:
+        print(f"error\t{status.error}")
+    return 0 if status.works else 1
+
+
+def cmd_component(args: argparse.Namespace) -> int:
+    store = state_store(args)
+    name = getattr(args, "name", None)
+    providers = provider_system(
+        args,
+        store,
+        load_config=name != "gateway",
+    )
+    action = args.component_action
+    if action in {"list", "status"}:
+        statuses = providers.statuses()
+        if action == "status" and args.name:
+            statuses = tuple(
+                status
+                for status in statuses
+                if status.name == args.name
+            )
+            if not statuses:
+                raise CycloError(
+                    f"unknown configured component: {args.name}"
+                )
+        _print_component_statuses(statuses)
+        if action == "list":
+            return 0
+        return 0 if all(status.works for status in statuses) else 1
+
+    assert isinstance(name, str)
+    with store.locked():
+        if action == "build":
+            print(providers.build_component(name))
+            return 0
+        if action == "start":
+            status = providers.start_component(name)
+        elif action == "restart":
+            status = providers.start_component(name, restart=True)
+        elif action == "stop":
+            print(
+                f"stopped {name}"
+                if providers.stop_component(name)
+                else f"{name} was not running"
+            )
+            return 0
+        elif action == "logs":
+            if args.lines <= 0:
+                raise CycloError("--lines must be a positive integer")
+            output = providers.component_logs(name, args.lines)
+            if output:
+                print(output)
+            return 0
+        else:
+            raise CycloError(f"unknown component action: {action}")
+    _print_component_statuses((status,))
+    return 0 if status.works else 1
 
 
 def cmd_gateway(args: argparse.Namespace) -> int:
@@ -999,7 +1119,8 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     proxy = gateway(args, store)
     action = args.gateway_action
     if action == "providers":
-        print(proxy.providers())
+        with store.locked():
+            print(proxy.providers())
         return 0
     if action == "status":
         return _print_gateway_status(proxy.status(), proxy.store_volume)
@@ -1012,18 +1133,17 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         if args.api_key_stdin:
             login_args.append("--api-key-stdin")
         with store.locked():
-            proxy.login(login_args)
-        print("restart the gateway to refresh its model catalogue")
-        return 0
+            status = proxy.login(login_args)
+        return _print_gateway_status(status, proxy.store_volume)
     with store.locked():
         if action == "build":
-            image = proxy.build()
-            print(image)
-            return _print_gateway_status(proxy.restart(build=False), proxy.store_volume)
+            status = proxy.restart()
+            print(status.image_id)
+            return _print_gateway_status(status, proxy.store_volume)
         if action == "start":
             return _print_gateway_status(proxy.start(), proxy.store_volume)
         if action == "restart":
-            return _print_gateway_status(proxy.restart(build=args.build), proxy.store_volume)
+            return _print_gateway_status(proxy.restart(), proxy.store_volume)
         if action == "stop":
             print("stopped gateway" if proxy.stop() else "gateway was not running")
             return 0
@@ -1090,18 +1210,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         failures += 1
         print(f"no  persisted instance state: {exc}")
 
-    docker = ComponentDocker()
-    ok, detail = docker.available()
+    controller = ComponentController()
+    ok, detail = controller.available()
     if not ok:
         print(f"no  Docker daemon: {detail}")
         return 1
     print(f"ok  Docker daemon: {detail}")
 
     try:
-        stack = provider_stack(args, store)
+        providers = provider_system(args, store)
         print(
-            f"ok  host provider configuration: {stack.assembly.path} "
-            f"({len(stack.assembly.providers)} component(s))"
+            "ok  host provider configuration: "
+            f"{providers.configuration.path} "
+            f"({len(providers.configuration.providers)} component(s))"
         )
     except CycloError as exc:
         failures += 1
@@ -1109,25 +1230,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        status = stack.status()
-        if not status.gateway.ready:
-            raise CycloError(f"gateway is {_component_state(status.gateway)}")
-        print("ok  credential gateway: current and ready")
+        statuses = providers.statuses()
     except CycloError as exc:
         failures += 1
-        print(f"no  credential gateway: {exc}")
+        print(f"no  component inspection: {exc}")
         return 1
 
-    for component in status.components:
-        state = _component_state(component)
-        if component.ready:
-            print(f"ok  provider component {component.instance}: ready")
+    for status in statuses:
+        state = _component_state(status)
+        label = (
+            "credential gateway"
+            if status.name == "gateway"
+            else f"provider component {status.name}"
+        )
+        if status.works:
+            print(f"ok  {label}: ready")
         else:
             failures += 1
-            print(f"no  provider component {component.instance}: {state}")
-    if status.ready:
+            detail = f" ({status.error})" if status.error else ""
+            print(f"no  {label}: {state}{detail}")
+    gateway_status = statuses[0]
+    if gateway_status.works:
         try:
-            models = stack.model_ids()
+            models = providers.model_ids()
             print(f"ok  outer provider catalogue: {len(models)} model(s)")
         except CycloError as exc:
             failures += 1
@@ -1139,12 +1264,10 @@ def add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--state-root",
         default=os.environ.get("CYCLO_STATE_ROOT"),
-        help="Cyclo state directory (default: $XDG_STATE_HOME/cyclo)",
-    )
-    parser.add_argument(
-        "--host-config",
-        default=os.environ.get("CYCLO_HOST_CONFIG", str(DEFAULT_HOST_CONFIG)),
-        help="provider assembly (default: /etc/cyclo/host.conf)",
+        help=(
+            "Cyclo installation directory; also selects STATE_ROOT/host.conf "
+            "(default state uses /etc/cyclo/host.conf)"
+        ),
     )
 
 
@@ -1155,7 +1278,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Everyday:  validate, run, stop, ps, inspect, logs, task, dashboard\n"
             "Authoring: team, project\n"
-            "Host:      models, usage, gateway, providers, doctor, refresh, repair"
+            "Host:      models, usage, component, gateway, providers, doctor, "
+            "refresh, repair"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1225,7 +1349,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     refresh = commands.add_parser(
         "refresh",
-        help="rebuild installed runtimes and restart the active Cyclo system",
+        help="restart the active Cyclo system and rebuild changed images",
     )
     refresh.set_defaults(func=cmd_refresh)
 
@@ -1245,11 +1369,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--port", type=int, default=0, help="AgentWS port; 0 chooses a free port")
     run.add_argument("--verbose", action="store_true")
     run.add_argument("--foreground", action="store_true")
-    run.add_argument(
-        "--build",
-        action="store_true",
-        help="rebuild the common runtime and selected derived team images",
-    )
     run.add_argument("--dry-run", action="store_true", help="print the team Docker command")
     run.set_defaults(func=cmd_run)
 
@@ -1321,27 +1440,79 @@ def build_parser() -> argparse.ArgumentParser:
     )
     repair.set_defaults(func=cmd_repair)
 
+    component = commands.add_parser(
+        "component",
+        help="inspect and control individual host components",
+        description=(
+            "List, inspect, build, start, stop, restart, or read logs from one "
+            "configured component. The inventory is the fixed gateway plus "
+            "providers declared in host.conf."
+        ),
+    )
+    component_commands = component.add_subparsers(
+        dest="component_action",
+        required=True,
+    )
+    component_list = component_commands.add_parser(
+        "list",
+        help="list configured components and their current status",
+    )
+    component_list.set_defaults(func=cmd_component)
+    component_status = component_commands.add_parser(
+        "status",
+        help="show all components or one named component",
+    )
+    component_status.add_argument(
+        "name",
+        nargs="?",
+        help="configured component name; omit to show all",
+    )
+    component_status.set_defaults(func=cmd_component)
+    for action, help_text in (
+        ("build", "build and validate one component image"),
+        ("start", "build and start one component"),
+        ("stop", "stop one component"),
+        ("restart", "build and restart one component"),
+    ):
+        selected = component_commands.add_parser(action, help=help_text)
+        selected.add_argument("name")
+        selected.set_defaults(func=cmd_component)
+    component_logs = component_commands.add_parser(
+        "logs",
+        help="show recent logs from one component",
+    )
+    component_logs.add_argument("name")
+    component_logs.add_argument(
+        "--lines",
+        type=int,
+        default=80,
+        help="number of log lines (default: 80)",
+    )
+    component_logs.set_defaults(func=cmd_component)
+
     providers = commands.add_parser(
         "providers",
-        help="manage the ordered Provider components declared in host.conf",
+        help="manage Provider components declared in host.conf",
         description=(
-            "Build, start, inspect, or stop the ordered Provider component stack. "
-            "The fixed credential gateway is its independent root."
+            "Validate, build, start, inspect, or stop the Provider components "
+            "declared in host.conf. Each component reports its own status; "
+            "the gateway remains the independent root provider."
         ),
     )
     provider_commands = providers.add_subparsers(dest="providers_action", required=True)
     provider_help = {
         "check": "validate host.conf and component declarations",
-        "build": "build every configured provider image without restarting",
-        "start": "start configured providers; the gateway must already be ready",
+        "build": "ask Docker to build every provider image without restarting",
+        "start": "build and start each configured provider",
         "stop": "stop provider components without stopping the gateway",
-        "status": "show gateway dependency and provider readiness",
+        "status": "show each provider component independently",
     }
     for action, help_text in provider_help.items():
         selected = provider_commands.add_parser(action, help=help_text)
         selected.set_defaults(func=cmd_providers)
-    restart = provider_commands.add_parser("restart", help="restart provider components")
-    restart.add_argument("--build", action="store_true", help="build before restarting")
+    restart = provider_commands.add_parser(
+        "restart", help="build through Docker and restart provider components"
+    )
     restart.set_defaults(func=cmd_providers)
 
     gateway_parser = commands.add_parser(
@@ -1367,10 +1538,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     provider_catalogue.set_defaults(func=cmd_gateway)
     gateway_help = {
-        "build": "build and restart the gateway",
-        "start": "start the current gateway image",
+        "build": "build through Docker and restart the gateway",
+        "start": "build and start the gateway",
         "stop": "stop the gateway without deleting its credential store",
-        "status": "show gateway readiness, image freshness, and store volume",
+        "status": "show gateway readiness, image identity, and store volume",
     }
     for action, help_text in gateway_help.items():
         selected = gateway_commands.add_parser(action, help=help_text)
@@ -1390,15 +1561,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="exact gateway Docker volume name",
     )
     destroy.set_defaults(func=cmd_gateway)
-    gateway_restart = gateway_commands.add_parser("restart", help="restart the gateway")
-    gateway_restart.add_argument("--build", action="store_true", help="build before restarting")
+    gateway_restart = gateway_commands.add_parser(
+        "restart", help="build through Docker and restart the gateway"
+    )
     gateway_restart.set_defaults(func=cmd_gateway)
     login = gateway_commands.add_parser(
         "login",
         help="store credentials for a provider account",
         description=(
             "Authenticate a catalogue provider/account name. The account name becomes "
-            "the model prefix (default: PROVIDER)."
+            "the model prefix (default: PROVIDER). Login publishes the updated "
+            "catalogue automatically."
         ),
     )
     login.add_argument("provider", help="gateway provider ID")
@@ -1428,13 +1601,13 @@ def _normalize_global_options(argv: list[str]) -> list[str]:
         if argument == "--":
             remaining.extend(argv[index:])
             break
-        if argument in {"--state-root", "--host-config"}:
+        if argument == "--state-root":
             global_options.append(argument)
             index += 1
             if index >= len(argv):
                 break
             global_options.append(argv[index])
-        elif argument.startswith("--state-root=") or argument.startswith("--host-config="):
+        elif argument.startswith("--state-root="):
             global_options.append(argument)
         else:
             remaining.append(argument)

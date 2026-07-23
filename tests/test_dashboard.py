@@ -21,22 +21,25 @@ from cyclo.dashboard import (
     scan_agentws_queue,
     validate_dashboard_host,
 )
-from cyclo.component_stack import (
-    ComponentStatus,
-    DockerStatus,
-    GatewayStatus,
-    StackStatus,
-)
+from cyclo.component import ComponentStatus
 from cyclo.errors import CycloError
 from cyclo.installation import team_container_name, team_network_name
+from cyclo.providers import ProviderConnection
 from cyclo.state import Instance, StateStore
 
 
 PROVIDER_GENERATION = "provider-generation"
 PROVIDER_SOCKET = Path("/var/lib/cyclo/providers/component.sock")
+GATEWAY_SOCKET = Path("/var/lib/cyclo/gateway/component.sock")
 
 
-def instance(identifier: str, *, active: bool = True, offline: bool = False) -> Instance:
+def instance(
+    identifier: str,
+    *,
+    active: bool = True,
+    offline: bool = False,
+    provider_socket: Path = GATEWAY_SOCKET,
+) -> Instance:
     return Instance(
         id=identifier,
         team_name=f"team-{identifier}",
@@ -52,7 +55,7 @@ def instance(identifier: str, *, active: bool = True, offline: bool = False) -> 
         offline=offline,
         active=active,
         port=4100 if not offline else None,
-        provider_socket_path=str(PROVIDER_SOCKET),
+        provider_socket_path=str(provider_socket),
         provider_generation=PROVIDER_GENERATION,
     )
 
@@ -304,68 +307,100 @@ class FakeUsage:
 
 
 class FakeProvider:
-    def __init__(self, status: StackStatus) -> None:
-        self.selected_status = status
+    def __init__(self, connection: ProviderConnection) -> None:
+        self.selected_connection = connection
         self.calls = 0
 
-    def status(self) -> StackStatus:
+    def statuses(self) -> tuple[ComponentStatus, ...]:
         self.calls += 1
-        return self.selected_status
+        return self.selected_connection.components
+
+    def connection(
+        self,
+        statuses: tuple[ComponentStatus, ...] | None = None,
+    ) -> ProviderConnection:
+        assert statuses is None or statuses == self.selected_connection.components
+        return self.selected_connection
 
 
-def docker_status(
+def component_status(
     *,
+    name: str = "gateway",
     present: bool = True,
     running: bool = True,
     current: bool = True,
-    lifecycle: str | None = None,
+    container_state: str | None = None,
     engine_health: str = "healthy",
-) -> DockerStatus:
-    return DockerStatus(
+    ready: bool = True,
+) -> ComponentStatus:
+    return ComponentStatus(
+        name,
+        "gateway" if name == "gateway" else "passthrough",
         "sha256:" + "1" * 64,
         "1" * 64 if present else None,
         running,
-        lifecycle or ("running" if running else "stopped"),
+        container_state or ("running" if running else "stopped"),
         engine_health,
         current,
+        "ready" if ready else "not-ready",
     )
 
 
 def provider_status(
     *,
-    gateway_docker: DockerStatus | None = None,
+    gateway_docker: ComponentStatus | None = None,
     gateway_ready: bool = True,
     component_name: str | None = None,
-    component_docker: DockerStatus | None = None,
+    component_docker: ComponentStatus | None = None,
     component_ready: bool = True,
-) -> StackStatus:
-    gateway_docker = gateway_docker or docker_status()
-    components = ()
+) -> ProviderConnection:
+    gateway = gateway_docker or component_status(ready=gateway_ready)
+    if gateway.health == "ready" and not gateway_ready:
+        gateway = ComponentStatus(
+            gateway.name,
+            gateway.kind,
+            gateway.image_id,
+            gateway.container_id,
+            gateway.running,
+            gateway.container_state,
+            gateway.engine_health,
+            gateway.current,
+            "not-ready",
+            gateway.error,
+        )
+    components: tuple[ComponentStatus, ...] = ()
     if component_name is not None:
-        selected_docker = component_docker or docker_status()
-        components = (
-            ComponentStatus(
+        selected = component_docker or component_status(
+            name=component_name,
+            ready=component_ready,
+        )
+        if selected.name != component_name or (
+            selected.health == "ready" and not component_ready
+        ):
+            selected = ComponentStatus(
                 component_name,
                 "passthrough",
-                True,
-                component_ready,
-                component_ready,
-                selected_docker,
-            ),
+                selected.image_id,
+                selected.container_id,
+                selected.running,
+                selected.container_state,
+                selected.engine_health,
+                selected.current,
+                "ready" if component_ready else "not-ready",
+                selected.error,
+            )
+        components = (
+            selected,
         )
-    ready = gateway_ready and all(component.ready for component in components)
-    return StackStatus(
+    selected_socket = (
+        PROVIDER_SOCKET
+        if components and components[-1].works
+        else GATEWAY_SOCKET
+    )
+    return ProviderConnection(
         PROVIDER_GENERATION,
-        PROVIDER_SOCKET,
-        GatewayStatus(
-            Path("/var/lib/cyclo/gateway/component.sock"),
-            True,
-            gateway_ready,
-            gateway_ready,
-            gateway_docker,
-        ),
-        components,
-        ready,
+        selected_socket,
+        (gateway, *components),
     )
 
 
@@ -480,7 +515,7 @@ def test_snapshot_reports_unresolved_planner_failure_as_attention(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    persist(store, instance("alpha"))
+    persist(store, instance("alpha", provider_socket=GATEWAY_SOCKET))
     root = queue(store, "alpha")
     mark_supervisor_ready(root)
     job = root / "jobs" / "uart-plan"
@@ -542,15 +577,21 @@ def test_snapshot_preserves_provider_failure_beside_agent_suspension(
         provider_reader=FakeProvider(
             provider_status(
                 component_name="fusion",
-                component_docker=docker_status(running=False),
+                component_docker=component_status(
+                    name="fusion",
+                    running=False,
+                ),
                 component_ready=False,
             )
         ),
     ).build()
 
     assert result["instances"][0]["health"] == {
-        "state": "provider-down",
-        "reason": "fusion stopped; 1 agent suspended: planner-1",
+        "state": "agents-suspended",
+        "reason": (
+            "ignored unavailable optional components: fusion stopped; "
+            "1 agent suspended: planner-1"
+        ),
     }
     assert result["summary"]["provider_issues"] == 1
     assert result["summary"]["attention"] == 1
@@ -561,7 +602,10 @@ def test_snapshot_preserves_provider_failure_beside_agent_suspension(
     [
         (
             provider_status(
-                gateway_docker=docker_status(present=False, running=False),
+                gateway_docker=component_status(
+                    present=False,
+                    running=False,
+                ),
                 gateway_ready=False,
             ),
             "provider-down",
@@ -570,31 +614,37 @@ def test_snapshot_preserves_provider_failure_beside_agent_suspension(
         (
             provider_status(
                 component_name="fusion",
-                component_docker=docker_status(running=False),
+                component_docker=component_status(
+                    name="fusion",
+                    running=False,
+                ),
                 component_ready=False,
             ),
-            "provider-down",
-            "fusion stopped",
+            "ready",
+            "ignored unavailable optional components: fusion stopped",
         ),
         (
             provider_status(
                 component_name="fusion",
-                component_docker=docker_status(current=False),
+                component_docker=component_status(
+                    name="fusion",
+                    current=False,
+                ),
             ),
-            "provider-stale",
-            "configuration or image stale: fusion",
+            "ready",
+            "ignored unavailable optional components: fusion stale",
         ),
     ],
 )
 def test_snapshot_exposes_exact_provider_health_and_reads_it_once(
     tmp_path: Path,
-    status: StackStatus,
+    status: ProviderConnection,
     health_state: str,
     reason: str,
 ) -> None:
     store = StateStore(tmp_path / "state")
     for identifier in ("alpha", "beta"):
-        persist(store, instance(identifier))
+        persist(store, instance(identifier, provider_socket=status.socket_path))
         mark_supervisor_ready(queue(store, identifier))
     persist(store, instance("stopped", active=False))
     queue(store, "stopped")
@@ -631,7 +681,7 @@ def test_snapshot_reports_provider_status_errors_as_unknown(tmp_path: Path) -> N
         calls = 0
 
         @classmethod
-        def status(cls) -> StackStatus:
+        def statuses(cls) -> tuple[ComponentStatus, ...]:
             cls.calls += 1
             raise CycloError("Docker socket denied")
 

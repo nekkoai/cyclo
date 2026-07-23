@@ -54,7 +54,7 @@ docker build --pull -t cyclo-passthrough:0.2.0 \
 docker run --rm --network none \
   -e CYCLO_HOST_UID=1000 -e CYCLO_HOST_GID=1000 \
   cyclo-team:0.2.0 python3 --version
-PYTHONPATH=src python3 -c 'from pathlib import Path; from cyclo.team_runtime_image import docker_runner, ensure_derived, image_id; base = docker_runner.inspect("image", "cyclo-team:0.2.0", missing=False); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); ensure_derived("cyclo-derived-team:0.2.0", root, image_id(base), build=True)'
+PYTHONPATH=src python3 -c 'from pathlib import Path; from cyclo.team_runtime_image import docker_runner, ensure_derived, image_id; base = docker_runner.inspect("image", "cyclo-team:0.2.0", missing=False); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); ensure_derived("cyclo-derived-team:0.2.0", root, image_id(base))'
 docker run --rm --network none --entrypoint /bin/sh \
   cyclo-derived-team:0.2.0 -ceu \
   'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
@@ -123,6 +123,7 @@ python3 -m venv /tmp/cyclo-release
 python -m pip install ./cyclo_agent-0.2.0-py3-none-any.whl
 cyclo --version
 cyclo team templates
+cyclo component list
 cyclo gateway status
 cyclo providers status
 ```
@@ -138,19 +139,15 @@ operate shared services in dependency order:
 
 ```sh
 sudo install -d -m 0755 /etc/cyclo
-cyclo gateway build
 cyclo gateway providers
 cyclo gateway login PROVIDER
-cyclo gateway restart
-cyclo providers check
-cyclo providers restart --build
-cyclo doctor
 cyclo models
+cyclo doctor
 ```
 
-The order is intentional: credential gateway, configured provider components,
-then `doctor`. None of `doctor`, `models`, or `run` starts or rebuilds these
-shared components.
+The order is intentional: login starts and publishes the credential gateway,
+then `models` builds and starts the configured provider components. `doctor`
+remains an observational check of the resulting installation.
 
 Initialize one packaged team, run `cyclo validate`, and perform a `run
 --dry-run` against a disposable project. Compare the copied wheel against

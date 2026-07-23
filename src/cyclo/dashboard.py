@@ -215,7 +215,10 @@ class DashboardSnapshot:
             "running": sum(1 for item in rows if item["state"] == "running"),
             "provider_issues": int(
                 shared_provider is not None
-                and shared_provider[0].state.startswith("provider-")
+                and (
+                    shared_provider[0].state.startswith("provider-")
+                    or bool(shared_provider[0].reason)
+                )
             ),
             "attention": sum(
                 1
@@ -223,6 +226,10 @@ class DashboardSnapshot:
                 if item["state"] in {"stale", "orphan", "unknown"}
                 or str(item["health"]["state"]).startswith("provider-")  # type: ignore[index]
                 or str(item["health"]["state"]).startswith("agents-")  # type: ignore[index]
+                or (
+                    item["health"]["state"] == "ready"  # type: ignore[index]
+                    and bool(item["health"]["reason"])  # type: ignore[index]
+                )
                 or item["counts"]["jobs"]["failed"] > 0  # type: ignore[index]
                 or bool(item["errors"])
             ),

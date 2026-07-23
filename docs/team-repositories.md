@@ -67,7 +67,7 @@ Four separate inputs have separate owners:
 
 | Input | Owns |
 |---|---|
-| `/etc/cyclo/host.conf` | Installation-wide provider composition and available models |
+| Installation `host.conf` | Installation-wide provider composition and available models |
 | Team repository | Agent roster, role behavior, optional team policy, and optionally the execution-image delta |
 | `project.cyclo` | Which teams run, which directories they receive, and each mount mode |
 | Cyclo state root | Tasks, jobs, comments, results, transcripts, Pi state, generated runtime files, and instance metadata |
@@ -91,8 +91,8 @@ A `team PATH ro` line is the normal reproducible mode. `team PATH rw`
 deliberately exposes the same Git working tree read-write at `/team`, allowing
 agents to edit their own roster, roles, policy, or Dockerfile. Such a Dockerfile
 edit affects the image selected by the next operator-initiated
-`cyclo run --build` or `cyclo refresh`; it never changes the image of an
-already running container.
+`cyclo run` or `cyclo refresh`; it never changes the image of an already
+running container.
 
 ## Optional derived team image
 
@@ -143,11 +143,11 @@ The team definition and execution image have related but distinct identities:
 
 - the **team generation** is the Git commit plus the live roster, roles, and
   optional team policy digest;
-- the **image generation** is the last successfully built team image, labelled
-  with the exact Cyclo-compatible base image ID.
+- the **image generation** is the exact ID of the last successfully built team
+  image, labelled with the exact Cyclo-compatible base image ID.
 
-An instance records both. Changing prompts does not imply an image rebuild.
-After changing Dockerfile inputs, explicitly run with `--build`.
+An instance records both. Docker alone interprets `.dockerignore` and decides
+whether a changed file affects the build cache.
 
 The accepted build lifecycle is:
 
@@ -158,22 +158,19 @@ The accepted build lifecycle is:
 5. Promote the expected tag only after the candidate succeeds.
 6. Record and run the exact resulting image ID.
 
-An ordinary `cyclo run` reuses an image built against the current base and
-refuses a missing image or one built against a different base. Cyclo does not
-guess whether arbitrary Docker build inputs changed. Rerunning the same project
-with `cyclo run --build` explicitly authorizes the common base and every
-selected derived image to build.
-`cyclo refresh` provides the corresponding explicit rebuild-and-restart
-operation for active projects and completes every image build before stopping
-the running fleet. Only the latest successfully promoted image is operational
-state; Cyclo keeps no registry of historical local builds.
+An ordinary `cyclo run` asks Docker to build the common runtime and each
+selected derived image. Docker applies the applicable `.dockerignore` or
+`Dockerfile.dockerignore` and reuses cached work. Cyclo passes the exact common
+base image ID, validates the completed candidate, and transactionally promotes
+it before starting any team. `cyclo refresh` stops and restarts the selected
+system through the same build path. Only the latest successfully promoted image
+is operational state; Cyclo keeps no registry of historical local builds.
 
-`cyclo run --build` and `cyclo refresh` authorize Cyclo to execute the selected
-team repository's Dockerfile through the Docker daemon and are therefore
-host-administration actions. Review the repository exactly as an installed
-provider component. An ordinary `cyclo run` never executes changed
-team-controlled build input. Runtime container isolation cannot make an unsafe
-build recipe safe to execute on the host.
+Running or refreshing a team with a Dockerfile authorizes Cyclo to execute that
+repository's build through the Docker daemon and is therefore a
+host-administration action. Review the repository exactly as an installed
+provider component. Runtime container isolation cannot make an unsafe build
+recipe safe to execute on the host.
 
 ## Reusable toolchain layers
 

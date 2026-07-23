@@ -180,11 +180,8 @@ class StateStore:
 
     @property
     def system(self) -> str:
-        """Stable installation identity derived from the canonical state root."""
+        """Stable installation identity derived from its component-state root."""
 
-        # Gateway and provider resources have always used the component-state
-        # root as their namespace input. Reuse it so every Docker resource in
-        # this installation carries one identity without renaming those stores.
         return installation_id(self.components_root)
 
     def _validate_resource_namespace(self, instance: Instance) -> None:

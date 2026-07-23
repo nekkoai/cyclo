@@ -236,11 +236,6 @@ def validate_run_options(args: argparse.Namespace, *, team_count: int) -> None:
             "--foreground is ambiguous for a project with multiple teams; "
             "use `cyclo logs -f INSTANCE`"
         )
-    if args.image and args.build:
-        raise CycloError(
-            "--build cannot rebuild an operator-supplied --image; build that "
-            "image separately or omit --image to build Cyclo team images"
-        )
 
 
 def project_run_bindings(

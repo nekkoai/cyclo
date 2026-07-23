@@ -10,8 +10,15 @@ from types import SimpleNamespace
 import pytest
 
 from cyclo.agentws_queue import AgentSupervisorStatus
-from cyclo.cli import _prepare_team_images, build_parser, main
-from cyclo.component_stack import COMPONENT_INTERFACE, PROVIDER_INTERFACE
+from cyclo.cli import (
+    DEFAULT_HOST_CONFIG,
+    _prepare_team_images,
+    build_parser,
+    host_config,
+    main,
+    state_store,
+)
+from cyclo.component import COMPONENT_INTERFACE, PROVIDER_INTERFACE
 from cyclo.errors import CycloError
 from cyclo.health import ProviderHealth
 from cyclo.installation import (
@@ -95,43 +102,52 @@ def persist(store: StateStore, selected: Instance) -> None:
     store.save(selected)
 
 
-def docker_status(
+def component_status(
     *,
+    name: str = "gateway",
     present: bool = True,
     running: bool = True,
     current: bool = True,
-    lifecycle: str = "running",
+    container_state: str = "running",
+    ready: bool = True,
+    error: str = "",
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        name=name,
+        kind="gateway" if name == "gateway" else "passthrough",
         image_id="sha256:" + "a" * 64,
         container_id="b" * 64 if present else None,
         running=running,
         current=current,
-        lifecycle=lifecycle,
+        container_state=container_state,
         engine_health="healthy" if running else "none",
+        health="ready" if ready else "not-ready",
+        error=error,
+        works=bool(present and running and current and ready and not error),
     )
 
 
 def gateway_status(*, ready: bool = True, current: bool = True) -> SimpleNamespace:
-    return SimpleNamespace(
+    return component_status(
+        name="gateway",
         ready=ready,
-        docker=docker_status(current=current),
-        socket_path=Path("/run/cyclo/gateway/component.sock"),
+        current=current,
     )
 
 
-def stack_status(socket_path: Path, *, ready: bool = True) -> SimpleNamespace:
-    component = SimpleNamespace(
-        instance="pass",
+def provider_connection(
+    socket_path: Path,
+    *,
+    ready: bool = True,
+) -> SimpleNamespace:
+    component = component_status(
+        name="pass",
         ready=ready,
-        docker=docker_status(),
     )
     return SimpleNamespace(
         generation="provider-generation",
-        provider_socket_path=socket_path,
-        gateway=gateway_status(ready=ready),
-        components=(component,),
-        ready=ready,
+        socket_path=socket_path,
+        components=(gateway_status(), component),
     )
 
 
@@ -158,33 +174,37 @@ class RecordingStore:
         return self.root / "instances" / identifier / "agentws-state"
 
 
-class RunStack:
+class RunSystem:
     def __init__(self, socket_path: Path) -> None:
-        self.status_value = stack_status(socket_path)
-        self.provider_socket_path = socket_path
-        self.assembly = SimpleNamespace(generation="provider-generation")
+        self.connection_value = provider_connection(socket_path)
+        self.configured_socket_path = socket_path
+        self.configuration = SimpleNamespace(generation="provider-generation")
+        self.gateway = SimpleNamespace(
+            socket_path=Path("/run/cyclo/gateway/component.sock")
+        )
         self.calls: list[str] = []
 
-    def require_ready(self):
-        self.calls.append("require_ready")
-        return self.status_value
+    def start(self):
+        self.calls.append("start")
+        return self.connection_value
 
-    def models_document(self):
+    def models_document(self, connection=None):
         self.calls.append("models_document")
+        assert connection is self.connection_value
         return {"models": [{"id": model} for model in MODELS]}
 
 
 def install_run_fakes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-) -> RunStack:
+) -> RunSystem:
     source = tmp_path / "agentws"
     source.mkdir()
     socket_dir = tmp_path / "provider-socket"
     socket_dir.mkdir()
-    stack = RunStack(socket_dir / "component.sock")
+    stack = RunSystem(socket_dir / "component.sock")
     monkeypatch.setattr("cyclo.cli.agentws_root", lambda: source)
-    monkeypatch.setattr("cyclo.cli.provider_stack", lambda *_args, **_kwargs: stack)
+    monkeypatch.setattr("cyclo.cli.provider_system", lambda *_args, **_kwargs: stack)
     monkeypatch.setattr(
         "cyclo.cli._prepare_team_images",
         lambda _bindings, **_kwargs: None,
@@ -220,6 +240,7 @@ def test_parser_exposes_only_the_cutover_command_surface() -> None:
         "usage",
         "models",
         "repair",
+        "component",
         "providers",
         "gateway",
         "doctor",
@@ -254,6 +275,30 @@ def test_run_parser_has_one_project_argument_and_loopback_default() -> None:
     assert args.project == "project.cyclo"
     assert not hasattr(args, "team")
     assert args.host == "127.0.0.1"
+
+
+def test_state_root_selects_the_host_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CYCLO_STATE_ROOT", raising=False)
+    default_args = build_parser().parse_args(["doctor"])
+    default_store = state_store(default_args)
+    assert host_config(default_args, default_store) == DEFAULT_HOST_CONFIG
+
+    selected = tmp_path / "installation"
+    explicit_args = build_parser().parse_args(
+        ["--state-root", str(selected), "doctor"]
+    )
+    explicit_store = state_store(explicit_args)
+    assert host_config(explicit_args, explicit_store) == selected / "host.conf"
+    assert not hasattr(explicit_args, "host_config")
+
+    configured = tmp_path / "environment-installation"
+    monkeypatch.setenv("CYCLO_STATE_ROOT", str(configured))
+    environment_args = build_parser().parse_args(["doctor"])
+    environment_store = state_store(environment_args)
+    assert host_config(environment_args, environment_store) == configured / "host.conf"
 
 
 def test_team_commands_own_initialization_and_template_discovery() -> None:
@@ -333,7 +378,7 @@ def test_project_init_rejects_bad_input_without_leaving_a_definition(
     assert not definition.exists()
 
 
-def test_refresh_builds_before_stopping_and_restarts_active_projects(
+def test_refresh_stops_then_rebuilds_provider_system_and_active_projects(
     tmp_path: Path,
     team_repo: Path,
     project_repo: Path,
@@ -361,25 +406,10 @@ def test_refresh_builds_before_stopping_and_restarts_active_projects(
     store = RecordingStore(tmp_path / "state", [selected])
     events: list[str] = []
 
-    class RefreshGateway:
-        @staticmethod
-        def build():
-            events.append("gateway-build")
-
-        @staticmethod
-        def restart(*, build):
-            assert build is False
-            events.append("gateway-restart")
-
     class RefreshStack:
         @staticmethod
-        def build():
-            events.append("providers-build")
-
-        @staticmethod
-        def restart(*, build):
-            assert build is False
-            events.append("providers-restart")
+        def restart():
+            events.append("provider-system-restart")
 
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
     monkeypatch.setattr("cyclo.cli.Docker", lambda: object())
@@ -387,19 +417,9 @@ def test_refresh_builds_before_stopping_and_restarts_active_projects(
         "cyclo.cli.active_instances",
         lambda selected_store, _docker: list(selected_store.instances),
     )
-    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: RefreshGateway())
-    monkeypatch.setattr("cyclo.cli.provider_stack", lambda _args, _store: RefreshStack())
     monkeypatch.setattr(
-        "cyclo.cli.ensure_team_runtime_image",
-        lambda image, *, build: events.append(f"image-build:{image}:{build}")
-        or "sha256:" + "a" * 64,
-    )
-    monkeypatch.setattr(
-        "cyclo.cli.ensure_derived_team_image",
-        lambda image, _root, base, *, build: events.append(
-            f"derived-build:{image}:{base}:{build}"
-        )
-        or "sha256:" + "b" * 64,
+        "cyclo.cli.provider_system",
+        lambda _args, _store: RefreshStack(),
     )
     monkeypatch.setattr(
         "cyclo.cli.stop_instance",
@@ -412,7 +432,6 @@ def test_refresh_builds_before_stopping_and_restarts_active_projects(
         assert project_args.offline is True
         assert project_args.host == "0.0.0.0"
         assert project_args.port == 4317
-        assert project_args.build is False
         events.append(f"run:{project_args.project}")
         return 0
 
@@ -420,24 +439,8 @@ def test_refresh_builds_before_stopping_and_restarts_active_projects(
 
     assert main(["refresh"]) == 0
     stopped = "stop:integration-project-review-team"
-    assert events.index("gateway-build") < events.index(stopped)
-    assert events.index("providers-build") < events.index(stopped)
-    assert events.index(stopped) < events.index("gateway-restart")
-    assert events.index("gateway-restart") < events.index("providers-restart")
-    assert events.index("providers-restart") < events.index(f"run:{definition}")
-    assert (
-        f"image-build:{team_image_name(store.system, '0.2.0')}:True"
-        in events
-    )
-    derived = derived_team_image_name(
-        store.system,
-        "0.2.0",
-        team_repo,
-        team_repo.name,
-    )
-    derived_event = f"derived-build:{derived}:sha256:{'a' * 64}:True"
-    assert derived_event in events
-    assert events.index(derived_event) < events.index(stopped)
+    assert events.index(stopped) < events.index("provider-system-restart")
+    assert events.index("provider-system-restart") < events.index(f"run:{definition}")
     assert "Cyclo refresh complete" in capsys.readouterr().out
 
 
@@ -591,7 +594,7 @@ def test_project_dry_run_selects_a_derived_image_per_team_dockerfile(
     )
 
 
-def test_run_rejects_build_with_an_operator_managed_image(
+def test_run_has_no_manual_build_mode(
     tmp_path: Path,
     team_repo: Path,
     project_repo: Path,
@@ -605,20 +608,16 @@ def test_run_rejects_build_with_an_operator_managed_image(
     )
     install_run_fakes(monkeypatch, tmp_path)
 
-    assert (
+    with pytest.raises(SystemExit, match="2"):
         main(
             [
                 "run",
                 "--dry-run",
                 "--build",
-                "--image",
-                "custom:approved",
                 str(definition),
             ]
         )
-        == 1
-    )
-    assert "cannot rebuild an operator-supplied --image" in capsys.readouterr().err
+    assert "unrecognized arguments: --build" in capsys.readouterr().err
 
 
 def test_prepare_team_images_resolves_base_and_derived_tags_to_exact_ids(
@@ -645,12 +644,12 @@ def test_prepare_team_images_resolves_base_and_derived_tags_to_exact_ids(
     calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(
         "cyclo.cli.ensure_team_runtime_image",
-        lambda image, *, build: calls.append(("base", image, build)) or base_id,
+        lambda image: calls.append(("base", image)) or base_id,
     )
     monkeypatch.setattr(
         "cyclo.cli.ensure_derived_team_image",
-        lambda image, root, base, *, build: calls.append(
-            ("derived", image, root, base, build)
+        lambda image, root, base: calls.append(
+            ("derived", image, root, base)
         )
         or derived_id,
     )
@@ -659,20 +658,18 @@ def test_prepare_team_images_resolves_base_and_derived_tags_to_exact_ids(
         _prepare_team_images(
             bindings,
             base_image="base:tag",
-            build=False,
         )
         == base_id
     )
     assert plain_instance.image == base_id
     assert derived_instance.image == derived_id
     assert calls == [
-        ("base", "base:tag", False),
+        ("base", "base:tag"),
         (
             "derived",
             "derived:tag",
             derived.root,
             base_id,
-            False,
         ),
     ]
 
@@ -698,7 +695,6 @@ def test_prepare_team_images_never_rebuilds_an_operator_override(
         _prepare_team_images(
             (binding,),
             base_image="base:tag",
-            build=False,
         )
         is None
     )
@@ -734,9 +730,7 @@ def test_run_preflights_every_team_then_starts_project_bindings(
 
     monkeypatch.setattr("cyclo.cli.start_binding", start)
 
-    result = main(
-        ["--state-root", str(tmp_path / "state"), "run", "--build", str(definition)]
-    )
+    result = main(["--state-root", str(tmp_path / "state"), "run", str(definition)])
 
     assert result == 0
     assert [event[0] for event in events] == [
@@ -812,8 +806,9 @@ class GatewayDouble:
         self.calls.append(("status",))
         return self.status_value
 
-    def login(self, arguments) -> None:
+    def login(self, arguments):
         self.calls.append(("login", tuple(arguments)))
+        return self.status_value
 
     def build(self) -> str:
         self.calls.append(("build",))
@@ -823,8 +818,8 @@ class GatewayDouble:
         self.calls.append(("start",))
         return self.status_value
 
-    def restart(self, *, build: bool = False):
-        self.calls.append(("restart", build))
+    def restart(self):
+        self.calls.append(("restart",))
         return self.status_value
 
     def stop(self) -> bool:
@@ -843,11 +838,11 @@ class GatewayDouble:
 @pytest.mark.parametrize(
     ("arguments", "call", "locks", "output"),
     (
-        (("providers",), ("providers",), 0, "OpenAI API"),
+        (("providers",), ("providers",), 1, "OpenAI API"),
         (("status",), ("status",), 0, "gateway\tready"),
-        (("build",), ("build",), 1, "sha256:"),
+        (("build",), ("restart",), 1, "sha256:"),
         (("start",), ("start",), 1, "gateway\tready"),
-        (("restart", "--build"), ("restart", True), 1, "gateway\tready"),
+        (("restart",), ("restart",), 1, "gateway\tready"),
         (("stop",), ("stop",), 1, "stopped gateway"),
         (
             ("destroy-store", "--confirm", "cyclo-gateway-state"),
@@ -871,14 +866,16 @@ def test_gateway_actions_use_only_the_gateway_component(
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
     monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: proxy)
     monkeypatch.setattr(
-        "cyclo.cli.provider_stack",
-        lambda *_args, **_kwargs: pytest.fail("gateway command used provider stack"),
+        "cyclo.cli.provider_system",
+        lambda *_args, **_kwargs: pytest.fail(
+            "gateway command used provider composition"
+        ),
     )
 
     result = main(["gateway", *arguments])
 
     assert result == 0
-    assert proxy.calls == ([call, ("restart", False)] if arguments == ("build",) else [call])
+    assert proxy.calls == [call]
     assert store.lock_entries == locks
     rendered = capsys.readouterr().out
     assert output in rendered
@@ -954,7 +951,7 @@ def test_gateway_login_forwards_only_explicit_login_arguments(
         ("login", ("openai", "--as", "work", "--api-key-env", "WORK_OPENAI_KEY"))
     ]
     assert store.lock_entries == 1
-    assert "restart the gateway" in capsys.readouterr().out
+    assert "gateway\tready" in capsys.readouterr().out
 
 
 def test_gateway_status_reports_stale_not_ready_component(
@@ -975,10 +972,17 @@ def test_gateway_status_reports_stale_not_ready_component(
     assert "stale\tstale" not in rendered
 
 
-class ProviderStackDouble:
+class ProviderSystemDouble:
     def __init__(self, socket_path: Path) -> None:
         self.calls: list[tuple[object, ...]] = []
-        self.status_value = stack_status(socket_path)
+        self.connection_value = provider_connection(socket_path)
+        self.gateway = SimpleNamespace(
+            socket_path=Path("/run/cyclo/gateway/component.sock")
+        )
+        self.configuration = SimpleNamespace(
+            path=Path("/etc/cyclo/host.conf"),
+            providers=(object(),),
+        )
 
     def check(self) -> int:
         self.calls.append(("check",))
@@ -988,25 +992,75 @@ class ProviderStackDouble:
         self.calls.append(("build",))
         return (("pass", "sha256:" + "d" * 64),)
 
-    def status(self):
-        self.calls.append(("status",))
-        return self.status_value
+    def statuses(self):
+        self.calls.append(("statuses",))
+        return self.connection_value.components
 
     def start(self):
         self.calls.append(("start",))
-        return self.status_value
+        return self.connection_value
 
-    def restart(self, *, build: bool = False):
-        self.calls.append(("restart", build))
-        return self.status_value
+    def restart(self):
+        self.calls.append(("restart",))
+        return self.connection_value
 
     def stop(self):
         self.calls.append(("stop",))
         return ("pass", "old-component")
 
-    def model_ids(self):
+    def model_ids(self, connection=None):
         self.calls.append(("model_ids",))
+        assert connection is self.connection_value
         return MODELS
+
+
+def test_component_list_reports_each_component_without_failing_for_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    providers = ProviderSystemDouble(tmp_path / "component.sock")
+    providers.connection_value = SimpleNamespace(
+        generation="provider-generation",
+        socket_path=tmp_path / "component.sock",
+        components=(
+            gateway_status(),
+            component_status(
+                name="broken",
+                present=False,
+                running=False,
+                ready=False,
+                error="build failed",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "cyclo.cli.provider_system",
+        lambda *_args, **_kwargs: providers,
+    )
+
+    assert main(["component", "list"]) == 0
+    rendered = capsys.readouterr().out
+    assert "gateway" in rendered
+    assert "broken" in rendered
+    assert "build failed" in rendered
+
+
+def test_component_gateway_status_does_not_parse_host_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    providers = ProviderSystemDouble(tmp_path / "component.sock")
+    loads: list[bool] = []
+
+    def make_system(_args, _store, *, load_config=True):
+        loads.append(load_config)
+        return providers
+
+    monkeypatch.setattr("cyclo.cli.provider_system", make_system)
+
+    assert main(["component", "status", "gateway"]) == 0
+    assert loads == [False]
 
 
 @pytest.mark.parametrize(
@@ -1014,9 +1068,9 @@ class ProviderStackDouble:
     (
         (("check",), ("check",), 0, "ok: 1 provider component(s)"),
         (("build",), ("build",), 1, "pass\tsha256:"),
-        (("status",), ("status",), 0, "pass\tready"),
-        (("start",), ("start",), 1, "gateway\tready"),
-        (("restart", "--build"), ("restart", True), 1, "pass\tready"),
+        (("status",), ("statuses",), 0, "passthrough"),
+        (("start",), ("start",), 1, "gateway"),
+        (("restart",), ("restart",), 1, "passthrough"),
     ),
 )
 def test_provider_actions_use_the_configured_stack(
@@ -1031,9 +1085,12 @@ def test_provider_actions_use_the_configured_stack(
     socket_dir = tmp_path / "provider"
     socket_dir.mkdir()
     store = RecordingStore(tmp_path / "state")
-    stack = ProviderStackDouble(socket_dir / "component.sock")
+    stack = ProviderSystemDouble(socket_dir / "component.sock")
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.provider_stack", lambda *_args, **_kwargs: stack)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_system",
+        lambda *_args, **_kwargs: stack,
+    )
 
     assert main(["providers", *arguments]) == 0
     assert stack.calls == [call]
@@ -1046,22 +1103,24 @@ def test_provider_stop_does_not_parse_an_invalid_host_configuration(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    invalid = tmp_path / "host.conf"
+    root = tmp_path / "state"
+    root.mkdir()
+    invalid = root / "host.conf"
     invalid.write_text("this is deliberately invalid\n", encoding="utf-8")
-    store = RecordingStore(tmp_path / "state")
-    stack = ProviderStackDouble(tmp_path / "component.sock")
+    store = RecordingStore(root)
+    stack = ProviderSystemDouble(tmp_path / "component.sock")
     loads: list[bool] = []
 
     def make_stack(args, selected_store, *, load_config=True):
         assert selected_store is store
-        assert Path(args.host_config) == invalid
+        assert host_config(args, selected_store) == invalid
         loads.append(load_config)
         return stack
 
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.provider_stack", make_stack)
+    monkeypatch.setattr("cyclo.cli.provider_system", make_stack)
 
-    result = main(["providers", "stop", "--host-config", str(invalid)])
+    result = main(["providers", "stop", "--state-root", str(root)])
 
     assert result == 0
     assert loads == [False]
@@ -1075,8 +1134,11 @@ def test_models_lists_only_the_outer_provider_catalogue(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    stack = ProviderStackDouble(tmp_path / "component.sock")
-    monkeypatch.setattr("cyclo.cli.provider_stack", lambda *_args, **_kwargs: stack)
+    stack = ProviderSystemDouble(tmp_path / "component.sock")
+    monkeypatch.setattr(
+        "cyclo.cli.provider_system",
+        lambda *_args, **_kwargs: stack,
+    )
     monkeypatch.setattr(
         "cyclo.cli.gateway",
         lambda *_args: pytest.fail("models queried gateway directly"),
@@ -1084,7 +1146,7 @@ def test_models_lists_only_the_outer_provider_catalogue(
 
     assert main(["models", "--state-root", str(tmp_path / "state")]) == 0
     assert capsys.readouterr().out.splitlines() == list(MODELS)
-    assert stack.calls == [("model_ids",)]
+    assert stack.calls == [("start",), ("model_ids",)]
 
 
 def test_models_explains_an_empty_catalogue(
@@ -1092,9 +1154,12 @@ def test_models_explains_an_empty_catalogue(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    stack = ProviderStackDouble(tmp_path / "component.sock")
-    stack.model_ids = lambda: ()
-    monkeypatch.setattr("cyclo.cli.provider_stack", lambda *_args, **_kwargs: stack)
+    stack = ProviderSystemDouble(tmp_path / "component.sock")
+    stack.model_ids = lambda _connection=None: ()
+    monkeypatch.setattr(
+        "cyclo.cli.provider_system",
+        lambda *_args, **_kwargs: stack,
+    )
 
     assert main(["models"]) == 1
     assert "cyclo gateway providers" in capsys.readouterr().err
@@ -1108,8 +1173,10 @@ def test_usage_is_the_gateway_global_report(
     proxy = GatewayDouble()
     monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: proxy)
     monkeypatch.setattr(
-        "cyclo.cli.provider_stack",
-        lambda *_args, **_kwargs: pytest.fail("usage queried provider stack"),
+        "cyclo.cli.provider_system",
+        lambda *_args, **_kwargs: pytest.fail(
+            "usage queried provider composition"
+        ),
     )
 
     assert main(["--state-root", str(tmp_path / "state"), "usage"]) == 0
@@ -1417,7 +1484,7 @@ def test_inspect_explains_one_persisted_instance_without_requiring_it_to_run(
 
     monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
     monkeypatch.setattr(
-        "cyclo.cli.provider_stack",
+        "cyclo.cli.provider_system",
         lambda *_args, **_kwargs: pytest.fail("stopped instance queried providers"),
     )
 
@@ -1437,8 +1504,11 @@ def test_doctor_reports_a_ready_installation_without_mutating_it(
 ) -> None:
     store = RecordingStore(tmp_path / "state")
     components = tmp_path / "components"
-    stack = ProviderStackDouble(tmp_path / "provider" / "component.sock")
-    stack.assembly = SimpleNamespace(path=tmp_path / "host.conf", providers=(object(),))
+    stack = ProviderSystemDouble(tmp_path / "provider" / "component.sock")
+    stack.configuration = SimpleNamespace(
+        path=tmp_path / "host.conf",
+        providers=(object(),),
+    )
     stack.model_ids = lambda: MODELS
 
     class FakeDocker:
@@ -1453,8 +1523,11 @@ def test_doctor_reports_a_ready_installation_without_mutating_it(
         "cyclo.cli.parse_declaration",
         lambda _path: SimpleNamespace(provides=(COMPONENT_INTERFACE, PROVIDER_INTERFACE)),
     )
-    monkeypatch.setattr("cyclo.cli.ComponentDocker", FakeDocker)
-    monkeypatch.setattr("cyclo.cli.provider_stack", lambda *_args, **_kwargs: stack)
+    monkeypatch.setattr("cyclo.cli.ComponentController", FakeDocker)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_system",
+        lambda *_args, **_kwargs: stack,
+    )
 
     assert main(["doctor"]) == 0
     output = capsys.readouterr().out
@@ -1463,7 +1536,7 @@ def test_doctor_reports_a_ready_installation_without_mutating_it(
     assert "ok  persisted instance state: 0 instance(s)" in output
     assert "ok  Docker daemon: test-engine" in output
     assert "ok  host provider configuration:" in output
-    assert "ok  credential gateway: current and ready" in output
+    assert "ok  credential gateway: ready" in output
     assert "ok  provider component pass: ready" in output
     assert "ok  outer provider catalogue: 2 model(s)" in output
     assert store.lock_entries == 0
@@ -1490,9 +1563,9 @@ def test_doctor_stops_cleanly_when_docker_is_unavailable(
         "cyclo.cli.parse_declaration",
         lambda _path: SimpleNamespace(provides=(COMPONENT_INTERFACE, PROVIDER_INTERFACE)),
     )
-    monkeypatch.setattr("cyclo.cli.ComponentDocker", MissingDocker)
+    monkeypatch.setattr("cyclo.cli.ComponentController", MissingDocker)
     monkeypatch.setattr(
-        "cyclo.cli.provider_stack",
+        "cyclo.cli.provider_system",
         lambda *_args, **_kwargs: pytest.fail("doctor parsed providers without Docker"),
     )
 
