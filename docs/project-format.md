@@ -102,19 +102,18 @@ each instance's metadata.
 
 `project.cyclo` owns the team and mount authority. Consequently `--name` and
 `--team-write` are rejected with this form; express those choices in the file.
-`--offline`, `--host`, `--image`, `--verbose`, `--build`, and `--dry-run`
+`--offline`, `--host`, `--image`, `--verbose`, and `--dry-run`
 still apply to the run.
 
 By default, a team without a Dockerfile uses Cyclo's installation-scoped common
 runtime image. A team with a Dockerfile gets its own installation-scoped image,
-built with the exact common image ID as `CYCLO_TEAM_BASE`. An ordinary run
-reuses an image built against the current base. A missing image, or one built
-against another base, fails with an instruction to rerun the same command with
-`--build`. Use `--build` after changing the Dockerfile or files it consumes.
+built with the exact common image ID as `CYCLO_TEAM_BASE`. Every ordinary run
+submits the common and selected team contexts to Docker before any team starts.
+Docker interprets `.dockerignore` and decides cache reuse.
 
 `--image` deliberately bypasses that selection with one operator-supplied image
 shared by every team in the definition. Cyclo validates but never builds that
-image, so `--image` and `--build` are mutually exclusive.
+operator-managed image.
 
 An explicit `--port` and `--foreground` are accepted only when the definition
 contains one team, because either option is ambiguous for several instances.

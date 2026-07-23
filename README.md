@@ -19,12 +19,8 @@ newly built gateway, provider, and team resources.
 
 ```sh
 python -m pip install .
-cyclo gateway build
 cyclo gateway providers
 cyclo gateway login openai-codex --as codex-work
-cyclo gateway restart
-cyclo providers check
-cyclo providers restart --build
 cyclo models
 cyclo doctor
 ```
@@ -38,21 +34,39 @@ keys in its Docker-managed state volume; they are never mounted into teams.
 `/etc/cyclo/host.conf` is an ordered, line-oriented configuration:
 
 ```text
-provider trace ./providers/passthrough upstream=gateway -- label=first
-provider outer ./providers/passthrough upstream=trace
+provider first ./providers/passthrough upstream=gateway
+provider second ./providers/passthrough upstream=first
 ```
 
 The first field is a host-local component instance and the second is its source
 directory. Named requirements from that repository's `component.conf` bind to
 `gateway` or an earlier instance. Words after `--` become separate component
-arguments. Relative paths resolve beside `host.conf`. An empty file means “use
-the gateway directly”. Edit the file, then run `cyclo providers restart`;
-Cyclo rebuilds only when `--build` is explicit.
+arguments that explicitly replace the image's OCI `CMD`; without `--`, the
+image's own `CMD` is used unchanged. Relative paths resolve beside `host.conf`.
+An empty file means “use the gateway directly”. Mutating lifecycle commands
+submit build contexts to Docker, validate completed images, and replace stale
+containers automatically. Docker owns `.dockerignore` and cache semantics;
+`status` and `doctor` remain observational.
 
 Providers are independent components using the ConnectRPC provider protocol
 over Unix-domain sockets. The gateway is the fixed root provider and catalogue
 authority. `cyclo models` prints the composed catalogue and `cyclo doctor`
 checks gateway, provider components, Docker image identity, and health.
+
+Every component can be inspected on its own:
+
+```sh
+cyclo component list
+cyclo component status gateway
+cyclo component status first
+cyclo component logs first
+```
+
+Each row is factual: image/container state, whether the launch configuration is
+current, Docker health, Component health, and any concrete error. There is no
+separate registry or graph-wide readiness flag. If an intermediate provider
+fails, Cyclo reports that component and selects the last working provider, so a
+broken optional component does not hide gateway models.
 
 ## Projects and teams
 
@@ -103,11 +117,14 @@ the browser link uses the host that served the page, not the bind wildcard.
 ## Multiple installations
 
 One installed `cyclo` command can operate several independent installations on
-the same Docker host. Give each one a distinct state root and host configuration:
+the same Docker host. The default installation reads `/etc/cyclo/host.conf`.
+An explicit state root instead reads `host.conf` from that root:
 
 ```sh
-CYCLO_STATE_ROOT=~/.local/state/cyclo-work CYCLO_HOST_CONFIG=/etc/cyclo/work.conf cyclo doctor
-CYCLO_STATE_ROOT=~/.local/state/cyclo-lab CYCLO_HOST_CONFIG=/etc/cyclo/lab.conf cyclo doctor
+mkdir -p ~/.local/state/cyclo-work ~/.local/state/cyclo-lab
+printf '%s\n' 'provider passthrough /opt/providers/passthrough upstream=gateway' > ~/.local/state/cyclo-work/host.conf
+CYCLO_STATE_ROOT=~/.local/state/cyclo-work cyclo doctor
+CYCLO_STATE_ROOT=~/.local/state/cyclo-lab cyclo doctor
 ```
 
 The canonical state root defines the installation identity. Cyclo includes it

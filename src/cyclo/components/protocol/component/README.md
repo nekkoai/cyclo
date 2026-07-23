@@ -45,7 +45,7 @@ require upstream cyclo.component.v1.Component
 
 `require` has a local name because a component may need the same interface
 more than once. The declaration contains no URL, socket, container, discovery,
-or routing policy. A later assembly layer binds requirement names to component
+or routing policy. The host configuration binds requirement names to component
 endpoints.
 
 Unknown directives, duplicate names, malformed interface names, missing base
@@ -70,9 +70,8 @@ This package exports its base descriptor as `@cyclo/component/contract` and
 includes both `proto/` and `gen/` when installed from a local path or tarball.
 Domain interfaces use the same layout. The sibling `../provider` package owns
 `cyclo.provider.v1.Provider` while using this package for declaration and
-binding machinery. The sibling `../gateway` program is the first actual
-component built from both interfaces. There is no central runtime discovery
-service.
+binding machinery. The `../../gateway` program is the root component built
+from both interfaces. There is no central runtime discovery service.
 
 ## Build and test
 

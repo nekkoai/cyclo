@@ -30,8 +30,9 @@ credential gateway (fixed root Provider)
 external model service
 ```
 
-The host `cyclo` command constructs this graph and manages Docker lifecycle. It
-is not a service in the data path.
+The host `cyclo` command reads the component inventory, applies explicit
+lifecycle operations, and selects the provider socket given to a team. It is
+not a service in the data path.
 
 ## Security architecture
 
@@ -64,25 +65,27 @@ confidentiality boundary.
 The trusted-host assumption establishes the deployment boundary; it does not
 prevent stronger deployment isolation. Mutually distrustful installations can
 run under separate operating-system or virtual-machine boundaries. Distinct
-Cyclo state roots and host configurations provide independent installations
-when several are operated in one trusted administrative domain.
+Cyclo state roots provide independent installations when several are operated
+in one trusted administrative domain.
 
-The canonical state-root path is the installation identity. Cyclo hashes that
-path to a stable 12-hex-character ID and scopes all owned Docker resources with
-it: gateway/provider containers and images, the credential volume, team
-containers and networks, common and derived team images, and ownership labels.
-The state root also contains that installation's queues and Unix sockets.
-Therefore two installations can reuse logical project, team, provider, and
-instance names without sharing mutable Docker names. A user-selected custom
-image is explicit shared authority and is not renamed.
+The canonical state root selects one canonical `components/` state path. Cyclo
+hashes that path to a stable 12-hex-character installation ID and scopes all
+owned Docker resources with it: gateway/provider containers and images, the
+credential volume, team containers and networks, common and derived team
+images, and ownership labels. The state root also contains that installation's
+queues and Unix sockets. Therefore two installations can reuse logical
+project, team, provider, and instance names without sharing mutable Docker
+names. A user-selected custom image is explicit shared authority and is not
+renamed.
 
-The host configuration is selected independently because it describes the
-installation's provider graph, not its identity. Operationally, a deployment
-must consistently pair one state root with one host configuration. Status and
-lifecycle commands discover resources from that pair and refuse resources
-labelled for a different installation. This is namespace separation inside one
-trusted Docker host, not a claim of protection from that host's administrator;
-mutually distrustful administrators still require separate OS/VM boundaries.
+The provider graph belongs to the installation rather than being selected
+independently. The default installation reads `/etc/cyclo/host.conf`; setting
+`CYCLO_STATE_ROOT` or `--state-root` selects `host.conf` inside that root.
+Status and lifecycle commands therefore cannot accidentally pair one
+installation's state with another installation's provider graph. This is
+namespace separation inside one trusted Docker host, not a claim of protection
+from that host's administrator; mutually distrustful administrators still
+require separate OS/VM boundaries.
 
 ### Capability model
 
@@ -161,7 +164,7 @@ src/cyclo/components/
 
 Protocol packages define interfaces and do not run independently. The gateway
 and intermediate providers are runnable components. The Pi adapter and team
-runtime are consumers of the outer Provider interface, not provider-stack
+runtime are consumers of the outer Provider interface, not provider
 components.
 
 Every component provides the base health interface:
@@ -185,7 +188,7 @@ provide cyclo.provider.v1.Provider
 require upstream cyclo.provider.v1.Provider
 ```
 
-The declaration contains no endpoint addresses. The host assembly binds the
+The declaration contains no endpoint addresses. The host configuration binds the
 named `upstream` requirement to a producer. Cyclo mounts the producer's socket
 directory read-only at `/run/cyclo/requirements/upstream`; the component owns
 `/run/cyclo/component.sock` in its output directory.
@@ -196,43 +199,76 @@ bounded PIDs/file descriptors, a small temporary filesystem, and the exact
 socket mounts implied by their declaration. Intermediate components use
 `--network none`. No component receives the Docker socket.
 
-Cyclo builds under a temporary candidate tag, validates the completed image,
-and only then moves the component's official tag to it. Runtime status checks
-that the container uses that exact image ID, plus container ownership, launch
-configuration, mounts, isolation, engine health, and the component's `Health`
-RPC. “Container running” alone is not readiness.
+Cyclo submits the component's normal build context to Docker, builds under a
+temporary candidate tag, validates the completed image, and only then moves
+the component's official tag to it. Docker is the sole authority for
+`.dockerignore` semantics and build-cache reuse. Runtime status checks that the
+container uses the exact currently promoted image ID, plus container ownership,
+launch configuration, mounts, isolation, engine health, and the component's
+`Health` RPC. Mutating start/run/login commands build through Docker and replace
+stale component containers automatically. Read-only status and doctor commands
+never do so. “Container running” alone is not readiness.
 
-## Provider stack
+The host-side implementation has four boundaries:
 
-`/etc/cyclo/host.conf` is an ordered assembly:
+- `component.py` defines declarations, component records, status records, and
+  the base ConnectRPC client;
+- `component_runtime.py` implements the generic Docker lifecycle;
+- `gateway.py` adds only credential-volume and login/catalogue policy; and
+- `providers.py` parses `host.conf`, binds Provider requirements, and chooses a
+  usable outer Provider socket.
+
+`ComponentStatus` describes one component only: its image and container
+identity, running/current state, Docker health, Component health, and concrete
+inspection error. There is no graph-wide readiness flag and no component
+registry service. Inventory is recomputed from the fixed gateway and
+`host.conf`.
+
+## Provider system
+
+The installation's `host.conf` is an ordered provider list:
 
 ```text
 # provider INSTANCE SOURCE [context=PATH] REQUIREMENT=TARGET ... [-- ARGUMENT ...]
-provider trace ./providers/passthrough upstream=gateway -- label=first
-provider outer ./providers/passthrough upstream=trace
+provider first ./providers/passthrough upstream=gateway
+provider second ./providers/passthrough upstream=first
 ```
 
 `INSTANCE` is the host-local component name. `SOURCE` contains `Dockerfile` and
 `component.conf`. Requirement bindings name `gateway` or an earlier component;
 forward references and missing or mismatched interfaces fail before Docker is
-called. Arguments after `--` are passed as distinct OCI arguments. Relative
-paths resolve beside `host.conf`.
+called. By default Docker runs the image's declared `ENTRYPOINT` and `CMD`;
+Cyclo does not inject or interpret a startup command. Arguments after `--`
+explicitly replace the image's OCI `CMD`. Relative paths resolve beside
+`host.conf`.
 
 The fixed gateway is always the root. If `host.conf` is absent or empty, the
-gateway socket is the outer provider endpoint. Otherwise the final declared
-component socket is the endpoint mounted into team containers. Editing the
-file changes the expected assembly; apply it explicitly with:
+gateway socket is the provider endpoint. Cyclo examines providers independently
+in declaration order and selects the last working component whose declared
+inputs are also working. If a component fails to build or start, its dependants
+are skipped and an earlier working provider—including the gateway—remains
+usable. `models` and project `run` warn; `providers status` prints every
+component and exits nonzero when any configured component is not working.
+Existing teams retain the endpoint selected when they started and are reported
+stale if that selection changes.
+
+Editing the file changes the expected provider list. The next mutating
+`providers start`, `providers restart`, `models`, or project `run` command asks
+Docker to build and start that list. There is no watcher or background
+reconciliation. Individual components can be inspected and controlled through
+the same lifecycle:
 
 ```sh
-cyclo providers restart --build   # rebuild only when component source changed
-```
-
-Normal lifecycle commands never infer or repair a different assembly:
-
-```sh
+cyclo component list
+cyclo component status [NAME]
+cyclo component build|start|stop|restart|logs NAME
 cyclo gateway build|start|restart|stop|status
 cyclo providers check|build|start|restart|stop|status
 ```
+
+Gateway commands add only gateway-specific operations such as login and store
+destruction. Provider commands are list-wide conveniences. Both delegate
+ordinary image and container work to the component controller.
 
 ## Provider protocol
 
@@ -268,9 +304,10 @@ component mounts that volume. The public model catalogue exposes account/model
 names and safe capabilities, never native headers, base URLs, or credentials.
 
 `cyclo gateway login` updates the private store. The long-running gateway reads
-credential values dynamically, while its model catalogue is a startup snapshot;
-restart it after login to publish catalogue changes. OAuth refreshes use a
-kernel lock and atomic file replacement.
+credential values dynamically, while its model catalogue is a startup snapshot.
+Login therefore restarts the gateway automatically and returns only after the
+updated catalogue is ready. OAuth refreshes use a kernel lock and atomic file
+replacement.
 
 Incoming ConnectRPC headers are not forwarded to native services. The gateway
 chooses the native model from its catalogue, resolves the matching credential,
@@ -296,7 +333,7 @@ mode controls whether `/team` itself is writable. Relative paths resolve beside
 the definition. All selected trees must be real, non-overlapping directories.
 
 Before the first container starts, Cyclo validates every team, requested model,
-mount, provider-stack readiness, and bind-source identity. A partial multi-team
+mount, provider connection, and bind-source identity. A partial multi-team
 startup rolls back only containers created by that invocation. Queue history
 remains under the state root.
 
@@ -324,8 +361,9 @@ A repository Dockerfile must declare `ARG CYCLO_TEAM_BASE` before its first
 `FROM`; its final stage must inherit that exact base. Earlier builder stages
 may use other images. Cyclo labels the derived image with the exact base image
 ID, builds under a candidate tag, validates the inherited runtime entrypoint,
-and promotes the team tag only after success. Teams without a Dockerfile use
-the common image directly.
+and promotes the team tag only after success. A normal project run always asks
+Docker to build the selected context; Docker reuses cached layers when
+appropriate. Teams without a Dockerfile use the common image directly.
 
 ## Team isolation and state
 
@@ -351,8 +389,8 @@ instances/INSTANCE/
   pi/                     Pi settings and runtime metadata
   runtime/                generated read-only AgentWS runtime
   run.json                persisted instance metadata
-sockets/gateway/          root component socket
-sockets/COMPONENT/        intermediate component sockets
+components/gateway/socket/       root component socket
+components/sockets/COMPONENT/    intermediate component sockets
 ```
 
 Physical credentials and the usage ledger live instead in a separately owned
@@ -371,14 +409,17 @@ authority for lifecycle operations.
 
 - AgentWS settles engine attempts from durable queue state and bounded retry
   rules. Provider health does not retroactively reinterpret an agent exit.
-- A component is ready only when its exact current container and dependencies
-  are ready and its health RPC succeeds.
+- A component works only when its exact current container is running, its
+  Docker healthcheck is healthy, and its own health RPC reports ready.
+- Provider dependency checks decide startup order and route selection; they do
+  not rewrite one component's status into an aggregate graph status.
 - Unknown models fail before native dispatch.
 - Connect failures remain transport failures; provider failures already emitted
   as Pi events remain Pi events.
-- Configuration is declarative and restart-applied. Cyclo does not silently
-  rebuild images or mutate configuration to make a failed health check pass.
+- Configuration is declarative and command-applied. Mutating lifecycle commands
+  apply the selected provider list; observational commands report component
+  facts without changing it.
 
 `cyclo doctor` checks the installed AgentWS/component ABI, persisted state,
-Docker, host assembly, gateway, every intermediate component, and the outer
+Docker, host configuration, gateway, every intermediate component, and the outer
 catalogue without changing the system.

@@ -35,8 +35,9 @@ allowlist. ConnectRPC carries cancellation out of band.
 Incoming RPC headers are never forwarded. Provider credentials never appear in
 the model catalogue, request payload, Docker arguments, logs, or downstream
 containers. The public catalogue is a startup snapshot; login or model changes
-therefore require a gateway restart. Credential values and OAuth refreshes are
-read dynamically and written with kernel locking plus atomic replacement.
+therefore require a gateway restart, which `cyclo gateway login` performs
+automatically. Credential values and OAuth refreshes are read dynamically and
+written with kernel locking plus atomic replacement.
 
 Usage is observed at the native Pi endpoint and appended to the private audit
 file. Accounting observes terminal event usage but does not alter or reorder
@@ -57,11 +58,11 @@ transport outcome.
 From `src/cyclo/components`:
 
 ```sh
-npm --prefix component ci
-npm --prefix provider ci
+npm --prefix protocol/component ci
+npm --prefix protocol/provider ci
 npm --prefix gateway ci
-npm --prefix component test
-npm --prefix provider test
+npm --prefix protocol/component test
+npm --prefix protocol/provider test
 npm --prefix gateway test
 docker build -f gateway/Dockerfile -t cyclo-gateway-component .
 ```

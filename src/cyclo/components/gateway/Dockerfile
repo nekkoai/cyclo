@@ -34,7 +34,6 @@ ENV NODE_ENV=production
 USER 1000:1000
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["node", "src/main.mjs"]
-CMD ["serve"]
 
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
   CMD ["node", "src/healthcheck.mjs"]

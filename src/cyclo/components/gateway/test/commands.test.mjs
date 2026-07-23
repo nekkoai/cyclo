@@ -7,6 +7,17 @@ import test from "node:test";
 import { usageRecord } from "../src/audit.mjs";
 import { main } from "../src/main.mjs";
 
+test("no command starts the gateway component", async () => {
+  let called = 0;
+  await main([], {
+    env: {},
+    runGateway: async () => {
+      called += 1;
+    },
+  });
+  assert.equal(called, 1);
+});
+
 test("providers is a pre-login command and never needs the credential store", async () => {
   const output = capture();
   await main(["providers"], {
@@ -58,6 +69,7 @@ test("usage prints only the global audit report", async (t) => {
 test("gateway informational commands reject trailing arguments", async () => {
   await assert.rejects(main(["providers", "extra"]), /usage:/u);
   await assert.rejects(main(["usage", "extra"]), /usage:/u);
+  await assert.rejects(main(["serve"]), /usage:/u);
 });
 
 function capture() {

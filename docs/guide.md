@@ -34,22 +34,16 @@ named `cyclo`.
 
 ## First gateway
 
-Build and start the isolated credential gateway:
-
-```sh
-cyclo gateway build
-cyclo gateway status
-```
-
-`gateway build` promotes the successfully built image and restarts the gateway
-on it. A separate `gateway start` is unnecessary. The private credential volume
-is created if absent and survives ordinary build, stop, and restart operations.
-
 List login choices before storing any credential:
 
 ```sh
 cyclo gateway providers
 ```
+
+Cyclo asks Docker to build the gateway before every mutating gateway operation.
+Docker applies the build context, `.dockerignore`, and cache rules. The private
+credential volume is created if absent and survives ordinary build, stop, and
+restart operations.
 
 Login using OAuth/subscription or an API key:
 
@@ -61,11 +55,10 @@ cyclo gateway login openai --as openai-work --api-key-env OPENAI_API_KEY
 ```
 
 The account name selected by `--as` becomes the public prefix in
-`ACCOUNT/MODEL`. Login changes the store; restart publishes the resulting model
-catalogue:
+`ACCOUNT/MODEL`. Login writes the store, restarts the gateway, and returns only
+after the resulting model catalogue is ready:
 
 ```sh
-cyclo gateway restart
 cyclo models
 ```
 
@@ -76,12 +69,15 @@ cyclo gateway providers
 cyclo gateway login PROVIDER [--as ACCOUNT] [--api-key-stdin|--api-key-env NAME]
 cyclo gateway build
 cyclo gateway start
-cyclo gateway restart [--build]
+cyclo gateway restart
 cyclo gateway stop
 cyclo gateway status
 cyclo gateway destroy-store --confirm VOLUME
 ```
 
+`build`, `start`, `restart`, login, and catalogue discovery all run the normal
+Docker build first. Cached inputs remain cheap; no separate freshness mechanism
+or force-build option exists in Cyclo.
 `destroy-store` is the explicit destructive operation for credentials and
 usage. `cyclo gateway status` prints `VOLUME`; no other gateway command deletes
 it.
@@ -89,15 +85,18 @@ it.
 ## Provider components
 
 The gateway is the fixed root Provider. Optional intermediate providers are an
-ordered component graph declared by `/etc/cyclo/host.conf` (or `--host-config`):
+ordered component graph declared by the installation's `host.conf`. The
+default installation uses `/etc/cyclo/host.conf`; an explicit state root uses
+`STATE_ROOT/host.conf`:
 
 ```text
 # provider INSTANCE SOURCE [context=PATH] REQUIREMENT=TARGET ... [-- ARGUMENT ...]
-provider trace ./providers/passthrough upstream=gateway -- label=first
-provider outer ./providers/passthrough upstream=trace
+provider first ./providers/passthrough upstream=gateway
+provider second ./providers/passthrough upstream=first
 ```
 
-Each `SOURCE` directory contains:
+`first` and `second` are ordinary host-local instance names; they have no
+special meaning. Each `SOURCE` directory contains:
 
 ```text
 Dockerfile
@@ -116,33 +115,57 @@ require upstream cyclo.provider.v1.Provider
 Requirement names in `component.conf` are bound with `NAME=TARGET` in
 `host.conf`. A target is `gateway` or an earlier component instance. The file
 order is therefore the dependency order; forward references fail. Arguments
-after `--` are passed separately to the component entrypoint. A `context=PATH`
-setting selects a Docker build context containing the component source.
+after `--` explicitly replace the image's OCI `CMD`; when they are absent,
+Docker uses the image's own command unchanged. Cyclo does not require a
+component command named `serve`. A `context=PATH` setting selects a Docker
+build context containing the component source.
 
 An absent or empty `host.conf` is valid and exposes the gateway directly.
 Relative source paths resolve from the configuration file's directory.
 
-Operate the complete configured stack with:
+Inspect or operate one component directly:
+
+```sh
+cyclo component list
+cyclo component status [NAME]
+cyclo component build NAME
+cyclo component start NAME
+cyclo component restart NAME
+cyclo component stop NAME
+cyclo component logs NAME
+```
+
+`list` and `status` report each component independently. They show whether its
+container is present, current, and running, together with Docker health,
+Component health, and a concrete error. They do not compute a graph-wide
+readiness flag. `cyclo component status gateway` remains usable even when
+`host.conf` is invalid.
+
+Operate every configured provider with:
 
 ```sh
 cyclo providers check
 cyclo providers build
 cyclo providers start
 cyclo providers restart
-cyclo providers restart --build
 cyclo providers status
 cyclo providers stop
 ```
 
-`start` never builds. `restart` rebuilds only with explicit `--build`.
+`build`, `start`, `restart`, `models`, and project `run` submit the configured
+component contexts to Docker. Docker alone decides context inclusion and cache
+reuse. Cyclo validates a completed image before promoting its stable tag and
+replaces containers whose image or launch configuration no longer matches.
 `stop` removes all provider-lifecycle containers owned by this Cyclo state root
 even if the current configuration is temporarily invalid. The gateway remains
 independent.
 
 Every provider component gets only its own output socket directory and the
 read-only socket directories named by its requirements. Intermediate
-components run with no network. The final component socket—or the gateway
-socket for an empty stack—is mounted read-only into teams.
+components run with no network. Cyclo selects the last working provider whose
+inputs are working and mounts that socket read-only into newly started teams.
+If a component cannot build or start, Cyclo reports it, skips its dependants,
+and keeps an earlier working provider available; this may be the gateway.
 
 The Provider data plane carries `model` and an opaque Pi JSON string. Relays do
 not understand prompts, history, tools, JSON Schema, or events. See
@@ -197,18 +220,17 @@ RUN apt-get update \
 ```
 
 Cyclo uses the common runtime directly when this file is absent. When it is
-present, first run the project with `cyclo run --build`; subsequent ordinary
-runs reuse the current installation-scoped image. Run with `--build` again
-after changing the Dockerfile or anything it consumes. Validate the repository
-with:
+present, every project run submits the team build context to Docker; Docker
+reuses cached work when the effective context is unchanged. Validate the
+repository with:
 
 ```sh
 cyclo validate ./teams/my-team
 ```
 
-After upgrading Cyclo or changing installed component source, rebuild the
-gateway, provider components, and team runtime and restart every active
-`project.cyclo` run with one command:
+After upgrading Cyclo or changing installed component source, rebuild changed
+images through Docker and restart every active `project.cyclo` run with one
+command:
 
 ```sh
 cyclo refresh
@@ -269,7 +291,6 @@ cyclo run ./project.cyclo
 Useful options:
 
 ```text
---build             rebuild the common and selected derived team images
 --offline           remove direct network access; provider UDS remains usable
 --host ADDRESS      AgentWS viewer bind address (default 127.0.0.1)
 --port PORT         fixed viewer port for a one-team project; 0 chooses one
@@ -356,8 +377,8 @@ cyclo doctor
 ```
 
 It verifies the bundled AgentWS and component ABI, persisted state, Docker,
-`host.conf`, exact image/container state, component health, dependency health,
-and the outer model catalogue.
+`host.conf`, exact image/container state, each component's own health, provider
+bindings, and the selected model catalogue.
 
 `cyclo ps` distinguishes team-container state from provider readiness. A team
 can be running while its model path is unavailable; the health reason makes
@@ -372,38 +393,42 @@ cyclo repair
 ## Persistent state
 
 The state root is `$XDG_STATE_HOME/cyclo` or `~/.local/state/cyclo` by default.
-Override it with `--state-root` or `CYCLO_STATE_ROOT`.
+Override it with `--state-root` or `CYCLO_STATE_ROOT`. The default installation
+uses `/etc/cyclo/host.conf`; an override uses `host.conf` inside the selected
+state root.
 
 ### Multiple installations on one host
 
-An installation is identified by its canonical state-root path. Cyclo derives
-a stable 12-hex-character installation ID from that path and uses it in every
-Docker resource it creates: the gateway and provider containers/images, gateway
-credential volume, team containers and networks, common and derived team
-images, and ownership labels. Two installations may therefore use the same
-project name, team name, and instance ID without Docker name or mutable-tag
-collisions.
+An installation is identified by its canonical state root. Cyclo derives a
+stable 12-hex-character installation ID from the root's fixed `components/`
+path and uses it in every Docker resource it creates: the gateway and provider
+containers/images, gateway credential volume, team containers and networks,
+common and derived team images, and ownership labels. Two installations may
+therefore use the same project name, team name, and instance ID without Docker
+name or mutable-tag collisions.
 
-Give each installation both its own state root and its own provider assembly:
+Give each installation its own state root and put its provider configuration
+there:
 
 ```sh
-CYCLO_STATE_ROOT=~/.local/state/cyclo-work CYCLO_HOST_CONFIG=/etc/cyclo/work.conf cyclo gateway build
-CYCLO_STATE_ROOT=~/.local/state/cyclo-lab CYCLO_HOST_CONFIG=/etc/cyclo/lab.conf cyclo gateway build
+mkdir -p ~/.local/state/cyclo-work ~/.local/state/cyclo-lab
+printf '%s\n' 'provider passthrough /opt/providers/passthrough upstream=gateway' > ~/.local/state/cyclo-work/host.conf
+CYCLO_STATE_ROOT=~/.local/state/cyclo-work cyclo gateway providers
+CYCLO_STATE_ROOT=~/.local/state/cyclo-lab cyclo gateway providers
 ```
 
-Use those same two settings on every command for that installation. Shell
+Use the same state-root setting on every command for that installation. Shell
 wrappers or environment files are convenient, but Cyclo needs no second binary
 installation. The equivalent explicit form is:
 
 ```sh
-cyclo --state-root ~/.local/state/cyclo-work --host-config /etc/cyclo/work.conf ps
+cyclo --state-root ~/.local/state/cyclo-work ps
 ```
 
 The state root owns the gateway credential store, usage data, queues, sockets,
-and Docker namespace. The host configuration owns only the optional provider
-assembly; do not point two supposedly independent installations at the same
-state root. `cyclo gateway status`, `cyclo providers status`, `cyclo ps`, and
-`cyclo doctor` inspect only the selected installation.
+Docker namespace, and optional provider configuration. `cyclo gateway status`,
+`cyclo providers status`, `cyclo ps`, and `cyclo doctor` inspect only the
+selected installation.
 
 `--image IMAGE` and `CYCLO_TEAM_IMAGE` deliberately bypass the namespaced
 common/derived image selection. Cyclo validates but does not build that
@@ -411,7 +436,7 @@ operator-supplied image. Use the override only when one externally managed
 image is intended for every team in the project.
 
 Cyclo 0.2 is a fresh-install boundary. It does not adopt or migrate 0.1 state,
-containers, networks, images, or provider-runtime configuration. Use a new
+containers, networks, images, or provider configuration. Use a new
 state root, build the 0.2 resources, and recreate projects from their
 `project.cyclo` files. A different state root keeps an old installation
 separate if it must remain available during the transition.
@@ -424,8 +449,8 @@ instances/INSTANCE/
   pi/               writable Pi settings and runtime metadata
   workspace/        inert named writable layout
   readonly/         inert named read-only layout
-gateway/socket/             root gateway socket
-sockets/COMPONENT/          intermediate component sockets
+components/gateway/socket/       root gateway socket
+components/sockets/COMPONENT/    intermediate component sockets
 ```
 
 The gateway credential and usage store is a separately labelled Docker volume.

@@ -47,8 +47,8 @@ interface.
 
 - Build component images under candidate tags and promote the official tag only
   after validation. Readiness verifies the exact image ID, ownership, launch
-  configuration, mounts, running state, dependency readiness, and the component
-  health RPC.
+  configuration, mounts, running state, Docker health, and the component health
+  RPC; provider bindings separately determine startup order and route selection.
 - Run intermediate providers without a network, Docker socket, or Linux
   capabilities, using read-only roots, private namespaces, bounded process and
   file-descriptor counts, and only the Unix sockets declared by their interface.
@@ -63,9 +63,16 @@ interface.
 - Harden persisted state with strict parsing, no-follow file access, atomic
   replacement, serialized queue mutations, bounded scans, and explicit handling
   of corrupt or incomplete instance records.
-- Keep configuration restart-applied: lifecycle and diagnostic commands report
-  stale, down, unhealthy, and uninspectable states without silently rebuilding
-  or repairing the system.
+- Delegate build-context selection, `.dockerignore`, and cache invalidation to
+  Docker. Mutating lifecycle commands run the cached build, validate candidates,
+  and replace stale component containers; diagnostic commands remain
+  observational.
+- Use each component image's declared OCI command unchanged. Cyclo only
+  overrides `CMD` when explicit arguments follow `--` in `host.conf`; the
+  component runtime has no special `serve` command convention.
+- Isolate optional provider build and startup failures. Failed components and
+  their dependants remain visible in status, while the last working provider
+  remains available to model listing and newly started projects.
 - Scope gateway, provider, and team Docker resources to the canonical state
   root, allowing several independent Cyclo installations on one trusted host.
   Team ownership records the installation, resource kind, and logical instance.
@@ -73,16 +80,24 @@ interface.
 ### Command line and operations
 
 - Organize authoring under `cyclo team` and `cyclo project`, task operations
-  under `cyclo task`, and the two independent host lifecycles under
-  `cyclo gateway` and `cyclo providers`.
+  under `cyclo task`, individual host components under `cyclo component`, and
+  gateway/provider conveniences under `cyclo gateway` and `cyclo providers`.
+- Report one factual status per component rather than an aggregate graph-ready
+  state. A failed provider remains visible while route selection falls back to
+  the last working provider.
+- Preserve component health messages and image-contract failures in status
+  output, and distinguish component class from observed container state in the
+  host implementation.
 - Add project-wide `run` and `stop`, detailed `inspect`, read-only fleet and
   AgentWS dashboards, provider-aware `models`, retained `usage`, and an
   observational full-system `doctor`.
 - Add `cyclo refresh` to rebuild installed gateway, provider, and team images,
   then restart active projects from their persisted definitions.
-- Keep gateway login limited to updating the private store; an explicit gateway
-  restart publishes catalogue changes while preserving the separately owned
-  credential and usage volume.
+- Make gateway login update the private store and automatically restart the
+  gateway so the new catalogue is immediately published.
+- Derive provider configuration from the installation: the default state root
+  uses `/etc/cyclo/host.conf`, while an explicit state root uses
+  `STATE_ROOT/host.conf`.
 - Keep wildcard dashboard binds as listening addresses only; generated browser
   links derive their host from the incoming request.
 
@@ -93,7 +108,7 @@ interface.
 - Organize shipped component sources by architectural role under
   `src/cyclo/components`: shared contracts in `protocol/`, runnable providers
   beside them, and an explicit `team-runtime` image context. Remove the retired
-  gateway and provider-runtime source trees.
+  gateway and provider source trees.
 - Ship a self-contained Python package with the AgentWS runtime, dashboard,
   component protocol, gateway and team build contexts, and built-in team
   templates. Cyclo no longer depends on external `agentws` or `multiagent`

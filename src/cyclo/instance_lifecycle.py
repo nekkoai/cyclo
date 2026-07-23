@@ -57,7 +57,7 @@ def stop_instance(
     *,
     expected_launch_id: str | None = None,
 ) -> None:
-    """Stop one team without changing the independent provider stack."""
+    """Stop one team without changing the independent provider components."""
 
     with store.locked():
         inventory = store.list()

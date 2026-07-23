@@ -60,7 +60,7 @@ mkdir -p "$dist" "$source_tree" "$empty_home" "$project" "$documentation"
 export HOME=$empty_home
 export XDG_STATE_HOME=$empty_home/.local/state
 unset PYTHONHOME PYTHONPATH \
-    CYCLO_TEAM_IMAGE CYCLO_STATE_ROOT CYCLO_HOST_CONFIG \
+    CYCLO_TEAM_IMAGE CYCLO_STATE_ROOT \
     PI_CODING_AGENT_DIR \
     AGENTWS_MAX_JOB_ATTEMPTS AGENTWS_MAX_CONSECUTIVE_FAILURES \
     AGENTWS_RETRY_INITIAL_SECONDS AGENTWS_RETRY_MAX_SECONDS
@@ -135,8 +135,13 @@ forbidden_names = {
     "cyclo/_agentws/UPSTREAM.json",
 }
 required_names = {
+    "cyclo/component.py",
+    "cyclo/component_runtime.py",
+    "cyclo/gateway.py",
     "cyclo/project.py",
+    "cyclo/providers.py",
 }
+forbidden_names.add("cyclo/component_stack.py")
 owned_sources = [component_root / "__init__.py"]
 for component in component_sources:
     owned_sources.extend((component_root / component).rglob("*"))
@@ -258,6 +263,11 @@ case $models_help in
     *"cyclo gateway providers"*) ;;
     *) fail "installed models help omits pre-login provider discovery" ;;
 esac
+component_help=$("$cyclo" component --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
+case $component_help in
+    *"list"*"status"*"build"*"start"*"stop"*"restart"*"logs"*) ;;
+    *) fail "installed component lifecycle help is incomplete" ;;
+esac
 destroy_help=$("$cyclo" gateway destroy-store --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
 case $destroy_help in
     *"--confirm VOLUME"*) ;;
@@ -348,7 +358,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         || fail "doctor returned $doctor_status with an intentionally absent gateway"
     grep -F 'ok  Docker daemon:' "$doctor_log" >/dev/null \
         || fail "doctor did not accept the Docker daemon"
-    grep -F 'no  credential gateway: gateway is absent' "$doctor_log" >/dev/null \
+    grep -F 'no  credential gateway: absent' "$doctor_log" >/dev/null \
         || fail "doctor did not diagnose the intentionally absent gateway"
 else
     [ "$doctor_status" -eq 1 ] \

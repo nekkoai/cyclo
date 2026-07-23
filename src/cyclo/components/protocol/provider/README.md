@@ -23,7 +23,7 @@ message InferResponse {
 `ListModels` is typed because Cyclo must assemble and expose a catalogue. Each
 model advertises an opaque ID, display metadata, capabilities, limits, and its
 `inference_format`. Components must reject incompatible formats when assembling
-a stack.
+a provider chain.
 
 `Infer` deliberately does not describe prompts, messages, tools, schemas,
 reasoning, arguments, or output events. Its request payload is one JSON string
