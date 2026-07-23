@@ -5,6 +5,7 @@ import pytest
 from cyclo.component_stack import Gateway, ProviderStack
 from cyclo.errors import CycloError
 from cyclo.installation import (
+    derived_team_image_name,
     gateway_name,
     installation_id,
     provider_name,
@@ -33,6 +34,12 @@ def test_state_root_defines_stable_independent_resource_namespace(
         f"cyclo-{first}-team-project-team-net"
     )
     assert team_image_name(first, "0.2.0") == f"cyclo-{first}-team:0.2.0"
+    assert derived_team_image_name(
+        first,
+        "0.2.0",
+        tmp_path / "teams" / "rtl",
+        "RTL Team",
+    ).startswith(f"cyclo-{first}-team-rtl-team-")
     assert len(
         {
             gateway_name(first),

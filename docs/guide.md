@@ -170,6 +170,7 @@ roles/
   planner.md
   ...
 AGENTS.md          # optional team-wide additions
+Dockerfile         # optional packages/tools, derived from CYCLO_TEAM_BASE
 ```
 
 The roster format is:
@@ -182,8 +183,24 @@ Supported engines are `pi` and `pi-interactive`. Each role needs a matching
 `roles/ROLE.md`. At least one agent must have role `planner` because new tasks
 begin with a planner job.
 
-Cyclo supplies AgentWS, Pi, and the provider extension. The team repository is
-data: roster, prompts, and optional instructions. Validate it with:
+Cyclo supplies AgentWS, Pi, and the provider extension. The team repository
+defines the roster, prompts, optional instructions, and—when needed—an
+execution-image delta:
+
+```dockerfile
+ARG CYCLO_TEAM_BASE=cyclo-team-base-required
+FROM ${CYCLO_TEAM_BASE}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends verilator yosys \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+Cyclo uses the common runtime directly when this file is absent. When it is
+present, first run the project with `cyclo run --build`; subsequent ordinary
+runs reuse the current installation-scoped image. Run with `--build` again
+after changing the Dockerfile or anything it consumes. Validate the repository
+with:
 
 ```sh
 cyclo validate ./teams/my-team
@@ -252,7 +269,7 @@ cyclo run ./project.cyclo
 Useful options:
 
 ```text
---build             rebuild the bundled team image
+--build             rebuild the common and selected derived team images
 --offline           remove direct network access; provider UDS remains usable
 --host ADDRESS      AgentWS viewer bind address (default 127.0.0.1)
 --port PORT         fixed viewer port for a one-team project; 0 chooses one
@@ -362,9 +379,10 @@ Override it with `--state-root` or `CYCLO_STATE_ROOT`.
 An installation is identified by its canonical state-root path. Cyclo derives
 a stable 12-hex-character installation ID from that path and uses it in every
 Docker resource it creates: the gateway and provider containers/images, gateway
-credential volume, team containers and networks, the bundled team image, and
-ownership labels. Two installations may therefore use the same project name,
-team name, and instance ID without Docker name or mutable-tag collisions.
+credential volume, team containers and networks, common and derived team
+images, and ownership labels. Two installations may therefore use the same
+project name, team name, and instance ID without Docker name or mutable-tag
+collisions.
 
 Give each installation both its own state root and its own provider assembly:
 
@@ -387,9 +405,10 @@ assembly; do not point two supposedly independent installations at the same
 state root. `cyclo gateway status`, `cyclo providers status`, `cyclo ps`, and
 `cyclo doctor` inspect only the selected installation.
 
-`--image IMAGE` and `CYCLO_TEAM_IMAGE` deliberately override the namespaced
-default team image. Use that override only when sharing one image between
-installations is intended.
+`--image IMAGE` and `CYCLO_TEAM_IMAGE` deliberately bypass the namespaced
+common/derived image selection. Cyclo validates but does not build that
+operator-supplied image. Use the override only when one externally managed
+image is intended for every team in the project.
 
 Cyclo 0.2 is a fresh-install boundary. It does not adopt or migrate 0.1 state,
 containers, networks, images, or provider-runtime configuration. Use a new

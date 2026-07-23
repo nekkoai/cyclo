@@ -13,7 +13,11 @@ from .dashboard import dashboard_host_is_loopback
 from .docker import ContainerSpec, Docker, overlaps, overlaps_lexically
 from .errors import CycloError
 from .instance_lifecycle import stop_remove_instance_container
-from .installation import team_container_name, team_network_name
+from .installation import (
+    derived_team_image_name,
+    team_container_name,
+    team_network_name,
+)
 from .project import (
     ProjectDefinition,
     ProjectMount,
@@ -28,7 +32,7 @@ from .team import (
     require_team_repository,
     team_generation,
 )
-from .team_runtime_image import PI_PACKAGES, ensure as ensure_team_runtime_image
+from .team_runtime_image import PI_PACKAGES
 
 
 def project_instance_id(project: ProjectDefinition, team: ProjectTeam) -> str:
@@ -48,6 +52,8 @@ def new_instance(
     *,
     identifier: str,
     system: str,
+    image: str,
+    image_override: str,
     team_write: bool,
     definition: ProjectDefinition,
 ) -> Instance:
@@ -61,7 +67,8 @@ def new_instance(
         models=sorted({agent.model for agent in team.agents}),
         container_name=team_container_name(system, identifier),
         network_name=team_network_name(system, identifier),
-        image=args.image,
+        image=image,
+        image_override=image_override,
         team_write=team_write,
         offline=args.offline,
         agentws_host=args.host,
@@ -229,6 +236,11 @@ def validate_run_options(args: argparse.Namespace, *, team_count: int) -> None:
             "--foreground is ambiguous for a project with multiple teams; "
             "use `cyclo logs -f INSTANCE`"
         )
+    if args.image and args.build:
+        raise CycloError(
+            "--build cannot rebuild an operator-supplied --image; build that "
+            "image separately or omit --image to build Cyclo team images"
+        )
 
 
 def project_run_bindings(
@@ -237,6 +249,8 @@ def project_run_bindings(
     configured_teams: tuple[tuple[ProjectTeam, Team], ...],
     *,
     system: str,
+    base_image: str,
+    version: str,
 ) -> tuple[RunBinding, ...]:
     result: list[RunBinding] = []
     identifiers: set[str] = set()
@@ -247,12 +261,23 @@ def project_run_bindings(
                 f"project teams produce duplicate instance ID {identifier!r}"
             )
         identifiers.add(identifier)
+        image_override = args.image or ""
+        image = (
+            image_override
+            or (
+                derived_team_image_name(system, version, team.root, team.name)
+                if team.dockerfile is not None
+                else base_image
+            )
+        )
         instance = new_instance(
             args,
             team,
             definition.path.parent,
             identifier=identifier,
             system=system,
+            image=image,
+            image_override=image_override,
             team_write=selected.writable,
             definition=definition,
         )
@@ -373,8 +398,6 @@ def start_binding(
     source: Path,
     store: StateStore,
     docker: Docker,
-    *,
-    build: bool,
 ) -> None:
     instance = binding.instance
     spec = container_spec(binding, store, args)
@@ -398,7 +421,6 @@ def start_binding(
         materialize_pi_settings(store, instance, binding.team)
         try:
             store.save(instance)
-            ensure_team_runtime_image(instance.image, build=build)
             docker.ensure_network(
                 instance.network_name,
                 instance.id,

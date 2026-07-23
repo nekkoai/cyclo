@@ -71,6 +71,7 @@ class Instance:
     image: str
     team_write: bool
     offline: bool
+    image_override: str = ""
     agentws_host: str = DEFAULT_AGENTWS_HOST
     active: bool = False
     port: int | None = None
@@ -97,6 +98,7 @@ class Instance:
             "container_name",
             "network_name",
             "image",
+            "image_override",
             "agentws_host",
             "created_at",
             "updated_at",

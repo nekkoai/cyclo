@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from importlib import resources
 from math import isfinite
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from .errors import CycloError
 from .installation import (
@@ -656,19 +656,22 @@ class ComponentDocker:
             if isinstance(value, Mapping) and value:
                 raise CycloError(message)
 
-    def build(self, deployment: Deployment) -> str:
-        current = self.inspect("image", deployment.image)
-        if current is not None:
-            self._require_owned(deployment, current, image=True)
-        repository = deployment.image.rsplit(":", 1)[0]
+    def build_image(
+        self,
+        image: str,
+        arguments: Sequence[str],
+        validate: Callable[[Mapping[str, object]], None],
+        *,
+        before_promote: Callable[[], None] | None = None,
+    ) -> str:
+        """Build, validate, and transactionally promote one Docker image."""
+
+        if not arguments or arguments[0] != "build":
+            raise CycloError("Cyclo image build arguments must start with 'build'")
+        repository = image.rsplit(":", 1)[0]
         candidate = f"{repository}:candidate-{os.getpid()}-{uuid.uuid4()}"
-        directory = Path(tempfile.mkdtemp(prefix="cyclo-component-build-"))
+        directory = Path(tempfile.mkdtemp(prefix="cyclo-image-build-"))
         iidfile = directory / "image-id"
-        labels = [
-            item
-            for key, value in self._expected_labels(deployment).items()
-            for item in ("--label", f"{key}={value}")
-        ]
         try:
             self.call(
                 [
@@ -677,10 +680,7 @@ class ComponentDocker:
                     candidate,
                     "--iidfile",
                     str(iidfile),
-                    *labels,
-                    "--file",
-                    str(deployment.source / "Dockerfile"),
-                    str(deployment.build_context),
+                    *arguments[1:],
                 ],
                 capture=False,
             )
@@ -695,9 +695,11 @@ class ComponentDocker:
             assert built is not None and candidate_info is not None
             if self._image_id(candidate_info) != image_id:
                 raise CycloError("Docker candidate tag does not reference the completed build")
-            self._validate_image(deployment, built)
-            self.call(["image", "tag", "--", image_id, deployment.image])
-            official = self.inspect("image", deployment.image, missing=False)
+            validate(built)
+            if before_promote is not None:
+                before_promote()
+            self.call(["image", "tag", "--", image_id, image])
+            official = self.inspect("image", image, missing=False)
             assert official is not None
             if self._image_id(official) != image_id:
                 raise CycloError("Docker official tag changed during build promotion")
@@ -705,6 +707,27 @@ class ComponentDocker:
         finally:
             self.call(["image", "rm", "--", candidate], check=False)
             shutil.rmtree(directory, ignore_errors=True)
+
+    def build(self, deployment: Deployment) -> str:
+        current = self.inspect("image", deployment.image)
+        if current is not None:
+            self._require_owned(deployment, current, image=True)
+        labels = [
+            item
+            for key, value in self._expected_labels(deployment).items()
+            for item in ("--label", f"{key}={value}")
+        ]
+        return self.build_image(
+            deployment.image,
+            [
+                "build",
+                *labels,
+                "--file",
+                str(deployment.source / "Dockerfile"),
+                str(deployment.build_context),
+            ],
+            lambda info: self._validate_image(deployment, info),
+        )
 
     def require_image(self, deployment: Deployment) -> str:
         image = self.inspect("image", deployment.image)

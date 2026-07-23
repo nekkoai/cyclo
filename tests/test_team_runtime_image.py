@@ -6,6 +6,26 @@ from pathlib import Path
 from cyclo import team_runtime_image
 
 
+IMAGE_ID = "sha256:" + "a" * 64
+
+
+def image_info(
+    fingerprint: str,
+    *,
+    base_image: str | None = None,
+) -> dict[str, object]:
+    labels = {team_runtime_image.SOURCE_FINGERPRINT_LABEL: fingerprint}
+    if base_image is not None:
+        labels[team_runtime_image.BASE_IMAGE_LABEL] = base_image
+    return {
+        "Id": IMAGE_ID,
+        "Config": {
+            "Entrypoint": list(team_runtime_image.TEAM_RUNTIME_ENTRYPOINT),
+            "Labels": labels,
+        },
+    }
+
+
 def test_source_files_prunes_installed_dependencies(tmp_path: Path) -> None:
     source = tmp_path / "team-runtime" / "src"
     source.mkdir(parents=True)
@@ -45,7 +65,7 @@ def test_packaged_team_image_uses_common_component_context() -> None:
     assert "/opt/cyclo/pi-provider/node_modules/@earendil-works/pi-ai" in dockerfile
 
     fingerprint = team_runtime_image.source_fingerprint()
-    command = team_runtime_image.build_command("cyclo-runtime:test", fingerprint)
+    command = team_runtime_image.build_command(fingerprint)
     assert command[-1] == str(root.parent)
     assert str(team_runtime_image.dockerfile_path()) in command
     assert len(fingerprint) == 64
@@ -54,7 +74,7 @@ def test_packaged_team_image_uses_common_component_context() -> None:
 def test_team_runtime_image_build_is_independent_from_gateway(
     monkeypatch,
 ) -> None:
-    commands: list[list[str]] = []
+    commands: list[tuple[str, list[str], str]] = []
     monkeypatch.setattr(
         team_runtime_image.docker_runner,
         "inspect",
@@ -62,16 +82,20 @@ def test_team_runtime_image_build_is_independent_from_gateway(
     )
     monkeypatch.setattr(
         team_runtime_image.docker_runner,
-        "call",
-        lambda command, **_kwargs: commands.append(["docker", *command])
-        or subprocess.CompletedProcess(command, 0),
+        "build_image",
+        lambda image, command, _validate, **_kwargs: commands.append(
+            (image, command, team_runtime_image.source_fingerprint())
+        )
+        or IMAGE_ID,
     )
 
-    team_runtime_image.ensure("cyclo-runtime:test")
+    assert team_runtime_image.ensure("cyclo-runtime:test") == IMAGE_ID
 
     assert commands == [
-        team_runtime_image.build_command(
-            "cyclo-runtime:test", team_runtime_image.source_fingerprint()
+        (
+            "cyclo-runtime:test",
+            team_runtime_image.build_command(team_runtime_image.source_fingerprint()),
+            team_runtime_image.source_fingerprint(),
         )
     ]
 
@@ -84,13 +108,7 @@ def test_team_runtime_image_is_reused_only_at_exact_fingerprint(
     monkeypatch.setattr(
         team_runtime_image.docker_runner,
         "inspect",
-        lambda _kind, _image: {
-            "Config": {
-                "Labels": {
-                    team_runtime_image.SOURCE_FINGERPRINT_LABEL: fingerprint
-                }
-            }
-        },
+        lambda _kind, _image: image_info(fingerprint),
     )
     monkeypatch.setattr(
         team_runtime_image.docker_runner,
@@ -98,6 +116,74 @@ def test_team_runtime_image_is_reused_only_at_exact_fingerprint(
         lambda command, **_kwargs: commands.append(command),
     )
 
-    team_runtime_image.ensure("cyclo-runtime:test")
+    assert team_runtime_image.ensure("cyclo-runtime:test") == IMAGE_ID
 
     assert commands == []
+
+
+def test_derived_team_image_tracks_exact_base(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "team"
+    root.mkdir()
+    dockerfile = root / "Dockerfile"
+    dockerfile.write_text(
+        "ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n",
+        encoding="utf-8",
+    )
+    (root / "packages.txt").write_text("verilator\n", encoding="utf-8")
+    base = "sha256:" + "b" * 64
+    def inspect(_kind, reference, **_kwargs):
+        if str(reference).startswith("cyclo-team-base-pin:"):
+            pinned = image_info("base")
+            pinned["Id"] = base
+            return pinned
+        return image_info("derived", base_image=base)
+
+    monkeypatch.setattr(
+        team_runtime_image.docker_runner,
+        "inspect",
+        inspect,
+    )
+    monkeypatch.setattr(
+        team_runtime_image.docker_runner,
+        "call",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0),
+    )
+    builds: list[list[str]] = []
+    monkeypatch.setattr(
+        team_runtime_image.docker_runner,
+        "build_image",
+        lambda _image, command, _validate, **_kwargs: builds.append(command)
+        or IMAGE_ID,
+    )
+
+    assert (
+        team_runtime_image.ensure_derived(
+            "cyclo-derived:test",
+            root,
+            base,
+        )
+        == IMAGE_ID
+    )
+    assert builds == []
+
+    assert (
+        team_runtime_image.ensure_derived(
+            "cyclo-derived:test",
+            root,
+            base,
+            build=True,
+        )
+        == IMAGE_ID
+    )
+    assert len(builds) == 1
+    command = builds[0]
+    assert any(
+        value.startswith("CYCLO_TEAM_BASE=cyclo-team-base-pin:")
+        for value in command
+    )
+    assert f"{team_runtime_image.BASE_IMAGE_LABEL}={base}" in command
+    assert command[command.index("--file") + 1] == str(dockerfile)
+    assert command[-1] == str(root)

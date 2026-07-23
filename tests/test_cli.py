@@ -10,11 +10,12 @@ from types import SimpleNamespace
 import pytest
 
 from cyclo.agentws_queue import AgentSupervisorStatus
-from cyclo.cli import build_parser, main
+from cyclo.cli import _prepare_team_images, build_parser, main
 from cyclo.component_stack import COMPONENT_INTERFACE, PROVIDER_INTERFACE
 from cyclo.errors import CycloError
 from cyclo.health import ProviderHealth
 from cyclo.installation import (
+    derived_team_image_name,
     installation_id,
     team_container_name,
     team_image_name,
@@ -22,6 +23,7 @@ from cyclo.installation import (
 )
 from cyclo.project import load_project
 from cyclo.state import Instance, StateStore
+from cyclo.team import load_team
 
 
 MODELS = ("openai-codex/gpt-test", "anthropic/claude-test")
@@ -183,6 +185,10 @@ def install_run_fakes(
     stack = RunStack(socket_dir / "component.sock")
     monkeypatch.setattr("cyclo.cli.agentws_root", lambda: source)
     monkeypatch.setattr("cyclo.cli.provider_stack", lambda *_args, **_kwargs: stack)
+    monkeypatch.setattr(
+        "cyclo.cli._prepare_team_images",
+        lambda _bindings, **_kwargs: None,
+    )
     return stack
 
 
@@ -329,16 +335,25 @@ def test_project_init_rejects_bad_input_without_leaving_a_definition(
 
 def test_refresh_builds_before_stopping_and_restarts_active_projects(
     tmp_path: Path,
+    team_repo: Path,
+    project_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    team = tmp_path / "team"
-    project = tmp_path / "source"
-    team.mkdir()
-    project.mkdir()
-    definition = write_project(tmp_path / "project.cyclo", team, project)
+    (team_repo / "Dockerfile").write_text(
+        "ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n",
+        encoding="utf-8",
+    )
+    definition = write_project(
+        tmp_path / "project.cyclo",
+        team_repo,
+        project_repo,
+    )
     selected = instance(
-        "integration-project-team", tmp_path, active=True, project_file=definition
+        "integration-project-review-team",
+        tmp_path,
+        active=True,
+        project_file=definition,
     )
     selected.agentws_host = "0.0.0.0"
     selected.offline = True
@@ -376,7 +391,15 @@ def test_refresh_builds_before_stopping_and_restarts_active_projects(
     monkeypatch.setattr("cyclo.cli.provider_stack", lambda _args, _store: RefreshStack())
     monkeypatch.setattr(
         "cyclo.cli.ensure_team_runtime_image",
-        lambda image, *, build: events.append(f"image-build:{image}:{build}"),
+        lambda image, *, build: events.append(f"image-build:{image}:{build}")
+        or "sha256:" + "a" * 64,
+    )
+    monkeypatch.setattr(
+        "cyclo.cli.ensure_derived_team_image",
+        lambda image, _root, base, *, build: events.append(
+            f"derived-build:{image}:{base}:{build}"
+        )
+        or "sha256:" + "b" * 64,
     )
     monkeypatch.setattr(
         "cyclo.cli.stop_instance",
@@ -385,7 +408,7 @@ def test_refresh_builds_before_stopping_and_restarts_active_projects(
 
     def run(project_args):
         assert project_args.project == str(definition)
-        assert project_args.image == selected.image
+        assert project_args.image is None
         assert project_args.offline is True
         assert project_args.host == "0.0.0.0"
         assert project_args.port == 4317
@@ -396,13 +419,25 @@ def test_refresh_builds_before_stopping_and_restarts_active_projects(
     monkeypatch.setattr("cyclo.cli.cmd_run", run)
 
     assert main(["refresh"]) == 0
-    stopped = "stop:integration-project-team"
+    stopped = "stop:integration-project-review-team"
     assert events.index("gateway-build") < events.index(stopped)
     assert events.index("providers-build") < events.index(stopped)
     assert events.index(stopped) < events.index("gateway-restart")
     assert events.index("gateway-restart") < events.index("providers-restart")
     assert events.index("providers-restart") < events.index(f"run:{definition}")
-    assert f"image-build:{selected.image}:True" in events
+    assert (
+        f"image-build:{team_image_name(store.system, '0.2.0')}:True"
+        in events
+    )
+    derived = derived_team_image_name(
+        store.system,
+        "0.2.0",
+        team_repo,
+        team_repo.name,
+    )
+    derived_event = f"derived-build:{derived}:sha256:{'a' * 64}:True"
+    assert derived_event in events
+    assert events.index(derived_event) < events.index(stopped)
     assert "Cyclo refresh complete" in capsys.readouterr().out
 
 
@@ -510,6 +545,166 @@ def test_project_dry_run_expands_team_and_mount_authority_without_state(
     assert not state_root.exists()
 
 
+def test_project_dry_run_selects_a_derived_image_per_team_dockerfile(
+    tmp_path: Path,
+    team_repo: Path,
+    project_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    derived_team = tmp_path / "rtl-team"
+    shutil.copytree(team_repo, derived_team)
+    (derived_team / "Dockerfile").write_text(
+        "ARG CYCLO_TEAM_BASE\n"
+        "FROM ${CYCLO_TEAM_BASE}\n"
+        "RUN apt-get update && apt-get install -y verilator\n",
+        encoding="utf-8",
+    )
+    definition = write_project(
+        tmp_path / "project.cyclo",
+        team_repo,
+        project_repo,
+        second_team=derived_team,
+    )
+    state_root = tmp_path / "state"
+    install_run_fakes(monkeypatch, tmp_path)
+
+    assert (
+        main(
+            [
+                "--state-root",
+                str(state_root),
+                "run",
+                "--dry-run",
+                str(definition),
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    system = installation_id(state_root / "components")
+    assert team_image_name(system, "0.2.0") in output
+    assert (
+        derived_team_image_name(system, "0.2.0", derived_team, "rtl-team")
+        in output
+    )
+
+
+def test_run_rejects_build_with_an_operator_managed_image(
+    tmp_path: Path,
+    team_repo: Path,
+    project_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    definition = write_project(
+        tmp_path / "project.cyclo",
+        team_repo,
+        project_repo,
+    )
+    install_run_fakes(monkeypatch, tmp_path)
+
+    assert (
+        main(
+            [
+                "run",
+                "--dry-run",
+                "--build",
+                "--image",
+                "custom:approved",
+                str(definition),
+            ]
+        )
+        == 1
+    )
+    assert "cannot rebuild an operator-supplied --image" in capsys.readouterr().err
+
+
+def test_prepare_team_images_resolves_base_and_derived_tags_to_exact_ids(
+    tmp_path: Path,
+    team_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plain = load_team(team_repo)
+    derived_root = tmp_path / "derived"
+    shutil.copytree(team_repo, derived_root)
+    (derived_root / "Dockerfile").write_text(
+        "ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n",
+        encoding="utf-8",
+    )
+    derived = load_team(derived_root)
+    base_id = "sha256:" + "a" * 64
+    derived_id = "sha256:" + "b" * 64
+    plain_instance = SimpleNamespace(image="base:tag", image_override="")
+    derived_instance = SimpleNamespace(image="derived:tag", image_override="")
+    bindings = (
+        SimpleNamespace(team=plain, instance=plain_instance),
+        SimpleNamespace(team=derived, instance=derived_instance),
+    )
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "cyclo.cli.ensure_team_runtime_image",
+        lambda image, *, build: calls.append(("base", image, build)) or base_id,
+    )
+    monkeypatch.setattr(
+        "cyclo.cli.ensure_derived_team_image",
+        lambda image, root, base, *, build: calls.append(
+            ("derived", image, root, base, build)
+        )
+        or derived_id,
+    )
+
+    assert (
+        _prepare_team_images(
+            bindings,
+            base_image="base:tag",
+            build=False,
+        )
+        == base_id
+    )
+    assert plain_instance.image == base_id
+    assert derived_instance.image == derived_id
+    assert calls == [
+        ("base", "base:tag", False),
+        (
+            "derived",
+            "derived:tag",
+            derived.root,
+            base_id,
+            False,
+        ),
+    ]
+
+
+def test_prepare_team_images_never_rebuilds_an_operator_override(
+    tmp_path: Path,
+    team_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = SimpleNamespace(image="custom:approved", image_override="custom:approved")
+    binding = SimpleNamespace(team=load_team(team_repo), instance=selected)
+    exact = "sha256:" + "c" * 64
+    monkeypatch.setattr(
+        "cyclo.cli.require_team_runtime_image",
+        lambda image: exact if image == "custom:approved" else None,
+    )
+    monkeypatch.setattr(
+        "cyclo.cli.ensure_team_runtime_image",
+        lambda *_args, **_kwargs: pytest.fail("override was rebuilt"),
+    )
+
+    assert (
+        _prepare_team_images(
+            (binding,),
+            base_image="base:tag",
+            build=False,
+        )
+        is None
+    )
+    assert selected.image == exact
+
+
 def test_run_preflights_every_team_then_starts_project_bindings(
     tmp_path: Path,
     team_repo: Path,
@@ -533,8 +728,8 @@ def test_run_preflights_every_team_then_starts_project_bindings(
         lambda binding, _store, _docker: events.append(("preflight", binding.instance.id)),
     )
 
-    def start(_args, binding, _source, _store, _docker, *, build):
-        events.append(("start", binding.instance.id, build))
+    def start(_args, binding, _source, _store, _docker):
+        events.append(("start", binding.instance.id))
         binding.instance.port = 4100 + len(events)
 
     monkeypatch.setattr("cyclo.cli.start_binding", start)
@@ -551,8 +746,10 @@ def test_run_preflights_every_team_then_starts_project_bindings(
         "start",
     ]
     starts = [event for event in events if event[0] == "start"]
-    assert starts[0][2] is True
-    assert starts[1][2] is False
+    assert [event[1] for event in starts] == [
+        "integration-project-review-team",
+        "integration-project-review-audit",
+    ]
     output = capsys.readouterr().out
     assert output.count("started Cyclo instance:") == 2
     assert "mount (rw): source" in output
@@ -582,8 +779,7 @@ def test_project_startup_interrupt_rolls_back_current_and_started_teams(
     started: list[tuple[str, str]] = []
     stopped: list[tuple[str, str | None]] = []
 
-    def start(_args, binding, _source, selected_store, _docker, *, build):
-        del build
+    def start(_args, binding, _source, selected_store, _docker):
         selected_store.save(binding.instance)
         started.append((binding.instance.id, binding.instance.launch_id))
         if len(started) == 2:

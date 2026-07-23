@@ -102,15 +102,19 @@ each instance's metadata.
 
 `project.cyclo` owns the team and mount authority. Consequently `--name` and
 `--team-write` are rejected with this form; express those choices in the file.
-`--offline`, `--host`, `--image`, `--verbose`,
-`--build`, and `--dry-run` still apply to the run.
+`--offline`, `--host`, `--image`, `--verbose`, `--build`, and `--dry-run`
+still apply to the run.
 
-In 0.2.0, `--image` is one tag override shared by every team in the definition.
-A missing or stale selected tag, as well as `--build`, builds Cyclo's packaged
-team-runtime context into that tag; it does not discover or build a Dockerfile
-from any team repository. The accepted future per-team inheritance contract is
-documented in [Team repositories](team-repositories.md). Until that cutover,
-do not treat `--image` as a stable per-team derived-image build mechanism.
+By default, a team without a Dockerfile uses Cyclo's installation-scoped common
+runtime image. A team with a Dockerfile gets its own installation-scoped image,
+built with the exact common image ID as `CYCLO_TEAM_BASE`. An ordinary run
+reuses an image built against the current base. A missing image, or one built
+against another base, fails with an instruction to rerun the same command with
+`--build`. Use `--build` after changing the Dockerfile or files it consumes.
+
+`--image` deliberately bypasses that selection with one operator-supplied image
+shared by every team in the definition. Cyclo validates but never builds that
+image, so `--image` and `--build` are mutually exclusive.
 
 An explicit `--port` and `--foreground` are accepted only when the definition
 contains one team, because either option is ambiguous for several instances.

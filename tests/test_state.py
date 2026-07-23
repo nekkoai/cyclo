@@ -136,6 +136,7 @@ def test_direct_instance_load_rejects_undecodable_and_symlinked_metadata(
         ("providers", "openai", "providers must be a list of strings"),
         ("port", True, "port must be null or an integer"),
         ("project_path", {}, "project_path must be a string"),
+        ("image_override", [], "image_override must be a string"),
         ("project_name", [], "project_name must be a string"),
         ("project_file", 3, "project_file must be a string"),
         (

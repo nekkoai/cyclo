@@ -5,19 +5,6 @@ not implement the Component or Provider interfaces, start a daemon, contain
 credentials, or own runtime state. Cyclo consumes the repository as data and
 runs it with the system-owned team runtime.
 
-## Implementation status
-
-Cyclo 0.2.0 implements the roster, roles, optional policy, Git generation,
-`project.cyclo` selection, and `/team` mount described below.
-
-The optional derived team image described in this document is the accepted
-contract for the component-system cutover. Cyclo 0.2.0 does **not** discover or
-build a `Dockerfile` from a team repository. It has one run-wide `--image`
-tag override. A missing or stale selected tag, as well as an explicit
-`--build`, builds Cyclo's packaged team-runtime context into that tag. A
-manually derived tag may therefore be replaced after the packaged base changes;
-do not treat `--image` as the per-team build mechanism described below.
-
 ## Repository contents
 
 The minimal repository is:
@@ -35,7 +22,7 @@ It may also contain:
 
 ```text
   AGENTS.md              # optional team-wide policy
-  Dockerfile             # optional execution-image delta; accepted design
+  Dockerfile             # optional execution-image delta
   .dockerignore          # recommended with Dockerfile
   README.md              # human documentation; ignored by Cyclo
   LICENSE                # repository metadata; ignored by Cyclo
@@ -85,7 +72,7 @@ Four separate inputs have separate owners:
 | `project.cyclo` | Which teams run, which directories they receive, and each mount mode |
 | Cyclo state root | Tasks, jobs, comments, results, transcripts, Pi state, generated runtime files, and instance metadata |
 
-After the component-system cutover, one generic team container will receive:
+At runtime, one generic team container receives:
 
 ```text
 /team                   selected team repository, read-only or read-write
@@ -103,8 +90,9 @@ repository itself calls no Cyclo API and executes no service.
 A `team PATH ro` line is the normal reproducible mode. `team PATH rw`
 deliberately exposes the same Git working tree read-write at `/team`, allowing
 agents to edit their own roster, roles, policy, or Dockerfile. Such a Dockerfile
-edit never authorizes or triggers a host build; it is inert until an operator
-explicitly builds a new image.
+edit affects the image selected by the next operator-initiated
+`cyclo run --build` or `cyclo refresh`; it never changes the image of an
+already running container.
 
 ## Optional derived team image
 
@@ -119,7 +107,7 @@ The required shape is:
 ```dockerfile
 # syntax=docker/dockerfile:1
 
-ARG CYCLO_TEAM_BASE
+ARG CYCLO_TEAM_BASE=cyclo-team-base-required
 FROM ${CYCLO_TEAM_BASE}
 
 RUN apt-get update \
@@ -133,16 +121,17 @@ RUN python -m pip install --no-cache-dir cocotb==2.0.0
 ```
 
 Docker permits a global `ARG` before `FROM`, so Cyclo can provide the exact
-compatible base reference at build time. The team should not hard-code a
-floating Cyclo base tag, replace the inherited runtime entrypoint, remove
-AgentWS or Pi, or install a separate provider transport. The completed image
-must still satisfy the Cyclo team-runtime ABI.
+compatible base reference at build time. In a multi-stage Dockerfile, the final
+stage must use `FROM ${CYCLO_TEAM_BASE}`; earlier builder stages may use other
+images. The team should not hard-code a floating Cyclo base tag, replace the
+inherited runtime entrypoint, remove AgentWS or Pi, or install a separate
+provider transport. The completed image must still satisfy the Cyclo
+team-runtime ABI.
 
 No API key, provider credential, subscription file, gateway store, project
 directory, Docker socket, or other host secret is supplied to this build.
-Docker build arguments are not a secret mechanism. A `.dockerignore` should
-exclude `.git`, generated files, local state, and anything else the build does
-not require.
+Docker receives the team repository as an ordinary build context and honors
+its `.dockerignore`; Docker build arguments are not a secret mechanism.
 
 See Docker's official documentation for
 [`ARG` and `FROM`](https://docs.docker.com/reference/dockerfile/) and
@@ -154,31 +143,37 @@ The team definition and execution image have related but distinct identities:
 
 - the **team generation** is the Git commit plus the live roster, roles, and
   optional team policy digest;
-- the **image generation** is the exact Cyclo-compatible base image ID plus the
-  effective Dockerfile/build-context digest.
+- the **image generation** is the last successfully built team image, labelled
+  with the exact Cyclo-compatible base image ID.
 
-An instance must record both. Changing prompts must not imply an image rebuild,
-and changing packages must not be hidden inside the prompt generation.
+An instance records both. Changing prompts does not imply an image rebuild.
+After changing Dockerfile inputs, explicitly run with `--build`.
 
 The accepted build lifecycle is:
 
 1. Resolve the installed Cyclo team base to an immutable image reference.
-2. Digest that exact base and the effective team build context.
+2. Give Docker the team repository as its normal build context.
 3. Build under a temporary candidate tag.
 4. Validate the completed image against the team-runtime ABI.
 5. Promote the expected tag only after the candidate succeeds.
 6. Record and run the exact resulting image ID.
 
-An ordinary run reuses the recorded current image. A missing or stale derived
-image requires a separate, explicit trusted build action; simply running a
-team, or allowing it to modify its repository, must not execute its Dockerfile.
-Only the latest successfully promoted image is operational state. Cyclo does
-not need a registry of every historical local build.
+An ordinary `cyclo run` reuses an image built against the current base and
+refuses a missing image or one built against a different base. Cyclo does not
+guess whether arbitrary Docker build inputs changed. Rerunning the same project
+with `cyclo run --build` explicitly authorizes the common base and every
+selected derived image to build.
+`cyclo refresh` provides the corresponding explicit rebuild-and-restart
+operation for active projects and completes every image build before stopping
+the running fleet. Only the latest successfully promoted image is operational
+state; Cyclo keeps no registry of historical local builds.
 
-Building a team Dockerfile executes repository-controlled code through the
-Docker daemon and is therefore a host-administration action. Review it exactly
-as an installed provider Dockerfile. Runtime container isolation cannot make an
-unsafe build recipe safe to execute on the host.
+`cyclo run --build` and `cyclo refresh` authorize Cyclo to execute the selected
+team repository's Dockerfile through the Docker daemon and are therefore
+host-administration actions. Review the repository exactly as an installed
+provider component. An ordinary `cyclo run` never executes changed
+team-controlled build input. Runtime container isolation cannot make an unsafe
+build recipe safe to execute on the host.
 
 ## Reusable toolchain layers
 
@@ -202,4 +197,5 @@ installed package state of several parent images.
 
 Cyclo should not invent a parallel `packages.conf` language. `apt`, `pip`,
 `npm`, compiler stages, version pinning, and distribution-specific setup remain
-ordinary Dockerfile concerns.
+ordinary Dockerfile concerns. Keep generated files and `.git` out of the
+context with `.dockerignore`.

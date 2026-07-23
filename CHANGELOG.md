@@ -33,8 +33,13 @@ interface.
   repositories remain independently selectable as read-only or writable.
 - Generate a host-path-free `/agentws/PROJECT.md` so every agent receives the
   same concise description of its logical filesystem and project authority.
-- Keep team repositories data-only: a roster, role prompts, and optional common
-  `AGENTS.md`. Cyclo supplies the AgentWS runtime and Pi provider extension.
+- Keep team behavior repository-defined: a roster, role prompts, optional
+  common `AGENTS.md`, and an optional Dockerfile for extra execution
+  dependencies. Cyclo supplies the AgentWS runtime and Pi provider extension as
+  the inherited `CYCLO_TEAM_BASE`.
+- Build an installation-scoped derived image for each team Dockerfile. Image
+  identity records the exact common base; candidate images are validated and
+  promoted transactionally.
 - Preserve AgentWS's durable task, job, comment, result, retry, and planner
   recovery loop without coupling queue state to provider health.
 

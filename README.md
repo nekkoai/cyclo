@@ -76,9 +76,11 @@ mount docs ./docs ro
 
 `rw` mounts are workspaces at `/workspace/<name>`; `ro` mounts are supporting
 inputs at `/readonly/<name>`. Teams cannot write read-only mounts. A team
-repository contains a `team` roster, `roles/*.md`, and optional `AGENTS.md`.
-Cyclo supplies the common AgentWS job loop and the provider socket; the team
-supplies data and prompts.
+repository contains a `team` roster, `roles/*.md`, optional `AGENTS.md`, and an
+optional Dockerfile derived from `CYCLO_TEAM_BASE` when its agents need extra
+tools. Cyclo builds and selects that image per team. Cyclo supplies the common
+AgentWS job loop and provider socket; the team supplies behavior and its
+additional execution dependencies.
 
 Run and inspect work:
 
