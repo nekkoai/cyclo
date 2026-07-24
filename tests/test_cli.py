@@ -454,7 +454,7 @@ def test_project_init_rejects_invalid_context_without_creating_definition(
     assert not definition.exists()
 
 
-def test_refresh_stops_then_rebuilds_provider_system_and_active_projects(
+def test_refresh_stops_then_refreshes_provider_system_and_active_projects(
     tmp_path: Path,
     team_repo: Path,
     project_repo: Path,
@@ -484,8 +484,8 @@ def test_refresh_stops_then_rebuilds_provider_system_and_active_projects(
 
     class RefreshStack:
         @staticmethod
-        def restart():
-            events.append("provider-system-restart")
+        def refresh():
+            events.append("provider-system-refresh")
 
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
     monkeypatch.setattr("cyclo.cli.Docker", lambda: object())
@@ -515,8 +515,8 @@ def test_refresh_stops_then_rebuilds_provider_system_and_active_projects(
 
     assert main(["refresh"]) == 0
     stopped = "stop:integration-project-review-team"
-    assert events.index(stopped) < events.index("provider-system-restart")
-    assert events.index("provider-system-restart") < events.index(f"run:{definition}")
+    assert events.index(stopped) < events.index("provider-system-refresh")
+    assert events.index("provider-system-refresh") < events.index(f"run:{definition}")
     assert "Cyclo refresh complete" in capsys.readouterr().out
 
 
@@ -995,6 +995,10 @@ class GatewayDouble:
         self.calls.append(("restart",))
         return self.status_value
 
+    def refresh(self):
+        self.calls.append(("refresh",))
+        return self.status_value
+
     def stop(self) -> bool:
         self.calls.append(("stop",))
         return True
@@ -1013,7 +1017,7 @@ class GatewayDouble:
     (
         (("providers",), ("providers",), 1, "OpenAI API"),
         (("status",), ("status",), 0, "gateway\tready"),
-        (("build",), ("restart",), 1, "sha256:"),
+        (("build",), ("refresh",), 1, "sha256:"),
         (("start",), ("start",), 1, "gateway\tready"),
         (("restart",), ("restart",), 1, "gateway\tready"),
         (("stop",), ("stop",), 1, "stopped gateway"),

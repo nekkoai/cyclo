@@ -34,8 +34,10 @@ outer component fails `ListModels` or violates the structural catalogue
 contract (for example, missing/duplicate IDs or a missing format identifier).
 Inference is never replayed through another component.
 
-Cyclo builds and starts components in declaration order. Each component gets a
-writable output socket directory at `/run/cyclo` and one read-only producer
+Cyclo starts components in declaration order from their valid current-release
+installed images, building only images that are absent or from a different release.
+An explicit restart requires those images and never builds. Each component gets
+a writable output socket directory at `/run/cyclo` and one read-only producer
 socket directory per requirement at
 `/run/cyclo/requirements/NAME`. Components run with `--network none`; the
 socket mount is the edge capability. They receive no sibling sockets, Docker

@@ -67,9 +67,14 @@ interface.
 - Harden persisted state with strict parsing, no-follow file access, atomic
   replacement, serialized queue mutations, bounded scans, and explicit handling
   of corrupt or incomplete instance records.
-- Delegate build-context selection, `.dockerignore`, and cache invalidation to
-  Docker. Mutating lifecycle commands run the cached build, validate candidates,
-  and replace stale component containers; diagnostic commands remain
+- Treat the validated official tag as the installed component. `start`,
+  `models`, project `run`, gateway provider discovery, and login reuse valid
+  current-release component images, building only missing images or images
+  from a different release. Restart requires an installed current image and
+  never builds.
+- Make explicit build and refresh commands the source-update boundary. Cyclo
+  keeps no source hash or cache database; Docker owns build-context,
+  `.dockerignore`, and layer-cache semantics. Diagnostic commands remain
   observational.
 - Use each component image's declared OCI command unchanged. Cyclo only
   overrides `CMD` when explicit arguments follow `--` in `host.conf`; the
@@ -111,9 +116,9 @@ interface.
 - Add project-wide `run` and `stop`, detailed `inspect`, read-only fleet and
   AgentWS dashboards, provider-aware `models`, retained `usage`, and an
   observational full-system `doctor`.
-- Add `cyclo refresh` to rebuild installed gateway, provider, and team images,
-  then reparse and restart active projects from their recorded definition
-  paths.
+- Add `cyclo refresh` to rebuild gateway and configured provider images plus the
+  common and derived team images selected by active projects, then reparse and
+  restart those projects from their recorded definition paths.
 - Make gateway login update the private store and automatically restart the
   gateway so the new catalogue is immediately published.
 - Derive provider configuration from the installation: the default state root

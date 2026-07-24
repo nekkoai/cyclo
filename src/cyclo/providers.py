@@ -664,7 +664,19 @@ class ProviderSystem:
         return self.connection(self.statuses(errors))
 
     def restart(self) -> ProviderConnection:
+        gateway = self.gateway.status()
+        if not gateway.works:
+            raise CycloError("credential gateway is not working")
+        for component in self.provider_components:
+            self.controller.require_image(component)
         self.stop()
+        return self.start()
+
+    def refresh(self) -> ProviderConnection:
+        self.gateway.build()
+        self.build()
+        self.stop()
+        self.gateway.restart()
         return self.start()
 
     def stop(self) -> tuple[str, ...]:

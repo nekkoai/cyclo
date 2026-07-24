@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from cyclo import __version__
 import cyclo.component_runtime as runtime_module
 from cyclo.component import (
     COMPONENT_INTERFACE,
@@ -16,6 +17,7 @@ from cyclo.component import (
     Mount,
 )
 from cyclo.component_runtime import (
+    LABEL_RELEASE,
     LABEL_TYPE,
     ComponentController,
 )
@@ -147,6 +149,79 @@ def _ready_status(component: Component) -> ComponentStatus:
         True,
         "ready",
     )
+
+
+class _ImageController(ComponentController):
+    def __init__(self, image: dict[str, object] | None) -> None:
+        self.image = image
+        self.builds: list[Component] = []
+
+    def inspect(
+        self,
+        kind: str,
+        reference: str,
+        *,
+        missing: bool = True,
+    ):
+        assert kind == "image"
+        assert reference == _component().image
+        return self.image
+
+    def build(self, component: Component) -> str:
+        self.builds.append(component)
+        return IMAGE_ID
+
+
+class _LifecycleController(ComponentController):
+    def __init__(self, status: ComponentStatus) -> None:
+        self.observed = status
+        self.events: list[str] = []
+
+    def status(
+        self,
+        component: Component,
+        *,
+        error: str = "",
+    ) -> ComponentStatus:
+        self.events.append("status")
+        return self.observed
+
+    def ensure_image(self, component: Component) -> str:
+        self.events.append("ensure")
+        return IMAGE_ID
+
+    def require_image(self, component: Component) -> str:
+        self.events.append("require")
+        return IMAGE_ID
+
+    def build(self, component: Component) -> str:
+        self.events.append("build")
+        return IMAGE_ID
+
+    def start_built(
+        self,
+        component: Component,
+        *,
+        replace: bool = False,
+    ) -> ComponentStatus:
+        self.events.append(f"start:{replace}")
+        return _ready_status(component)
+
+
+def test_component_images_are_scoped_to_the_cyclo_release() -> None:
+    assert _labels()[LABEL_RELEASE] == __version__
+
+
+def test_current_image_check_reports_a_release_mismatch() -> None:
+    image = _image()
+    config = image["Config"]
+    assert isinstance(config, dict)
+    labels = config["Labels"]
+    assert isinstance(labels, dict)
+    labels[LABEL_RELEASE] = "another-release"
+
+    with pytest.raises(CycloError, match="different Cyclo release"):
+        _ImageController(image).require_image(_component())
 
 
 @pytest.mark.parametrize(
@@ -573,29 +648,91 @@ def test_run_uses_image_command_unless_explicitly_overridden(
     assert run[run.index(IMAGE_ID) :] == [IMAGE_ID, *expected_command]
 
 
-def test_start_builds_automatically_and_reuses_a_working_container() -> None:
+def test_ensure_image_reuses_a_valid_installed_image() -> None:
     component = _component()
+    controller = _ImageController(_image())
 
-    class Controller(ComponentController):
-        def __init__(self) -> None:
-            self.events: list[str] = []
+    assert controller.ensure_image(component) == IMAGE_ID
+    assert controller.builds == []
 
-        def build(self, selected: Component) -> str:
-            assert selected is component
-            self.events.append("build")
-            return IMAGE_ID
 
-        def status(
-            self,
-            selected: Component,
-            *,
-            error: str = "",
-        ) -> ComponentStatus:
-            assert selected is component
-            self.events.append("status")
-            return _ready_status(selected)
+@pytest.mark.parametrize("stale", [False, True])
+def test_ensure_image_builds_an_absent_or_old_release(stale: bool) -> None:
+    component = _component()
+    image = _image() if stale else None
+    if image is not None:
+        config = image["Config"]
+        assert isinstance(config, dict)
+        labels = config["Labels"]
+        assert isinstance(labels, dict)
+        labels[LABEL_RELEASE] = "0.1.0"
 
-    controller = Controller()
+    controller = _ImageController(image)
+    assert controller.ensure_image(component) == IMAGE_ID
+    assert controller.builds == [component]
+
+
+@pytest.mark.parametrize(
+    ("foreign", "stale"),
+    ((False, False), (False, True), (True, False)),
+)
+def test_ensure_image_rejects_a_malformed_or_foreign_current_image(
+    foreign: bool,
+    stale: bool,
+) -> None:
+    component = _component()
+    image = _image()
+    config = image["Config"]
+    assert isinstance(config, dict)
+    if foreign:
+        labels = config["Labels"]
+        assert isinstance(labels, dict)
+        labels[LABEL_SYSTEM] = "foreign"
+    else:
+        config["Entrypoint"] = None
+        if stale:
+            labels = config["Labels"]
+            assert isinstance(labels, dict)
+            labels[LABEL_RELEASE] = "0.1.0"
+
+    controller = _ImageController(image)
+    message = "not owned" if foreign else "ENTRYPOINT"
+    with pytest.raises(CycloError, match=message):
+        controller.ensure_image(component)
+    assert controller.builds == []
+
+
+def test_start_reuses_a_working_container_without_building() -> None:
+    component = _component()
+    controller = _LifecycleController(_ready_status(component))
 
     assert controller.start(component).works
-    assert controller.events == ["build", "status"]
+    assert controller.events == ["status"]
+
+
+def test_start_repairs_an_unready_component_from_the_installed_image() -> None:
+    component = _component()
+    controller = _LifecycleController(
+        replace(
+            _ready_status(component),
+            running=False,
+            container_state="stopped",
+            engine_health="missing",
+            health="unreachable",
+        )
+    )
+
+    assert controller.start(component).works
+    assert controller.events == ["status", "ensure", "start:False"]
+
+
+def test_restart_reuses_the_installed_image_and_refresh_rebuilds() -> None:
+    component = _component()
+    controller = _LifecycleController(_ready_status(component))
+
+    assert controller.restart(component).works
+    assert controller.events == ["require", "start:True"]
+
+    controller.events.clear()
+    assert controller.refresh(component).works
+    assert controller.events == ["build", "start:True"]

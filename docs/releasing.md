@@ -145,8 +145,10 @@ cyclo models
 cyclo doctor
 ```
 
-The order is intentional: login starts and publishes the credential gateway,
-then `models` builds and starts the configured provider components. `doctor`
+The order is intentional: provider discovery builds the absent gateway image,
+login reuses it and restarts the gateway to publish the credential, then
+`models` builds the absent provider images and starts them. On an existing
+installation these commands reuse valid current-release images. `doctor`
 remains an observational check of the resulting installation.
 
 Initialize one packaged team, run `cyclo validate`, and perform a `run

@@ -40,10 +40,12 @@ List login choices before storing any credential:
 cyclo gateway providers
 ```
 
-Cyclo asks Docker to build the gateway before every mutating gateway operation.
-Docker applies the build context, `.dockerignore`, and cache rules. The private
-credential volume is created if absent and survives ordinary build, stop, and
-restart operations.
+The validated official tag is the installed gateway image. Provider discovery,
+login, and start reuse a valid current-release image, building only when it is
+absent or from a different release. Restart requires an already-installed
+current image and never builds. `cyclo gateway build` explicitly rebuilds and
+restarts the gateway. The private credential volume is created if absent and
+survives ordinary build, stop, and restart operations.
 
 Login using OAuth/subscription or an API key:
 
@@ -77,9 +79,12 @@ cyclo gateway status
 cyclo gateway destroy-store --confirm VOLUME
 ```
 
-`build`, `start`, `restart`, login, and catalogue discovery all run the normal
-Docker build first. Cached inputs remain cheap; no separate freshness mechanism
-or force-build option exists in Cyclo.
+`gateway build` is the source-update boundary. The other gateway commands do not
+compare the installed image with its source. Cyclo keeps no source hash or cache
+database; Docker applies `.dockerignore` and layer-cache rules during an
+explicit build. After changing gateway source, use `cyclo gateway build` or
+`cyclo refresh`.
+
 `destroy-store` is the explicit destructive operation for credentials and
 usage. `cyclo gateway status` prints `VOLUME`; no other gateway command deletes
 it.
@@ -155,13 +160,18 @@ cyclo providers status
 cyclo providers stop
 ```
 
-`build`, `start`, `restart`, `models`, and project `run` submit the configured
-component contexts to Docker. Docker alone decides context inclusion and cache
-reuse. Cyclo validates a completed image before promoting its stable tag and
-replaces containers whose image or launch configuration no longer matches.
+The validated official tag is the installed component. `component build` and
+`providers build` submit the selected contexts to Docker and validate each
+candidate before promoting that tag; they do not restart containers. `start`,
+`models`, and project `run` reuse valid current-release installed images,
+building only missing images or images from a different release. `restart`
+requires installed current images and recreates containers without building.
+Use `cyclo refresh` after changing installed component source.
+
 `stop` removes all provider-lifecycle containers owned by this Cyclo state root
 even if the current configuration is temporarily invalid. The gateway remains
-independent.
+independent. Team images have a separate lifecycle: an ordinary project run
+still submits the selected common and derived team contexts as described below.
 
 Every provider component gets only its own output socket directory and the
 read-only socket directories named by its requirements. Intermediate
@@ -240,9 +250,10 @@ repository with:
 cyclo validate ./teams/my-team
 ```
 
-After upgrading Cyclo or changing installed component source, rebuild changed
-images through Docker and restart every active `project.cyclo` run with one
-command:
+After upgrading Cyclo or changing installed component or team source, use one
+command to stop active project runs, rebuild and restart the gateway and
+configured providers, then rebuild the selected common and derived team images
+while recreating every active `project.cyclo` run:
 
 ```sh
 cyclo refresh

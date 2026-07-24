@@ -76,7 +76,6 @@ def test_gateway_usage_mounts_credential_store_read_only(
         controller=controller,  # type: ignore[arg-type]
     )
     controller.gateway = gateway
-    monkeypatch.setattr(gateway, "build", lambda: IMAGE_ID)
 
     assert gateway.usage() == {"totals": {"requests": 0}}
     command = controller.commands[-1]
@@ -96,13 +95,17 @@ def test_gateway_usage_mounts_credential_store_read_only(
     ) in mounts
 
 
-def test_gateway_login_builds_then_restarts_after_credential_change(
+def test_gateway_login_ensures_then_restarts_after_credential_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[object] = []
 
     class Controller:
+        def ensure_image(self, _component: Component) -> str:
+            events.append("ensure")
+            return IMAGE_ID
+
         def status(
             self,
             _component: Component,
@@ -122,13 +125,11 @@ def test_gateway_login_builds_then_restarts_after_credential_change(
                 "ready",
             )
 
-        def start_built(
+        def restart(
             self,
             _component: Component,
-            *,
-            replace: bool = False,
         ) -> ComponentStatus:
-            events.append("start-built")
+            events.append("restart")
             return _status(gateway)
 
     controller = Controller()
@@ -137,11 +138,6 @@ def test_gateway_login_builds_then_restarts_after_credential_change(
         controller=controller,  # type: ignore[arg-type]
     )
     published = _status(gateway)
-    monkeypatch.setattr(
-        gateway,
-        "build",
-        lambda: events.append("build") or IMAGE_ID,
-    )
     monkeypatch.setattr(gateway, "store_ready", lambda **_options: True)
     monkeypatch.setattr(
         gateway,
@@ -157,23 +153,17 @@ def test_gateway_login_builds_then_restarts_after_credential_change(
     )
     monkeypatch.setattr(
         gateway,
-        "stop",
-        lambda: events.append("stop") or True,
-    )
-    monkeypatch.setattr(
-        gateway,
         "status",
         lambda **_options: published,
     )
 
     assert gateway.login(["anthropic"]) is published
     assert events == [
-        "build",
+        "ensure",
         "status",
         ("exclusive", CONTAINER_ID),
         ("tool", ("login", "anthropic"), True),
-        "stop",
-        "start-built",
+        "restart",
     ]
 
 
@@ -187,8 +177,8 @@ def test_gateway_failed_login_does_not_stop_the_running_gateway(
         controller=controller,
     )
     controller.status.return_value = _status(gateway)
+    controller.ensure_image.return_value = IMAGE_ID
     monkeypatch.setattr(gateway, "_prepare", Mock())
-    monkeypatch.setattr(gateway, "build", Mock(return_value=IMAGE_ID))
     monkeypatch.setattr(gateway, "store_ready", Mock(return_value=True))
     monkeypatch.setattr(gateway, "_require_exclusive_store", Mock())
     monkeypatch.setattr(
@@ -196,14 +186,10 @@ def test_gateway_failed_login_does_not_stop_the_running_gateway(
         "_tool",
         Mock(side_effect=CycloError("candidate catalogue is invalid")),
     )
-    stop = Mock()
-    monkeypatch.setattr(gateway, "stop", stop)
-
     with pytest.raises(CycloError, match="candidate catalogue"):
         gateway.login(["unknown", "--api-key-stdin"])
 
-    stop.assert_not_called()
-    controller.start_built.assert_not_called()
+    controller.restart.assert_not_called()
 
 
 def test_gateway_readiness_failure_reports_cleanup_failure(
