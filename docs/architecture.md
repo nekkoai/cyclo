@@ -200,15 +200,23 @@ bounded PIDs/file descriptors, a small temporary filesystem, and the exact
 socket mounts implied by their declaration. Intermediate components use
 `--network none`. No component receives the Docker socket.
 
-Cyclo submits the component's normal build context to Docker, builds under a
-temporary candidate tag, validates the completed image, and only then moves
-the component's official tag to it. Docker is the sole authority for
-`.dockerignore` semantics and build-cache reuse. Runtime status checks that the
-container uses the exact currently promoted image ID, plus container ownership,
+The validated image under a component's official tag is the installed
+component. Its labels bind it to the installation, component class, and Cyclo
+release. `start`, `models`, project `run`, gateway provider discovery, and login
+reuse a valid current-release installed image, building only when the tag is
+absent or contains an owned image from a different release. Foreign or malformed
+tagged images are rejected. Restart requires an already-installed current image
+and strictly recreates the container without building.
+
+An explicit build submits the component's normal context to Docker, builds under
+a temporary candidate tag, validates the completed image, and only then moves
+the official tag to it. Build and refresh are the source-update boundaries:
+Cyclo keeps no source hash or cache database, and Docker remains the sole
+authority for `.dockerignore` and layer-cache reuse. Runtime status checks that
+the container uses the exact installed image ID, plus container ownership,
 launch configuration, mounts, isolation, engine health, and the component's
-`Health` RPC. Mutating start/run/login commands build through Docker and replace
-stale component containers automatically. Read-only status and doctor commands
-never do so. “Container running” alone is not readiness.
+`Health` RPC. Read-only status and doctor commands never build or start
+components. “Container running” alone is not readiness.
 
 The host-side implementation has four boundaries:
 
@@ -261,11 +269,13 @@ boundary then validates the roster's selected models against the pinned Pi ABI.
 Fallback is control-plane-only: Cyclo never retries an inference request
 through another provider.
 
-Editing the file changes the expected provider list. The next mutating
-`providers start`, `providers restart`, `models`, or project `run` command asks
-Docker to build and start that list. There is no watcher or background
-reconciliation. Individual components can be inspected and controlled through
-the same lifecycle:
+Editing the file changes the expected provider list. `providers start`,
+`models`, and project `run` start that list from valid current-release installed
+images, building only images that are absent or from a different release.
+`providers restart` requires current installed images and never builds. Source
+edits require an explicit component/provider build or `cyclo refresh`; there is
+no watcher or background reconciliation. Individual components can be
+inspected and controlled through the same lifecycle:
 
 ```sh
 cyclo component list
@@ -278,6 +288,11 @@ cyclo providers check|build|start|restart|stop|status
 Gateway commands add only gateway-specific operations such as login and store
 destruction. Provider commands are list-wide conveniences. Both delegate
 ordinary image and container work to the component controller.
+`component build` and `providers build` update images without restarting them;
+`gateway build` rebuilds and restarts the gateway. Global `cyclo refresh`
+stops active team instances, rebuilds and restarts the gateway and configured
+providers, then rebuilds the selected common and derived team images while
+restarting each active project.
 
 ## Provider protocol
 

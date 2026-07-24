@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -563,6 +564,93 @@ def test_stop_runs_in_reverse_order_then_removes_owned_stray(
     ]
     assert ("stop", "--timeout", "10", CONTAINER_ID) in controller.events
     assert ("rm", "--volumes", CONTAINER_ID) in controller.events
+
+
+def test_restart_preflights_installed_images_before_stopping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_component(tmp_path, "first")
+    config = tmp_path / "host.conf"
+    config.write_text(
+        "provider first ./first upstream=gateway\n",
+        encoding="utf-8",
+    )
+    lifecycle = Mock()
+    lifecycle.require_image.return_value = IMAGE_ID
+    lifecycle.stop.return_value = ("first",)
+    controller = Mock()
+    controller.require_image = lifecycle.require_image
+    root = tmp_path / "components"
+    gateway = FakeGateway(root, controller)
+    providers = ProviderSystem(
+        root,
+        config,
+        gateway=gateway,  # type: ignore[arg-type]
+        controller=controller,  # type: ignore[arg-type]
+    )
+    expected = ProviderConnection(
+        providers.configuration.generation,
+        gateway.socket_path,
+        (_status("gateway"),),
+    )
+    lifecycle.start.return_value = expected
+    monkeypatch.setattr(providers, "stop", lifecycle.stop)
+    monkeypatch.setattr(providers, "start", lifecycle.start)
+
+    assert providers.restart() is expected
+    assert lifecycle.mock_calls == [
+        call.require_image(providers.provider_components[0]),
+        call.stop(),
+        call.start(),
+    ]
+
+
+def test_refresh_builds_every_image_before_replacing_components(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_component(tmp_path, "first")
+    config = tmp_path / "host.conf"
+    config.write_text(
+        "provider first ./first upstream=gateway\n",
+        encoding="utf-8",
+    )
+
+    controller = Mock()
+    root = tmp_path / "components"
+    gateway = FakeGateway(root, controller)
+    providers = ProviderSystem(
+        root,
+        config,
+        gateway=gateway,  # type: ignore[arg-type]
+        controller=controller,  # type: ignore[arg-type]
+    )
+    expected = ProviderConnection(
+        providers.configuration.generation,
+        gateway.socket_path,
+        (_status("gateway"),),
+    )
+    lifecycle = Mock()
+    lifecycle.gateway_build.return_value = IMAGE_ID
+    lifecycle.provider_build.return_value = (("first", IMAGE_ID),)
+    lifecycle.provider_stop.return_value = ("first",)
+    lifecycle.gateway_restart.return_value = _status("gateway")
+    lifecycle.provider_start.return_value = expected
+    monkeypatch.setattr(gateway, "build", lifecycle.gateway_build)
+    monkeypatch.setattr(providers, "build", lifecycle.provider_build)
+    monkeypatch.setattr(providers, "stop", lifecycle.provider_stop)
+    monkeypatch.setattr(gateway, "restart", lifecycle.gateway_restart)
+    monkeypatch.setattr(providers, "start", lifecycle.provider_start)
+
+    assert providers.refresh() is expected
+    assert lifecycle.mock_calls == [
+        call.gateway_build(),
+        call.provider_build(),
+        call.provider_stop(),
+        call.gateway_restart(),
+        call.provider_start(),
+    ]
 
 
 def test_empty_model_catalogue_is_an_empty_list(

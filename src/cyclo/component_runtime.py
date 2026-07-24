@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from . import __version__
 from .component import Component, ComponentStatus, Mount, probe_component
 from .errors import CycloError
 from .installation import LABEL_INSTANCE, LABEL_SYSTEM
@@ -18,6 +19,7 @@ from .installation import LABEL_INSTANCE, LABEL_SYSTEM
 
 LABEL_OWNED = "io.cyclo.component"
 LABEL_TYPE = "io.cyclo.component-type"
+LABEL_RELEASE = "io.cyclo.release"
 # Keep the persisted label key stable; its value names the component class.
 LABEL_COMPONENT_CLASS = "io.cyclo.lifecycle"
 
@@ -163,6 +165,7 @@ class ComponentController:
             LABEL_INSTANCE: component.name,
             LABEL_COMPONENT_CLASS: component.component_class,
             LABEL_TYPE: component.kind,
+            LABEL_RELEASE: __version__,
         }
 
     def require_owned(
@@ -207,12 +210,16 @@ class ComponentController:
         self,
         component: Component,
         info: Mapping[str, object],
+        *,
+        check_release: bool = True,
     ) -> None:
         self.require_owned(component, info, image=True)
         labels = self.labels(info)
+        expected = self.expected_labels(component)
+        release = expected.pop(LABEL_RELEASE)
         if any(
             labels.get(key) != value
-            for key, value in self.expected_labels(component).items()
+            for key, value in expected.items()
         ):
             raise CycloError(
                 f"Docker image has incomplete component labels: {component.image}"
@@ -260,6 +267,11 @@ class ComponentController:
             value = config.get(field)
             if isinstance(value, Mapping) and value:
                 raise CycloError(message)
+        if check_release and labels.get(LABEL_RELEASE) != release:
+            raise CycloError(
+                "Docker image belongs to a different Cyclo release: "
+                f"{component.image}"
+            )
 
     def build_image(
         self,
@@ -347,6 +359,17 @@ class ComponentController:
         if image is None:
             raise CycloError(f"component image is not built: {component.name}")
         self._validate_image(component, image)
+        return self.image_id(image)
+
+    def ensure_image(self, component: Component) -> str:
+        """Return the image, building when absent or from another release."""
+
+        image = self.inspect("image", component.image)
+        if image is None:
+            return self.build(component)
+        self._validate_image(component, image, check_release=False)
+        if self.labels(image).get(LABEL_RELEASE) != __version__:
+            return self.build(component)
         return self.image_id(image)
 
     @staticmethod
@@ -748,10 +771,17 @@ class ComponentController:
             raise
 
     def start(self, component: Component) -> ComponentStatus:
-        self.build(component)
+        current = self.status(component)
+        if current.works:
+            return current
+        self.ensure_image(component)
         return self.start_built(component)
 
     def restart(self, component: Component) -> ComponentStatus:
+        self.require_image(component)
+        return self.start_built(component, replace=True)
+
+    def refresh(self, component: Component) -> ComponentStatus:
         self.build(component)
         return self.start_built(component, replace=True)
 

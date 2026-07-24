@@ -7,7 +7,7 @@ import stat
 import subprocess
 from dataclasses import replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .component import (
     COMPONENT_INTERFACE,
@@ -218,6 +218,9 @@ class Gateway:
     def build(self) -> str:
         return self.controller.build(self.component)
 
+    def ensure_image(self) -> str:
+        return self.controller.ensure_image(self.component)
+
     def status(self, *, error: str = "") -> ComponentStatus:
         status = self.controller.status(self.component, error=error)
         store_ready = self.store_ready()
@@ -255,28 +258,30 @@ class Gateway:
             + cleanup_error
         )
 
-    def start(self) -> ComponentStatus:
+    def _activate(
+        self,
+        operation: Callable[[Component], ComponentStatus],
+    ) -> ComponentStatus:
         self._prepare()
         self.store_ready(create=True)
         current = self.controller.status(self.component)
         self._require_exclusive_store(current.container_id)
-        status = self.controller.start(self.component)
+        status = operation(self.component)
         return self._require_working(
             self.status(error=status.error)
         )
+
+    def start(self) -> ComponentStatus:
+        return self._activate(self.controller.start)
 
     def stop(self) -> bool:
         return self.controller.stop(self.component)
 
     def restart(self) -> ComponentStatus:
-        self._prepare()
-        self.store_ready(create=True)
-        current = self.controller.status(self.component)
-        self._require_exclusive_store(current.container_id)
-        status = self.controller.restart(self.component)
-        return self._require_working(
-            self.status(error=status.error)
-        )
+        return self._activate(self.controller.restart)
+
+    def refresh(self) -> ComponentStatus:
+        return self._activate(self.controller.refresh)
 
     def logs(self, lines: int = 80) -> str:
         return self.controller.logs(self.component, lines)
@@ -346,7 +351,7 @@ class Gateway:
         )
 
     def providers(self) -> str:
-        self.build()
+        self.ensure_image()
         return (
             self._tool(["providers"], volume=False).stdout or ""
         ).rstrip()
@@ -375,7 +380,7 @@ class Gateway:
         ):
             raise CycloError("gateway login requires a provider")
         self._prepare()
-        self.build()
+        self.ensure_image()
         normalized = list(arguments)
         indexes = [
             index
@@ -416,8 +421,7 @@ class Gateway:
             capture=False,
             config=True,
         )
-        self.stop()
-        status = self.controller.start_built(self.component)
+        status = self.controller.restart(self.component)
         return self._require_working(
             self.status(error=status.error)
         )

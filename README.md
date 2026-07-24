@@ -43,10 +43,14 @@ directory. Named requirements from that repository's `component.conf` bind to
 `gateway` or an earlier instance. Words after `--` become separate component
 arguments that explicitly replace the image's OCI `CMD`; without `--`, the
 image's own `CMD` is used unchanged. Relative paths resolve beside `host.conf`.
-An empty file means “use the gateway directly”. Mutating lifecycle commands
-submit build contexts to Docker, validate completed images, and replace stale
-containers automatically. Docker owns `.dockerignore` and cache semantics;
-`status` and `doctor` remain observational.
+An empty file means “use the gateway directly”. The validated official tag is
+the installed component. `start`, `models`, project `run`, gateway provider
+discovery, and login reuse a valid current-release component image, building
+only when it is absent or from a different release. Restart strictly recreates a
+container from an already installed current image and never builds. Explicit
+build and refresh commands are the source-update boundary: Cyclo keeps no source
+hash or cache database, while Docker owns `.dockerignore` and layer-cache
+semantics. `status` and `doctor` remain observational.
 
 Providers are independent components using the ConnectRPC provider protocol
 over Unix-domain sockets. The gateway is the fixed root provider and catalogue
@@ -119,7 +123,7 @@ cyclo task list <instance>
 cyclo task show <instance> uart-ip
 cyclo logs <instance>
 cyclo dashboard --host 127.0.0.1
-cyclo refresh                       # rebuild runtimes and restart active projects
+cyclo refresh                       # rebuild installed images and restart the active fleet
 ```
 
 The dashboard is read-only and shows team/job state, provider health, and

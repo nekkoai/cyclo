@@ -539,7 +539,7 @@ def _refresh_projects(
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
-    """Restart the active system, rebuilding changed images through Docker."""
+    """Rebuild installed images and restart the active Cyclo system."""
 
     store = state_store(args)
     docker = Docker()
@@ -563,7 +563,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 
     print("rebuilding and restarting provider system")
     with store.locked():
-        providers.restart()
+        providers.refresh()
 
     start_failures: list[str] = []
     for project_args in projects:
@@ -1219,7 +1219,7 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         return _print_gateway_status(status, proxy.store_volume)
     with store.locked():
         if action == "build":
-            status = proxy.restart()
+            status = proxy.refresh()
             print(status.image_id)
             return _print_gateway_status(status, proxy.store_volume)
         if action == "start":
@@ -1452,7 +1452,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     refresh = commands.add_parser(
         "refresh",
-        help="restart the active Cyclo system and rebuild changed images",
+        help="rebuild installed images and restart the active Cyclo system",
     )
     refresh.set_defaults(func=cmd_refresh)
 
@@ -1589,9 +1589,12 @@ def build_parser() -> argparse.ArgumentParser:
     component_status.set_defaults(func=cmd_component)
     for action, help_text in (
         ("build", "build and validate one component image"),
-        ("start", "build and start one component"),
+        (
+            "start",
+            "start one component, installing a current-release image if needed",
+        ),
         ("stop", "stop one component"),
-        ("restart", "build and restart one component"),
+        ("restart", "restart one component from its installed image"),
     ):
         selected = component_commands.add_parser(action, help=help_text)
         selected.add_argument("name")
@@ -1622,7 +1625,7 @@ def build_parser() -> argparse.ArgumentParser:
     provider_help = {
         "check": "validate host.conf and component declarations",
         "build": "ask Docker to build every provider image without restarting",
-        "start": "build and start each configured provider",
+        "start": "start each provider, installing current-release images if needed",
         "stop": "stop provider components without stopping the gateway",
         "status": "show each provider component independently",
     }
@@ -1630,7 +1633,7 @@ def build_parser() -> argparse.ArgumentParser:
         selected = provider_commands.add_parser(action, help=help_text)
         selected.set_defaults(func=cmd_providers)
     restart = provider_commands.add_parser(
-        "restart", help="build through Docker and restart provider components"
+        "restart", help="restart provider components from their installed images"
     )
     restart.set_defaults(func=cmd_providers)
 
@@ -1658,7 +1661,7 @@ def build_parser() -> argparse.ArgumentParser:
     provider_catalogue.set_defaults(func=cmd_gateway)
     gateway_help = {
         "build": "build through Docker and restart the gateway",
-        "start": "build and start the gateway",
+        "start": "start the gateway, installing its current-release image if needed",
         "stop": "stop the gateway without deleting its credential store",
         "status": "show gateway readiness, image identity, and store volume",
     }
@@ -1681,7 +1684,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     destroy.set_defaults(func=cmd_gateway)
     gateway_restart = gateway_commands.add_parser(
-        "restart", help="build through Docker and restart the gateway"
+        "restart", help="restart the gateway from its installed image"
     )
     gateway_restart.set_defaults(func=cmd_gateway)
     login = gateway_commands.add_parser(
