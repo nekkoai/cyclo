@@ -239,18 +239,20 @@ class Gateway:
     def _require_working(self, status: ComponentStatus) -> ComponentStatus:
         if status.works:
             return status
+        cleanup_error = ""
         if status.container_id:
             try:
                 self.controller.stop(
                     self.component,
                     status.container_id,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                cleanup_error = f"; cleanup failed: {exc}"
         detail = status.error or status.health
         raise CycloError(
             "gateway did not become ready"
             + (f": {detail}" if detail else "")
+            + cleanup_error
         )
 
     def start(self) -> ComponentStatus:
@@ -289,6 +291,7 @@ class Gateway:
         input_data: str | None = None,
         capture: bool = True,
         volume_read_only: bool = False,
+        config: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         image_id = self.controller.require_image(self.component)
         arguments = [
@@ -322,6 +325,16 @@ class Gateway:
                         f"type=volume,src={self.store_volume},"
                         "dst=/var/lib/cyclo-gateway"
                         + (",readonly" if volume_read_only else "")
+                    ),
+                ]
+            )
+        if config:
+            arguments.extend(
+                [
+                    "--mount",
+                    (
+                        f"type=bind,src={self.config_dir},"
+                        "dst=/etc/cyclo-gateway,readonly"
                     ),
                 ]
             )
@@ -401,6 +414,7 @@ class Gateway:
             interactive=True,
             input_data=input_data,
             capture=False,
+            config=True,
         )
         self.stop()
         status = self.controller.start_built(self.component)

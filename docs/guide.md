@@ -55,8 +55,10 @@ cyclo gateway login openai --as openai-work --api-key-env OPENAI_API_KEY
 ```
 
 The account name selected by `--as` becomes the public prefix in
-`ACCOUNT/MODEL`. Login writes the store, restarts the gateway, and returns only
-after the resulting model catalogue is ready:
+`ACCOUNT/MODEL`. Account names are 1–64 lowercase letters, numbers,
+underscores, or hyphens, begin with a letter or number, and may not use a
+reserved Cyclo route name. Login writes the store, restarts the gateway, and
+returns only after the resulting model catalogue is ready:
 
 ```sh
 cyclo models
@@ -138,8 +140,9 @@ cyclo component logs NAME
 `list` and `status` report each component independently. They show whether its
 container is present, current, and running, together with Docker health,
 Component health, and a concrete error. They do not compute a graph-wide
-readiness flag. `cyclo component status gateway` remains usable even when
-`host.conf` is invalid.
+readiness flag. A named `status` inspects only that component, so an unrelated
+broken container cannot prevent diagnosis. `cyclo component status gateway`
+remains usable even when `host.conf` is invalid.
 
 Operate every configured provider with:
 
@@ -166,6 +169,11 @@ components run with no network. Cyclo selects the last working provider whose
 inputs are working and mounts that socket read-only into newly started teams.
 If a component cannot build or start, Cyclo reports it, skips its dependants,
 and keeps an earlier working provider available; this may be the gateway.
+Catalogue selection also tries usable components from outermost to innermost:
+if a health-ready component cannot return a structurally valid `ListModels`
+response, model listing and a new project fall back without retrying inference
+requests. The catalogue itself is format-neutral. A project run separately
+checks that every model requested by its current Pi team is Pi-compatible.
 
 The Provider data plane carries `model` and an opaque Pi JSON string. Relays do
 not understand prompts, history, tools, JSON Schema, or events. See
@@ -179,11 +187,15 @@ List installed templates:
 cyclo team templates
 ```
 
-Create a team repository using an exact model from `cyclo models`:
+Create a team repository using a Pi-compatible model from `cyclo models`:
 
 ```sh
 cyclo team init ./teams/my-team --template plan-execute-verify --model codex-work/MODEL_ID
 ```
+
+`cyclo models` prints the selected Provider catalogue, including models for
+future inference formats. `cyclo run` fails before starting containers if a
+Pi-based roster selects a model with an incompatible format or metadata.
 
 The repository contains:
 
@@ -241,10 +253,11 @@ path so Cyclo can reproducibly recreate the same mount and team authority.
 
 ## Define a project
 
-Create a validated one-team project definition directly:
+Create a validated one-team definition spanning two writable projects and one
+read-only input:
 
 ```sh
-cyclo project init ./project.cyclo --team ./teams/jon-rtl ro --mount source /home/user/openhw/core-et rw
+cyclo project init ./project.cyclo --context ./project-context.md --team ./teams/jon-rtl ro --mount core-et /home/user/openhw/core-et rw --mount uart-ip /home/user/openhw/uart-ip rw --mount specifications ./references/specifications ro
 ```
 
 Add further `--team PATH MODE` or `--mount NAME PATH MODE` options as needed.
@@ -254,25 +267,43 @@ Create `project.cyclo`:
 
 ```text
 name core-et-uart
-description Design and verify a UART IP.
+description Integrate and verify a reusable UART IP in CORE-ET.
+
+context <<PROJECT_CONTEXT
+`core-et` is the processor implementation repository.
+`uart-ip` is the separately versioned UART repository being integrated into it.
+`specifications` contains normative interface documents for both projects.
+PROJECT_CONTEXT
 
 team ./teams/jon-rtl ro
 team ./teams/rtl-auditor ro
 
-mount source /home/user/openhw/core-et rw
+mount core-et /home/user/openhw/core-et rw
+mount uart-ip /home/user/openhw/uart-ip rw
 mount specifications ./references/specifications ro
 ```
 
 The syntax is whitespace-delimited and has no quoting or `~` expansion.
 Relative paths resolve beside the file.
 
+The optional literal `context <<MARKER` block explains what the mounted
+projects are, where work belongs, and how the repositories and supporting
+inputs relate. On launch or refresh, Cyclo creates the fixed, read-only
+`/agentws/project.cyclo` snapshot. It uses the same grammar, keeps the authored
+name, description, and context, selects the current team as `/team`, and
+rewrites structured paths automatically: `rw` mounts become `/workspace/NAME`
+and `ro` mounts become `/readonly/NAME`. Authored description/context text is
+copied literally. Every team agent reads that
+instance-wide contract; tasks contain only task-specific work.
+
 - `team PATH ro` mounts the team definition read-only at `/team`.
 - `team PATH rw` deliberately permits team self-modification.
-- `mount NAME PATH rw` creates `/workspace/NAME`.
+- `mount NAME PATH rw` creates one writable project at `/workspace/NAME`.
 - `mount NAME PATH ro` creates `/readonly/NAME`.
 
-Read-only mounts are supporting inputs, not projects. Writable projects always
-live below `/workspace`.
+Several `rw` lines intentionally expose several writable projects. Cyclo does
+not infer which is primary; the description and context explain their
+relationship. Read-only mounts are supporting inputs, not projects.
 
 Validate before running:
 
@@ -341,6 +372,17 @@ cyclo stop ./project.cyclo
 ```
 
 Queue state and transcripts survive the team-container removal.
+
+When a stopped instance binding is no longer wanted, retire it explicitly:
+
+```sh
+cyclo forget INSTANCE --confirm INSTANCE
+```
+
+This permanently removes that instance's tasks, jobs, transcripts, generated
+runtime, and metadata. It refuses an active container. The explicit operation
+allows a later project at a moved path to reuse the logical instance name
+without silently mixing old queue state into the new project.
 
 ## Dashboards
 
@@ -454,8 +496,10 @@ components/sockets/COMPONENT/    intermediate component sockets
 ```
 
 The gateway credential and usage store is a separately labelled Docker volume.
-Cyclo verifies installation, resource-kind, and instance ownership before
-adopting, mounting, or deleting Docker resources.
+Cyclo verifies installation, resource-kind, instance, and persisted launch
+identity before operating on a current team container. Startup replacement
+uses the first three labels so it can remove a stopped previous launch; it
+never adopts that previous launch as the current instance.
 
 ## Security model
 

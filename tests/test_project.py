@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -8,9 +10,11 @@ import pytest
 from cyclo.errors import CycloError
 from cyclo.project import (
     MAX_PROJECT_FILE_BYTES,
+    ProjectDefinition,
     ProjectTeam,
     load_project,
-    render_project_manifest,
+    read_project_context,
+    render_container_project,
 )
 
 
@@ -32,6 +36,28 @@ def valid_text() -> str:
         "mount core-et ../sources/core-et rw\n"
         "mount specifications ../references/specifications ro\n"
     )
+
+
+def load_rendered_container_project(
+    tmp_path: Path,
+    rendered: str,
+    source: ProjectDefinition,
+) -> ProjectDefinition:
+    """Parse normalized container paths after mapping them to real test paths."""
+
+    selected = source.teams[0]
+    translated = rendered.replace(
+        f"team /team {selected.mode}",
+        f"team {selected.path} {selected.mode}",
+    )
+    for mount in source.mounts:
+        translated = translated.replace(
+            f"mount {mount.name} {mount.container_path} {mount.mode}",
+            f"mount {mount.name} {mount.path} {mount.mode}",
+        )
+    path = tmp_path / "rendered-container-project.cyclo"
+    path.write_text(translated, encoding="utf-8")
+    return load_project(path)
 
 
 def test_loads_strict_project_definition_relative_to_its_file(
@@ -116,29 +142,172 @@ def test_definition_digest_is_semantic_and_deterministic(tmp_path: Path) -> None
     ).definition_sha256
 
 
-def test_agent_manifest_has_container_paths_but_no_host_paths(tmp_path: Path) -> None:
-    config_dir, team_path, source, docs = project_tree(tmp_path)
+def test_context_block_is_literal_hashed_and_rendered(tmp_path: Path) -> None:
+    config_dir, _team, _source, _docs = project_tree(tmp_path)
+    config = config_dir / "project.cyclo"
+    context = (
+        "`core-et` is the implementation tree.\n"
+        "\n"
+        "  Preserve this indentation.\n"
+        "# This is project guidance, not a comment.\n"
+        "mount example /not/a/directive rw\n"
+        "CYCLO_CONTEXT\n"
+        "CYCLO_CONTEXT_2"
+    )
+    config.write_text(
+        valid_text().replace(
+            "team ../teams/jon-rtl ro\n",
+            f"context <<PROJECT_CONTEXT\n\n{context}\n\nPROJECT_CONTEXT\n"
+            "team ../teams/jon-rtl ro\n",
+        ),
+        encoding="utf-8",
+    )
+
+    project = load_project(config)
+    rendered = render_container_project(project, team=project.teams[0])
+
+    assert project.context == context
+    assert rendered.count(context) == 1
+    assert "context <<CYCLO_CONTEXT_3\n" in rendered
+    assert load_rendered_container_project(
+        tmp_path, rendered, project
+    ).context == context
+
+    original_hash = project.definition_sha256
+    equivalent = config_dir / "equivalent.cyclo"
+    equivalent.write_bytes(
+        config.read_text(encoding="utf-8")
+        .replace("PROJECT_CONTEXT", "OTHER_MARKER")
+        .replace("\n", "\r\n")
+        .encode("utf-8")
+    )
+    assert load_project(equivalent).definition_sha256 == original_hash
+
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "implementation tree", "RTL implementation tree"
+        ),
+        encoding="utf-8",
+    )
+    assert load_project(config).definition_sha256 != original_hash
+
+
+def test_container_project_rejects_generated_output_over_size_limit(
+    tmp_path: Path,
+) -> None:
+    config_dir, _team, _source, _docs = project_tree(tmp_path)
     config = config_dir / "project.cyclo"
     config.write_text(valid_text(), encoding="utf-8")
     project = load_project(config)
+    oversized = replace(project, context="x" * MAX_PROJECT_FILE_BYTES)
 
-    generic = render_project_manifest(project)
-    selected = render_project_manifest(project, team=project.teams[0])
-
-    assert "Name: core-et-uart" in selected
-    assert "Description: Design and verify" in selected
-    assert "## Writable workspace mounts" in selected
-    assert "/workspace/core-et (read-write)" in selected
-    assert "## Read-only mounts" in selected
-    assert "/readonly/specifications (read-only)" in selected
-    assert "/team (read-only; jon-rtl)" in selected
-    assert "jon-rtl (read-only)" in generic
-    for host_path in (config, team_path, source, docs):
-        assert str(host_path.resolve()) not in generic
-        assert str(host_path.resolve()) not in selected
+    with pytest.raises(
+        CycloError,
+        match="container project configuration exceeds",
+    ):
+        render_container_project(oversized, team=oversized.teams[0])
 
 
-def test_manifest_rejects_a_team_from_another_definition(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("block", "message"),
+    [
+        ("context words\n", "expected context"),
+        ("context <<bad-marker\n", "expected context"),
+        ("context <<END\nEND\n", "must not be empty"),
+        ("context <<END\nwords\n", "unterminated context block"),
+        (
+            "context <<ONE\nfirst\nONE\ncontext <<TWO\nsecond\nTWO\n",
+            "duplicate context",
+        ),
+    ],
+)
+def test_rejects_malformed_context_blocks(
+    tmp_path: Path, block: str, message: str
+) -> None:
+    config_dir, _team, _source, _docs = project_tree(tmp_path)
+    config = config_dir / "project.cyclo"
+    config.write_text(
+        "name demo\n"
+        "description words\n"
+        f"{block}"
+        "team ../teams/jon-rtl ro\n"
+        "mount source ../sources/core-et rw\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CycloError, match=message) as stopped:
+        load_project(config)
+
+    assert str(config) in str(stopped.value)
+
+
+def test_container_project_is_valid_normalized_and_has_no_host_paths(
+    tmp_path: Path,
+) -> None:
+    config_dir, team_path, source, docs = project_tree(tmp_path)
+    audit_team = tmp_path / "teams" / "rtl-auditor"
+    firmware = tmp_path / "sources" / "firmware"
+    audit_team.mkdir()
+    firmware.mkdir()
+    config = config_dir / "project.cyclo"
+    config.write_text(
+        valid_text().replace(
+            "team ../teams/jon-rtl ro\n",
+            "team ../teams/jon-rtl ro\n"
+            "team ../teams/rtl-auditor rw\n",
+        )
+        + "mount firmware ../sources/firmware rw\n",
+        encoding="utf-8",
+    )
+    project = load_project(config)
+
+    rendered = render_container_project(project, team=project.teams[0])
+    audit_rendered = render_container_project(project, team=project.teams[1])
+    reparsed = load_rendered_container_project(tmp_path, rendered, project)
+
+    assert "name core-et-uart\n" in rendered
+    assert (
+        "description Design and verify a UART IP for OpenHW CORE-V.\n"
+        in rendered
+    )
+    assert "team /team ro\n" in rendered
+    assert rendered.count("\nteam ") == 1
+    assert "team /team rw\n" in audit_rendered
+    assert audit_rendered.count("\nteam ") == 1
+    assert "mount core-et /workspace/core-et rw\n" in rendered
+    assert "mount firmware /workspace/firmware rw\n" in rendered
+    assert (
+        "mount specifications /readonly/specifications ro\n"
+        in rendered
+    )
+    assert reparsed.name == project.name
+    assert reparsed.description == project.description
+    assert reparsed.context == project.context
+    assert [(team.mode, team.path) for team in reparsed.teams] == [
+        ("ro", team_path.resolve())
+    ]
+    assert [
+        (mount.name, mount.mode, mount.path) for mount in reparsed.mounts
+    ] == [
+        ("core-et", "rw", source.resolve()),
+        ("specifications", "ro", docs.resolve()),
+        ("firmware", "rw", firmware.resolve()),
+    ]
+    for host_path in (
+        config,
+        team_path,
+        audit_team,
+        source,
+        docs,
+        firmware,
+    ):
+        assert str(host_path.resolve()) not in rendered
+        assert str(host_path.resolve()) not in audit_rendered
+
+
+def test_container_project_rejects_a_team_from_another_definition(
+    tmp_path: Path,
+) -> None:
     config_dir, _team, _source, _docs = project_tree(tmp_path)
     config = config_dir / "project.cyclo"
     config.write_text(valid_text(), encoding="utf-8")
@@ -146,7 +315,7 @@ def test_manifest_rejects_a_team_from_another_definition(tmp_path: Path) -> None
     foreign = ProjectTeam(path=tmp_path / "foreign", mode="ro", line=1)
 
     with pytest.raises(ValueError, match="not part"):
-        render_project_manifest(project, team=foreign)
+        render_container_project(project, team=foreign)
 
 
 @pytest.mark.parametrize(
@@ -402,3 +571,21 @@ def test_project_file_must_be_regular_bounded_utf8_without_controls(
     oversized.write_bytes(b"#" * (MAX_PROJECT_FILE_BYTES + 1))
     with pytest.raises(CycloError, match="exceeds"):
         load_project(oversized)
+
+
+def test_project_context_file_uses_the_same_safe_read_boundary(
+    tmp_path: Path,
+) -> None:
+    context = tmp_path / "context.md"
+    context.write_bytes(b"Source layout.\r\n")
+    assert read_project_context(context) == "Source layout."
+
+    alias = tmp_path / "context-alias.md"
+    alias.symlink_to(context)
+    with pytest.raises(CycloError, match="must not be a symlink"):
+        read_project_context(alias)
+
+    fifo = tmp_path / "context.fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(CycloError, match="not a regular file"):
+        read_project_context(fifo)

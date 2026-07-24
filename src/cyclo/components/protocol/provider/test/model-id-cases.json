@@ -1,0 +1,138 @@
+[
+  {
+    "name": "ordinary route",
+    "prefix": "work/",
+    "unit": "model",
+    "repeat": 1,
+    "suffix": "",
+    "valid": true
+  },
+  {
+    "name": "nested model name",
+    "prefix": "work/",
+    "unit": "family/model",
+    "repeat": 1,
+    "suffix": "",
+    "valid": true
+  },
+  {
+    "name": "provider prefix boundary",
+    "prefix": "",
+    "unit": "a",
+    "repeat": 64,
+    "suffix": "/model",
+    "valid": true
+  },
+  {
+    "name": "provider prefix over boundary",
+    "prefix": "",
+    "unit": "a",
+    "repeat": 65,
+    "suffix": "/model",
+    "valid": false
+  },
+  {
+    "name": "provider prefix starts with underscore",
+    "prefix": "_legacy/",
+    "unit": "model",
+    "repeat": 1,
+    "suffix": "",
+    "valid": false
+  },
+  {
+    "name": "provider prefix starts with hyphen",
+    "prefix": "-legacy/",
+    "unit": "model",
+    "repeat": 1,
+    "suffix": "",
+    "valid": false
+  },
+  {
+    "name": "ASCII local-ID boundary",
+    "prefix": "work/",
+    "unit": "a",
+    "repeat": 1024,
+    "suffix": "",
+    "valid": true
+  },
+  {
+    "name": "ASCII local-ID over boundary",
+    "prefix": "work/",
+    "unit": "a",
+    "repeat": 1025,
+    "suffix": "",
+    "valid": false
+  },
+  {
+    "name": "astral Unicode local-ID boundary",
+    "prefix": "work/",
+    "unit": "😀",
+    "repeat": 512,
+    "suffix": "",
+    "valid": true
+  },
+  {
+    "name": "astral Unicode local-ID over boundary",
+    "prefix": "work/",
+    "unit": "😀",
+    "repeat": 513,
+    "suffix": "",
+    "valid": false
+  },
+  {
+    "name": "ASCII control",
+    "prefix": "work/",
+    "unit": "bad\u0007model",
+    "repeat": 1,
+    "suffix": "",
+    "valid": false
+  },
+  {
+    "name": "ASCII delete control",
+    "prefix": "work/",
+    "unit": "bad\u007fmodel",
+    "repeat": 1,
+    "suffix": "",
+    "valid": false
+  },
+  {
+    "name": "Unicode whitespace",
+    "prefix": "work/",
+    "unit": "bad\u0085model",
+    "repeat": 1,
+    "suffix": "",
+    "valid": false
+  },
+  {
+    "name": "ECMAScript byte-order-mark whitespace",
+    "prefix": "work/",
+    "unit": "bad\ufeffmodel",
+    "repeat": 1,
+    "suffix": "",
+    "valid": false
+  },
+  {
+    "name": "lone UTF-16 surrogate",
+    "prefix": "work/",
+    "unit": "\ud800",
+    "repeat": 1,
+    "suffix": "",
+    "valid": false
+  },
+  {
+    "name": "escaped UTF-16 surrogate-pair boundary",
+    "prefix": "work/",
+    "unit": "\ud83d\ude00",
+    "repeat": 512,
+    "suffix": "",
+    "valid": true
+  },
+  {
+    "name": "reserved provider",
+    "prefix": "gateway/",
+    "unit": "model",
+    "repeat": 1,
+    "suffix": "",
+    "valid": false
+  }
+]

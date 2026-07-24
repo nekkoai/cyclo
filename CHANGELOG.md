@@ -26,13 +26,17 @@ interface.
 ### Projects and teams
 
 - Add strict, line-oriented `project.cyclo` files containing a project name,
-  description, one or more team repositories, and named `ro`/`rw` mounts.
-  Relative paths resolve beside the project file and unknown directives fail.
+  description, optional literal project-context block, one or more team
+  repositories, and named `ro`/`rw` mounts. Relative paths resolve beside the
+  project file and unknown directives fail.
 - Start one container per selected team. Writable mounts appear below
   `/workspace`, read-only supporting material below `/readonly`, and team
   repositories remain independently selectable as read-only or writable.
-- Generate a host-path-free `/agentws/PROJECT.md` so every agent receives the
-  same concise description of its logical filesystem and project authority.
+- Generate one read-only `/agentws/project.cyclo` per running team instance.
+  It keeps the authored description and context while rewriting every mount
+  into the container namespace, so multiple writable projects remain explicit
+  without introducing a second manifest format. Keep that context out of tasks
+  and job prompts.
 - Keep team behavior repository-defined: a roster, role prompts, optional
   common `AGENTS.md`, and an optional Dockerfile for extra execution
   dependencies. Cyclo supplies the AgentWS runtime and Pi provider extension as
@@ -73,6 +77,22 @@ interface.
 - Isolate optional provider build and startup failures. Failed components and
   their dependants remain visible in status, while the last working provider
   remains available to model listing and newly started projects.
+- Fall back across health-ready providers when an outer `ListModels` call is
+  invalid or unavailable, without ever replaying inference.
+- Keep provider catalogue selection format-neutral, then reject roster models
+  incompatible with the pinned Pi ABI at the team-runtime preflight boundary.
+- Enforce one bounded `PROVIDER/MODEL` route grammar across gateway login,
+  catalogues, team rosters, Pi registration, inference audit, and usage reports.
+- Validate gateway login against an in-memory candidate catalogue before
+  atomically replacing the credential store.
+- Make the append-only usage ledger crash-recoverable: startup removes only an
+  incomplete final record, reports read a bounded committed snapshot, and an
+  append failure remains unhealthy until restart.
+- Require system, kind, instance, and current launch identity before team
+  status, task, log, copy, exec, or readiness operations; Docker names alone
+  are never authority.
+- Add `cyclo forget INSTANCE --confirm INSTANCE` as the explicit way to retire
+  stopped durable state before reusing a logical instance name.
 - Scope gateway, provider, and team Docker resources to the canonical state
   root, allowing several independent Cyclo installations on one trusted host.
   Team ownership records the installation, resource kind, and logical instance.
@@ -92,7 +112,8 @@ interface.
   AgentWS dashboards, provider-aware `models`, retained `usage`, and an
   observational full-system `doctor`.
 - Add `cyclo refresh` to rebuild installed gateway, provider, and team images,
-  then restart active projects from their persisted definitions.
+  then reparse and restart active projects from their recorded definition
+  paths.
 - Make gateway login update the private store and automatically restart the
   gateway so the new catalogue is immediately published.
 - Derive provider configuration from the installation: the default state root

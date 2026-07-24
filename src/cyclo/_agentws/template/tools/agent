@@ -113,16 +113,6 @@ def load_team_context(root: Path, role: str):
     return protocol_file, role_file, protocol_text, role_text
 
 
-def load_project_context(root: Path) -> tuple[Path | None, str]:
-    value = os.environ.get("CYCLO_PROJECT_MANIFEST")
-    if not value:
-        return None, ""
-    manifest = configured_team_path(root, "CYCLO_PROJECT_MANIFEST", root / "PROJECT.md")
-    if not manifest.is_file():
-        die(f"Cyclo project manifest not found: {manifest}")
-    return manifest, manifest.read_text(encoding="utf-8", errors="replace")
-
-
 def build_initial_prompt(
     agent_name: str,
     role: str,
@@ -133,8 +123,6 @@ def build_initial_prompt(
     protocol_text: str,
     role_text: str,
     console: bool = False,
-    project_file: Path | None = None,
-    project_text: str = "",
 ) -> str:
     mode_text = """
 You are the AgentWS console assistant. You are not assigned a queued job and do
@@ -142,41 +130,33 @@ not have a current-job. The queued-job lifecycle portions of the generic
 protocol do not apply to this console session. Use the local AgentWS bin/ tools
 to inspect and manage tasks, jobs, and agents, and dispatch work when asked.
 """ if console else ""
-    project_source = str(project_file) if project_file is not None else "not provided"
-    project_section = (
-        f"""
-<cyclo-project>
-{project_text.strip()}
-</cyclo-project>
-"""
-        if project_text.strip()
-        else ""
-    )
+    project_source = runtime_root / "project.cyclo"
     return f"""You are agent {agent_name} with role {role}.
 
 AgentWS runtime root: {runtime_root}
 Workspace namespace (current working directory): {workspace}
-Cyclo project manifest: {project_source}
+Cyclo project definition: {project_source}
 System protocol source: {protocol_file}
 Role instruction source: {role_file}
 {mode_text}
 Run AgentWS queue and state commands from the runtime root above. Use the
 project layout as the default location for inspection and work unless the task
-or job names a more specific worktree. Interpret task paths using the Cyclo
-project manifest. Writable named projects are under `/workspace/<name>`;
+or job names a more specific worktree. Interpret task paths using
+`project.cyclo`. Writable named projects are under `/workspace/<name>`;
 read-only inputs are under `/readonly/<name>`. In a direct compatibility run,
 project paths are relative to `/workspace`. Report changed artifacts using
 their actual mounted paths.
 
-The Cyclo project manifest is independent of the team protocol. It defines the
+The Cyclo project definition is independent of the team protocol. It defines the
 actual writable workspaces and read-only inputs. Read it before touching project
 files, including when the team supplies its own AGENTS.md.
 
-The complete project, protocol, and role instructions are included below.
-Treat this included content as authoritative; you do not need cwd-based prompt discovery.
+The complete protocol and role instructions are included below. The
+container-facing project definition remains an instance-wide file; read it
+from the path above rather than expecting it to be copied into every job
+prompt. Treat the included protocol and role content as authoritative.
 When the protocol tells you to read roles/<role>.md, use the role instructions
 included here or their explicit source path above.
-{project_section}
 
 <agentws-protocol>
 {protocol_text.strip()}
@@ -1399,7 +1379,6 @@ def main() -> int:
         die(f"cannot establish the agent process fence: {exc}")
 
     protocol_file, role_file, protocol_text, role_text = load_team_context(root, args.role)
-    project_file, project_text = load_project_context(root)
     max_job_attempts = positive_env_int(
         "AGENTWS_MAX_JOB_ATTEMPTS", DEFAULT_MAX_JOB_ATTEMPTS
     )
@@ -1484,8 +1463,6 @@ def main() -> int:
             role_file,
             protocol_text,
             role_text,
-            project_file=project_file,
-            project_text=project_text,
         )
         write_file(agent_dir / "prompt.md", prompt)
 

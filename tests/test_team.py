@@ -107,17 +107,29 @@ def test_rejects_provider_names_the_gateway_cannot_route(
         load_team(team_repo)
 
 
-@pytest.mark.parametrize("provider", ["_legacy", "-legacy"])
-def test_preserves_legacy_direct_provider_names(
+@pytest.mark.parametrize(
+    "provider",
+    ["_legacy", "-legacy", "a" * 65],
+)
+def test_rejects_invalid_provider_prefixes(
     team_repo: Path, provider: str
 ) -> None:
     (team_repo / "team").write_text(
         f"planner-1 planner pi {provider}/model\n", encoding="utf-8"
     )
 
+    with pytest.raises(CycloError, match="invalid proxy model"):
+        load_team(team_repo)
+
+
+def test_accepts_bounded_provider_and_nested_model_ids(team_repo: Path) -> None:
+    provider = "a" * 64
+    (team_repo / "team").write_text(
+        f"planner-1 planner pi {provider}/family/model\n", encoding="utf-8"
+    )
+
     team = load_team(team_repo)
-    assert team.providers == (provider,)
-    assert team.agents[0].model == f"{provider}/model"
+    assert team.agents[0].model == f"{provider}/family/model"
 
 
 def test_rejects_non_pi_engine(team_repo: Path) -> None:

@@ -1,11 +1,12 @@
-import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
+import {
+  isLocalModelId,
+  isProviderPrefix,
+  PI_INFERENCE_FORMAT,
+} from "@cyclo/provider/protocol";
 
 import { getPiProviders, validatePiProviders } from "./pi-registry.mjs";
 import { readJson } from "./store.mjs";
 
-const ACCOUNT_NAME = /^[a-z0-9_-]+$/u;
-const MODEL_ID = /^[^\s\u0000-\u001f\u007f]+$/u;
-const RESERVED_ACCOUNTS = new Set(["__proto__", "constructor", "gateway", "prototype"]);
 export const EXPOSED_APIS = new Set([
   "anthropic-messages",
   "openai-codex-responses",
@@ -22,7 +23,7 @@ function objectDocument(value, label) {
 }
 
 function routeName(value, label) {
-  if (typeof value !== "string" || !ACCOUNT_NAME.test(value) || RESERVED_ACCOUNTS.has(value)) {
+  if (!isProviderPrefix(value)) {
     throw new Error(`${label} is not a valid route name`);
   }
   return value;
@@ -35,10 +36,8 @@ function providerUrl(provider, value) {
   let parsed;
   try {
     parsed = new URL(value);
-  } catch (error) {
-    throw new Error(`provider ${provider} has an invalid baseUrl: ${error.message}`, {
-      cause: error,
-    });
+  } catch {
+    throw new Error(`provider ${provider} has an invalid baseUrl`);
   }
   if (!["http:", "https:"].includes(parsed.protocol)) {
     throw new Error(`provider ${provider} baseUrl must use http or https`);
@@ -77,7 +76,11 @@ function customProviders(modelsPath) {
 function credentialAccounts(authPath) {
   const value = readJson(authPath);
   if (value === null) return Object.freeze([]);
-  const document = objectDocument(value, `credential store ${authPath}`);
+  return credentialAccountsDocument(value, `credential store ${authPath}`);
+}
+
+function credentialAccountsDocument(value, label) {
+  const document = objectDocument(value, label);
   const accounts = [];
   for (const [account, raw] of Object.entries(document)) {
     routeName(account, "account name");
@@ -108,7 +111,12 @@ function credentialAccounts(authPath) {
 
 function cloneAndFreeze(value) {
   if (!value || typeof value !== "object") return value;
-  const clone = structuredClone(value);
+  let clone;
+  try {
+    clone = structuredClone(value);
+  } catch {
+    throw new Error("model metadata cannot be cloned");
+  }
   const freeze = (current) => {
     if (!current || typeof current !== "object" || Object.isFrozen(current)) return current;
     for (const child of Object.values(current)) freeze(child);
@@ -122,7 +130,9 @@ function effectiveModel(provider, raw, defaults, { custom = false } = {}) {
   if (custom && Object.hasOwn(model, "headers")) {
     throw new Error(`custom model ${provider}/${model.id ?? "?"} must not define headers`);
   }
-  if (typeof model.id !== "string" || !MODEL_ID.test(model.id)) {
+  if (
+    !isLocalModelId(model.id)
+  ) {
     throw new Error(`provider ${provider} has an invalid model id`);
   }
   if (
@@ -142,6 +152,27 @@ function effectiveModel(provider, raw, defaults, { custom = false } = {}) {
   return cloneAndFreeze({ ...model, provider, api, baseUrl });
 }
 
+function effectiveModels(provider, rawModels, defaults, { custom = false, reject }) {
+  const models = [];
+  const ids = new Set();
+  for (const raw of rawModels) {
+    let model;
+    try {
+      model = effectiveModel(provider, raw, defaults, { custom });
+    } catch (error) {
+      reject(raw?.id, error);
+      continue;
+    }
+    if (ids.has(model.id)) {
+      reject(model.id, new Error(`provider ${provider} repeats model ${model.id}`));
+      continue;
+    }
+    ids.add(model.id);
+    models.push(model);
+  }
+  return models;
+}
+
 function publicModel(account, model) {
   const capabilities = Object.freeze({
     inputModalities: Object.freeze(model.input.includes("image") ? [TEXT, IMAGE] : [TEXT]),
@@ -155,20 +186,22 @@ function publicModel(account, model) {
     extensionTypes: Object.freeze([]),
     reasoning: model.reasoning === true,
   });
-  const result = {
+  return Object.freeze({
     id: `${account}/${model.id}`,
     displayName: typeof model.name === "string" && model.name ? model.name : model.id,
     capabilities,
     extensions: Object.freeze([]),
     inferenceFormat: PI_INFERENCE_FORMAT,
-  };
-  if (Number.isSafeInteger(model.contextWindow) && model.contextWindow > 0) {
-    result.contextWindowTokens = BigInt(model.contextWindow);
+    contextWindowTokens: BigInt(tokenLimit(model.contextWindow, "context window", account, model.id)),
+    maxOutputTokens: BigInt(tokenLimit(model.maxTokens, "output limit", account, model.id)),
+  });
+}
+
+function tokenLimit(value, label, account, model) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`model ${account}/${model} has no usable ${label}`);
   }
-  if (Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0) {
-    result.maxOutputTokens = BigInt(model.maxTokens);
-  }
-  return Object.freeze(result);
+  return value;
 }
 
 export function buildCatalogue({
@@ -185,14 +218,58 @@ export function buildCatalogue({
     const valid = name.endsWith("Path") ? typeof value === "string" && value : typeof value === "function";
     if (!valid) throw new TypeError(`${name} is required`);
   }
-  const custom = customProviders(modelsPath);
-  const builtins = new Map(
-    validatePiProviders(providers).map((provider) => [provider.id, provider]),
-  );
+  return buildCatalogueFromAccounts({
+    accounts: credentialAccounts(authPath),
+    custom: customProviders(modelsPath),
+    providers,
+    getApiProvider,
+  });
+}
+
+// Login validates an in-memory candidate document through exactly the same
+// catalogue path used at gateway startup. The live credential file is not
+// changed unless this succeeds.
+export function buildCatalogueForCredentials({
+  credentials,
+  modelsPath,
+  providers = getPiProviders(),
+  getApiProvider,
+}) {
+  if (typeof modelsPath !== "string" || !modelsPath) {
+    throw new TypeError("modelsPath is required");
+  }
+  if (typeof getApiProvider !== "function") {
+    throw new TypeError("getApiProvider is required");
+  }
+  return buildCatalogueFromAccounts({
+    accounts: credentialAccountsDocument(
+      structuredClone(credentials),
+      "candidate credential store",
+    ),
+    custom: customProviders(modelsPath),
+    providers,
+    getApiProvider,
+  });
+}
+
+function buildCatalogueFromAccounts({
+  accounts,
+  custom,
+  providers,
+  getApiProvider,
+}) {
+  const builtins = new Map(validatePiProviders(providers).map((provider) => [
+    provider.id,
+    provider,
+  ]));
   const models = [];
   const routes = Object.create(null);
+  const diagnostics = [];
 
-  for (const { account, provider, credential } of credentialAccounts(authPath)) {
+  for (const { account, provider, credential } of accounts) {
+    const reject = (model, error) => {
+      diagnostics.push(diagnostic(account, model, error));
+    };
     let rawModels;
     let defaults = {};
     let customModels = false;
@@ -201,57 +278,98 @@ export function buildCatalogue({
       customModels = true;
     } else if (builtins.has(provider)) {
       const builtin = builtins.get(provider);
-      rawModels = builtin.getModels();
+      try {
+        rawModels = builtin.getModels();
+      } catch {
+        reject(
+          undefined,
+          new Error(`provider ${provider} model discovery failed`),
+        );
+        continue;
+      }
       if (!Array.isArray(rawModels)) {
-        throw new Error(`built-in provider ${provider} returned a malformed model list`);
+        reject(
+          undefined,
+          new Error(`built-in provider ${provider} returned a malformed model list`),
+        );
+        continue;
       }
       defaults = { baseUrl: builtin.baseUrl };
     } else {
       throw new Error(`account ${account} names unknown provider ${provider}`);
     }
 
-    let candidates = rawModels.map((raw) => effectiveModel(
-      provider,
-      raw,
-      defaults,
-      { custom: customModels },
-    ));
-    const sourceIds = new Set();
-    for (const model of candidates) {
-      if (sourceIds.has(model.id)) throw new Error(`provider ${provider} repeats model ${model.id}`);
-      sourceIds.add(model.id);
-    }
+    let candidates = effectiveModels(provider, rawModels, defaults, {
+      custom: customModels,
+      reject,
+    });
     const originals = new Map(candidates.map((model) => [model.id, model.api]));
     const filterModels = builtins.get(provider)?.filterModels;
     if (credential.type === "oauth" && typeof filterModels === "function") {
-      const modified = filterModels(
-        candidates.map((model) => structuredClone(model)),
-        credential,
-      );
-      if (!Array.isArray(modified)) {
-        throw new Error(`provider ${provider} returned a malformed filtered model list`);
+      let modified;
+      try {
+        modified = filterModels(
+          candidates.map((model) => structuredClone(model)),
+          credential,
+        );
+      } catch {
+        reject(
+          undefined,
+          new Error(`provider ${provider} OAuth model filtering failed`),
+        );
+        continue;
       }
-      candidates = modified.map((raw) => effectiveModel(provider, raw, defaults));
-      if (candidates.some((model) => originals.get(model.id) !== model.api)) {
-        throw new Error(`provider ${provider} changed a model identity while filtering`);
+      if (!Array.isArray(modified)) {
+        reject(
+          undefined,
+          new Error(`provider ${provider} returned a malformed filtered model list`),
+        );
+        continue;
+      }
+      candidates = effectiveModels(provider, modified, defaults, { reject });
+      const changed = candidates.find((model) => originals.get(model.id) !== model.api);
+      if (changed) {
+        reject(
+          changed.id,
+          new Error(`provider ${provider} changed a model identity while filtering`),
+        );
+        continue;
       }
     }
 
-    const seen = new Set();
     for (const model of candidates) {
-      if (seen.has(model.id)) throw new Error(`provider ${provider} repeats model ${model.id}`);
-      seen.add(model.id);
       if (!EXPOSED_APIS.has(model.api)) continue;
-      const apiProvider = getApiProvider(model.api);
+      let apiProvider;
+      try {
+        apiProvider = getApiProvider(model.api);
+      } catch {
+        reject(
+          model.id,
+          new Error(`model ${provider}/${model.id} API lookup failed`),
+        );
+        continue;
+      }
       if (
         !apiProvider
         || apiProvider.api !== model.api
         || typeof apiProvider.stream !== "function"
         || typeof apiProvider.streamSimple !== "function"
       ) {
-        throw new Error(`model ${provider}/${model.id} has no API implementation for ${model.api}`);
+        reject(
+          model.id,
+          new Error(
+            `model ${provider}/${model.id} has no API implementation for ${model.api}`,
+          ),
+        );
+        continue;
       }
-      const published = publicModel(account, model);
+      let published;
+      try {
+        published = publicModel(account, model);
+      } catch (error) {
+        reject(model.id, error);
+        continue;
+      }
       if (Object.hasOwn(routes, published.id)) {
         throw new Error(`duplicate public model id ${published.id}`);
       }
@@ -272,5 +390,20 @@ export function buildCatalogue({
   return Object.freeze({
     models: Object.freeze(models),
     routes: Object.freeze(routes),
+    diagnostics: Object.freeze(diagnostics),
+  });
+}
+
+function diagnostic(account, model, error) {
+  const raw = error instanceof Error ? error.message : String(error);
+  const message = raw
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 512) || "invalid catalogue entry";
+  return Object.freeze({
+    account,
+    ...(typeof model === "string" && model ? { model } : {}),
+    message,
   });
 }

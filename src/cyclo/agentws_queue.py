@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 SAFE_QUEUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+TASK_STATES = ("open", "closed", "unknown")
 KNOWN_JOB_STATUSES = ("pending", "claimed", "running", "done", "failed")
 JOB_STATUSES = (*KNOWN_JOB_STATUSES, "unknown")
 SUPERVISOR_DIRECTORY = ".team-runs"
@@ -80,7 +81,7 @@ class AgentSupervisorStatus:
 
 def empty_counts() -> dict[str, dict[str, int]]:
     return {
-        "tasks": {"total": 0, "open": 0, "closed": 0},
+        "tasks": {"total": 0, **{name: 0 for name in TASK_STATES}},
         "jobs": {"total": 0, **{name: 0 for name in JOB_STATUSES}},
         "agents": {"total": 0, "active": 0},
     }
@@ -290,14 +291,6 @@ def _read_regular_at(
         os.close(descriptor)
 
 
-def _regular_file_at(directory_fd: int, name: str) -> bool:
-    try:
-        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except OSError:
-        return False
-    return stat.S_ISREG(info.st_mode)
-
-
 def _latest_regular_mtime_at(
     directory_fd: int, baseline: float, names: tuple[str, ...]
 ) -> float:
@@ -407,17 +400,19 @@ def scan_agentws_queue(
                     tasks_fd, budget, errors
                 ):
                     state = _read_regular_at(
-                        task_fd, "state", budget, max_bytes=128, default="open"
-                    ).strip().lower() or "open"
+                        task_fd,
+                        "state",
+                        budget,
+                        max_bytes=128,
+                        default="unknown",
+                    ).strip() or "unknown"
                     task_rows.append(
                         {
                             "id": task_id,
-                            "state": (
-                                "closed"
-                                if state != "open"
-                                or _regular_file_at(task_fd, "result.md")
-                                else "open"
-                            ),
+                            "state": {
+                                "open": "open",
+                                "done": "closed",
+                            }.get(state, "unknown"),
                             "updated_ts": _latest_regular_mtime_at(
                                 task_fd,
                                 info.st_mtime,
@@ -552,18 +547,25 @@ def scan_agentws_queue(
                 f"{count} job{'s have' if count != 1 else ' has'} an unknown "
                 "or unreadable status"
             )
+        task_states = {name: 0 for name in TASK_STATES}
+        for item in task_rows:
+            task_states[str(item["state"])] += 1
+        if task_states["unknown"]:
+            count = task_states["unknown"]
+            errors.append(
+                f"{count} task{'s have' if count != 1 else ' has'} an unknown "
+                "or unreadable state"
+            )
         active_agent_ids = {
             str(item["agent_id"])
             for item in job_rows
             if item["status"] in {"claimed", "running"} and item["agent_id"]
         }
-        task_open = sum(item["state"] == "open" for item in task_rows)
         return {
             "counts": {
                 "tasks": {
                     "total": len(task_rows),
-                    "open": task_open,
-                    "closed": len(task_rows) - task_open,
+                    **task_states,
                 },
                 "jobs": {"total": len(job_rows), **statuses},
                 "agents": {

@@ -12,6 +12,11 @@ import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
 import { groupModels } from "../src/adapter.mjs";
 import { registerCycloProviders } from "../src/extension.mjs";
 
+const MODEL_ID_CASES = JSON.parse(await readFile(
+  new URL("../../protocol/provider/test/model-id-cases.json", import.meta.url),
+  "utf8",
+));
+
 test("pins the Pi package to the inference format advertised on the wire", async () => {
   const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(
@@ -22,6 +27,20 @@ test("pins the Pi package to the inference format advertised on the wire", async
     manifest.devDependencies["@earendil-works/pi-ai"],
     manifest.peerDependencies["@earendil-works/pi-ai"],
   );
+});
+
+test("uses the shared Pi route-ID semantics", () => {
+  for (const fixture of MODEL_ID_CASES) {
+    const id = fixture.prefix + fixture.unit.repeat(fixture.repeat) + fixture.suffix;
+    const warnings = [];
+    const groups = groupModels([portableModel(id)], {
+      onInvalid(message) { warnings.push(message); },
+    });
+    const accepted = [...groups.values()].flat().some((route) => route.publicId === id);
+
+    assert.equal(accepted, fixture.valid, fixture.name);
+    assert.equal(warnings.length, fixture.valid ? 0 : 1, fixture.name);
+  }
 });
 
 test("sends one opaque Pi call frame and returns native Pi events unchanged", async () => {
@@ -132,16 +151,27 @@ test("turns transport and JSON failures into Pi error terminals", async () => {
   });
 });
 
-test("rejects incompatible or unsafe catalogue entries", () => {
-  assert.throws(
-    () => groupModels([{ ...portableModel("work/model"), inferenceFormat: "other" }]),
-    /unsupported inference format/u,
+test("isolates incompatible catalogue entries without hiding valid models", () => {
+  const warnings = [];
+  const groups = groupModels([
+    { ...portableModel("work/wrong-format"), inferenceFormat: "other" },
+    { ...portableModel("work/missing-limit"), maxOutputTokens: undefined },
+    portableModel("gateway/reserved"),
+    portableModel("work/usable"),
+    portableModel("work/usable"),
+  ], {
+    onInvalid(message) { warnings.push(message); },
+  });
+
+  assert.deepEqual(
+    groups.get("work").map(({ publicId }) => publicId),
+    ["work/usable"],
   );
-  assert.throws(() => groupModels([portableModel("gateway/model")]), /PROVIDER\/MODEL/u);
-  assert.throws(
-    () => groupModels([portableModel("work/model"), portableModel("work/model")]),
-    /duplicate/u,
-  );
+  assert.equal(warnings.length, 4);
+  assert.match(warnings[0], /unsupported inference format/u);
+  assert.match(warnings[1], /no usable output limit/u);
+  assert.match(warnings[2], /PROVIDER\/MODEL/u);
+  assert.match(warnings[3], /duplicate/u);
 });
 
 async function withProvider(run) {

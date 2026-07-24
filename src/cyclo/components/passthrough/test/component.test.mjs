@@ -15,7 +15,8 @@ import {
   listenComponentServer,
 } from "@cyclo/component/server";
 import { createUnixTransport } from "@cyclo/component/transport";
-import { Provider } from "@cyclo/provider/contract";
+import { Modality, Provider } from "@cyclo/provider/contract";
+import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
 
 import { runPassthrough } from "../src/main.mjs";
 import { createPassthroughServer } from "../src/server.mjs";
@@ -52,6 +53,39 @@ test("forwards model, request payload, and response payloads exactly", async () 
     assert.deepEqual(actual, responsePayloads);
     assert.equal(observed.headers[0].get("authorization"), null);
     assert.equal(observed.headers[0].get("cookie"), null);
+  });
+});
+
+test("forwards the complete typed model catalogue unchanged", async () => {
+  const models = [{
+    id: "account/model",
+    displayName: "Model",
+    capabilities: {
+      inputModalities: [Modality.TEXT],
+      outputModalities: [Modality.TEXT],
+      functionTools: true,
+      parallelToolCalls: true,
+      extensionTypes: [],
+    },
+    contextWindowTokens: 4096n,
+    maxOutputTokens: 1024n,
+    extensions: [],
+    inferenceFormat: PI_INFERENCE_FORMAT,
+  }];
+  await withPassthrough({ models }, async ({ provider }) => {
+    const [model] = (await provider.listModels({})).models;
+    assert.equal(model.id, models[0].id);
+    assert.equal(model.inferenceFormat, models[0].inferenceFormat);
+    assert.equal(model.contextWindowTokens, models[0].contextWindowTokens);
+    assert.equal(model.maxOutputTokens, models[0].maxOutputTokens);
+    assert.deepEqual(
+      model.capabilities.inputModalities,
+      models[0].capabilities.inputModalities,
+    );
+    assert.deepEqual(
+      model.capabilities.outputModalities,
+      models[0].capabilities.outputModalities,
+    );
   });
 });
 
@@ -153,7 +187,15 @@ function state() {
   return { failHealth: false, headers: [], requests: [] };
 }
 
-function upstreamServer(observed, { responsePayloads = [], wait = false, canceled } = {}) {
+function upstreamServer(
+  observed,
+  {
+    responsePayloads = [],
+    models = [],
+    wait = false,
+    canceled,
+  } = {},
+) {
   const bindings = resolveBindings(parseDeclaration(`
     component upstream
     provide cyclo.component.v1.Component
@@ -167,7 +209,7 @@ function upstreamServer(observed, { responsePayloads = [], wait = false, cancele
         listModels(_request, context) {
           observed.headers.push(new Headers(context.requestHeader));
           if (observed.failHealth) throw new Error("private upstream failure");
-          return { models: [] };
+          return { models };
         },
         async *infer(request, context) {
           observed.headers.push(new Headers(context.requestHeader));

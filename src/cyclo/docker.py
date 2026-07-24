@@ -29,7 +29,7 @@ from .project import (
     MOUNT_NAME_RE,
     ProjectMount,
 )
-from .state import DEFAULT_AGENTWS_HOST, Instance
+from .state import DEFAULT_AGENTWS_HOST, LAUNCH_ID_RE, Instance
 from .team import Team
 
 
@@ -247,6 +247,10 @@ def validate_container_spec(spec: ContainerSpec) -> None:
         raise CycloError(
             "Cyclo team resources do not match the selected installation"
         )
+    if not LAUNCH_ID_RE.fullmatch(spec.instance.launch_id):
+        raise CycloError(
+            f"invalid launch identity for Cyclo instance: {spec.instance.id}"
+        )
     provider_socket_dir = spec.provider_socket_dir
     if (
         not provider_socket_dir.is_absolute()
@@ -294,8 +298,7 @@ def container_command(spec: ContainerSpec) -> list[str]:
             f"cyclo.generation={instance.generation}",
         ]
     )
-    if instance.launch_id:
-        command.extend(["--label", f"cyclo.launch={instance.launch_id}"])
+    command.extend(["--label", f"cyclo.launch={instance.launch_id}"])
     command.extend(
         [
             "--restart",
@@ -343,8 +346,6 @@ def container_command(spec: ContainerSpec) -> list[str]:
             f"AGENTWS_TEAM_ROLES_DIR={CONTAINER_TEAM / 'roles'}",
             "-e",
             f"AGENTWS_WORKSPACE={CONTAINER_WORKSPACE}",
-            "-e",
-            f"CYCLO_PROJECT_MANIFEST={CONTAINER_AGENTWS / 'PROJECT.md'}",
             "-e",
             f"CYCLO_PROVIDER_SOCKET={CONTAINER_PROVIDER_SOCKET}",
         ]
@@ -522,14 +523,18 @@ class Docker:
     def _owned_container(
         self, name: str, expected_instance: str, expected_system: str
     ) -> dict[str, object] | None:
+        if name != team_container_name(expected_system, expected_instance):
+            raise CycloError(
+                "Cyclo container name does not match the selected installation "
+                f"and instance: {name}"
+            )
         info = self._inspect_container(name)
         if info is None:
             return None
         config = info.get("Config")
         labels = config.get("Labels") if isinstance(config, dict) else None
         current = (
-            name == team_container_name(expected_system, expected_instance)
-            and isinstance(labels, dict)
+            isinstance(labels, dict)
             and all(
                 (
                     labels.get(LABEL_SYSTEM) == expected_system,
@@ -542,26 +547,61 @@ class Docker:
             raise CycloError(f"refusing to use non-Cyclo container: {name}")
         return info
 
-    def container_running(self, name: str) -> bool:
-        return self.container_lifecycle_state(name).operational
-
-    def container_lifecycle_state(self, name: str) -> DockerContainerState:
-        return docker_container_state(self._inspect_container(name), name=name)
-
-    def container_lifecycle_active(self, name: str) -> bool:
-        return self.container_lifecycle_state(name).lifecycle_active
-
-    def container_label(self, name: str, label: str = LABEL_INSTANCE) -> str | None:
-        info = self._inspect_container(name)
+    def _current_container(
+        self, instance: Instance, system: str
+    ) -> dict[str, object] | None:
+        info = self._owned_container(instance.container_name, instance.id, system)
         if info is None:
-            return None
+            return info
+        if not LAUNCH_ID_RE.fullmatch(instance.launch_id):
+            raise CycloError(
+                f"invalid launch identity for Cyclo instance: {instance.id}"
+            )
         config = info.get("Config")
         labels = config.get("Labels") if isinstance(config, dict) else None
-        value = labels.get(label) if isinstance(labels, dict) else None
-        return value if isinstance(value, str) and value else None
+        actual_launch = (
+            labels.get("cyclo.launch") if isinstance(labels, dict) else None
+        )
+        if actual_launch != instance.launch_id:
+            raise CycloError(
+                f"Cyclo container launch identity changed: "
+                f"{instance.container_name}"
+            )
+        return info
 
-    def container_exists(self, name: str) -> bool:
-        return self._inspect_container(name) is not None
+    def _required_current_container_id(
+        self, instance: Instance, system: str
+    ) -> str:
+        info = self._current_container(instance, system)
+        if info is None:
+            raise CycloError(f"Cyclo container not found: {instance.container_name}")
+        return self._resource_id(
+            info, kind="container", name=instance.container_name
+        )
+
+    def container_running(self, instance: Instance, *, system: str) -> bool:
+        return self.container_lifecycle_state(instance, system=system).operational
+
+    def container_lifecycle_state(
+        self, instance: Instance, *, system: str
+    ) -> DockerContainerState:
+        info = self._current_container(instance, system)
+        return docker_container_state(info, name=instance.container_name)
+
+    def previous_launch_lifecycle_state(
+        self, instance: Instance, *, system: str
+    ) -> DockerContainerState:
+        """Inspect ownership during startup without adopting a previous launch."""
+
+        info = self._owned_container(instance.container_name, instance.id, system)
+        return docker_container_state(info, name=instance.container_name)
+
+    def container_lifecycle_active(
+        self, instance: Instance, *, system: str
+    ) -> bool:
+        return self.container_lifecycle_state(
+            instance, system=system
+        ).lifecycle_active
 
     def ensure_network(
         self,
@@ -635,6 +675,8 @@ class Docker:
         return result
 
     def start(self, spec: ContainerSpec) -> int | None:
+        validate_container_spec(spec)
+        command = container_command(spec)
         info = self._owned_container(
             spec.instance.container_name, spec.instance.id, spec.system
         )
@@ -650,12 +692,9 @@ class Docker:
             resource_id = self._resource_id(
                 info, kind="container", name=spec.instance.container_name
             )
-            self._run(["docker", "rm", resource_id])
-        validate_container_spec(spec)
-        self._run(container_command(spec))
-        info = self._owned_container(
-            spec.instance.container_name, spec.instance.id, spec.system
-        )
+            self._remove_container(resource_id, state)
+        self._run(command)
+        info = self._current_container(spec.instance, spec.system)
         if info is None:
             raise CycloError(
                 f"Cyclo container disappeared after start: {spec.instance.container_name}"
@@ -667,6 +706,20 @@ class Docker:
             return None
         return self.published_port(resource_id)
 
+    def _remove_container(
+        self,
+        resource_id: str,
+        state: DockerContainerState,
+    ) -> None:
+        if state is DockerContainerState.PAUSED:
+            self._run(["docker", "unpause", resource_id])
+        if state.lifecycle_active:
+            self._run(["docker", "stop", "--timeout", "30", resource_id])
+        remove = ["docker", "rm"]
+        if state is DockerContainerState.DEAD:
+            remove.append("--force")
+        self._run([*remove, resource_id])
+
     def published_port(self, container: str) -> int:
         proc = self._run(["docker", "port", container, "4137/tcp"], capture=True)
         line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
@@ -677,9 +730,10 @@ class Docker:
 
     def wait_ready(
         self,
-        container: str,
+        instance: Instance,
         port: int | None,
         *,
+        system: str,
         host: str = DEFAULT_AGENTWS_HOST,
         timeout: float = 15.0,
     ) -> None:
@@ -687,16 +741,31 @@ class Docker:
         probe_host = DEFAULT_AGENTWS_HOST if host == "0.0.0.0" else host
         url = f"http://{probe_host}:{port}/" if port is not None else "http://127.0.0.1:4137/"
         while time.monotonic() < deadline:
-            if not self.container_running(container):
+            info = self._current_container(instance, system)
+            state = docker_container_state(info, name=instance.container_name)
+            if not state.operational:
+                if info is None:
+                    raise CycloError(
+                        "Cyclo container disappeared before AgentWS became "
+                        f"ready: {instance.container_name}"
+                    )
+                container_id = self._resource_id(
+                    info, kind="container", name=instance.container_name
+                )
                 logs = self._run(
-                    ["docker", "logs", "--tail", "40", container],
+                    ["docker", "logs", "--tail", "40", container_id],
                     capture=True,
                     check=False,
                 )
                 detail = ((logs.stdout or "") + (logs.stderr or "")).strip()
                 raise CycloError(
-                    f"Cyclo container exited before AgentWS became ready: {detail or container}"
+                    "Cyclo container exited before AgentWS became ready: "
+                    f"{detail or instance.container_name}"
                 )
+            assert info is not None
+            container_id = self._resource_id(
+                info, kind="container", name=instance.container_name
+            )
             if port is None:
                 probe = self._run(
                     [
@@ -704,7 +773,7 @@ class Docker:
                         "exec",
                         "--user",
                         f"{os.getuid()}:{os.getgid()}",
-                        container,
+                        container_id,
                         "python3",
                         "-c",
                         "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4137/', timeout=1).read(1)",
@@ -718,44 +787,49 @@ class Docker:
                 try:
                     with urllib.request.urlopen(url, timeout=1) as response:
                         if response.status == 200:
-                            return
+                            final = self._current_container(instance, system)
+                            if docker_container_state(
+                                final, name=instance.container_name
+                            ).operational:
+                                return
                 except (urllib.error.URLError, OSError):
                     pass
             time.sleep(0.2)
-        location = url if port is not None else f"inside {container} on port 4137"
+        location = (
+            url
+            if port is not None
+            else f"inside {instance.container_name} on port 4137"
+        )
         raise CycloError(f"timed out waiting for AgentWS {location}")
 
     def stop_remove(
         self,
         container: str,
-        expected_instance: str | None = None,
-        expected_system: str | None = None,
-        expected_launch: str | None = None,
-    ) -> None:
-        if expected_instance is None:
-            raise CycloError("expected Cyclo instance ID is required for container removal")
-        if expected_system is None:
-            raise CycloError("expected Cyclo installation ID is required for container removal")
+        expected_instance: str,
+        *,
+        expected_system: str,
+        expected_launch: str,
+    ) -> bool:
+        if not LAUNCH_ID_RE.fullmatch(expected_launch):
+            raise CycloError(
+                f"invalid launch identity for Cyclo instance: {expected_instance}"
+            )
         info = self._owned_container(container, expected_instance, expected_system)
         if info is None:
-            return
-        if expected_launch is not None:
-            config = info.get("Config")
-            labels = config.get("Labels") if isinstance(config, dict) else None
-            actual_launch = (
-                labels.get("cyclo.launch") if isinstance(labels, dict) else None
+            return False
+        config = info.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        actual_launch = (
+            labels.get("cyclo.launch") if isinstance(labels, dict) else None
+        )
+        if actual_launch != expected_launch:
+            raise CycloError(
+                f"Cyclo container launch identity changed: {container}"
             )
-            if actual_launch != expected_launch:
-                raise CycloError(
-                    f"Cyclo container launch identity changed: {container}"
-                )
         resource_id = self._resource_id(info, kind="container", name=container)
         state = docker_container_state(info, name=container)
-        if state is DockerContainerState.PAUSED:
-            self._run(["docker", "unpause", resource_id])
-        if state.lifecycle_active:
-            self._run(["docker", "stop", "--timeout", "30", resource_id])
-        self._run(["docker", "rm", resource_id])
+        self._remove_container(resource_id, state)
+        return True
 
     def remove_network(
         self, name: str, expected_instance: str, *, system: str
@@ -785,25 +859,37 @@ class Docker:
             )
         self._run(["docker", "network", "rm", network_id])
 
-    def logs(self, container: str, *, follow: bool) -> int:
+    def logs(self, instance: Instance, *, system: str, follow: bool) -> int:
+        container_id = self._required_current_container_id(instance, system)
         command = ["docker", "logs"]
         if follow:
             command.append("--follow")
-        command.append(container)
+        command.append(container_id)
         return self._run(command, check=False).returncode
 
-    def copy_to(self, container: str, source: Path, destination: str) -> None:
-        self._run(["docker", "cp", str(source), f"{container}:{destination}"])
+    def copy_to(
+        self,
+        instance: Instance,
+        source: Path,
+        destination: str,
+        *,
+        system: str,
+    ) -> None:
+        container_id = self._required_current_container_id(instance, system)
+        self._run(["docker", "cp", str(source), f"{container_id}:{destination}"])
 
     def exec(
         self,
-        container: str,
+        instance: Instance,
         command: Sequence[str],
         *,
+        system: str,
         check: bool = True,
         user: str | None = None,
     ) -> int:
+        container_id = self._required_current_container_id(instance, system)
         identity = user or f"{os.getuid()}:{os.getgid()}"
         return self._run(
-            ["docker", "exec", "--user", identity, container, *command], check=check
+            ["docker", "exec", "--user", identity, container_id, *command],
+            check=check,
         ).returncode

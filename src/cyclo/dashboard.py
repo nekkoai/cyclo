@@ -18,7 +18,7 @@ from .agentws_queue import (
     read_agent_supervisor_status,
     scan_agentws_queue,
 )
-from .docker import Docker
+from .docker import Docker, DockerContainerState
 from .errors import CycloError
 from .health import (
     INACTIVE_TEAM_HEALTH,
@@ -28,6 +28,7 @@ from .health import (
     read_provider_status,
     team_health,
 )
+from .instance_lifecycle import instance_lifecycle_label
 from .project_state import decode_instance_project
 from .state import DEFAULT_AGENTWS_HOST, Instance, StateStore, utc_now
 
@@ -59,18 +60,6 @@ def _usage_counters(value: object) -> dict[str, int]:
         "total_tokens": input_tokens + output_tokens,
         "requests": _safe_number(data.get("requests")),
     }
-
-
-def _instance_state(instance: Instance, running: bool | None) -> str:
-    if running is None:
-        return "unknown"
-    if running and instance.active:
-        return "running"
-    if running:
-        return "orphan"
-    if instance.active:
-        return "stale"
-    return "stopped"
 
 
 def _project_metadata(
@@ -123,11 +112,15 @@ class DashboardSnapshot:
         for instance in instances:
             errors: list[str] = []
             try:
-                running: bool | None = self.docker.container_running(instance.container_name)
+                docker_state: DockerContainerState | None = (
+                    self.docker.container_lifecycle_state(
+                        instance, system=self.store.system
+                    )
+                )
             except Exception as exc:
-                running = None
+                docker_state = None
                 errors.append(f"Docker status unavailable: {exc}")
-            state = _instance_state(instance, running)
+            state = instance_lifecycle_label(instance, docker_state)
             if state == "running":
                 if shared_provider is None:
                     shared_provider = read_provider_status(self.provider_reader)
@@ -168,7 +161,7 @@ class DashboardSnapshot:
             if isinstance(queue_errors, list):
                 errors.extend(str(item) for item in queue_errors)
             agentws_port = None
-            if running and not instance.offline and instance.port:
+            if state == "running" and not instance.offline and instance.port:
                 agentws_port = instance.port
             try:
                 project, project_errors = _project_metadata(instance)
@@ -204,7 +197,15 @@ class DashboardSnapshot:
                 }
             )
 
-        state_priority = {"running": 0, "stale": 1, "orphan": 2, "unknown": 3, "stopped": 4}
+        state_priority = {
+            "running": 0,
+            "restarting": 1,
+            "paused": 2,
+            "stale": 3,
+            "orphan": 4,
+            "unknown": 5,
+            "stopped": 6,
+        }
         rows.sort(key=lambda item: (state_priority.get(str(item["state"]), 9), str(item["id"])))
         source_errors = [*instance_state_errors]
         if usage_error:
@@ -223,7 +224,13 @@ class DashboardSnapshot:
             "attention": sum(
                 1
                 for item in rows
-                if item["state"] in {"stale", "orphan", "unknown"}
+                if item["state"] in {
+                    "restarting",
+                    "paused",
+                    "stale",
+                    "orphan",
+                    "unknown",
+                }
                 or str(item["health"]["state"]).startswith("provider-")  # type: ignore[index]
                 or str(item["health"]["state"]).startswith("agents-")  # type: ignore[index]
                 or (

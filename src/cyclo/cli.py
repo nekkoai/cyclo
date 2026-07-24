@@ -36,9 +36,21 @@ from .health import (
     read_provider_status,
     team_health,
 )
-from .instance_lifecycle import active_instances, stop_instance as stop_managed_instance
+from .instance_lifecycle import (
+    active_instances,
+    instance_lifecycle_label,
+    stop_instance as stop_managed_instance,
+    stop_instance_locked as stop_managed_instance_locked,
+    stop_remove_instance_container,
+)
 from .installation import team_image_name
-from .project import ProjectDefinition, ProjectTeam, load_project
+from .project import (
+    ProjectDefinition,
+    ProjectTeam,
+    load_project,
+    project_context_marker,
+    read_project_context,
+)
 from .project_run import (
     RunBinding,
     container_spec,
@@ -46,12 +58,12 @@ from .project_run import (
     preflight_binding,
     project_instance_id,
     project_run_bindings,
-    start_binding,
+    start_binding_locked,
     validate_run_options,
-    validate_team_models,
+    validate_pi_team_models,
 )
 from .project_state import decode_instance_project
-from .providers import ProviderConnection, ProviderSystem
+from .providers import ProviderConnection, ProviderSystem, catalogue_ids
 from .state import Instance, StateStore, slug, validate_instance_id
 from .team import Team, init_team, load_team, require_team_repository, team_generation, verify_agentws_abi
 from .team_templates import bundled_team_template_names
@@ -218,8 +230,12 @@ def cmd_project_init(args: argparse.Namespace) -> int:
     lines = [
         f"name {name}",
         f"description {description}",
-        "",
     ]
+    if args.context_file:
+        context = read_project_context(args.context_file)
+        marker = project_context_marker(context)
+        lines.extend(["", f"context <<{marker}", context, marker])
+    lines.append("")
     for path, mode in args.team:
         if mode not in {"ro", "rw"}:
             raise CycloError(f"invalid team access mode {mode!r}; expected ro or rw")
@@ -265,21 +281,6 @@ def cmd_project_init(args: argparse.Namespace) -> int:
     print(f"next: cyclo validate {destination}")
     print(f"then: cyclo run {destination}")
     return 0
-
-
-def _catalogue_ids(document: dict[str, object]) -> set[str]:
-    raw_models = document.get("models")
-    if not isinstance(raw_models, list):
-        raise CycloError("provider system returned an invalid model catalogue")
-    result: set[str] = set()
-    for raw in raw_models:
-        model = raw.get("id") if isinstance(raw, dict) else None
-        if not isinstance(model, str) or not model or model in result:
-            raise CycloError(
-                "provider system returned an invalid or duplicate model ID"
-            )
-        result.add(model)
-    return result
 
 
 def _announce_binding(binding: RunBinding, store: StateStore) -> None:
@@ -387,71 +388,68 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     with store.locked():
         connection = providers.start()
+        connection, catalogue = providers.catalogue(connection)
         _warn_unavailable_providers(connection, providers.gateway.socket_path)
-        available_models = _catalogue_ids(
-            providers.models_document(connection)
-        )
-    for binding in bindings:
-        validate_team_models(binding.team, available_models)
-        binding.instance.provider_socket_path = str(connection.socket_path)
-        binding.instance.provider_generation = connection.generation
-
-    for binding in bindings:
-        preflight_binding(binding, store, docker)
-
-    with store.locked():
+        for binding in bindings:
+            validate_pi_team_models(binding.team, catalogue)
+            binding.instance.provider_socket_path = str(connection.socket_path)
+            binding.instance.provider_generation = connection.generation
+        for binding in bindings:
+            preflight_binding(binding, store, docker)
         _prepare_team_images(
             bindings,
             base_image=base_image,
         )
-
-    started: list[RunBinding] = []
-    current: RunBinding | None = None
-    try:
-        for binding in bindings:
-            current = binding
-            start_binding(
-                args,
-                binding,
-                source,
-                store,
-                docker,
-            )
-            started.append(binding)
-            current = None
-    except BaseException:
-        rollback_errors: list[str] = []
-        rollback = list(started)
-        if current is not None and all(
-            item.instance.id != current.instance.id for item in rollback
-        ):
-            try:
-                persisted = store.load(current.instance.id)
-            except CycloError as exc:
-                if store.metadata_path(current.instance.id).is_file():
-                    rollback_errors.append(
-                        f"{current.instance.id}: cannot verify in-flight launch: {exc}"
-                    )
-            else:
-                if persisted.active and persisted.launch_id == current.instance.launch_id:
-                    rollback.append(current)
-        for binding in reversed(rollback):
-            try:
-                stop_instance(
+        started: list[RunBinding] = []
+        current: RunBinding | None = None
+        try:
+            for binding in bindings:
+                current = binding
+                start_binding_locked(
                     args,
+                    binding,
+                    source,
                     store,
-                    binding.instance.id,
-                    expected_launch_id=binding.instance.launch_id,
+                    docker,
                 )
-            except Exception as exc:
-                rollback_errors.append(f"{binding.instance.id}: {exc}")
-        if rollback_errors:
-            print(
-                "warning: project startup rollback was incomplete: "
-                + "; ".join(rollback_errors),
-                file=sys.stderr,
-            )
-        raise
+                started.append(binding)
+                current = None
+        except BaseException:
+            rollback_errors: list[str] = []
+            rollback = list(started)
+            if current is not None and all(
+                item.instance.id != current.instance.id for item in rollback
+            ):
+                try:
+                    persisted = store.load(current.instance.id)
+                except CycloError as exc:
+                    if store.metadata_path(current.instance.id).is_file():
+                        rollback_errors.append(
+                            f"{current.instance.id}: "
+                            f"cannot verify in-flight launch: {exc}"
+                        )
+                else:
+                    if (
+                        persisted.active
+                        and persisted.launch_id == current.instance.launch_id
+                    ):
+                        rollback.append(current)
+            for binding in reversed(rollback):
+                try:
+                    stop_managed_instance_locked(
+                        store,
+                        docker,
+                        binding.instance,
+                    )
+                except Exception as exc:
+                    rollback_errors.append(f"{binding.instance.id}: {exc}")
+            if rollback_errors:
+                print(
+                    "warning: project startup rollback was incomplete: "
+                    + "; ".join(rollback_errors),
+                    file=sys.stderr,
+                )
+            raise
 
     for binding in bindings:
         _announce_binding(binding, store)
@@ -459,9 +457,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.foreground:
         binding = bindings[0]
         try:
-            return docker.logs(binding.instance.container_name, follow=True)
+            return docker.logs(
+                binding.instance, system=store.system, follow=True
+            )
         except KeyboardInterrupt:
-            stop_instance(args, store, binding.instance.id)
+            stop_instance(args, store, binding.instance)
     return 0
 
 
@@ -551,7 +551,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     stop_failures: list[str] = []
     for instance in instances:
         try:
-            stop_instance(args, store, instance.id)
+            stop_instance(args, store, instance)
         except Exception as exc:
             stop_failures.append(f"{instance.id}: {exc}")
         else:
@@ -582,15 +582,12 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 def stop_instance(
     _args: argparse.Namespace,
     store: StateStore,
-    identifier: str,
-    *,
-    expected_launch_id: str | None = None,
+    instance: Instance,
 ) -> None:
     stop_managed_instance(
         store,
         Docker(),
-        identifier,
-        expected_launch_id=expected_launch_id,
+        instance,
     )
 
 
@@ -602,7 +599,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
     except CycloError:
         candidate_id = None
     if candidate_id is not None and store.metadata_path(candidate_id).is_file():
-        stop_instance(args, store, candidate_id)
+        candidate = store.load(candidate_id)
+        stop_instance(args, store, candidate)
         print(f"stopped Cyclo instance: {candidate_id}")
         return 0
 
@@ -620,13 +618,56 @@ def cmd_stop(args: argparse.Namespace) -> int:
     failures: list[str] = []
     for instance in targets:
         try:
-            stop_instance(args, store, instance.id)
+            stop_instance(args, store, instance)
         except Exception as exc:
             failures.append(f"{instance.id}: {exc}")
         else:
             print(f"stopped Cyclo instance: {instance.id}")
     if failures:
         raise CycloError(f"project stop incomplete: {'; '.join(failures)}")
+    return 0
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    """Retire one stopped instance and delete its durable AgentWS state."""
+
+    store = state_store(args)
+    if args.confirm != args.instance:
+        raise CycloError(
+            "refusing to forget instance; --confirm must exactly match "
+            f"{args.instance!r}"
+        )
+    docker = Docker()
+    with store.locked():
+        instance = store.load(args.instance)
+        if instance.active:
+            raise CycloError(
+                f"Cyclo instance is still active: {instance.id}; stop it first"
+            )
+        state = docker.container_lifecycle_state(
+            instance,
+            system=store.system,
+        )
+        if state.lifecycle_active:
+            raise CycloError(
+                f"Cyclo instance container is still {state.value}: "
+                f"{instance.id}; stop it first"
+            )
+        stop_remove_instance_container(
+            docker,
+            instance,
+            system=store.system,
+        )
+        docker.remove_network(
+            instance.network_name,
+            instance.id,
+            system=store.system,
+        )
+        store.remove_instance(
+            instance.id,
+            expected_launch_id=instance.launch_id,
+        )
+    print(f"forgot Cyclo instance: {instance.id}")
     return 0
 
 
@@ -637,11 +678,13 @@ def _shared_provider_health(
     return read_provider_status(provider_system(args, store))
 
 
-def _instance_lifecycle_state(instance: Instance, docker: Docker) -> str:
-    running = docker.container_running(instance.container_name)
-    if running:
-        return "running" if instance.active else "orphan"
-    return "stale" if instance.active else "stopped"
+def _instance_lifecycle_state(
+    instance: Instance, docker: Docker, *, system: str
+) -> str:
+    return instance_lifecycle_label(
+        instance,
+        docker.container_lifecycle_state(instance, system=system),
+    )
 
 
 def _running_instance_health(
@@ -667,7 +710,24 @@ def cmd_ps(args: argparse.Namespace) -> int:
     rows = []
     shared: tuple[ProviderHealth, ProviderConnection | None] | None = None
     for instance in store.list():
-        state = _instance_lifecycle_state(instance, docker)
+        try:
+            state = _instance_lifecycle_state(
+                instance,
+                docker,
+                system=store.system,
+            )
+        except CycloError as exc:
+            rows.append(
+                (
+                    instance.id,
+                    "unknown",
+                    f"unknown ({exc})",
+                    instance.team_name,
+                    instance.project_name or Path(instance.project_path).name,
+                    str(instance.port or ""),
+                )
+            )
+            continue
         if state == "running":
             if shared is None:
                 shared = _shared_provider_health(args, store)
@@ -700,7 +760,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     store = state_store(args)
     instance = store.load(args.instance)
     docker = Docker()
-    state = _instance_lifecycle_state(instance, docker)
+    state = _instance_lifecycle_state(instance, docker, system=store.system)
     health = INACTIVE_TEAM_HEALTH.label()
     if state == "running":
         shared = _shared_provider_health(args, store)
@@ -805,13 +865,13 @@ def _task_project_summary(instance: Instance) -> tuple[str, ...]:
     )
 
 
-def _task_target(args: argparse.Namespace) -> tuple[Instance, Docker]:
+def _task_target(args: argparse.Namespace) -> tuple[Instance, Docker, str]:
     store = state_store(args)
     instance = store.load(args.instance)
     docker = Docker()
-    if not docker.container_running(instance.container_name):
+    if not docker.container_running(instance, system=store.system):
         raise CycloError(f"Cyclo instance is not running: {instance.id}")
-    return instance, docker
+    return instance, docker, store.system
 
 
 def _validate_task_id(task_id: str) -> None:
@@ -831,8 +891,8 @@ def _validate_task_id(task_id: str) -> None:
 
 
 def _exec_task_command(args: argparse.Namespace, command: list[str]) -> int:
-    instance, docker = _task_target(args)
-    return docker.exec(instance.container_name, command, check=False)
+    instance, docker, system = _task_target(args)
+    return docker.exec(instance, command, system=system, check=False)
 
 
 def cmd_task_list(args: argparse.Namespace) -> int:
@@ -849,24 +909,48 @@ def cmd_task_run(args: argparse.Namespace) -> int:
     spec = Path(args.spec).expanduser().resolve()
     if not spec.is_file():
         raise CycloError(f"task specification not found: {spec}")
-    instance, docker = _task_target(args)
+    instance, docker, system = _task_target(args)
     container_spec_path = f"/tmp/cyclo-task-{args.task_id}-{secrets.token_hex(8)}.md"
-    docker.copy_to(instance.container_name, spec, container_spec_path)
+    docker.copy_to(instance, spec, container_spec_path, system=system)
+
+    def remove_copied_spec() -> None:
+        cleanup_status = docker.exec(
+            instance,
+            ["rm", "-f", container_spec_path],
+            system=system,
+            check=False,
+            user="0:0",
+        )
+        if cleanup_status != 0:
+            raise CycloError(
+                f"container rm exited with status {cleanup_status}"
+            )
+
+    def clean_up_copied_spec() -> None:
+        try:
+            remove_copied_spec()
+        except Exception as cleanup:
+            print(
+                f"warning: copied task specification cleanup failed: {cleanup}",
+                file=sys.stderr,
+            )
+
     try:
         result = docker.exec(
-            instance.container_name,
+            instance,
             ["/agentws/bin/task-create", args.task_id, container_spec_path],
+            system=system,
             check=False,
         )
         if result != 0:
             raise CycloError(f"AgentWS task creation failed with status {result}")
-    finally:
-        docker.exec(
-            instance.container_name,
-            ["rm", "-f", container_spec_path],
-            check=False,
-            user="0:0",
-        )
+    except BaseException:
+        clean_up_copied_spec()
+        raise
+    # task-create has committed the task at this point. A best-effort removal
+    # failure must not turn that durable success into a reported failure whose
+    # retry would collide with the task that now exists.
+    clean_up_copied_spec()
     for line in _task_project_summary(instance):
         print(line)
     return 0
@@ -889,8 +973,9 @@ def cmd_task_state(args: argparse.Namespace) -> int:
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
-    instance = state_store(args).load(args.instance)
-    return Docker().logs(instance.container_name, follow=args.follow)
+    store = state_store(args)
+    instance = store.load(args.instance)
+    return Docker().logs(instance, system=store.system, follow=args.follow)
 
 
 def cmd_path(args: argparse.Namespace) -> int:
@@ -910,11 +995,12 @@ def cmd_models(args: argparse.Namespace) -> int:
     providers = provider_system(args, store)
     with store.locked():
         connection = providers.start()
+        connection, catalogue = providers.catalogue(connection)
         _warn_unavailable_providers(
             connection,
             providers.gateway.socket_path,
         )
-        models = providers.model_ids(connection)
+        models = catalogue_ids(catalogue)
     if not models:
         raise CycloError(
             "provider system returned no models; run "
@@ -928,6 +1014,8 @@ def cmd_models(args: argparse.Namespace) -> int:
 def _component_state(status: ComponentStatus) -> str:
     if status.works:
         return "ready"
+    if status.container_state == "unknown":
+        return "unknown"
     if not status.container_id:
         return "absent"
     if not status.current:
@@ -1069,17 +1157,11 @@ def cmd_component(args: argparse.Namespace) -> int:
     )
     action = args.component_action
     if action in {"list", "status"}:
-        statuses = providers.statuses()
-        if action == "status" and args.name:
-            statuses = tuple(
-                status
-                for status in statuses
-                if status.name == args.name
-            )
-            if not statuses:
-                raise CycloError(
-                    f"unknown configured component: {args.name}"
-                )
+        statuses = (
+            (providers.status_component(args.name),)
+            if action == "status" and args.name
+            else providers.statuses()
+        )
         _print_component_statuses(statuses)
         if action == "list":
             return 0
@@ -1169,12 +1251,11 @@ def cmd_repair(args: argparse.Namespace) -> int:
         for instance in store.list():
             if instance.active:
                 continue
-            if docker.container_exists(instance.container_name):
-                docker.stop_remove(
-                    instance.container_name,
-                    instance.id,
-                    expected_system=store.system,
-                )
+            if stop_remove_instance_container(
+                docker,
+                instance,
+                system=store.system,
+            ):
                 removed += 1
             docker.remove_network(
                 instance.network_name, instance.id, system=store.system
@@ -1236,6 +1317,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"no  component inspection: {exc}")
         return 1
 
+    catalogue_models: tuple[str, ...] | None = None
+    catalogue_error = ""
+    gateway_status = statuses[0]
+    if gateway_status.works:
+        try:
+            connection, catalogue = providers.catalogue(
+                providers.connection(statuses)
+            )
+            statuses = connection.components
+            catalogue_models = catalogue_ids(catalogue)
+        except CycloError as exc:
+            catalogue_error = str(exc)
+
     for status in statuses:
         state = _component_state(status)
         label = (
@@ -1249,14 +1343,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             failures += 1
             detail = f" ({status.error})" if status.error else ""
             print(f"no  {label}: {state}{detail}")
-    gateway_status = statuses[0]
     if gateway_status.works:
-        try:
-            models = providers.model_ids()
-            print(f"ok  outer provider catalogue: {len(models)} model(s)")
-        except CycloError as exc:
+        if catalogue_error:
             failures += 1
-            print(f"no  outer provider catalogue: {exc}")
+            print(f"no  provider catalogue: {catalogue_error}")
+        else:
+            assert catalogue_models is not None
+            print(
+                "ok  selected provider catalogue: "
+                f"{len(catalogue_models)} model(s)"
+            )
     return 1 if failures else 0
 
 
@@ -1316,7 +1412,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="create a project.cyclo from existing teams and mounts",
         description=(
             "Create a project definition from one or more --team PATH MODE and "
-            "--mount NAME PATH MODE declarations. MODE is ro or rw."
+            "--mount NAME PATH MODE declarations. MODE is ro or rw. Optional "
+            "--context FILE embeds project layout guidance."
         ),
     )
     project_init.add_argument("definition", help="new project.cyclo path")
@@ -1324,6 +1421,12 @@ def build_parser() -> argparse.ArgumentParser:
     project_init.add_argument(
         "--description",
         help="project description (default: derived from name)",
+    )
+    project_init.add_argument(
+        "--context",
+        dest="context_file",
+        metavar="FILE",
+        help="embed project layout and source guidance from FILE",
     )
     project_init.add_argument(
         "--team",
@@ -1375,6 +1478,22 @@ def build_parser() -> argparse.ArgumentParser:
     stop = commands.add_parser("stop", help="stop an instance or a whole project")
     stop.add_argument("target", help="instance ID or project.cyclo")
     stop.set_defaults(func=cmd_stop)
+    forget = commands.add_parser(
+        "forget",
+        help="delete a stopped instance and its durable AgentWS state",
+        description=(
+            "Permanently delete one stopped instance record, including all "
+            "tasks, jobs, transcripts, and runtime state."
+        ),
+    )
+    forget.add_argument("instance", help="stopped instance ID from cyclo ps")
+    forget.add_argument(
+        "--confirm",
+        required=True,
+        metavar="INSTANCE",
+        help="exact instance ID, required because durable work is deleted",
+    )
+    forget.set_defaults(func=cmd_forget)
     ps = commands.add_parser("ps", help="list team instances")
     ps.set_defaults(func=cmd_ps)
     inspect = commands.add_parser("inspect", help="show one instance in detail")

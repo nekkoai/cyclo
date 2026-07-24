@@ -1,7 +1,8 @@
+import { isProviderPrefix } from "@cyclo/provider/protocol";
+
 import { EXPOSED_APIS } from "./catalogue.mjs";
 import { getPiProviders, validatePiProviders } from "./pi-registry.mjs";
 
-const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]*$/u;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/u;
 
 // pi-ai owns the provider registry but does not provide safe human-readable
@@ -99,7 +100,7 @@ export function formatSupportedProviders(providers = discoverSupportedProviders(
     if (
       !provider
       || typeof provider !== "object"
-      || !PROVIDER_ID.test(provider.provider ?? "")
+      || !isProviderPrefix(provider.provider)
       || [provider.description, provider.auth, provider.login].some(
         (value) => typeof value !== "string" || !value || CONTROL_CHARACTER.test(value),
       )

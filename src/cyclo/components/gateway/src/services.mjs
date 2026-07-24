@@ -25,6 +25,25 @@ export function createGatewayServices(options = {}) {
     modelsPath: paths.modelsPath,
     getApiProvider,
   });
+  const warn = options.warn ?? console.warn;
+  if (typeof warn !== "function") throw new TypeError("warn must be a function");
+  for (const diagnostic of catalogue.diagnostics ?? []) {
+    const route = safeDiagnostic(
+      diagnostic.model
+        ? `${diagnostic.account}/${diagnostic.model}`
+        : diagnostic.account,
+      1_024,
+      "unknown",
+    );
+    warn(
+      `Cyclo gateway excluded unusable catalogue entry ${route}: `
+      + safeDiagnostic(
+        diagnostic.message,
+        512,
+        "invalid catalogue entry",
+      ),
+    );
+  }
   const credentials = options.credentials ?? createCredentialResolver({
     authPath: paths.authPath,
   });
@@ -37,7 +56,10 @@ export function createGatewayServices(options = {}) {
         try {
           credentials.check?.(Object.values(catalogue.routes));
           audit.check?.();
-          return { status: HealthStatus.READY, message: "ready" };
+          return {
+            status: HealthStatus.READY,
+            message: "ready",
+          };
         } catch {
           return {
             status: HealthStatus.NOT_READY,
@@ -121,4 +143,13 @@ async function record(audit, value) {
   } catch {
     throw new ConnectError("gateway usage audit unavailable", Code.Internal);
   }
+}
+
+function safeDiagnostic(value, limit, fallback) {
+  const clean = String(value)
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, limit);
+  return clean || fallback;
 }

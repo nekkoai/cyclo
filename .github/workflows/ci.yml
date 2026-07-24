@@ -139,10 +139,12 @@ jobs:
             src/cyclo/components
       - name: Build a derived team image through Cyclo
         run: |
-          PYTHONPATH=src python -c 'from pathlib import Path; from cyclo.team_runtime_image import docker_runner, ensure_derived, image_id; base = docker_runner.inspect("image", "cyclo-team:ci", missing=False); assert base is not None; ensure_derived("cyclo-derived-team:ci", Path("tests/fixtures/derived-team").resolve(), image_id(base), build=True)'
+          PYTHONPATH=src python -c 'from pathlib import Path; from cyclo.team_runtime_image import docker_runner, ensure_derived, image_id; base = docker_runner.inspect("image", "cyclo-team:ci", missing=False); assert base is not None; ensure_derived("cyclo-derived-team:ci", Path("tests/fixtures/derived-team").resolve(), image_id(base))'
           docker run --rm --network none --entrypoint /bin/sh \
             cyclo-derived-team:ci -ceu \
             'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
+      - name: Exercise the real multi-project team runtime
+        run: PYTHONPATH=src tools/runtime-write-acceptance cyclo-team:ci
       - name: Build gateway image
         run: |
           docker build --pull \

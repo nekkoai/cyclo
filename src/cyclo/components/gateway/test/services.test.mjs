@@ -11,6 +11,9 @@ import { createUnixTransport } from "@cyclo/component/transport";
 import { Modality, Provider } from "@cyclo/provider/contract";
 import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
 
+import { aggregateUsageFile } from "../src/audit.mjs";
+import { buildCatalogue } from "../src/catalogue.mjs";
+import { login } from "../src/login.mjs";
 import { createGatewayServer } from "../src/server.mjs";
 import { createGatewayServices } from "../src/services.mjs";
 
@@ -75,6 +78,93 @@ test("routes only on model and passes the opaque payload to the endpoint", async
   }
 });
 
+test("one public ID survives login, catalogue, inference, audit, and usage", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "cyclo-gateway-route-contract-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const authPath = join(directory, "auth.json");
+  const modelsPath = join(directory, "models.json");
+  const usagePath = join(directory, "usage.jsonl");
+  const account = "a".repeat(64);
+  const localModel = "😀".repeat(512);
+  const publicId = `${account}/${localModel}`;
+  const apiProvider = {
+    api: "openai-responses",
+    stream() {},
+    streamSimple() {},
+  };
+  const providers = [{
+    id: "openai",
+    auth: { apiKey: {} },
+    getModels() { return []; },
+    streamSimple() {},
+  }];
+  await writeFile(authPath, "{}\n", { mode: 0o600 });
+  await writeFile(modelsPath, JSON.stringify({
+    providers: {
+      custom: {
+        api: "openai-responses",
+        baseUrl: "https://example.invalid/v1",
+        models: [{
+          id: localModel,
+          input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
+        }],
+      },
+    },
+  }), { mode: 0o600 });
+
+  await login(
+    ["custom", "--as", account, "--api-key-env", "TEST_KEY"],
+    {
+      env: {
+        CYCLO_GATEWAY_AUTH_JSON: authPath,
+        CYCLO_GATEWAY_MODELS_JSON: modelsPath,
+        TEST_KEY: "test-only-key",
+      },
+      output: { write() {} },
+      providers,
+      getApiProvider: () => apiProvider,
+    },
+  );
+  const catalogue = buildCatalogue({
+    authPath,
+    modelsPath,
+    providers,
+    getApiProvider: () => apiProvider,
+  });
+  assert.deepEqual(catalogue.models.map(({ id }) => id), [publicId]);
+
+  const services = createGatewayServices({
+    env: {
+      CYCLO_GATEWAY_AUTH_JSON: authPath,
+      CYCLO_GATEWAY_MODELS_JSON: modelsPath,
+      CYCLO_GATEWAY_USAGE_JSONL: usagePath,
+    },
+    catalogue,
+    backend: {
+      async *infer(_route, payload, credential) {
+        assert.equal(payload, "opaque");
+        assert.equal(credential.apiKey, "test-only-key");
+        yield {
+          payload: "response",
+          usage: { inputTokens: 2, outputTokens: 3 },
+        };
+      },
+    },
+  });
+  const responses = [];
+  for await (const response of services.provider.infer(
+    { model: publicId, payload: "opaque" },
+    { signal: new AbortController().signal },
+  )) responses.push(response.payload);
+  assert.deepEqual(responses, ["response"]);
+
+  const usage = await aggregateUsageFile(usagePath);
+  assert.equal(usage.by_provider[account].requests, 1);
+  assert.equal(usage.by_model[publicId].total_tokens, 5);
+});
+
 test("records client abandonment without requiring inference semantics", async () => {
   const model = publicModel("work/gpt-test");
   const audit = [];
@@ -96,6 +186,56 @@ test("records client abandonment without requiring inference semantics", async (
   assert.equal((await iterator.next()).value.payload, "first");
   await iterator.return();
   assert.equal(audit.at(-1).outcome, "client_abandoned");
+});
+
+test("startup logs models excluded from the usable catalogue", () => {
+  const warnings = [];
+  const services = createGatewayServices({
+    catalogue: {
+      models: [],
+      routes: Object.freeze(Object.create(null)),
+      diagnostics: [{
+        account: "work",
+        model: "broken",
+        message: "private diagnostic",
+      }],
+    },
+    credentials: { check() {} },
+    backend: {},
+    audit: { check() {} },
+    warn(message) { warnings.push(message); },
+  });
+
+  assert.deepEqual(warnings, [
+    "Cyclo gateway excluded unusable catalogue entry work/broken: private diagnostic",
+  ]);
+  assert.deepEqual(services.component.health({}), {
+    status: HealthStatus.READY,
+    message: "ready",
+  });
+});
+
+test("startup catalogue diagnostics cannot inject multiline log entries", () => {
+  const warnings = [];
+  createGatewayServices({
+    catalogue: {
+      models: [],
+      routes: Object.freeze(Object.create(null)),
+      diagnostics: [{
+        account: "work",
+        model: "bad\nmodel\u0007",
+        message: "invalid\ncatalogue\u0007entry",
+      }],
+    },
+    credentials: { check() {} },
+    backend: {},
+    audit: { check() {} },
+    warn(message) { warnings.push(message); },
+  });
+
+  assert.deepEqual(warnings, [
+    "Cyclo gateway excluded unusable catalogue entry work/bad model: invalid catalogue entry",
+  ]);
 });
 
 test("default construction publishes compatible Pi models", async () => {

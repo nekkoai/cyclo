@@ -22,6 +22,7 @@ from cyclo.dashboard import (
     validate_dashboard_host,
 )
 from cyclo.component import ComponentStatus
+from cyclo.docker import Docker, DockerContainerState
 from cyclo.errors import CycloError
 from cyclo.installation import team_container_name, team_network_name
 from cyclo.providers import ProviderConnection
@@ -53,6 +54,7 @@ def instance(
         image="cyclo-runtime:test",
         team_write=False,
         offline=offline,
+        launch_id="0" * 32,
         active=active,
         port=4100 if not offline else None,
         provider_socket_path=str(provider_socket),
@@ -98,8 +100,10 @@ def test_queue_snapshot_counts_agentws_state(tmp_path: Path) -> None:
     task_open = root / "tasks" / "open-task"
     task_open.mkdir()
     (task_open / "spec.md").write_text("# Fix the widget\n", encoding="utf-8")
+    (task_open / "state").write_text("open\n", encoding="utf-8")
     task_closed = root / "tasks" / "closed-task"
     task_closed.mkdir()
+    (task_closed / "state").write_text("done\n", encoding="utf-8")
     (task_closed / "result.md").write_text("done\n", encoding="utf-8")
 
     running = root / "jobs" / "job-running"
@@ -116,7 +120,7 @@ def test_queue_snapshot_counts_agentws_state(tmp_path: Path) -> None:
     result = scan_agentws_queue(root)
 
     assert result["counts"] == {
-        "tasks": {"total": 2, "open": 1, "closed": 1},
+        "tasks": {"total": 2, "open": 1, "closed": 1, "unknown": 0},
         "jobs": {
             "total": 2,
             "pending": 0,
@@ -134,6 +138,51 @@ def test_queue_snapshot_counts_agentws_state(tmp_path: Path) -> None:
     }
     assert {item["kind"] for item in result["recent_activity"]} == {"task", "job"}
     assert result["errors"] == []
+
+
+def test_queue_snapshot_reports_invalid_task_states_as_unknown(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    root = queue(store, "alpha")
+
+    reopened = root / "tasks" / "reopened"
+    reopened.mkdir()
+    (reopened / "state").write_text("open\n", encoding="utf-8")
+    (reopened / "result.md").write_text("result from prior cycle\n", encoding="utf-8")
+
+    done = root / "tasks" / "done"
+    done.mkdir()
+    (done / "state").write_text("done\n", encoding="utf-8")
+
+    invalid = root / "tasks" / "invalid"
+    invalid.mkdir()
+    (invalid / "state").write_text("closed\n", encoding="utf-8")
+    (invalid / "result.md").write_text("must not mask corruption\n", encoding="utf-8")
+
+    unreadable = root / "tasks" / "unreadable"
+    unreadable.mkdir()
+    outside = tmp_path / "outside-state"
+    outside.write_text("done\n", encoding="utf-8")
+    (unreadable / "state").symlink_to(outside)
+
+    result = scan_agentws_queue(root)
+
+    assert result["counts"]["tasks"] == {
+        "total": 4,
+        "open": 1,
+        "closed": 1,
+        "unknown": 2,
+    }
+    assert {
+        item["id"]: item["state"] for item in result["recent_tasks"]
+    } == {
+        "done": "closed",
+        "invalid": "unknown",
+        "reopened": "open",
+        "unreadable": "unknown",
+    }
+    assert "2 tasks have an unknown or unreadable state" in result["errors"]
 
 
 def test_queue_activity_uses_log_mtime_not_only_directory_mtime(tmp_path: Path) -> None:
@@ -278,14 +327,28 @@ def test_queue_snapshot_has_a_shared_entry_budget(tmp_path: Path) -> None:
 
 
 class FakeDocker:
-    def __init__(self, running: dict[str, bool]) -> None:
-        self.running = running
+    def __init__(
+        self,
+        states: dict[str, bool | DockerContainerState],
+    ) -> None:
+        self.states = states
 
-    def container_running(self, name: str) -> bool:
-        if name in self.running:
-            return self.running[name]
-        logical = name.split("-team-", 1)[-1]
-        return self.running[f"cyclo-{logical}"]
+    def container_lifecycle_state(
+        self, instance: Instance, *, system: str
+    ) -> DockerContainerState:
+        assert system
+        name = instance.container_name
+        if name not in self.states:
+            logical = name.split("-team-", 1)[-1]
+            name = f"cyclo-{logical}"
+        state = self.states[name]
+        if isinstance(state, bool):
+            return (
+                DockerContainerState.RUNNING
+                if state
+                else DockerContainerState.STOPPED
+            )
+        return state
 
 
 class FakeUsage:
@@ -306,6 +369,37 @@ class FakeUsage:
         }
 
 
+def test_snapshot_reports_foreign_same_name_container_as_untrusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = instance("alpha")
+    persist(store, selected)
+    docker = Docker()
+    monkeypatch.setattr(
+        docker,
+        "_inspect_container",
+        lambda _name: {
+            "Id": "foreign-container-id",
+            "Config": {
+                "Labels": {
+                    "io.cyclo.system": "ba9876543210",
+                    "io.cyclo.kind": "team",
+                    "io.cyclo.instance": selected.id,
+                }
+            },
+            "State": {"Running": True},
+        },
+    )
+
+    result = DashboardSnapshot(store, docker=docker).build()
+
+    row = result["instances"][0]
+    assert row["state"] == "unknown"
+    assert row["agentws_port"] is None
+    assert any("non-Cyclo container" in error for error in row["errors"])
+
+
 class FakeProvider:
     def __init__(self, connection: ProviderConnection) -> None:
         self.selected_connection = connection
@@ -321,6 +415,13 @@ class FakeProvider:
     ) -> ProviderConnection:
         assert statuses is None or statuses == self.selected_connection.components
         return self.selected_connection
+
+    def catalogue(
+        self,
+        connection: ProviderConnection,
+    ) -> tuple[ProviderConnection, dict[str, object]]:
+        assert connection is self.selected_connection
+        return self.selected_connection, {"models": []}
 
 
 def component_status(
@@ -419,6 +520,7 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     mark_supervisor_ready(alpha_queue)
     task = alpha_queue / "tasks" / "work"
     task.mkdir()
+    (task / "state").write_text("open\n", encoding="utf-8")
     job = alpha_queue / "jobs" / "job"
     job.mkdir()
     (job / "status").write_text("failed\n", encoding="utf-8")
@@ -634,6 +736,32 @@ def test_snapshot_preserves_provider_failure_beside_agent_suspension(
             "ready",
             "ignored unavailable optional components: fusion stale",
         ),
+        (
+            ProviderConnection(
+                PROVIDER_GENERATION,
+                GATEWAY_SOCKET,
+                (
+                    component_status(),
+                    ComponentStatus(
+                        "fusion",
+                        "passthrough",
+                        None,
+                        None,
+                        False,
+                        "unknown",
+                        "missing",
+                        False,
+                        "unreachable",
+                        "cannot inspect ownership",
+                    ),
+                ),
+            ),
+            "ready",
+            (
+                "ignored unavailable optional components: fusion unknown: "
+                "cannot inspect ownership"
+            ),
+        ),
     ],
 )
 def test_snapshot_exposes_exact_provider_health_and_reads_it_once(
@@ -724,8 +852,18 @@ def test_snapshot_fails_closed_when_provider_health_is_not_ready(
     }
 
 
-def test_snapshot_does_not_persist_an_active_team_inactive_when_not_operational(
+@pytest.mark.parametrize(
+    ("docker_state", "expected_state"),
+    [
+        (DockerContainerState.STOPPED, "stale"),
+        (DockerContainerState.PAUSED, "paused"),
+        (DockerContainerState.RESTARTING, "restarting"),
+    ],
+)
+def test_snapshot_reports_nonoperational_lifecycle_without_persisting_it(
     tmp_path: Path,
+    docker_state: DockerContainerState,
+    expected_state: str,
 ) -> None:
     store = StateStore(tmp_path / "state")
     selected = instance("alpha")
@@ -733,12 +871,13 @@ def test_snapshot_does_not_persist_an_active_team_inactive_when_not_operational(
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": False}),  # type: ignore[arg-type]
+        docker=FakeDocker({"cyclo-alpha": docker_state}),  # type: ignore[arg-type]
         provider_reader=ready_provider(),
     ).build()
 
-    assert result["instances"][0]["state"] == "stale"
+    assert result["instances"][0]["state"] == expected_state
     assert result["instances"][0]["health"]["state"] == "inactive"
+    assert result["summary"]["attention"] == 1
     assert store.load("alpha").active is True
 
 
@@ -953,6 +1092,26 @@ def test_snapshot_counts_unknown_job_status_as_attention(tmp_path: Path) -> None
     row = result["instances"][0]
     assert row["counts"]["jobs"]["unknown"] == 1
     assert any("unknown or unreadable status" in error for error in row["errors"])
+    assert result["summary"]["attention"] == 1
+
+
+def test_snapshot_counts_unknown_task_state_as_attention(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    persist(store, instance("alpha"))
+    root = queue(store, "alpha")
+    mark_supervisor_ready(root)
+    task = root / "tasks" / "task-without-state"
+    task.mkdir()
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
+        provider_reader=ready_provider(),
+    ).build()
+
+    row = result["instances"][0]
+    assert row["counts"]["tasks"]["unknown"] == 1
+    assert any("unknown or unreadable state" in error for error in row["errors"])
     assert result["summary"]["attention"] == 1
 
 

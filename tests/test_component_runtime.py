@@ -404,6 +404,119 @@ def test_run_rolls_back_exact_container_on_keyboard_interrupt() -> None:
     ] in controller.calls
 
 
+class _LegacyRuntimeError(RuntimeError):
+    """Model an exception without BaseException.add_note, as on Python 3.10."""
+
+    add_note = None  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize(
+    "launch_error",
+    (
+        CycloError("launch inspection failed"),
+        _LegacyRuntimeError("launch inspection failed"),
+    ),
+)
+def test_failed_start_reports_an_incomplete_container_rollback(
+    launch_error: Exception,
+) -> None:
+    class Controller(ComponentController):
+        def __init__(self) -> None:
+            self.inspect_count = 0
+
+        def inspect(
+            self,
+            kind: str,
+            _reference: str,
+            *,
+            missing: bool = True,
+        ):
+            assert kind == "container"
+            self.inspect_count += 1
+            if self.inspect_count == 1:
+                return None
+            return {
+                "Id": CONTAINER_ID,
+                "Name": f"/{_component().container}",
+                "Config": {"Labels": _labels()},
+            }
+
+        def require_image(self, _component: Component) -> str:
+            return IMAGE_ID
+
+        def call(self, arguments, **_options):
+            if arguments[0] == "run":
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    f"{CONTAINER_ID}\n",
+                    "",
+                )
+            raise CycloError("Docker refused cleanup")
+
+        def status(
+            self,
+            _component: Component,
+            *,
+            error: str = "",
+        ) -> ComponentStatus:
+            raise launch_error
+
+    with pytest.raises(
+        CycloError,
+        match="launch inspection failed.*rollback failed.*refused cleanup",
+    ):
+        Controller()._run(_component())
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (
+            {"Running": True, "Paused": True, "Status": "paused"},
+            [
+                ["unpause", CONTAINER_ID],
+                ["stop", "--timeout", "10", CONTAINER_ID],
+                ["rm", "--volumes", CONTAINER_ID],
+            ],
+        ),
+        (
+            {"Running": False, "Dead": True, "Status": "dead"},
+            [["rm", "--volumes", "--force", CONTAINER_ID]],
+        ),
+    ],
+)
+def test_stop_handles_paused_and_dead_component_containers(
+    state: dict[str, object],
+    expected: list[list[str]],
+) -> None:
+    container = _container()
+    container["State"] = state
+
+    class Controller(ComponentController):
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def inspect(
+            self,
+            kind: str,
+            reference: str,
+            *,
+            missing: bool = True,
+        ):
+            assert kind == "container"
+            assert reference == _component().container
+            return container
+
+        def call(self, arguments, **_options):
+            self.calls.append(list(arguments))
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    controller = Controller()
+    assert controller.stop(_component())
+    assert controller.calls == expected
+
+
 @pytest.mark.parametrize(
     ("arguments", "expected_command"),
     [

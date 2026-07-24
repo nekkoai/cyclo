@@ -83,6 +83,18 @@ def _validate_runtime_image(
         raise CycloError(
             "team image must inherit Cyclo's runtime ENTRYPOINT unchanged"
         )
+    # Docker omits Config.User entirely when the image uses the default root
+    # account. Treat that canonical representation exactly like an empty User;
+    # an explicitly present non-string value is still malformed inspection
+    # data.
+    user = config.get("User", "")
+    if not isinstance(user, str):
+        raise CycloError("cannot parse Cyclo team image user")
+    account = user.partition(":")[0]
+    if account not in {"", "0", "root"}:
+        raise CycloError(
+            "team image must run Cyclo's runtime ENTRYPOINT as root"
+        )
     if (
         base_image is not None
         and image_label(info, BASE_IMAGE_LABEL) != base_image

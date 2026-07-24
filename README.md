@@ -75,26 +75,38 @@ repositories:
 
 ```sh
 cyclo team init ./teams/jon-rtl --template plan-execute-verify --model PROVIDER/MODEL
-cyclo project init ./project.cyclo --team ./teams/jon-rtl ro --mount source /home/user/openhw/core-et rw
+cyclo project init ./project.cyclo --context ./project-context.md --team ./teams/jon-rtl ro --mount core-et /home/user/openhw/core-et rw --mount uart-ip /home/user/openhw/uart-ip rw --mount specifications ./specifications ro
 ```
 
-The generated project file uses the same small line-oriented format:
+A project definition uses a small line-oriented format:
 
 ```text
 name rtl-work
-description RTL design experiment
+description Integrate a reusable UART IP into CORE-ET.
+context <<PROJECT_CONTEXT
+`core-et` is the processor implementation repository.
+`uart-ip` is the separately versioned UART repository being integrated into it.
+`specifications` contains the normative interface documents for both projects.
+PROJECT_CONTEXT
 team ./teams/jon-rtl ro
-mount source /home/user/openhw/core-et rw
-mount docs ./docs ro
+mount core-et /home/user/openhw/core-et rw
+mount uart-ip /home/user/openhw/uart-ip rw
+mount specifications ./specifications ro
 ```
 
-`rw` mounts are workspaces at `/workspace/<name>`; `ro` mounts are supporting
-inputs at `/readonly/<name>`. Teams cannot write read-only mounts. A team
-repository contains a `team` roster, `roles/*.md`, optional `AGENTS.md`, and an
-optional Dockerfile derived from `CYCLO_TEAM_BASE` when its agents need extra
-tools. Cyclo builds and selects that image per team. Cyclo supplies the common
-AgentWS job loop and provider socket; the team supplies behavior and its
-additional execution dependencies.
+Each `rw` mount is a writable project at `/workspace/<name>`; several `rw`
+lines deliberately give the team several projects. Each `ro` mount is
+supporting input at `/readonly/<name>`. Cyclo creates a per-instance,
+container-facing snapshot at the fixed, read-only
+`/agentws/project.cyclo`: it retains the authored name, description, and
+context, but rewrites the structured `team` and `mount` paths into the
+container namespace. Authored description/context text remains literal, so it
+must not contain secrets. Teams cannot write that snapshot or read-only inputs.
+A team repository contains a `team` roster,
+`roles/*.md`, optional `AGENTS.md`, and an optional Dockerfile derived from
+`CYCLO_TEAM_BASE` when its agents need extra tools. Cyclo builds and selects
+that image per team. Cyclo supplies the common AgentWS job loop and provider
+socket; the team supplies behavior and its additional execution dependencies.
 
 Run and inspect work:
 

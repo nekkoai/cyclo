@@ -35,6 +35,20 @@ IMAGE_ID = f"sha256:{'a' * 64}"
 CONTAINER_ID = "b" * 64
 
 
+def _model(identifier: str) -> dict[str, object]:
+    return {
+        "id": identifier,
+        "displayName": identifier,
+        "capabilities": {
+            "inputModalities": ["MODALITY_TEXT"],
+            "outputModalities": ["MODALITY_TEXT"],
+        },
+        "contextWindowTokens": "128000",
+        "maxOutputTokens": "4096",
+        "inferenceFormat": "pi-ai@0.81.1",
+    }
+
+
 def _write_component(
     root: Path,
     directory_name: str,
@@ -280,6 +294,137 @@ def test_failed_provider_keeps_gateway_selected_and_exposes_error(
     assert broken.error == "deliberate provider failure"
 
 
+def test_unavailable_dependency_does_not_inspect_or_abort_its_dependant(
+    tmp_path: Path,
+) -> None:
+    _write_component(tmp_path, "broken")
+    _write_component(tmp_path, "dependent")
+    config = tmp_path / "host.conf"
+    config.write_text(
+        "provider broken ./broken upstream=gateway\n"
+        "provider dependent ./dependent upstream=broken\n",
+        encoding="utf-8",
+    )
+
+    class Controller:
+        def status(
+            self,
+            component: Component,
+            *,
+            error: str = "",
+        ) -> ComponentStatus:
+            if component.name == "dependent":
+                raise CycloError("dependent container has invalid ownership")
+            return _status(
+                component.name,
+                present=False,
+                running=False,
+                ready=False,
+                error=error,
+            )
+
+        def start(self, component: Component) -> ComponentStatus:
+            if component.name == "broken":
+                raise CycloError("deliberate provider failure")
+            raise AssertionError("dependent provider must not be started")
+
+        def stop(self, *_args) -> bool:
+            raise AssertionError("unverified dependent must not be removed")
+
+        def call(self, arguments, **_options):
+            assert arguments[:2] == ["container", "ls"]
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    controller = Controller()
+    root = tmp_path / "components"
+    providers = ProviderSystem(
+        root,
+        config,
+        gateway=FakeGateway(root, controller),  # type: ignore[arg-type]
+        controller=controller,  # type: ignore[arg-type]
+    )
+
+    connection = providers.start()
+
+    assert connection.socket_path == providers.gateway.socket_path
+    assert [status.name for status in connection.components] == [
+        "gateway",
+        "broken",
+        "dependent",
+    ]
+    assert connection.components[1].error == "deliberate provider failure"
+    assert "required component unavailable: broken" in connection.components[2].error
+    assert "dependent container has invalid ownership" in connection.components[2].error
+
+
+def test_unavailable_dependency_cleanup_failure_does_not_abort_fallback(
+    tmp_path: Path,
+) -> None:
+    _write_component(tmp_path, "broken")
+    _write_component(tmp_path, "dependent")
+    _write_component(tmp_path, "healthy")
+    config = tmp_path / "host.conf"
+    config.write_text(
+        "provider broken ./broken upstream=gateway\n"
+        "provider dependent ./dependent upstream=broken\n"
+        "provider healthy ./healthy upstream=gateway\n",
+        encoding="utf-8",
+    )
+
+    class Controller:
+        def status(
+            self,
+            component: Component,
+            *,
+            error: str = "",
+        ) -> ComponentStatus:
+            if component.name == "dependent":
+                return _status(component.name, error=error)
+            if component.name == "healthy":
+                return _status(component.name, error=error)
+            return _status(
+                component.name,
+                present=False,
+                running=False,
+                ready=False,
+                error=error,
+            )
+
+        def start(self, component: Component) -> ComponentStatus:
+            if component.name == "broken":
+                raise CycloError("deliberate provider failure")
+            if component.name == "healthy":
+                return _status(component.name)
+            raise AssertionError("dependent provider must not be started")
+
+        def stop(self, component: Component, expected_id: str) -> bool:
+            assert component.name == "dependent"
+            assert expected_id == CONTAINER_ID
+            raise CycloError("Docker refused dependent cleanup")
+
+        def call(self, arguments, **_options):
+            assert arguments[:2] == ["container", "ls"]
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    controller = Controller()
+    root = tmp_path / "components"
+    providers = ProviderSystem(
+        root,
+        config,
+        gateway=FakeGateway(root, controller),  # type: ignore[arg-type]
+        controller=controller,  # type: ignore[arg-type]
+    )
+
+    connection = providers.start()
+
+    assert connection.socket_path == providers.socket_path("healthy")
+    by_name = {status.name: status for status in connection.components}
+    assert by_name["broken"].error == "deliberate provider failure"
+    assert "required component unavailable: broken" in by_name["dependent"].error
+    assert "cleanup failed: Docker refused dependent cleanup" in by_name["dependent"].error
+    assert by_name["healthy"].works
+
+
 def test_last_working_provider_is_selected_when_a_later_one_fails(
     tmp_path: Path,
 ) -> None:
@@ -388,6 +533,18 @@ def test_stop_runs_in_reverse_order_then_removes_owned_stray(
         def container_state(_info) -> str:
             return "running"
 
+        def remove_verified_container(
+            self,
+            identifier: str,
+            state: str,
+            *,
+            preserve_volumes: bool,
+        ) -> None:
+            assert state == "running"
+            assert not preserve_volumes
+            self.call(["stop", "--timeout", "10", identifier])
+            self.call(["rm", "--volumes", identifier])
+
     controller = Controller()
     root = tmp_path / "components"
     gateway = FakeGateway(root, controller)
@@ -435,48 +592,176 @@ def test_empty_model_catalogue_is_an_empty_list(
         lambda *_args, **_kwargs: {},
     )
 
-    assert providers.models_document() == {"models": []}
-    assert providers.model_ids() == ()
+    connection, catalogue = providers.catalogue(providers.connection())
+    assert connection.socket_path == gateway.socket_path
+    assert catalogue == {"models": []}
 
 
-def test_catalogue_uses_the_exact_selected_connection(
+def test_catalogue_falls_back_when_a_ready_outer_provider_cannot_list_models(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _write_component(tmp_path, "first")
+    _write_component(tmp_path, "outer")
+    config = tmp_path / "host.conf"
+    config.write_text(
+        "provider first ./first upstream=gateway\n"
+        "provider outer ./outer upstream=first\n",
+        encoding="utf-8",
+    )
+
     class Controller:
-        pass
+        def status(
+            self,
+            component: Component,
+            *,
+            error: str = "",
+        ) -> ComponentStatus:
+            return _status(component.name, error=error)
 
     controller = Controller()
     root = tmp_path / "components"
     gateway = FakeGateway(root, controller)
     providers = ProviderSystem(
         root,
-        tmp_path / "host.conf",
+        config,
         gateway=gateway,  # type: ignore[arg-type]
         controller=controller,  # type: ignore[arg-type]
     )
-    selected_socket = (tmp_path / "selected" / COMPONENT_SOCKET).resolve()
-    connection = ProviderConnection(
-        "selected-generation",
-        selected_socket,
-        (_status("gateway"),),
-    )
     calls: list[Path] = []
-    monkeypatch.setattr(
-        providers,
-        "connection",
-        lambda *_args: pytest.fail("catalogue reselected its provider"),
+
+    def list_models(socket_path, *_args, **_options):
+        calls.append(socket_path)
+        if socket_path == providers.socket_path("outer"):
+            raise CycloError("outer catalogue crashed")
+        return {"models": [_model("first/model")]}
+
+    monkeypatch.setattr(providers_module, "connect_unary", list_models)
+
+    connection, document = providers.catalogue(providers.connection())
+
+    assert calls == [
+        providers.socket_path("outer"),
+        providers.socket_path("first"),
+    ]
+    assert connection.socket_path == providers.socket_path("first")
+    assert document == {"models": [_model("first/model")]}
+    outer = next(
+        status
+        for status in connection.components
+        if status.name == "outer"
     )
+    assert not outer.works
+    assert "outer catalogue crashed" in outer.error
+
+
+@pytest.mark.parametrize(
+    "invalid_models",
+    [
+        [{}],
+        [{"id": ""}],
+        [_model("outer/model"), _model("outer/model")],
+        [{"id": "outer/model"}],
+        [_model("_legacy/model")],
+        [_model(f"{'a' * 65}/model")],
+        [_model("outer/bad\u0085model")],
+        [_model(f"outer/{'😀' * 513}")],
+        [_model("outer/\ud800")],
+    ],
+)
+def test_catalogue_falls_back_from_invalid_outer_model_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_models: list[dict[str, object]],
+) -> None:
+    _write_component(tmp_path, "first")
+    _write_component(tmp_path, "outer")
+    config = tmp_path / "host.conf"
+    config.write_text(
+        "provider first ./first upstream=gateway\n"
+        "provider outer ./outer upstream=first\n",
+        encoding="utf-8",
+    )
+
+    class Controller:
+        def status(
+            self,
+            component: Component,
+            *,
+            error: str = "",
+        ) -> ComponentStatus:
+            return _status(component.name, error=error)
+
+    controller = Controller()
+    root = tmp_path / "components"
+    providers = ProviderSystem(
+        root,
+        config,
+        gateway=FakeGateway(root, controller),  # type: ignore[arg-type]
+        controller=controller,  # type: ignore[arg-type]
+    )
+
+    def list_models(socket_path, *_args, **_options):
+        if socket_path == providers.socket_path("outer"):
+            return {"models": invalid_models}
+        return {"models": [_model("first/model")]}
+
+    monkeypatch.setattr(providers_module, "connect_unary", list_models)
+
+    connection, document = providers.catalogue(providers.connection())
+
+    assert connection.socket_path == providers.socket_path("first")
+    assert document == {"models": [_model("first/model")]}
+    assert not connection.components[-1].works
+    assert "invalid" in connection.components[-1].error
+
+
+def test_catalogue_keeps_a_structurally_valid_non_pi_outer_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_component(tmp_path, "outer")
+    config = tmp_path / "host.conf"
+    config.write_text(
+        "provider outer ./outer upstream=gateway\n",
+        encoding="utf-8",
+    )
+
+    class Controller:
+        def status(
+            self,
+            component: Component,
+            *,
+            error: str = "",
+        ) -> ComponentStatus:
+            return _status(component.name, error=error)
+
+    controller = Controller()
+    root = tmp_path / "components"
+    providers = ProviderSystem(
+        root,
+        config,
+        gateway=FakeGateway(root, controller),  # type: ignore[arg-type]
+        controller=controller,  # type: ignore[arg-type]
+    )
+    document = {
+        "models": [
+            {
+                "id": "future/model",
+                "inferenceFormat": "future-runtime@1",
+            }
+        ]
+    }
     monkeypatch.setattr(
         providers_module,
         "connect_unary",
-        lambda socket_path, *_args, **_kwargs: (
-            calls.append(socket_path) or {"models": []}
-        ),
+        lambda *_args, **_options: document,
     )
 
-    assert providers.models_document(connection) == {"models": []}
-    assert calls == [selected_socket]
+    connection, selected = providers.catalogue(providers.connection())
+
+    assert connection.socket_path == providers.socket_path("outer")
+    assert selected == document
 
 
 def test_component_start_rejects_an_unavailable_requirement(
@@ -516,6 +801,139 @@ def test_component_start_rejects_an_unavailable_requirement(
 
     with pytest.raises(CycloError, match="required component unavailable"):
         providers.start_component("pass")
+
+
+def test_component_status_and_start_do_not_inspect_unrelated_components(
+    tmp_path: Path,
+) -> None:
+    _write_component(tmp_path, "first")
+    _write_component(tmp_path, "unrelated")
+    config = tmp_path / "host.conf"
+    config.write_text(
+        "provider first ./first upstream=gateway\n"
+        "provider unrelated ./unrelated upstream=gateway\n",
+        encoding="utf-8",
+    )
+
+    class Controller:
+        def __init__(self) -> None:
+            self.inspected: list[str] = []
+
+        def status(
+            self,
+            component: Component,
+            *,
+            error: str = "",
+        ) -> ComponentStatus:
+            self.inspected.append(component.name)
+            if component.name == "unrelated":
+                raise CycloError("unrelated component is malformed")
+            return _status(component.name, error=error)
+
+        def start(self, component: Component) -> ComponentStatus:
+            return _status(component.name)
+
+    controller = Controller()
+    root = tmp_path / "components"
+    providers = ProviderSystem(
+        root,
+        config,
+        gateway=FakeGateway(root, controller),  # type: ignore[arg-type]
+        controller=controller,  # type: ignore[arg-type]
+    )
+
+    assert providers.status_component("first").works
+    assert controller.inspected == ["first"]
+    assert providers.start_component("first").works
+    assert controller.inspected == ["first"]
+
+
+def test_component_start_does_not_prepare_an_unrelated_socket_tree(
+    tmp_path: Path,
+) -> None:
+    _write_component(tmp_path, "first")
+    _write_component(tmp_path, "unrelated")
+    config = tmp_path / "host.conf"
+    config.write_text(
+        "provider first ./first upstream=gateway\n"
+        "provider unrelated ./unrelated upstream=gateway\n",
+        encoding="utf-8",
+    )
+
+    class Controller:
+        def status(
+            self,
+            component: Component,
+            *,
+            error: str = "",
+        ) -> ComponentStatus:
+            return _status(component.name, error=error)
+
+        def start(self, component: Component) -> ComponentStatus:
+            return _status(component.name)
+
+    controller = Controller()
+    root = tmp_path / "components"
+    providers = ProviderSystem(
+        root,
+        config,
+        gateway=FakeGateway(root, controller),  # type: ignore[arg-type]
+        controller=controller,  # type: ignore[arg-type]
+    )
+    providers.sockets_root.mkdir(parents=True)
+    unrelated_target = tmp_path / "outside"
+    unrelated_target.mkdir()
+    providers.socket_dir("unrelated").symlink_to(
+        unrelated_target,
+        target_is_directory=True,
+    )
+
+    assert providers.start_component("first").works
+    assert providers.socket_dir("unrelated").is_symlink()
+
+
+def test_component_start_checks_transitive_dependencies(
+    tmp_path: Path,
+) -> None:
+    _write_component(tmp_path, "first")
+    _write_component(tmp_path, "second")
+    config = tmp_path / "host.conf"
+    config.write_text(
+        "provider first ./first upstream=gateway\n"
+        "provider second ./second upstream=first\n",
+        encoding="utf-8",
+    )
+
+    class Controller:
+        def status(
+            self,
+            component: Component,
+            *,
+            error: str = "",
+        ) -> ComponentStatus:
+            return _status(component.name, error=error)
+
+    controller = Controller()
+    root = tmp_path / "components"
+    gateway = FakeGateway(root, controller)
+    gateway.status = lambda **_options: _status(
+        "gateway",
+        present=False,
+        running=False,
+        ready=False,
+    )
+    providers = ProviderSystem(
+        root,
+        config,
+        gateway=gateway,  # type: ignore[arg-type]
+        controller=controller,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        CycloError,
+        match=r"required component unavailable: gateway, first",
+    ):
+        providers.start_component("second")
 
 
 def test_component_start_rejects_an_unknown_name_cleanly(

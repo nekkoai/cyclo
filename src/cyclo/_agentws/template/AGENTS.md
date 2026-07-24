@@ -1,9 +1,10 @@
 # AgentWS - Generic Agent Protocol
 
-You are an AgentWS role agent. The launcher starts you with a minimal prompt:
+You are an AgentWS role agent. The launcher starts you with a self-contained
+prompt whose opening line is:
 
 ```text
-You are agent <name>.
+You are agent <name> with role <role>.
 ```
 
 Your agent directory is:
@@ -14,17 +15,23 @@ agents/<name>/
 
 ## Filesystem Layout
 
-Read `$CYCLO_PROJECT_MANIFEST` before touching project files. It names every
-mounted directory and states whether it is read-only or read/write; this
-project context remains authoritative even when the team has its own
-`AGENTS.md`.
+Read `/agentws/project.cyclo` before touching project files. Cyclo creates this
+read-only, instance-wide view of the project definition at launch or refresh;
+it remains authoritative even when the team has its own `AGENTS.md`.
+
+The file uses ordinary Cyclo project syntax. Its `name`, `description`, and
+optional `context` explain the work. Each `mount NAME /workspace/NAME rw` is a
+writable project; there may be several. Each
+`mount NAME /readonly/NAME ro` is a read-only supporting input. The `team`
+line names `/team`. Paths in `team` and `mount` directives are the paths
+available inside this container; authored description/context text is literal.
 
 - `/workspace` — writable project checkouts only, mounted at
   `/workspace/<name>`.
 - `/readonly` — named read-only inputs such as documentation and specifications.
 - `/team` — the team definition: protocol, roster, and roles; normally read-only.
 - `/agentws` — AgentWS protocol and runtime state: tasks, jobs, agents, and tools.
-- `/agentws/PROJECT.md` — generated project name, description, mounts, and modes.
+- `/agentws/project.cyclo` — generated container-facing project definition.
 - `/agentws/jobs/<job-id>/workspace` — job scratch/handoff files, not project source.
 
 Do not mistake `/readonly`, `/team`, `/agentws`, or a job workspace for a
@@ -33,8 +40,8 @@ writable project.
 All `bin/`, `tasks/`, `jobs/`, and `agents/` paths below are relative to
 `$CYCLO_AGENTWS_RUNTIME` (`/agentws`). Run queue commands from that directory;
 run project commands from the selected writable path below `/workspace`. If the
-manifest declares no writable project, put generated artifacts in the job
-workspace and report their paths to the planner.
+project definition declares no writable project, put generated artifacts in
+the job workspace and report their paths to the planner.
 
 The launcher has already selected your role, claimed one job for that role, and
 recorded that job in your agent directory. Discover your assignment from files,
@@ -62,6 +69,7 @@ according to the problem-handling rules.
 Read these files first:
 
 ```text
+/agentws/project.cyclo
 agents/<name>/role
 agents/<name>/current-job
 jobs/<job-id>/task-id

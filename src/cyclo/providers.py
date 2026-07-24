@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -38,6 +38,7 @@ from .installation import (
     installation_id,
     provider_name,
 )
+from .model_ids import split_public_model_id
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,30 @@ class ProviderConnection:
     generation: str
     socket_path: Path
     components: tuple[ComponentStatus, ...]
+
+
+def catalogue_ids(document: Mapping[str, object]) -> tuple[str, ...]:
+    """Return ordered model IDs from a structurally valid Provider catalogue."""
+
+    models = document.get("models")
+    if not isinstance(models, list):
+        raise CycloError("provider system returned an invalid model catalogue")
+    result: list[str] = []
+    seen: set[str] = set()
+    for model in models:
+        identifier = model.get("id") if isinstance(model, dict) else None
+        if (
+            split_public_model_id(identifier) is None
+            or identifier in seen
+            or not isinstance(model.get("inferenceFormat"), str)
+            or not model["inferenceFormat"]
+        ):
+            raise CycloError(
+                "provider system returned an invalid or duplicate model"
+            )
+        seen.add(identifier)
+        result.append(identifier)
+    return tuple(result)
 
 
 def _strip_comment(line: str) -> str:
@@ -376,10 +401,13 @@ class ProviderSystem:
             )
         return tuple(result)
 
-    def _prepare(self) -> None:
+    def _prepare(
+        self,
+        providers: tuple[ProviderDefinition, ...],
+    ) -> None:
         ensure_directory(self.components_root, 0o700)
         ensure_directory(self.sockets_root, 0o700)
-        for provider in self.configuration.providers:
+        for provider in providers:
             output = ensure_directory(
                 self.socket_dir(provider.name),
                 0o777,
@@ -403,22 +431,101 @@ class ProviderSystem:
     def check(self) -> int:
         return len(self.provider_components)
 
+    @staticmethod
+    def _unavailable_status(
+        component: Component,
+        error: str,
+    ) -> ComponentStatus:
+        return ComponentStatus(
+            component.name,
+            component.kind,
+            None,
+            None,
+            False,
+            "unknown",
+            "missing",
+            False,
+            "unreachable",
+            error,
+        )
+
+    def status_component(
+        self,
+        name: str,
+        *,
+        error: str = "",
+    ) -> ComponentStatus:
+        """Inspect exactly one component without touching unrelated providers."""
+
+        component = self.component(name)
+        try:
+            if name == "gateway":
+                return self.gateway.status(error=error)
+            return self.controller.status(component, error=error)
+        except CycloError as exc:
+            observed = str(exc)
+            detail = (
+                f"{error}; inspection failed: {observed}"
+                if error and observed not in error
+                else error or observed
+            )
+            return self._unavailable_status(component, detail)
+
     def statuses(
         self,
         errors: Mapping[str, str] | None = None,
     ) -> tuple[ComponentStatus, ...]:
         failures = errors or {}
-        result = [
-            self.gateway.status(error=failures.get("gateway", ""))
-        ]
-        result.extend(
-            self.controller.status(
-                component,
+        return tuple(
+            self.status_component(
+                component.name,
                 error=failures.get(component.name, ""),
             )
-            for component in self.provider_components
+            for component in self.components
         )
-        return tuple(result)
+
+    def _usable_components(
+        self,
+        statuses: tuple[ComponentStatus, ...],
+    ) -> dict[str, bool]:
+        by_name = {status.name: status for status in statuses}
+        gateway = by_name.get("gateway")
+        usable = {"gateway": bool(gateway and gateway.works)}
+        for definition in self.configuration.providers:
+            status = by_name.get(definition.name)
+            usable[definition.name] = bool(
+                status
+                and status.works
+                and all(
+                    usable.get(target, False)
+                    for _requirement, target in definition.bindings
+                )
+            )
+        return usable
+
+    def _dependency_names(self, name: str) -> tuple[str, ...]:
+        definitions = {
+            definition.name: definition
+            for definition in self.configuration.providers
+        }
+        needed: set[str] = set()
+
+        def add_dependencies(selected: str) -> None:
+            definition = definitions.get(selected)
+            if definition is None:
+                return
+            for _requirement, target in definition.bindings:
+                if target in needed:
+                    continue
+                needed.add(target)
+                add_dependencies(target)
+
+        add_dependencies(name)
+        return tuple(
+            component.name
+            for component in self.components
+            if component.name in needed
+        )
 
     def connection(
         self,
@@ -426,29 +533,18 @@ class ProviderSystem:
     ) -> ProviderConnection:
         observed = self.statuses() if statuses is None else statuses
         by_name = {status.name: status for status in observed}
+        usable = self._usable_components(observed)
         gateway_status = by_name.get("gateway")
-        if gateway_status is None or not gateway_status.works:
+        if not usable["gateway"]:
             detail = gateway_status.error if gateway_status else "not found"
             raise CycloError(
                 "credential gateway is not working"
                 + (f": {detail}" if detail else "")
             )
 
-        usable = {"gateway": True}
         selected = self.gateway.socket_path
         for definition in self.configuration.providers:
-            status = by_name.get(definition.name)
-            dependencies_work = all(
-                usable.get(target, False)
-                for _requirement, target in definition.bindings
-            )
-            works = bool(
-                status is not None
-                and status.works
-                and dependencies_work
-            )
-            usable[definition.name] = works
-            if works:
+            if usable[definition.name]:
                 selected = self.socket_path(definition.name)
         return ProviderConnection(
             self.configuration.generation,
@@ -480,19 +576,22 @@ class ProviderSystem:
                 else self.gateway.start()
             )
         component = self.component(name)
-        self._prepare()
         definition = next(
             provider
             for provider in self.configuration.providers
             if provider.name == name
         )
-        observed = {
-            status.name: status for status in self.statuses()
-        }
+        self._prepare((definition,))
+        dependency_names = self._dependency_names(name)
+        observed = tuple(
+            self.status_component(dependency)
+            for dependency in dependency_names
+        )
+        usable = self._usable_components(observed)
         unavailable = [
-            target
-            for _requirement, target in definition.bindings
-            if not observed[target].works
+            dependency
+            for dependency in dependency_names
+            if not usable.get(dependency, False)
         ]
         if unavailable:
             raise CycloError(
@@ -520,7 +619,7 @@ class ProviderSystem:
         gateway_status = self.gateway.start()
         if not gateway_status.works:
             raise CycloError("credential gateway is not working")
-        self._prepare()
+        self._prepare(())
         working = {"gateway": True}
         by_name = {
             provider.name: provider
@@ -534,16 +633,25 @@ class ProviderSystem:
                 if not working.get(target, False)
             ]
             if unavailable:
-                current = self.controller.status(component)
-                if current.container_id:
-                    self.controller.stop(component, current.container_id)
-                errors[component.name] = (
+                detail = (
                     "required component unavailable: "
                     + ", ".join(unavailable)
                 )
+                current = self.status_component(
+                    component.name,
+                    error=detail,
+                )
+                detail = current.error or detail
+                if current.container_id:
+                    try:
+                        self.controller.stop(component, current.container_id)
+                    except CycloError as exc:
+                        detail += f"; cleanup failed: {exc}"
+                errors[component.name] = detail
                 working[component.name] = False
                 continue
             try:
+                self._prepare((definition,))
                 status = self.controller.start(component)
             except CycloError as exc:
                 errors[component.name] = str(exc)
@@ -623,48 +731,84 @@ class ProviderSystem:
             assert isinstance(name, str)
             if name in configured:
                 continue
-            if self.controller.container_state(info) != "stopped":
-                self.controller.call(
-                    ["stop", "--timeout", "10", identifier]
-                )
-            self.controller.call(["rm", "--volumes", identifier])
+            state = self.controller.container_state(info)
+            self.controller.remove_verified_container(
+                identifier,
+                state,
+                preserve_volumes=False,
+            )
             stopped.append(name)
         return tuple(stopped)
 
-    def models_document(
-        self,
-        connection: ProviderConnection | None = None,
+    @staticmethod
+    def _validate_models_document(
+        response: dict[str, object],
     ) -> dict[str, object]:
-        selected = connection or self.connection()
-        response = connect_unary(
-            selected.socket_path,
-            PROVIDER_INTERFACE,
-            "ListModels",
-            timeout=10.0,
-        )
-        models = response.get("models", [])
-        if not isinstance(models, list) or any(
-            not isinstance(model, dict) for model in models
-        ):
-            raise CycloError(
-                "provider system returned an invalid model catalogue"
-            )
-        return {**response, "models": models}
+        document = {**response, "models": response.get("models", [])}
+        catalogue_ids(document)
+        return document
 
-    def model_ids(
+    def _models_document_at(self, socket_path: Path) -> dict[str, object]:
+        return self._validate_models_document(
+            connect_unary(
+                socket_path,
+                PROVIDER_INTERFACE,
+                "ListModels",
+                timeout=10.0,
+            )
+        )
+
+    def catalogue(
         self,
-        connection: ProviderConnection | None = None,
-    ) -> tuple[str, ...]:
-        result: list[str] = []
-        for model in self.models_document(connection)["models"]:  # type: ignore[index]
-            model_id = model.get("id") if isinstance(model, dict) else None
-            if (
-                not isinstance(model_id, str)
-                or not model_id
-                or model_id in result
-            ):
-                raise CycloError(
-                    "provider system returned an invalid or duplicate model ID"
+        connection: ProviderConnection,
+    ) -> tuple[ProviderConnection, dict[str, object]]:
+        """Select the newest usable provider that returns a valid catalogue."""
+
+        observed = connection
+        usable = self._usable_components(observed.components)
+        candidates = [
+            "gateway",
+            *(
+                definition.name
+                for definition in self.configuration.providers
+                if usable.get(definition.name, False)
+            ),
+        ]
+        failures: dict[str, str] = {}
+        for name in reversed(candidates):
+            socket_path = (
+                self.gateway.socket_path
+                if name == "gateway"
+                else self.socket_path(name)
+            )
+            try:
+                document = self._models_document_at(socket_path)
+            except CycloError as exc:
+                failures[name] = str(exc)
+                continue
+            statuses = tuple(
+                replace(
+                    status,
+                    error=(
+                        f"model catalogue unavailable: {failures[status.name]}"
+                    ),
                 )
-            result.append(model_id)
-        return tuple(result)
+                if status.name in failures
+                else status
+                for status in observed.components
+            )
+            return (
+                ProviderConnection(
+                    observed.generation,
+                    socket_path,
+                    statuses,
+                ),
+                document,
+            )
+        detail = "; ".join(
+            f"{name}: {error}" for name, error in failures.items()
+        )
+        raise CycloError(
+            "no working provider returned a valid model catalogue"
+            + (f": {detail}" if detail else "")
+        )

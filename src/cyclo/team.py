@@ -12,12 +12,11 @@ from pathlib import Path
 
 from .agentws_bundle import packaged_agentws_template
 from .errors import CycloError
+from .model_ids import split_public_model_id
 from .team_templates import packaged_team_template
 
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-PROVIDER_RE = re.compile(r"^[a-z0-9_-]+$")
-RESERVED_PROVIDER_NAMES = {"__proto__", "constructor", "gateway", "prototype"}
 SUPPORTED_ENGINES = {"pi", "pi-interactive"}
 ROSTER_NAMES = ("team", "default.team")
 MAX_TEAM_FILE_BYTES = 1024 * 1024
@@ -94,16 +93,12 @@ def _validate_name(label: str, value: str, source: Path, line_no: int) -> None:
 
 
 def validate_proxy_model(model: str) -> tuple[str, str]:
-    if any(char.isspace() for char in model) or model.count("/") < 1:
+    if "/" not in model:
         raise CycloError("model must be a proxy name such as provider/model")
-    provider, model_id = model.split("/", 1)
-    if (
-        not PROVIDER_RE.fullmatch(provider)
-        or provider in RESERVED_PROVIDER_NAMES
-        or not model_id
-    ):
+    parsed = split_public_model_id(model)
+    if parsed is None:
         raise CycloError(f"invalid proxy model {model!r}")
-    return provider, model_id
+    return parsed
 
 
 def _regular_file_flags() -> int:

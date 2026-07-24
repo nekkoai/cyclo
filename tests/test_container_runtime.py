@@ -9,6 +9,15 @@ import pytest
 from cyclo import container_runtime
 
 
+CONTAINER_PROJECT_CONFIG = (
+    "name runtime-test\n"
+    "description Container supervisor test.\n"
+    "team /team ro\n"
+    "mount source /workspace/source rw\n"
+    "mount references /readonly/references ro\n"
+)
+
+
 def test_runtime_lock_excludes_a_second_queue_owner(tmp_path: Path) -> None:
     runtime = tmp_path / "agentws"
     runtime.mkdir()
@@ -28,6 +37,63 @@ def runtime_environment(
     monkeypatch.setenv("AGENTWS_TEAM_ROSTER", str(roster))
     monkeypatch.delenv("CYCLO_VERBOSE", raising=False)
     (runtime / "agents").mkdir(parents=True)
+    (runtime / "project.cyclo").write_text(
+        CONTAINER_PROJECT_CONFIG,
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "missing",
+        "empty",
+        "whitespace",
+        "invalid-utf8",
+        "oversized",
+        "directory",
+        "fifo",
+        "symlink",
+    ],
+)
+def test_invalid_project_config_stops_before_runtime_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    kind: str,
+) -> None:
+    runtime = tmp_path / "agentws"
+    roster = tmp_path / "team"
+    runtime_environment(monkeypatch, runtime, roster)
+    project_config = runtime / "project.cyclo"
+    project_config.unlink()
+    if kind == "empty":
+        project_config.touch()
+    elif kind == "whitespace":
+        project_config.write_text(" \n", encoding="utf-8")
+    elif kind == "invalid-utf8":
+        project_config.write_bytes(b"\xff")
+    elif kind == "oversized":
+        project_config.write_bytes(
+            b"x" * (container_runtime.MAX_PROJECT_CONFIG_BYTES + 1)
+        )
+    elif kind == "directory":
+        project_config.mkdir()
+    elif kind == "fifo":
+        os.mkfifo(project_config)
+    elif kind == "symlink":
+        target = tmp_path / "project-target.cyclo"
+        target.write_text(CONTAINER_PROJECT_CONFIG, encoding="utf-8")
+        project_config.symlink_to(target)
+
+    monkeypatch.setattr(
+        container_runtime.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("runtime process was started"),
+    )
+
+    assert container_runtime.main() == 70
+    assert "invalid project config" in capsys.readouterr().err
 
 
 def test_queue_recovery_precedes_every_runtime_process(

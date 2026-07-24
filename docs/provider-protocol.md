@@ -29,7 +29,10 @@ The gateway is always the root Provider. An empty `host.conf` selects its
 socket directly. Otherwise Cyclo selects the last working component whose
 declared inputs are also working. A build or startup failure leaves an earlier
 working provider selected—possibly the gateway—while status exposes the failed
-component.
+component. For catalogue discovery, Cyclo also falls back when a health-ready
+outer component fails `ListModels` or violates the structural catalogue
+contract (for example, missing/duplicate IDs or a missing format identifier).
+Inference is never replayed through another component.
 
 Cyclo builds and starts components in declaration order. Each component gets a
 writable output socket directory at `/run/cyclo` and one read-only producer
@@ -58,9 +61,21 @@ component sockets.
 
 `ListModels` returns the model IDs accepted by that component, display data,
 capabilities, token limits, and an `inference_format` identifier. Cyclo reads
-this information to assemble the catalogue and Pi reads it to register models.
+this information to assemble the format-neutral catalogue. Before launching a
+Pi-based team, the team-runtime boundary verifies that every roster model uses
+the pinned Pi format and has capabilities and limits Pi can register. Every
+model advertising the Pi format must provide positive context-window and
+maximum-output token limits. The gateway excludes an invalid model with a
+bounded diagnostic rather than hiding otherwise valid models from that
+account; the team-side Pi adapter independently repeats the compatibility
+check in case a provider changes after host preflight.
 
-Model IDs are opaque strings. A component that aliases, combines, or selects
+Public model IDs are `PROVIDER/MODEL`. `PROVIDER` is a 1–64 character,
+lowercase host route prefix that begins with a letter or number and may then
+contain letters, numbers, underscores, or hyphens. `MODEL` is an opaque
+provider-local value of at most 1,024 UTF-16 code units with no whitespace,
+control characters, or unpaired surrogates; it may contain additional slashes.
+A component that aliases, combines, or selects
 upstreams publishes its own IDs. A pure relay returns the upstream catalogue
 unchanged. Components must not connect an input whose `inference_format` they
 do not implement.

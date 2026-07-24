@@ -668,24 +668,38 @@ class ComponentController:
                     f"component did not start with the requested isolation: "
                     f"{component.name}"
                 )
-        except BaseException:
-            self._remove_started(component, container_id)
+        except BaseException as exc:
+            self._rollback_started(component, container_id, exc)
             raise
         return container_id
 
     def _remove_started(self, component: Component, identifier: str) -> None:
+        container = self.inspect("container", identifier)
+        if container is None:
+            return
+        self.require_owned(component, container, image=False)
+        command = ["rm", "--force"]
+        if not component.preserve_volumes:
+            command.append("--volumes")
+        command.append(identifier)
+        self.call(command)
+
+    def _rollback_started(
+        self,
+        component: Component,
+        identifier: str,
+        cause: BaseException,
+    ) -> None:
+        """Remove a failed launch and retain both failures if cleanup fails."""
+
         try:
-            container = self.inspect("container", identifier)
-            if container is None:
-                return
-            self.require_owned(component, container, image=False)
-            command = ["rm", "--force"]
-            if not component.preserve_volumes:
-                command.append("--volumes")
-            command.append(identifier)
-            self.call(command, check=False)
-        except Exception:
-            pass
+            self._remove_started(component, identifier)
+        except Exception as cleanup:
+            detail = (
+                f"component {component.name} rollback failed: {cleanup}"
+            )
+            primary = str(cause) or cause.__class__.__name__
+            raise CycloError(f"{primary}; {detail}") from cause
 
     def wait_ready(
         self,
@@ -729,8 +743,8 @@ class ComponentController:
         identifier = self._run(component)
         try:
             return self.wait_ready(component)
-        except BaseException:
-            self._remove_started(component, identifier)
+        except BaseException as exc:
+            self._rollback_started(component, identifier, exc)
             raise
 
     def start(self, component: Component) -> ComponentStatus:
@@ -758,13 +772,38 @@ class ComponentController:
         container_id = self.container_id(container)
         if expected_id is not None and expected_id != container_id:
             raise CycloError("Docker returned a different container than requested")
-        if self.container_state(container) != "stopped":
+        state = self.container_state(container)
+        self.remove_verified_container(
+            container_id,
+            state,
+            preserve_volumes=component.preserve_volumes,
+        )
+        return True
+
+    def remove_verified_container(
+        self,
+        container_id: str,
+        state: str,
+        *,
+        preserve_volumes: bool,
+    ) -> None:
+        """Remove a container after its ownership and immutable ID were verified."""
+
+        if not _CONTAINER_ID_RE.fullmatch(container_id):
+            raise CycloError("invalid verified container ID")
+        if state not in {"running", "paused", "restarting", "stopped", "dead"}:
+            raise CycloError(f"invalid verified container state: {state}")
+        if state == "paused":
+            self.call(["unpause", container_id])
+            state = "running"
+        if state not in {"stopped", "dead"}:
             self.call(["stop", "--timeout", "10", container_id])
         command = ["rm", container_id]
-        if not component.preserve_volumes:
+        if state == "dead":
+            command.insert(1, "--force")
+        if not preserve_volumes:
             command.insert(1, "--volumes")
         self.call(command)
-        return True
 
     def logs(self, component: Component, lines: int = 80) -> str:
         info = self.inspect("container", component.container)

@@ -1,6 +1,5 @@
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-
-const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]*$/u;
+import { isProviderPrefix } from "@cyclo/provider/protocol";
 
 export function validatePiProviders(providers) {
   if (!Array.isArray(providers) || providers.length === 0) {
@@ -11,8 +10,7 @@ export function validatePiProviders(providers) {
     if (
       !provider
       || typeof provider !== "object"
-      || typeof provider.id !== "string"
-      || !PROVIDER_ID.test(provider.id)
+      || !isProviderPrefix(provider.id)
       || ids.has(provider.id)
       || !provider.auth
       || typeof provider.auth !== "object"

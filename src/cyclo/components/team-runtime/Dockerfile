@@ -32,11 +32,12 @@ RUN cd pi-provider \
     && npm cache clean --force
 COPY pi-provider/src ./pi-provider/src
 
-# Pi and its extension must share the same pi-ai module instance. A second copy
-# would split the provider registry and streaming types across module graphs.
+# Pi and its extension must share the pi-ai instance nested under the pinned Pi
+# CLI. The top-level pi-ai is intentionally older: npm keeps it there for
+# plugins whose peer range predates Pi 0.81.
 RUN rm -rf /opt/cyclo/pi-provider/node_modules/@earendil-works/pi-ai \
     && mkdir -p /opt/cyclo/pi-provider/node_modules/@earendil-works \
-    && ln -s /opt/cyclo-agent-tools/lib/node_modules/@earendil-works/pi-ai \
+    && ln -s /opt/cyclo-agent-tools/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai \
         /opt/cyclo/pi-provider/node_modules/@earendil-works/pi-ai
 
 # The pinned Python image is also Debian 13/trixie, so the official Node binary

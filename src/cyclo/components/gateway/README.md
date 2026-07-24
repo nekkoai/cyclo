@@ -36,13 +36,26 @@ Incoming RPC headers are never forwarded. Provider credentials never appear in
 the model catalogue, request payload, Docker arguments, logs, or downstream
 containers. The public catalogue is a startup snapshot; login or model changes
 therefore require a gateway restart, which `cyclo gateway login` performs
-automatically. Credential values and OAuth refreshes are read dynamically and
-written with kernel locking plus atomic replacement.
+automatically. Login builds the candidate catalogue in memory before atomically
+replacing `auth.json`; an unknown provider or unusable custom catalogue leaves
+the previous credential store and running gateway untouched. Credential values
+and OAuth refreshes are read dynamically and written with kernel locking plus
+atomic replacement.
+
+Models using the Pi inference format must publish positive context-window and
+output-token limits. The gateway excludes an unusable model without hiding
+valid models from the same account, and reports a bounded safe reason at
+startup logs. The team-side Pi adapter repeats this check because an
+intermediate provider may supply its own catalogue; it logs and ignores only
+the bad entry. Intermediate relays preserve the typed catalogue fields
+unchanged.
 
 Usage is observed at the native Pi endpoint and appended to the private audit
 file. Accounting observes terminal event usage but does not alter or reorder
 the payload stream. A client-abandoned or failed stream is recorded with its
-transport outcome.
+transport outcome. Records are newline-committed: startup truncates only an
+incomplete crash tail, and a write failure keeps health not-ready until that
+restart repair has run.
 
 ## Files
 
