@@ -80,7 +80,7 @@ test("an unavailable audit sink fails startup", async (t) => {
   assert.throws(() => createUsageAudit(join(blocker, "usage.jsonl")));
 });
 
-test("a later audit failure is visible to health and can recover", async (t) => {
+test("an append failure stays unhealthy until restart repairs the tail", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "cyclo-gateway-audit-recovery-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, "usage.jsonl");
@@ -91,8 +91,61 @@ test("a later audit failure is visible to health and can recover", async (t) => 
   assert.throws(() => audit.check(), /unavailable/u);
 
   await chmod(path, 0o600);
-  await audit.record({ sequence: 2 });
-  assert.doesNotThrow(() => audit.check());
+  await assert.rejects(audit.record({ sequence: 2 }));
+  assert.throws(() => audit.check(), /unavailable/u);
+
+  const restarted = createUsageAudit(path);
+  await restarted.record({ sequence: 3 });
+  assert.doesNotThrow(() => restarted.check());
+  assert.deepEqual(
+    (await readFile(path, "utf8")).trim().split("\n").map(JSON.parse),
+    [{ sequence: 3 }],
+  );
+});
+
+test("startup removes only a crash-truncated final record", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "cyclo-gateway-audit-repair-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "usage.jsonl");
+  const first = usageRecord({
+    model: "work/first",
+    started: Date.now(),
+    outcome: "ok",
+  });
+  const second = usageRecord({
+    model: "work/second",
+    started: Date.now(),
+    outcome: "ok",
+  });
+  await writeFile(path, `${JSON.stringify(first)}\n{"timestamp":`, { mode: 0o600 });
+
+  const audit = createUsageAudit(path);
+  await audit.record(second);
+
+  const report = await aggregateUsageFile(path);
+  assert.equal(report.totals.requests, 2);
+  assert.equal(report.by_model["work/first"].requests, 1);
+  assert.equal(report.by_model["work/second"].requests, 1);
+});
+
+test("usage aggregation ignores an incomplete snapshot tail", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "cyclo-gateway-usage-snapshot-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "usage.jsonl");
+  const record = usageRecord({
+    model: "work/complete",
+    started: Date.now(),
+    outcome: "ok",
+  });
+  await writeFile(
+    path,
+    `${JSON.stringify(record)}\n${"x".repeat(MAX_USAGE_RECORD_BYTES * 2)}`,
+    { mode: 0o600 },
+  );
+
+  const report = await aggregateUsageFile(path);
+  assert.equal(report.totals.requests, 1);
+  assert.equal(report.by_model["work/complete"].requests, 1);
 });
 
 test("usage aggregation is global by provider and exact public model", async (t) => {
@@ -168,13 +221,33 @@ test("usage aggregation fails closed on malformed, oversized, and linked records
       started: Date.now(),
       outcome: "ok",
     }))}\n`, /invalid provider\/model/u],
+    [`${JSON.stringify(usageRecord({
+      model: "_legacy/model",
+      started: Date.now(),
+      outcome: "ok",
+    }))}\n`, /invalid provider\/model/u],
+    [`${JSON.stringify(usageRecord({
+      model: `${"a".repeat(65)}/model`,
+      started: Date.now(),
+      outcome: "ok",
+    }))}\n`, /invalid provider\/model/u],
+    [`${JSON.stringify(usageRecord({
+      model: `work/${"😀".repeat(513)}`,
+      started: Date.now(),
+      outcome: "ok",
+    }))}\n`, /invalid provider\/model/u],
+    [`${JSON.stringify(usageRecord({
+      model: "work/\ud800",
+      started: Date.now(),
+      outcome: "ok",
+    }))}\n`, /invalid provider\/model/u],
     ["\n", /record 1 is empty/u],
   ]) {
     await writeFile(path, contents, { mode: 0o600 });
     await assert.rejects(aggregateUsageFile(path), pattern);
   }
 
-  await writeFile(path, "x".repeat(MAX_USAGE_RECORD_BYTES + 1), { mode: 0o600 });
+  await writeFile(path, `${"x".repeat(MAX_USAGE_RECORD_BYTES + 1)}\n`, { mode: 0o600 });
   await assert.rejects(aggregateUsageFile(path), /exceeds 16384 bytes/u);
 
   const target = join(root, "target.jsonl");

@@ -12,6 +12,15 @@ from cyclo.installation import team_container_name, team_network_name
 from cyclo.state import Instance, StateStore, instance_id
 
 
+CONTAINER_PROJECT_CONFIG = (
+    "name runtime-test\n"
+    "description State materialization test.\n"
+    "team /team ro\n"
+    "mount source /workspace/source rw\n"
+    "mount docs /readonly/docs ro\n"
+)
+
+
 def make_instance(identifier: str, store: StateStore) -> Instance:
     return Instance(
         id=identifier,
@@ -26,6 +35,7 @@ def make_instance(identifier: str, store: StateStore) -> Instance:
         image="cyclo-runtime:test",
         team_write=False,
         offline=False,
+        launch_id="0" * 32,
         provider_socket_path="/tmp/cyclo-provider/component.sock",
         provider_generation="provider-generation",
     )
@@ -51,6 +61,54 @@ def test_metadata_round_trip_has_no_token(tmp_path: Path) -> None:
     assert loaded == instance
     assert "token" not in text.lower()
     assert store.metadata_path("alpha").stat().st_mode & 0o777 == 0o600
+
+
+def test_persisted_instance_requires_a_launch_identity(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    selected.launch_id = ""
+
+    with pytest.raises(CycloError, match="launch_id must be"):
+        store.save(selected)
+
+
+def test_remove_instance_deletes_its_complete_durable_state(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    store.save(selected)
+    task = store.tasks_dir("alpha") / "task"
+    task.mkdir(parents=True)
+    (task / "spec.md").write_text("durable work\n", encoding="utf-8")
+
+    assert store.remove_instance(
+        "alpha",
+        expected_launch_id=selected.launch_id,
+    )
+    assert not store.instance_dir("alpha").exists()
+    assert not store.remove_instance(
+        "alpha",
+        expected_launch_id=selected.launch_id,
+    )
+
+
+def test_remove_instance_rejects_invalid_or_replaced_launch_identity(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    store.save(selected)
+
+    with pytest.raises(CycloError, match="invalid launch identity"):
+        store.remove_instance("alpha", expected_launch_id="")
+    with pytest.raises(CycloError, match="was replaced"):
+        store.remove_instance(
+            "alpha",
+            expected_launch_id="1" * 32,
+        )
+
+    assert store.load("alpha").launch_id == selected.launch_id
 
 
 def test_state_rejects_namespaced_resources_from_another_installation(
@@ -375,19 +433,54 @@ def test_save_refuses_state_that_strict_reader_would_reject(tmp_path: Path) -> N
 def test_materialize_agentws_preserves_queue_state(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     script = Path(__file__).parents[1] / "src" / "cyclo" / "container_runtime.py"
-    runtime = store.materialize_agentws("alpha", packaged_agentws_template(), script)
+    runtime = store.materialize_agentws(
+        "alpha",
+        packaged_agentws_template(),
+        script,
+        project_config=CONTAINER_PROJECT_CONFIG,
+    )
     marker = store.tasks_dir("alpha") / "existing"
     marker.mkdir()
     (marker / "state").write_text("open\n", encoding="utf-8")
+    updated_config = CONTAINER_PROJECT_CONFIG.replace(
+        "State materialization test.",
+        "Updated state materialization test.",
+    )
 
-    store.materialize_agentws("alpha", packaged_agentws_template(), script)
+    store.materialize_agentws(
+        "alpha",
+        packaged_agentws_template(),
+        script,
+        project_config=updated_config,
+    )
 
     assert (marker / "state").read_text(encoding="utf-8") == "open\n"
     assert (runtime / "tools" / "run_agentws").is_file()
     assert (runtime / ".cyclo-runtime.py").is_file()
+    project_config = runtime / "project.cyclo"
+    assert project_config.read_text(encoding="utf-8") == updated_config
+    assert project_config.stat().st_mode & 0o777 == 0o444
 
 
-def test_materialized_project_manifest_and_workspace_layout_are_replaced_safely(
+def test_materialize_agentws_requires_project_config(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    script = Path(__file__).parents[1] / "src" / "cyclo" / "container_runtime.py"
+
+    with pytest.raises(
+        CycloError,
+        match="project configuration must not be empty",
+    ):
+        store.materialize_agentws(
+            "alpha",
+            packaged_agentws_template(),
+            script,
+            project_config=" \n",
+        )
+
+    assert not store.runtime_root("alpha").exists()
+
+
+def test_materialized_project_config_and_workspace_layout_are_replaced_safely(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
@@ -396,15 +489,14 @@ def test_materialized_project_manifest_and_workspace_layout_are_replaced_safely(
         "alpha",
         packaged_agentws_template(),
         script,
-        project_manifest="# Project\n\n- /workspace/source (read-write)\n",
+        project_config=CONTAINER_PROJECT_CONFIG,
     )
     layout = store.materialize_workspace_layout("alpha", ["source"])
     readonly_layout = store.materialize_readonly_layout("alpha", ["docs"])
 
-    assert (runtime / "PROJECT.md").read_text(encoding="utf-8").startswith(
-        "# Project"
-    )
-    assert (runtime / "PROJECT.md").stat().st_mode & 0o777 == 0o444
+    project_config = runtime / "project.cyclo"
+    assert project_config.read_text(encoding="utf-8") == CONTAINER_PROJECT_CONFIG
+    assert project_config.stat().st_mode & 0o777 == 0o444
     assert sorted(path.name for path in layout.iterdir()) == ["source"]
     assert sorted(path.name for path in readonly_layout.iterdir()) == ["docs"]
 
@@ -461,14 +553,24 @@ def test_save_rejects_symlinked_instance_directory(tmp_path: Path) -> None:
 def test_rematerialize_does_not_follow_persisted_symlink(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     script = Path(__file__).parents[1] / "src" / "cyclo" / "container_runtime.py"
-    runtime = store.materialize_agentws("alpha", packaged_agentws_template(), script)
+    runtime = store.materialize_agentws(
+        "alpha",
+        packaged_agentws_template(),
+        script,
+        project_config=CONTAINER_PROJECT_CONFIG,
+    )
     target = tmp_path / "host-target"
     target.write_text("unchanged\n", encoding="utf-8")
     runtime_script = runtime / ".cyclo-runtime.py"
     runtime_script.unlink()
     runtime_script.symlink_to(target)
 
-    store.materialize_agentws("alpha", packaged_agentws_template(), script)
+    store.materialize_agentws(
+        "alpha",
+        packaged_agentws_template(),
+        script,
+        project_config=CONTAINER_PROJECT_CONFIG,
+    )
 
     assert target.read_text(encoding="utf-8") == "unchanged\n"
     assert not (store.runtime_root("alpha") / ".cyclo-runtime.py").is_symlink()

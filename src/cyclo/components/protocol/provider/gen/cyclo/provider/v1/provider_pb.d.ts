@@ -40,8 +40,9 @@ export declare type ListModelsResponse = Message<"cyclo.provider.v1.ListModelsRe
 export declare const ListModelsResponseSchema: GenMessage<ListModelsResponse>;
 
 /**
- * A model ID is opaque, provider-local, and unique within one catalogue.
- * Callers send it back unchanged in InferRequest.model.
+ * A public model ID is PROVIDER/MODEL and unique within one catalogue. The
+ * provider-local MODEL portion is otherwise opaque and may contain slashes.
+ * Callers send the full public ID back unchanged in InferRequest.model.
  *
  * @generated from message cyclo.provider.v1.Model
  */
@@ -62,6 +63,10 @@ export declare type Model = Message<"cyclo.provider.v1.Model"> & {
   capabilities?: ModelCapabilities | undefined;
 
   /**
+   * A component advertising the Pi inference format must set both limits to
+   * positive values. They remain optional at the generic Provider layer so a
+   * future inference format can define different resource metadata.
+   *
    * @generated from field: optional uint64 context_window_tokens = 4;
    */
   contextWindowTokens?: bigint | undefined;

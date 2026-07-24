@@ -43,6 +43,7 @@ team=$work_root/team
 project=$work_root/project
 documentation=$work_root/documentation
 project_file=$work_root/project.cyclo
+project_context=$work_root/project-context.md
 doctor_log=$work_root/doctor.log
 
 mkdir -p "$dist" "$source_tree" "$empty_home" "$project" "$documentation"
@@ -293,13 +294,20 @@ expected_templates=$(printf '%s\n' \
     --model openai-codex/release-acceptance
 "$cyclo" validate "$team"
 
+printf '%s\n' \
+    'release-acceptance-context-marker' \
+    'Use `/workspace/source` for implementation work.' \
+    > "$project_context"
 "$cyclo" project init "$project_file" \
     --name release-acceptance \
     --description 'Exercise packaged multi-mount project definitions.' \
+    --context "$project_context" \
     --team "$team" ro \
     --mount source "$project" rw \
     --mount documentation "$documentation" ro
 "$cyclo" validate "$project_file"
+grep -F 'release-acceptance-context-marker' "$project_file" >/dev/null \
+    || fail "project init omitted its embedded context"
 
 project_dry_run=$(
     "$cyclo" --state-root "$state_root" run \
@@ -329,8 +337,7 @@ case $project_dry_run in
     *) fail "project.cyclo dry-run omitted its read-only documentation mount" ;;
 esac
 case $project_dry_run in
-    *"CYCLO_PROJECT_MANIFEST=/agentws/PROJECT.md"*) ;;
-    *) fail "project.cyclo dry-run omitted agent project context" ;;
+    *"CYCLO_PROJECT_MANIFEST="*) fail "project context path was unexpectedly configurable" ;;
 esac
 
 case $project_dry_run in

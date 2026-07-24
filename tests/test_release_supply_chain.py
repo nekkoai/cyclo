@@ -45,6 +45,33 @@ def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() ->
                 assert dependency.get("integrity")
 
 
+def test_pi_extension_shares_the_cli_pi_ai_without_replacing_legacy_peers() -> None:
+    dockerfile = (RUNTIME / "Dockerfile").read_text(encoding="utf-8")
+    runtime_lock = json.loads(
+        (RUNTIME / "package-lock.json").read_text(encoding="utf-8")
+    )
+    extension = json.loads(
+        (COMPONENTS / "pi-provider" / "package.json").read_text(encoding="utf-8")
+    )
+    packages = runtime_lock["packages"]
+    cli_path = "node_modules/@earendil-works/pi-coding-agent"
+    cli_pi_path = f"{cli_path}/node_modules/@earendil-works/pi-ai"
+    legacy_pi_path = "node_modules/@earendil-works/pi-ai"
+    cli_version = packages[cli_path]["version"]
+
+    assert packages[cli_pi_path]["version"] == cli_version == "0.81.1"
+    assert extension["peerDependencies"]["@earendil-works/pi-ai"] == cli_version
+    assert packages[legacy_pi_path]["version"] != cli_version
+    assert (
+        "/opt/cyclo-agent-tools/lib/node_modules/@earendil-works/"
+        "pi-coding-agent/node_modules/@earendil-works/pi-ai"
+    ) in dockerfile
+    assert (
+        "ln -s /opt/cyclo-agent-tools/lib/node_modules/@earendil-works/pi-ai"
+        not in dockerfile
+    )
+
+
 def test_gateway_node_install_is_locked_to_the_runtime_pi_generation() -> None:
     dockerfile = (GATEWAY / "Dockerfile").read_text(encoding="utf-8")
     package = json.loads((GATEWAY / "package.json").read_text(encoding="utf-8"))
@@ -129,6 +156,7 @@ def test_workflow_actions_are_pinned_to_full_commits() -> None:
 
 def test_ci_uses_and_tests_the_current_component_layout() -> None:
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    release = (ROOT / "tools" / "build-release").read_text(encoding="utf-8")
 
     assert "src/cyclo/_bundle" not in ci
     assert (
@@ -143,6 +171,10 @@ def test_ci_uses_and_tests_the_current_component_layout() -> None:
     for component in ("team-runtime", "gateway", "passthrough"):
         assert f"src/cyclo/components/{component}/Dockerfile" in ci
     assert ci.count("src/cyclo/components\n") >= 3
+    assert "ensure_derived(" in ci
+    assert "ensure_derived(" in release
+    assert "build=True" not in ci
+    assert "build=True" not in release
 
 
 def test_build_backend_dependencies_are_available_in_test_and_release_envs() -> None:

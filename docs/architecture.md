@@ -11,6 +11,7 @@ project.cyclo
   +-- team repositories -------- roles, roster, optional AGENTS.md
   +-- rw mounts ---------------- /workspace/NAME
   +-- ro mounts ---------------- /readonly/NAME
+  +-- container snapshot ------- /agentws/project.cyclo
   |
   v
 one team container per selected team
@@ -252,6 +253,14 @@ component and exits nonzero when any configured component is not working.
 Existing teams retain the endpoint selected when they started and are reported
 stale if that selection changes.
 
+Provider route health and catalogue usability are distinct observations.
+Before a new team receives a socket, Cyclo asks usable candidates for
+`ListModels` from outermost to gateway and selects the first structurally valid
+response. This selection remains inference-format-neutral. The team/Pi runtime
+boundary then validates the roster's selected models against the pinned Pi ABI.
+Fallback is control-plane-only: Cyclo never retries an inference request
+through another provider.
+
 Editing the file changes the expected provider list. The next mutating
 `providers start`, `providers restart`, `models`, or project `run` command asks
 Docker to build and start that list. There is no watcher or background
@@ -303,16 +312,22 @@ credentials, OAuth sessions, and the usage ledger. No team or intermediate
 component mounts that volume. The public model catalogue exposes account/model
 names and safe capabilities, never native headers, base URLs, or credentials.
 
-`cyclo gateway login` updates the private store. The long-running gateway reads
-credential values dynamically, while its model catalogue is a startup snapshot.
-Login therefore restarts the gateway automatically and returns only after the
-updated catalogue is ready. OAuth refreshes use a kernel lock and atomic file
-replacement.
+`cyclo gateway login` constructs the candidate credential document under the
+gateway's kernel file lock and validates it through the same configured
+catalogue path before atomically replacing the private store. An unknown or
+misconfigured provider therefore leaves the previous store and running gateway
+intact. The long-running gateway reads credential values dynamically, while its
+model catalogue is a startup snapshot. Successful login restarts the gateway
+automatically and returns only after the updated catalogue is ready. OAuth
+refreshes use the same kernel lock and atomic file replacement.
 
 Incoming ConnectRPC headers are not forwarded to native services. The gateway
 chooses the native model from its catalogue, resolves the matching credential,
 overrides credential/transport controls, and records observed Pi usage. Usage
-observation does not mutate or reorder the response payload stream.
+observation does not mutate or reorder the response payload stream. The
+append-only ledger treats newline as the record commit boundary, repairs an
+incomplete crash tail at startup, and remains unhealthy after an append error
+until restart rather than writing behind an uncertain tail.
 
 ## Projects and teams
 
@@ -320,17 +335,25 @@ observation does not mutate or reorder the response payload stream.
 
 ```text
 name core-et-uart
-description Design and verify a UART IP.
+description Integrate and verify a reusable UART IP in CORE-ET.
+context <<PROJECT_CONTEXT
+`core-et` is the processor repository; `uart-ip` is a separate project being
+integrated into it; `specifications` is normative input for both.
+PROJECT_CONTEXT
 team ../teams/jon-rtl ro
 team ../teams/rtl-auditor ro
-mount source ../sources/core-et rw
+mount core-et ../sources/core-et rw
+mount uart-ip ../sources/uart-ip rw
 mount specifications ../references/specifications ro
 ```
 
-Cyclo starts one independent instance per team. A `rw` mount is a project at
-`/workspace/NAME`; a `ro` mount is supporting input at `/readonly/NAME`. Team
-mode controls whether `/team` itself is writable. Relative paths resolve beside
-the definition. All selected trees must be real, non-overlapping directories.
+Cyclo starts one independent instance per team. Every `rw` mount is a writable
+project at `/workspace/NAME`, so one run may intentionally expose several
+projects. A `ro` mount is supporting input at `/readonly/NAME`. Cyclo does not
+infer a primary project; the authored description and context explain what
+each project is and how the mounted trees relate. Team mode controls whether
+`/team` itself is writable. Relative paths resolve beside the definition. All
+selected trees must be real, non-overlapping directories.
 
 Before the first container starts, Cyclo validates every team, requested model,
 mount, provider connection, and bind-source identity. A partial multi-team
@@ -354,16 +377,25 @@ AGENT ROLE ENGINE PROVIDER/MODEL
 ```
 
 Cyclo supplies the common AgentWS runtime and Pi extension in the team image.
-It generates `/agentws/PROJECT.md` with logical mount paths and requires agents
-to read it. The host paths never need to be embedded in team prompts.
+It generates one `/agentws/project.cyclo` per running team instance. The
+snapshot uses the same grammar as the host definition, keeps its authored
+name, description, and context, selects only that instance's team at `/team`,
+and replaces structured host paths with `/workspace/NAME` or
+`/readonly/NAME`. The runtime tree and snapshot are mounted read-only, and the
+generic `AGENTS.md` requires every agent to read that fixed project contract.
+Its contents are not duplicated into tasks or job prompts. Generated `team`
+and `mount` fields never expose host paths; authored description/context text
+is copied literally.
 
 A repository Dockerfile must declare `ARG CYCLO_TEAM_BASE` before its first
 `FROM`; its final stage must inherit that exact base. Earlier builder stages
 may use other images. Cyclo labels the derived image with the exact base image
 ID, builds under a candidate tag, validates the inherited runtime entrypoint,
-and promotes the team tag only after success. A normal project run always asks
-Docker to build the selected context; Docker reuses cached layers when
-appropriate. Teams without a Dockerfile use the common image directly.
+requires that entrypoint to start as root so it can create and drop to the
+host-mapped runtime identity, and promotes the team tag only after success. A
+normal project run always asks Docker to build the selected context; Docker
+reuses cached layers when appropriate. Teams without a Dockerfile use the
+common image directly.
 
 ## Team isolation and state
 
@@ -403,7 +435,10 @@ New team resources use `cyclo-SYSTEM-team-INSTANCE` containers and
 `cyclo-SYSTEM-team:VERSION`; derived images add a team name and repository-path
 digest. `SYSTEM` is derived from the state root. Labels record the same system,
 resource kind, and logical instance, so a name alone is never sufficient
-authority for lifecycle operations.
+authority for lifecycle operations. Operations on a persisted current instance
+also require its `cyclo.launch` identity and target the immutable inspected
+container ID. Startup may inspect a stopped previous launch by ownership so it
+can replace it, but does not adopt that launch as current.
 
 ## Failure model
 

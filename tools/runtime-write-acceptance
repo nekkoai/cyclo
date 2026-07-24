@@ -42,6 +42,7 @@ trap 'exit 143' TERM
 state_root=$work_root/state
 team=$work_root/team
 project=$work_root/project
+verification=$work_root/verification
 documentation=$work_root/documentation
 workspace_layout=$state_root/instances/runtime-write/workspace
 readonly_layout=$state_root/instances/runtime-write/readonly
@@ -50,6 +51,7 @@ pi_root=$work_root/pi
 mkdir -p \
     "$team/roles" \
     "$project" \
+    "$verification" \
     "$documentation" \
     "$fake_bin" \
     "$pi_root/agent"
@@ -57,32 +59,44 @@ mkdir -p \
 # Use the AgentWS payload from the installed Cyclo package and the same atomic
 # materialization path used for a normal instance. This deliberately avoids any
 # external AgentWS checkout.
-"$python" - "$state_root" <<'PY'
+"$python" - "$state_root" "$team" "$project" "$verification" "$documentation" <<'PY'
 from pathlib import Path
 import sys
 
 from cyclo import container_runtime
 from cyclo.agentws_bundle import packaged_agentws_template
+from cyclo.project import load_project, render_container_project
 from cyclo.state import StateStore
 
-store = StateStore(Path(sys.argv[1]))
+state_root, team, project, verification, documentation = map(Path, sys.argv[1:])
+definition_path = state_root.parent / "project.cyclo"
+definition_path.write_text(
+    "name runtime-write\n"
+    "description Exercise writable workspaces and read-only inputs.\n"
+    "context <<PROJECT_CONTEXT\n"
+    "`source` is the implementation project; `verification` tests it.\n"
+    "runtime-write-context-marker\n"
+    "PROJECT_CONTEXT\n"
+    f"team {team} ro\n"
+    f"mount source {project} rw\n"
+    f"mount verification {verification} rw\n"
+    f"mount documentation {documentation} ro\n",
+    encoding="utf-8",
+)
+definition = load_project(definition_path)
+store = StateStore(state_root)
 store.materialize_agentws(
     "runtime-write",
     packaged_agentws_template(),
     Path(container_runtime.__file__),
-    project_manifest=(
-        "# Cyclo project\n\n"
-        "Name: runtime-write\n"
-        "Description: Exercise writable workspaces and read-only inputs.\n\n"
-        "## Writable workspace mounts\n\n"
-        "- /workspace/source (read-write)\n"
-        "\n## Read-only mounts\n\n"
-        "- /readonly/documentation (read-only)\n"
+    project_config=render_container_project(
+        definition,
+        team=definition.teams[0],
     ),
 )
 store.materialize_workspace_layout(
     "runtime-write",
-    ["source"],
+    ["source", "verification"],
 )
 store.materialize_readonly_layout(
     "runtime-write",
@@ -176,13 +190,29 @@ while [ ! -s /workspace/source/.cyclo-worker-descendant-heartbeat ]; do
     sleep 0.01
 done
 
-grep -F '/workspace/source (read-write)' "$CYCLO_PROJECT_MANIFEST" >/dev/null \
+grep -F 'team /team ro' /agentws/project.cyclo >/dev/null \
     || exit 38
-grep -F '/readonly/documentation (read-only)' "$CYCLO_PROJECT_MANIFEST" >/dev/null \
+grep -F 'mount source /workspace/source rw' /agentws/project.cyclo >/dev/null \
     || exit 39
+grep -F 'mount verification /workspace/verification rw' /agentws/project.cyclo >/dev/null \
+    || exit 45
+grep -F 'mount documentation /readonly/documentation ro' /agentws/project.cyclo >/dev/null \
+    || exit 46
+grep -F 'runtime-write-context-marker' /agentws/project.cyclo >/dev/null \
+    || exit 47
+if (printf '%s\n' changed >> /agentws/project.cyclo) 2>/dev/null; then
+    printf '%s\n' 'project configuration unexpectedly allowed a write' >&2
+    exit 48
+fi
+if [ -e /agentws/PROJECT.md ]; then
+    printf '%s\n' 'obsolete project manifest is still present' >&2
+    exit 49
+fi
 
 marker=/workspace/source/.cyclo-runtime-write-check
 printf '%s\n' 'workspace-write-ok' > "$marker"
+printf '%s\n' 'second-workspace-write-ok' \
+    > /workspace/verification/.cyclo-runtime-write-check
 
 team_probe=/team/.cyclo-runtime-write-check
 if (: > "$team_probe") 2>/dev/null; then
@@ -241,7 +271,6 @@ docker run --detach \
     --env AGENTWS_TEAM_PROTOCOL=/team/AGENTS.md \
     --env AGENTWS_TEAM_ROLES_DIR=/team/roles \
     --env AGENTWS_WORKSPACE=/workspace \
-    --env CYCLO_PROJECT_MANIFEST=/agentws/PROJECT.md \
     --env AGENTWS_MAX_JOB_ATTEMPTS=2 \
     --env AGENTWS_MAX_CONSECUTIVE_FAILURES=1 \
     --env AGENTWS_RETRY_INITIAL_SECONDS=1 \
@@ -255,6 +284,7 @@ docker run --detach \
     --mount "type=bind,src=$workspace_layout,dst=/workspace,readonly" \
     --mount "type=bind,src=$readonly_layout,dst=/readonly,readonly" \
     --mount "type=bind,src=$project,dst=/workspace/source" \
+    --mount "type=bind,src=$verification,dst=/workspace/verification" \
     --mount "type=bind,src=$documentation,dst=/readonly/documentation,readonly" \
     --mount "type=bind,src=$fake_bin,dst=/acceptance-bin,readonly" \
     "$image" python3 /agentws/.cyclo-runtime.py >/dev/null
@@ -278,6 +308,8 @@ done
 
 [ "$(cat "$project/.cyclo-runtime-write-check" 2>/dev/null || true)" = workspace-write-ok ] \
     || fail "agent did not write the project marker from /workspace"
+[ "$(cat "$verification/.cyclo-runtime-write-check" 2>/dev/null || true)" = second-workspace-write-ok ] \
+    || fail "agent did not write the second project marker from /workspace"
 [ "$(cat "$project/.cyclo-runtime-crash-fence-check" 2>/dev/null || true)" = container-crash-fence-ok ] \
     || fail "replacement worker started before the old container process tree stopped"
 worker_heartbeat_before=$(cat "$project/.cyclo-worker-descendant-heartbeat" 2>/dev/null || true)

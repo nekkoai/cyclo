@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 RUNTIME_LOCK_FD_ENV = "CYCLO_RUNTIME_LOCK_FD"
+MAX_PROJECT_CONFIG_BYTES = 1024 * 1024
 
 
 def required(name: str) -> str:
@@ -62,9 +63,57 @@ def acquire_runtime_lock(runtime: Path) -> int:
     return descriptor
 
 
+def require_project_config(runtime: Path) -> Path:
+    """Require the immutable, instance-wide project configuration."""
+
+    config = runtime / "project.cyclo"
+    flags = (
+        os.O_RDONLY
+        | os.O_NONBLOCK
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(config, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(f"not a regular file: {config}")
+        chunks: list[bytes] = []
+        remaining = MAX_PROJECT_CONFIG_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > MAX_PROJECT_CONFIG_BYTES:
+            raise OSError(f"file is too large: {config}")
+        if not content.strip():
+            raise OSError(f"file is empty: {config}")
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise OSError(f"file is not valid UTF-8: {config}") from exc
+    finally:
+        os.close(descriptor)
+    return config
+
+
 def main() -> int:
     runtime = Path(required("CYCLO_AGENTWS_RUNTIME"))
     roster = required("AGENTWS_TEAM_ROSTER")
+    try:
+        require_project_config(runtime)
+    except OSError as exc:
+        print(
+            f"cyclo runtime: invalid project configuration "
+            f"{runtime / 'project.cyclo'}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 70
     verbose = os.environ.get("CYCLO_VERBOSE") == "1"
     stopping = False
     processes: list[subprocess.Popen[bytes]] = []

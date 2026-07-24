@@ -67,11 +67,15 @@ test("the catalogue publishes account/model IDs and keeps native routes private"
           baseUrl: "https://two.invalid/v1",
           reasoning: true,
           input: ["text"],
+          contextWindow: 8192,
+          maxTokens: 2048,
         },
         {
           id: "ordinary",
           reasoning: false,
           input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
         },
         {
           id: "not-yet-supported",
@@ -136,6 +140,8 @@ test("legacy credentials default their provider type to the account name", async
           api: "openai-responses",
           reasoning: false,
           input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
         }], { baseUrl: "https://api.openai.invalid/v1" })],
     }),
   });
@@ -143,7 +149,7 @@ test("legacy credentials default their provider type to the account name", async
   assert.equal(catalogue.routes["openai/gpt"].provider, "openai");
 });
 
-test("malformed configuration and missing API implementations fail closed", async (t) => {
+test("malformed configuration fails closed and bad models are isolated", async (t) => {
   const badUrl = await fixture(t, {
     work: { type: "api_key", provider: "custom", key: "key" },
   }, {
@@ -165,16 +171,17 @@ test("malformed configuration and missing API implementations fail closed", asyn
         baseUrl: "https://example.invalid/v1",
         reasoning: false,
         input: ["text"],
+        contextWindow: 4096,
+        maxTokens: 1024,
       }],
     },
   });
-  assert.throws(
-    () => buildCatalogue({
-      ...unavailable,
-      ...dependencies({ getApiProvider: () => undefined }),
-    }),
-    /no API implementation/u,
-  );
+  const unavailableCatalogue = buildCatalogue({
+    ...unavailable,
+    ...dependencies({ getApiProvider: () => undefined }),
+  });
+  assert.deepEqual(unavailableCatalogue.models, []);
+  assert.match(unavailableCatalogue.diagnostics[0].message, /no API implementation/u);
 
   const secretHeader = await fixture(t, {
     work: { type: "api_key", provider: "custom", key: "key" },
@@ -189,10 +196,139 @@ test("malformed configuration and missing API implementations fail closed", asyn
       }],
     },
   });
+  const secretCatalogue = buildCatalogue({ ...secretHeader, ...dependencies() });
+  assert.deepEqual(secretCatalogue.models, []);
+  assert.match(secretCatalogue.diagnostics[0].message, /must not define headers/u);
+});
+
+test("account prefixes and local model IDs obey the public route contract", async (t) => {
+  const invalidAccount = await fixture(t, {
+    _legacy: { type: "api_key", provider: "openai", key: "key" },
+  }, {});
   assert.throws(
-    () => buildCatalogue({ ...secretHeader, ...dependencies() }),
-    /must not define headers/u,
+    () => buildCatalogue({ ...invalidAccount, ...dependencies() }),
+    /account name/u,
   );
+
+  const invalidProvider = await fixture(t, {}, {
+    "-legacy": {
+      api: "openai-responses",
+      baseUrl: "https://example.invalid/v1",
+      models: [],
+    },
+  });
+  assert.throws(
+    () => buildCatalogue({ ...invalidProvider, ...dependencies() }),
+    /custom provider name/u,
+  );
+
+  const account = "a".repeat(64);
+  const boundaryModel = "😀".repeat(512);
+  const paths = await fixture(t, {
+    [account]: { type: "api_key", provider: "custom", key: "key" },
+  }, {
+    custom: {
+      api: "openai-responses",
+      baseUrl: "https://example.invalid/v1",
+      models: [
+        {
+          id: boundaryModel,
+          input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
+        },
+        {
+          id: "bad\u0085model",
+          input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
+        },
+        {
+          id: "😀".repeat(513),
+          input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
+        },
+        {
+          id: "\ud800",
+          input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
+        },
+      ],
+    },
+  });
+
+  const catalogue = buildCatalogue({ ...paths, ...dependencies() });
+  assert.deepEqual(catalogue.models.map(({ id }) => id), [
+    `${account}/${boundaryModel}`,
+  ]);
+  assert.equal(catalogue.diagnostics.length, 3);
+  assert.ok(catalogue.diagnostics.every(({ message }) => /invalid model id/u.test(message)));
+});
+
+test("a model without Pi token limits cannot hide valid models", async (t) => {
+  const paths = await fixture(t, {
+    work: { type: "api_key", provider: "custom", key: "key" },
+  }, {
+    custom: {
+      api: "openai-responses",
+      baseUrl: "https://example.invalid/v1",
+      models: [
+        {
+          id: "broken",
+          input: ["text"],
+          contextWindow: 4096,
+        },
+        {
+          id: "usable",
+          input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
+        },
+      ],
+    },
+  });
+  const catalogue = buildCatalogue({ ...paths, ...dependencies() });
+
+  assert.deepEqual(catalogue.models.map(({ id }) => id), ["work/usable"]);
+  assert.deepEqual(catalogue.diagnostics.map(({ model }) => model), ["broken"]);
+  assert.match(catalogue.diagnostics[0].message, /no usable output limit/u);
+});
+
+test("provider failures are isolated without exposing exception text", async (t) => {
+  const paths = await fixture(t, {
+    broken: { type: "api_key", provider: "broken", key: "key" },
+    work: { type: "api_key", provider: "known", key: "key" },
+  }, {});
+  const broken = piProvider("broken", [], {
+    baseUrl: "https://broken.invalid/v1",
+  });
+  broken.getModels = () => {
+    throw new Error("provider leaked private-key");
+  };
+  const catalogue = buildCatalogue({
+    ...paths,
+    ...dependencies({
+      providers: [
+        broken,
+        piProvider("known", [{
+          id: "usable",
+          api: "openai-responses",
+          input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
+        }], { baseUrl: "https://known.invalid/v1" }),
+      ],
+    }),
+  });
+
+  assert.deepEqual(catalogue.models.map(({ id }) => id), ["work/usable"]);
+  assert.equal(
+    catalogue.diagnostics[0].message,
+    "provider broken model discovery failed",
+  );
+  assert.doesNotMatch(JSON.stringify(catalogue.diagnostics), /private-key/u);
 });
 
 test("provider-owned OAuth filtering limits an account's model catalogue", async (t) => {
@@ -214,11 +350,15 @@ test("provider-owned OAuth filtering limits an account's model catalogue", async
           id: "kept",
           api: "openai-responses",
           input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
         },
         {
           id: "hidden",
           api: "openai-responses",
           input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
         },
       ], {
         baseUrl: "https://default.invalid/v1",

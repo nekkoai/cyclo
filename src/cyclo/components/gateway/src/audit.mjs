@@ -2,11 +2,16 @@ import {
   closeSync,
   constants as fsConstants,
   fchmodSync,
+  fstatSync,
+  ftruncateSync,
   mkdirSync,
   openSync,
+  readSync,
 } from "node:fs";
 import { appendFile, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
+
+import { splitPublicModelId } from "@cyclo/provider/protocol";
 
 export const MAX_USAGE_RECORD_BYTES = 16 * 1024;
 
@@ -20,10 +25,7 @@ const USAGE_RECORD_FIELDS = Object.freeze([
   "cached_input_tokens",
   "reasoning_tokens",
 ]);
-const ROUTE = /^[a-z0-9][a-z0-9_-]*$/u;
-const MODEL = /^[^\s\u0000-\u001f\u007f]+$/u;
 const SAFE_TEXT = /^[^\u0000-\u001f\u007f]+$/u;
-const RESERVED_ROUTES = new Set(["__proto__", "constructor", "gateway", "prototype"]);
 
 export function createUsageAudit(path) {
   if (typeof path !== "string" || !path) throw new TypeError("audit path is required");
@@ -33,12 +35,15 @@ export function createUsageAudit(path) {
 
   async function record(value) {
     const write = tail.then(async () => {
+      // An append error may have written only part of a record. Do not append
+      // anything else to that uncertain tail in this process; restart repairs
+      // it before accepting another inference request.
+      if (failure) throw failure;
       await mkdir(dirname(path), { recursive: true, mode: 0o700 });
       await appendFile(path, JSON.stringify(value) + "\n", { encoding: "utf8", mode: 0o600 });
-      failure = null;
     });
     tail = write.catch((error) => {
-      failure = error;
+      if (!failure) failure = error;
     });
     await write;
   }
@@ -55,17 +60,39 @@ function prepareAuditPath(path) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const descriptor = openSync(
     path,
-    fsConstants.O_WRONLY
+    fsConstants.O_RDWR
       | fsConstants.O_APPEND
       | fsConstants.O_CREAT
       | fsConstants.O_NOFOLLOW,
     0o600,
   );
   try {
+    const information = fstatSync(descriptor);
+    if (!information.isFile()) throw new Error("usage audit is not a regular file");
+    repairIncompleteTail(descriptor, information.size);
     fchmodSync(descriptor, 0o600);
   } finally {
     closeSync(descriptor);
   }
+}
+
+function repairIncompleteTail(descriptor, size) {
+  if (size === 0) return;
+  const block = Buffer.allocUnsafe(Math.min(64 * 1024, size));
+  let cursor = size;
+  while (cursor > 0) {
+    const length = Math.min(block.byteLength, cursor);
+    cursor -= length;
+    const count = readSync(descriptor, block, 0, length, cursor);
+    if (count !== length) throw new Error("cannot read the usage audit tail");
+    const newline = block.lastIndexOf(0x0a, count - 1);
+    if (newline >= 0) {
+      const completeSize = cursor + newline + 1;
+      if (completeSize !== size) ftruncateSync(descriptor, completeSize);
+      return;
+    }
+  }
+  ftruncateSync(descriptor, 0);
 }
 
 export function usageRecord({ model, started, outcome, usage }) {
@@ -98,36 +125,61 @@ export async function aggregateUsageFile(
     throw new Error(`cannot open usage audit: ${error.message}`, { cause: error });
   }
 
-  const report = usageAccumulator();
-  const stream = handle.createReadStream({ autoClose: false });
-  let pending = Buffer.alloc(0);
-  let line = 0;
   try {
     const information = await handle.stat();
     if (!information.isFile()) throw new Error("usage audit is not a regular file");
+    if (information.size === 0) return emptyUsageReport();
 
-    for await (const chunk of stream) {
-      const data = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-      let start = 0;
-      for (let index = data.indexOf(0x0a, start); index >= 0; index = data.indexOf(0x0a, start)) {
-        line += 1;
-        let record = data.subarray(start, index);
-        if (record.at(-1) === 0x0d) record = record.subarray(0, -1);
-        addUsageLine(report, record, line, maxRecordBytes);
-        start = index + 1;
+    // Read a fixed snapshot. A concurrent append may be visible only in part;
+    // only newline-terminated records belong to this report.
+    const stream = handle.createReadStream({
+      autoClose: false,
+      start: 0,
+      end: information.size - 1,
+    });
+    const report = usageAccumulator();
+    let pending = Buffer.alloc(0);
+    let oversized = false;
+    let line = 0;
+
+    try {
+      for await (const chunk of stream) {
+        let start = 0;
+        while (start < chunk.byteLength) {
+          const newline = chunk.indexOf(0x0a, start);
+          const end = newline < 0 ? chunk.byteLength : newline;
+          const fragment = chunk.subarray(start, end);
+          if (!oversized) {
+            const length = pending.byteLength + fragment.byteLength;
+            if (length > maxRecordBytes + 1) {
+              pending = Buffer.alloc(0);
+              oversized = true;
+            } else if (fragment.byteLength) {
+              pending = pending.byteLength
+                ? Buffer.concat([pending, fragment])
+                : Buffer.from(fragment);
+            }
+          }
+          if (newline < 0) break;
+          line += 1;
+          if (oversized) {
+            throw new Error(`usage audit record ${line} exceeds ${maxRecordBytes} bytes`);
+          }
+          let record = pending;
+          if (record.at(-1) === 0x0d) record = record.subarray(0, -1);
+          addUsageLine(report, record, line, maxRecordBytes);
+          pending = Buffer.alloc(0);
+          oversized = false;
+          start = newline + 1;
+        }
       }
-      pending = Buffer.from(data.subarray(start));
-      if (pending.byteLength > maxRecordBytes) {
-        throw new Error(`usage audit record ${line + 1} exceeds ${maxRecordBytes} bytes`);
-      }
+      // A non-newline-terminated tail may be an append currently in progress.
+      // Startup will truncate it only if the writer actually crashed.
+      return finishUsageReport(report);
+    } finally {
+      stream.destroy();
     }
-    if (pending.length) {
-      line += 1;
-      addUsageLine(report, pending, line, maxRecordBytes);
-    }
-    return finishUsageReport(report);
   } finally {
-    stream.destroy();
     await handle.close();
   }
 }
@@ -213,20 +265,11 @@ function validateUsageRecord(record, line) {
       throw new Error(`usage audit record ${line} has an invalid ${field}`);
     }
   }
-  if (typeof record.model !== "string" || !MODEL.test(record.model)) {
-    throw new Error(`usage audit record ${line} has an invalid model`);
-  }
-  const separator = record.model.indexOf("/");
-  const provider = separator > 0 ? record.model.slice(0, separator) : "";
-  const model = separator > 0 ? record.model : "";
-  if (
-    !ROUTE.test(provider)
-    || RESERVED_ROUTES.has(provider)
-    || separator === record.model.length - 1
-  ) {
+  const route = splitPublicModelId(record.model);
+  if (!route) {
     throw new Error(`usage audit record ${line} has an invalid provider/model`);
   }
-  return { provider, model };
+  return { provider: route.provider, model: record.model };
 }
 
 function addGroup(groups, key, record, line) {

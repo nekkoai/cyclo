@@ -100,8 +100,6 @@ def build_prompt(
     role_file: Path,
     protocol_text: str,
     role_text: str,
-    project_file: Path | None = None,
-    project_text: str = "",
 ) -> str:
     return agent_mod.build_initial_prompt(
         agent_name,
@@ -113,8 +111,6 @@ def build_prompt(
         protocol_text,
         role_text,
         console=console,
-        project_file=project_file,
-        project_text=project_text,
     )
 
 
@@ -132,7 +128,6 @@ def main() -> int:
         agent_mod.die(f"cannot establish the agent process fence: {exc}")
 
     protocol_file, role_file, protocol_text, role_text = agent_mod.load_team_context(ROOT, args.role)
-    project_file, project_text = agent_mod.load_project_context(ROOT)
     max_job_attempts = agent_mod.positive_env_int(
         "AGENTWS_MAX_JOB_ATTEMPTS", agent_mod.DEFAULT_MAX_JOB_ATTEMPTS
     )
@@ -165,8 +160,6 @@ def main() -> int:
         role_file,
         protocol_text,
         role_text,
-        project_file,
-        project_text,
     )
     agent_mod.write_file(agent_dir / "prompt.md", prompt)
 

@@ -34,21 +34,25 @@ def test_agent_prompt_treats_workspace_as_an_internal_project_root() -> None:
     )
 
     normalized = " ".join(prompt.split())
-    assert "Workspace namespace (current working directory): /workspace" in normalized
-    assert "Interpret task paths using the Cyclo project manifest" in normalized
+    assert (
+        "Workspace namespace (current working directory): /workspace"
+        in normalized
+    )
+    assert "Interpret task paths using `project.cyclo`" in normalized
     assert "Writable named projects are under `/workspace/<name>`" in normalized
     assert "read-only inputs are under `/readonly/<name>`" in normalized
     assert "Agent workspace:" not in normalized
 
 
-def test_agent_prompt_always_includes_project_mounts_beside_custom_team_protocol() -> None:
+def test_agent_prompt_references_project_config_without_copying_it() -> None:
     agent_script = packaged_agentws_template() / "tools" / "agent"
     build_initial_prompt = runpy.run_path(str(agent_script))["build_initial_prompt"]
-    manifest = (
-        "# Cyclo project\n\n"
-        "Name: uart\n"
-        "- /workspace/core (read-write)\n"
-        "- /readonly/specifications (read-only)\n"
+    project_config = (
+        "name uart\n"
+        "description UART implementation.\n"
+        "team /team ro\n"
+        "mount core /workspace/core rw\n"
+        "mount specifications /readonly/specifications ro\n"
     )
 
     prompt = build_initial_prompt(
@@ -60,15 +64,14 @@ def test_agent_prompt_always_includes_project_mounts_beside_custom_team_protocol
         Path("/team/roles/designer.md"),
         "Custom team protocol that does not mention mounts.",
         "Design RTL.",
-        project_file=Path("/agentws/PROJECT.md"),
-        project_text=manifest,
     )
 
-    assert "Cyclo project manifest: /agentws/PROJECT.md" in prompt
-    assert "/workspace/core (read-write)" in prompt
-    assert "/readonly/specifications (read-only)" in prompt
+    assert "Cyclo project definition: /agentws/project.cyclo" in prompt
+    assert "mount core /workspace/core rw" not in prompt
+    assert "mount specifications /readonly/specifications ro" not in prompt
     assert "Custom team protocol that does not mention mounts." in prompt
-    assert prompt.count(manifest.strip()) == 1
+    assert project_config.strip() not in prompt
+    assert "PROJECT.md" not in prompt
 
 
 def test_team_protocol_is_layered_after_system_protocol(
@@ -101,18 +104,20 @@ def test_team_protocol_is_layered_after_system_protocol(
     )
 
 
-def test_interactive_agent_prompt_includes_configured_project_manifest(
+def test_interactive_agent_prompt_references_instance_project_config(
     tmp_path: Path,
 ) -> None:
     runtime, workspace = copy_runtime(tmp_path)
     create_planner_job(runtime, tmp_path, "interactive-project-context")
-    manifest = tmp_path / "project-manifest.md"
-    manifest.write_text(
-        "# Interactive project\n\n- /workspace/core (read-write)\n",
+    project_config = runtime / "project.cyclo"
+    project_config.write_text(
+        "name interactive\n"
+        "description Interactive project.\n"
+        "team /team ro\n"
+        "mount core /workspace/core rw\n",
         encoding="utf-8",
     )
     environment = agent_environment(tmp_path, workspace, "#!/bin/sh\nexit 23\n")
-    environment["CYCLO_PROJECT_MANIFEST"] = str(manifest)
 
     result = subprocess.run(
         [
@@ -132,8 +137,9 @@ def test_interactive_agent_prompt_includes_configured_project_manifest(
     prompt = (runtime / "agents" / "planner-1" / "prompt.md").read_text(
         encoding="utf-8"
     )
-    assert f"Cyclo project manifest: {manifest}" in prompt
-    assert "/workspace/core (read-write)" in prompt
+    assert f"Cyclo project definition: {project_config}" in prompt
+    assert "mount core /workspace/core rw" not in prompt
+    assert "PROJECT.md" not in prompt
 
 
 def test_interactive_initial_rpc_failure_settles_the_claimed_job(

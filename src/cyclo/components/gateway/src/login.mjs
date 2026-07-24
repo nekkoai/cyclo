@@ -3,12 +3,13 @@ import { stdin, stdout } from "node:process";
 import { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
+import { getApiProvider } from "@earendil-works/pi-ai/compat";
+import { isProviderPrefix } from "@cyclo/provider/protocol";
+
+import { buildCatalogueForCredentials } from "./catalogue.mjs";
 import { createAuthInteraction } from "./oauth-ui.mjs";
 import { getPiProvider, getPiProviders } from "./pi-registry.mjs";
 import { readJson, withFileLock, writeJsonAtomic } from "./store.mjs";
-
-const ROUTE = /^[a-z0-9_-]+$/u;
-const RESERVED = new Set(["__proto__", "constructor", "gateway", "prototype"]);
 
 export async function login(argv, options = {}) {
   const env = options.env ?? process.env;
@@ -16,6 +17,7 @@ export async function login(argv, options = {}) {
   const output = options.output ?? stdout;
   const providerLookup = options.getProvider ?? getPiProvider;
   const providers = options.providers ?? getPiProviders();
+  const apiProviderLookup = options.getApiProvider ?? getApiProvider;
   const parsed = parseLoginArgs(argv);
   const key = await resolveApiKey(parsed, { env, input, output });
   const account = parsed.account ?? parsed.provider;
@@ -23,10 +25,27 @@ export async function login(argv, options = {}) {
     ? await oauthLogin(parsed.provider, { input, output, providerLookup, providers })
     : { type: "api_key", key };
   const authPath = env.CYCLO_GATEWAY_AUTH_JSON ?? "/var/lib/cyclo-gateway/auth.json";
+  const modelsPath = env.CYCLO_GATEWAY_MODELS_JSON ?? "/etc/cyclo-gateway/models.json";
+  const validateStore = options.validateStore ?? ((candidate) => {
+    const catalogue = buildCatalogueForCredentials({
+      credentials: candidate,
+      modelsPath,
+      providers,
+      getApiProvider: apiProviderLookup,
+    });
+    const usable = Object.values(catalogue.routes).some(
+      (route) => route.account === account,
+    );
+    if (!usable) {
+      throw new Error(
+        `provider ${parsed.provider} exposes no usable models for account ${account}`,
+      );
+    }
+  });
   await storeCredential(authPath, account, {
     ...credential,
     provider: parsed.provider,
-  });
+  }, validateStore);
   output.write(`stored ${credential.type} credential for ${account}\n`);
 }
 
@@ -48,15 +67,20 @@ export function parseLoginArgs(argv) {
   return result;
 }
 
-export async function storeCredential(path, account, credential) {
+async function storeCredential(path, account, credential, validate) {
   routeName(account, "account name");
-  await withFileLock(path, () => {
+  if (typeof validate !== "function") {
+    throw new TypeError("credential validator must be a function");
+  }
+  await withFileLock(path, async () => {
     const store = readJson(path) ?? {};
     if (!store || typeof store !== "object" || Array.isArray(store)) {
       throw new Error("credential store must be a JSON object");
     }
-    store[account] = credential;
-    writeJsonAtomic(path, store);
+    const candidate = structuredClone(store);
+    candidate[account] = structuredClone(credential);
+    await validate(structuredClone(candidate));
+    writeJsonAtomic(path, candidate);
   });
 }
 
@@ -124,8 +148,11 @@ async function hiddenQuestion(input, output, prompt) {
 }
 
 function routeName(value, label) {
-  if (typeof value !== "string" || !ROUTE.test(value) || RESERVED.has(value)) {
-    throw new Error(`${label} must use lowercase letters, numbers, underscore, or hyphen`);
+  if (!isProviderPrefix(value)) {
+    throw new Error(
+      `${label} must start with a lowercase letter or number and use at most `
+      + "64 lowercase letters, numbers, underscores, or hyphens",
+    );
   }
   return value;
 }

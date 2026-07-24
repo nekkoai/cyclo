@@ -17,6 +17,11 @@ class ProviderStatusReader(Protocol):
         statuses: tuple[ComponentStatus, ...] | None = None,
     ) -> ProviderConnection: ...
 
+    def catalogue(
+        self,
+        connection: ProviderConnection,
+    ) -> tuple[ProviderConnection, dict[str, object]]: ...
+
 
 @dataclass(frozen=True)
 class ProviderHealth:
@@ -64,7 +69,9 @@ def provider_health(
             "configuration or image stale: gateway",
         )
     if not gateway.works:
-        if not gateway.container_id:
+        if gateway.container_state == "unknown":
+            state = "unknown"
+        elif not gateway.container_id:
             state = "absent"
         elif not gateway.running:
             state = gateway.container_state
@@ -79,7 +86,9 @@ def provider_health(
     for component in components:
         if component.name == "gateway" or component.works:
             continue
-        if component.container_id and not component.current:
+        if component.container_state == "unknown":
+            state = "unknown"
+        elif component.container_id and not component.current:
             state = "stale"
         elif not component.container_id:
             state = "absent"
@@ -120,6 +129,7 @@ def read_provider_status(
         return health, None
     try:
         connection = reader.connection(components)
+        connection, _catalogue = reader.catalogue(connection)
     except Exception as exc:
         return (
             ProviderHealth(
@@ -128,7 +138,7 @@ def read_provider_status(
             ),
             None,
         )
-    return health, connection
+    return provider_health(connection.components), connection
 
 
 def instance_provider_health(

@@ -105,7 +105,7 @@
     const raw = stringValue(value, "unknown").toLowerCase();
     if (["running", "up", "online", "active", "healthy"].includes(raw)) return "running";
     if (["starting", "created", "restarting", "pending"].includes(raw)) return "starting";
-    if (["failed", "error", "unhealthy", "orphan", "orphaned", "stale", "unknown", "missing"].includes(raw)) return "attention";
+    if (["failed", "error", "unhealthy", "orphan", "orphaned", "paused", "stale", "unknown", "missing"].includes(raw)) return "attention";
     if (["stopped", "exited", "dead", "removed", "offline"].includes(raw)) return "stopped";
     return raw;
   }
@@ -210,7 +210,7 @@
     const readOnlyMounts = normalizeProjectLocations(rawProject.read_only_mounts);
     const mode = asObject(raw.mode);
     const counts = asObject(raw.counts);
-    const tasks = normalizeCounterGroup(counts.tasks, ["total", "open", "closed"]);
+    const tasks = normalizeCounterGroup(counts.tasks, ["total", "open", "closed", "unknown"]);
     const jobs = normalizeCounterGroup(counts.jobs, [
       "total",
       "pending",
@@ -243,9 +243,14 @@
       || health.state.startsWith("provider-")
       || health.state.startsWith("agents-")
       || errors.length > 0
+      || tasks.unknown > 0
       || jobs.failed > 0
       || jobs.unknown > 0;
     const displayState = needsAttention ? "attention" : runtimeState;
+    const unknownTasksReported = errors.some((error) =>
+      /\btasks? (?:has|have) an unknown or unreadable state\b/i.test(error));
+    const unknownJobsReported = errors.some((error) =>
+      /\bjobs? (?:has|have) an unknown or unreadable status\b/i.test(error));
     const instance = {
       id,
       team,
@@ -272,7 +277,10 @@
       recentActivity: [],
       recentTasks: [],
       generatedAt,
-      failureCount: jobs.failed + jobs.unknown + errors.length,
+      failureCount: jobs.failed
+        + errors.length
+        + (unknownTasksReported ? 0 : tasks.unknown)
+        + (unknownJobsReported ? 0 : jobs.unknown),
     };
 
     instance.recentActivity = asArray(raw.recent_activity)
@@ -337,7 +345,7 @@
       running: 0,
       providerIssues: 0,
       attention: 0,
-      tasks: { total: 0, open: 0, closed: 0 },
+      tasks: { total: 0, open: 0, closed: 0, unknown: 0 },
       jobs: { total: 0, active: 0, done: 0, failed: 0, unknown: 0 },
       agents: { total: 0, active: 0 },
       tokens: 0,
@@ -351,6 +359,7 @@
       summary.tasks.total += instance.tasks.total;
       summary.tasks.open += instance.tasks.open;
       summary.tasks.closed += instance.tasks.closed;
+      summary.tasks.unknown += instance.tasks.unknown;
       summary.jobs.total += instance.jobs.total;
       summary.jobs.active += instance.jobs.pending + instance.jobs.claimed + instance.jobs.running;
       summary.jobs.done += instance.jobs.done;
@@ -443,7 +452,7 @@
   function stateLabel(instance) {
     if (instance.state === "attention") return instance.rawState;
     if (instance.state === "running") return "running";
-    if (instance.state === "starting") return "starting";
+    if (instance.state === "starting") return instance.rawState;
     if (instance.state === "stopped") return "stopped";
     return instance.rawState || "unknown";
   }
@@ -474,7 +483,12 @@
     elements.statInstances.textContent = formatCount(summary.total);
     elements.statRunning.textContent = `${plural(summary.running, "running")} · ${formatCount(summary.total - summary.running)} not running`;
     elements.statTasks.textContent = formatCount(summary.tasks.open);
-    elements.statTasksDetail.textContent = `${plural(summary.tasks.total, "task")} · ${formatCount(summary.tasks.closed)} closed`;
+    const taskSummary = [
+      plural(summary.tasks.total, "task"),
+      `${formatCount(summary.tasks.closed)} closed`,
+    ];
+    if (summary.tasks.unknown) taskSummary.push(`${formatCount(summary.tasks.unknown)} unknown`);
+    elements.statTasksDetail.textContent = taskSummary.join(" · ");
     elements.statAgents.textContent = formatCount(summary.agents.active);
     elements.statAgentsDetail.textContent = `${plural(summary.agents.total, "agent")} configured`;
     elements.statTokens.textContent = formatTokens(summary.tokens);
@@ -607,7 +621,12 @@
     generation.title = instance.generation;
 
     fragment.querySelector(".task-count").textContent = formatCount(instance.tasks.open);
-    fragment.querySelector(".task-detail").textContent = `${formatCount(instance.tasks.total)} total · ${formatCount(instance.tasks.closed)} closed`;
+    const taskDetails = [
+      `${formatCount(instance.tasks.total)} total`,
+      `${formatCount(instance.tasks.closed)} closed`,
+    ];
+    if (instance.tasks.unknown) taskDetails.push(`${formatCount(instance.tasks.unknown)} unknown`);
+    fragment.querySelector(".task-detail").textContent = taskDetails.join(" · ");
     const activeJobs = instance.jobs.pending + instance.jobs.claimed + instance.jobs.running;
     fragment.querySelector(".job-count").textContent = formatCount(activeJobs);
     const jobDetails = [

@@ -39,12 +39,26 @@ def _instance(
         image="cyclo-runtime:test",
         team_write=False,
         offline=False,
+        launch_id="0" * 32,
         active=active,
     )
 
 
-def _lifecycle_info(flag: str) -> dict[str, object]:
-    return {"State": {"Running": True, flag: True}}
+def _lifecycle_info(
+    flag: str, selected: Instance, *, system: str
+) -> dict[str, object]:
+    return {
+        "Id": f"{selected.id}-container-id",
+        "Config": {
+            "Labels": {
+                "io.cyclo.system": system,
+                "io.cyclo.kind": "team",
+                "io.cyclo.instance": selected.id,
+                "cyclo.launch": selected.launch_id,
+            }
+        },
+        "State": {"Running": True, flag: True},
+    }
 
 
 def _persist(store: StateStore, selected: Instance) -> None:
@@ -61,18 +75,24 @@ def _persist(store: StateStore, selected: Instance) -> None:
     ],
 )
 def test_paused_and_restarting_are_lifecycle_active_but_not_operational(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     flag: str,
     expected: DockerContainerState,
 ) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = _instance("team", tmp_path / "team", tmp_path / "project")
+    _persist(store, selected)
     docker = Docker()
     monkeypatch.setattr(
-        docker, "_inspect_container", lambda _name: _lifecycle_info(flag)
+        docker,
+        "_inspect_container",
+        lambda _name: _lifecycle_info(flag, selected, system=store.system),
     )
 
-    assert docker.container_lifecycle_state("cyclo-team") is expected
-    assert docker.container_lifecycle_active("cyclo-team") is True
-    assert docker.container_running("cyclo-team") is False
+    assert docker.container_lifecycle_state(selected, system=store.system) is expected
+    assert docker.container_lifecycle_active(selected, system=store.system) is True
+    assert docker.container_running(selected, system=store.system) is False
 
 
 @pytest.mark.parametrize("flag", ["Paused", "Restarting"])
@@ -86,13 +106,33 @@ def test_active_instances_preserves_temporary_lifecycle_states(
     _persist(store, selected)
     docker = Docker()
     monkeypatch.setattr(
-        docker, "_inspect_container", lambda _name: _lifecycle_info(flag)
+        docker,
+        "_inspect_container",
+        lambda _name: _lifecycle_info(flag, selected, system=store.system),
     )
     stale: list[Instance] = []
 
     retained = active_instances(store, docker, stale=stale)
 
     assert [instance.id for instance in retained] == [selected.id]
+    assert store.load(selected.id).active is True
+    assert stale == []
+
+
+def test_active_instances_rejects_a_foreign_same_name_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = _instance("team", tmp_path / "team", tmp_path / "project")
+    _persist(store, selected)
+    docker = Docker()
+    foreign = _lifecycle_info("Paused", selected, system="ba9876543210")
+    monkeypatch.setattr(docker, "_inspect_container", lambda _name: foreign)
+    stale: list[Instance] = []
+
+    with pytest.raises(CycloError, match="non-Cyclo container"):
+        active_instances(store, docker, stale=stale)
+
     assert store.load(selected.id).active is True
     assert stale == []
 
@@ -122,11 +162,89 @@ def test_stop_refuses_incomplete_inventory_before_any_side_effect(
         stop_instance(
             store,
             NoDockerWrites(),  # type: ignore[arg-type]
-            selected.id,
+            selected,
         )
 
     assert events == []
     assert store.metadata_path(selected.id).read_bytes() == metadata_before
+
+
+def test_stop_uses_one_launch_checked_removal_without_preinspection(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = _instance("team", tmp_path / "team", tmp_path / "project")
+    selected.port = 4137
+    _persist(store, selected)
+    events: list[tuple[object, ...]] = []
+
+    class RemovalOnlyDocker:
+        @staticmethod
+        def stop_remove(
+            container,
+            expected_instance,
+            *,
+            expected_system,
+            expected_launch,
+        ):
+            events.append(
+                (
+                    "container",
+                    container,
+                    expected_instance,
+                    expected_system,
+                    expected_launch,
+                )
+            )
+            return True
+
+        @staticmethod
+        def remove_network(name, expected_instance, *, system):
+            events.append(("network", name, expected_instance, system))
+
+    stop_instance(
+        store,
+        RemovalOnlyDocker(),  # type: ignore[arg-type]
+        selected,
+    )
+
+    persisted = store.load(selected.id)
+    assert persisted.active is False
+    assert persisted.port is None
+    assert events == [
+        (
+            "container",
+            selected.container_name,
+            selected.id,
+            store.system,
+            selected.launch_id,
+        ),
+        ("network", selected.network_name, selected.id, store.system),
+    ]
+
+
+def test_stop_rejects_a_replaced_persisted_launch_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    expected = _instance("team", tmp_path / "team", tmp_path / "project")
+    _persist(store, expected)
+    replacement = store.load(expected.id)
+    replacement.launch_id = "1" * 32
+    store.save(replacement)
+
+    class NoDockerWrites:
+        def __getattr__(self, name: str):
+            raise AssertionError(f"unexpected Docker operation: {name}")
+
+    with pytest.raises(CycloError, match="was replaced"):
+        stop_instance(
+            store,
+            NoDockerWrites(),  # type: ignore[arg-type]
+            expected,
+        )
+
+    assert store.load(expected.id).active is True
 
 
 @pytest.mark.parametrize("flag", ["Paused", "Restarting"])
@@ -140,7 +258,9 @@ def test_repair_does_not_revoke_or_delete_lifecycle_active_team(
     _persist(store, selected)
     docker = Docker()
     monkeypatch.setattr(
-        docker, "_inspect_container", lambda _name: _lifecycle_info(flag)
+        docker,
+        "_inspect_container",
+        lambda _name: _lifecycle_info(flag, selected, system=store.system),
     )
     events: list[object] = []
     monkeypatch.setattr(
@@ -175,20 +295,25 @@ def test_preflight_rejects_duplicate_lifecycle_active_container(
     monkeypatch: pytest.MonkeyPatch,
     flag: str,
 ) -> None:
+    store = StateStore(tmp_path / "state")
     selected = _instance("team", team_repo, project_repo)
+    selected.container_name = team_container_name(store.system, selected.id)
+    selected.network_name = team_network_name(store.system, selected.id)
     binding = RunBinding(
         team=load_team(team_repo),
         project_root=project_repo,
         instance=selected,
-        manifest="",
+        project_config="",
     )
     docker = Docker()
     monkeypatch.setattr(
-        docker, "_inspect_container", lambda _name: _lifecycle_info(flag)
+        docker,
+        "_inspect_container",
+        lambda _name: _lifecycle_info(flag, selected, system=store.system),
     )
 
     with pytest.raises(CycloError, match=f"already active \\({flag.lower()}\\)"):
-        preflight_binding(binding, StateStore(tmp_path / "state"), docker)
+        preflight_binding(binding, store, docker)
 
 
 @pytest.mark.parametrize("flag", ["Paused", "Restarting"])
@@ -210,7 +335,7 @@ def test_mount_preflight_includes_lifecycle_active_containers(
         team=load_team(team_repo),
         project_root=nested_project,
         instance=_instance("new", team_repo, nested_project),
-        manifest="",
+        project_config="",
         project_mounts=(
             ProjectMount("source", nested_project.resolve(), "rw", 1),
         ),
@@ -219,7 +344,7 @@ def test_mount_preflight_includes_lifecycle_active_containers(
     monkeypatch.setattr(
         docker,
         "_inspect_container",
-        lambda name: _lifecycle_info(flag)
+        lambda name: _lifecycle_info(flag, running, system=store.system)
         if name == running.container_name
         else None,
     )

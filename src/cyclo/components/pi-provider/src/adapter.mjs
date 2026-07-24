@@ -5,29 +5,46 @@ import {
   decodePayload,
   encodePayload,
   PI_INFERENCE_FORMAT,
+  splitPublicModelId,
 } from "@cyclo/provider/protocol";
 
 const API = "cyclo-pi";
-const PROVIDER = /^[a-z0-9_-]+$/u;
-const MODEL = /^[^\s\u0000-\u001f\u007f]+$/u;
-const RESERVED_PROVIDERS = new Set(["__proto__", "constructor", "gateway", "prototype"]);
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 const MAX_SAFE_UINT64 = BigInt(Number.MAX_SAFE_INTEGER);
 
-export function groupModels(models) {
+export function groupModels(models, { onInvalid = console.warn } = {}) {
   if (!Array.isArray(models)) throw new TypeError("Provider catalogue has no model list");
+  if (typeof onInvalid !== "function") throw new TypeError("onInvalid must be a function");
   const groups = new Map();
   const publicIds = new Set();
 
   for (const portable of models) {
-    const { provider, id } = splitModelId(portable?.id);
-    if (publicIds.has(portable.id)) throw new TypeError(`duplicate model ${portable.id}`);
-    publicIds.add(portable.id);
-    const group = groups.get(provider) ?? [];
-    group.push({ publicId: portable.id, model: piModel(portable, id) });
-    groups.set(provider, group);
+    let provider;
+    let id;
+    try {
+      const split = splitPublicModelId(portable?.id);
+      if (!split) throw new TypeError(`model id ${portable?.id} must be PROVIDER/MODEL`);
+      ({ provider, model: id } = split);
+      if (publicIds.has(portable.id)) throw new TypeError(`duplicate model ${portable.id}`);
+      const model = piModel(portable, id);
+      publicIds.add(portable.id);
+      const group = groups.get(provider) ?? [];
+      group.push({ publicId: portable.id, model });
+      groups.set(provider, group);
+    } catch (error) {
+      onInvalid(diagnosticMessage(error));
+    }
   }
   return groups;
+}
+
+function diagnosticMessage(error) {
+  const raw = error instanceof Error ? error.message : String(error);
+  return raw
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 512) || "invalid provider model";
 }
 
 // This is the only Pi-to-wire boundary. Context and inference options are
@@ -136,20 +153,6 @@ function piModel(portable, id) {
     contextWindow: uint64Number(portable.contextWindowTokens, "context window", portable.id),
     maxTokens: uint64Number(portable.maxOutputTokens, "output limit", portable.id),
   });
-}
-
-function splitModelId(value) {
-  if (typeof value !== "string" || !MODEL.test(value)) {
-    throw new TypeError("Provider emitted an invalid model id");
-  }
-  const slash = value.indexOf("/");
-  const provider = slash < 0 ? "" : value.slice(0, slash);
-  const id = slash < 0 ? "" : value.slice(slash + 1);
-  if (!PROVIDER.test(provider) || RESERVED_PROVIDERS.has(provider)
-      || !id || id.length > 1_024 || !MODEL.test(id)) {
-    throw new TypeError(`model id ${value} must be PROVIDER/MODEL`);
-  }
-  return { provider, id };
 }
 
 function uint64Number(value, label, model) {

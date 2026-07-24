@@ -169,6 +169,67 @@ test("dashboard treats suspended AgentWS supervisors as instance attention", asy
   assert.equal(plannerFailure.displayState, "attention");
 });
 
+test("dashboard preserves paused and restarting lifecycle labels", async () => {
+  const { normalizeInstance, stateLabel } = await dashboardHelpers([
+    "normalizeInstance",
+    "stateLabel",
+  ]);
+  const paused = normalizeInstance({
+    id: "paused-team",
+    state: "paused",
+    health: { state: "inactive", reason: "" },
+  });
+  const restarting = normalizeInstance({
+    id: "restarting-team",
+    state: "restarting",
+    health: { state: "inactive", reason: "" },
+  });
+
+  assert.equal(paused.state, "attention");
+  assert.equal(stateLabel(paused), "paused");
+  assert.equal(restarting.state, "starting");
+  assert.equal(stateLabel(restarting), "restarting");
+});
+
+test("dashboard preserves unknown task counts as attention", async () => {
+  const { normalizeInstance, computeSummary } = await dashboardHelpers([
+    "normalizeInstance",
+    "computeSummary",
+  ]);
+  const instance = normalizeInstance({
+    id: "corrupt-task",
+    state: "running",
+    health: { state: "ready", reason: "" },
+    counts: {
+      tasks: { total: 1, open: 0, closed: 0, unknown: 1 },
+    },
+  });
+
+  assert.equal(instance.tasks.unknown, 1);
+  assert.equal(instance.displayState, "attention");
+  assert.equal(instance.failureCount, 1);
+  assert.equal(computeSummary([instance]).tasks.unknown, 1);
+});
+
+test("failure sorting does not count reported unknown queue states twice", async () => {
+  const { normalizeInstance } = await dashboardHelpers(["normalizeInstance"]);
+  const instance = normalizeInstance({
+    id: "corrupt-queue",
+    state: "running",
+    health: { state: "ready", reason: "" },
+    counts: {
+      tasks: { total: 4, open: 0, closed: 0, unknown: 4 },
+      jobs: { total: 5, failed: 2, unknown: 3 },
+    },
+    errors: [
+      "4 tasks have an unknown or unreadable state",
+      "3 jobs have an unknown or unreadable status",
+    ],
+  });
+
+  assert.equal(instance.failureCount, 4);
+});
+
 test("API v3 keeps gateway usage global and ignores per-instance attribution", async () => {
   const { normalizeSnapshot } = await dashboardHelpers(["normalizeSnapshot"]);
   const snapshot = normalizeSnapshot({

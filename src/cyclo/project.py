@@ -17,6 +17,7 @@ MAX_PROJECT_FILE_BYTES = 1024 * 1024
 PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 MOUNT_NAME_RE = PROJECT_NAME_RE
 TEAM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+CONTEXT_MARKER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
 AccessMode = Literal["ro", "rw"]
 CONTAINER_WORKSPACE_ROOT = Path("/workspace")
 CONTAINER_READONLY_ROOT = Path("/readonly")
@@ -80,6 +81,7 @@ class ProjectDefinition:
     path: Path
     name: str
     description: str
+    context: str
     teams: tuple[ProjectTeam, ...]
     mounts: tuple[ProjectMount, ...]
     definition_sha256: str
@@ -95,49 +97,48 @@ def _selected_path(value: str | os.PathLike[str]) -> Path:
     return Path(os.path.abspath(selected))
 
 
-def _read_project_file(path: Path) -> bytes:
+def _read_regular_file(path: Path, label: str) -> bytes:
     if not hasattr(os, "O_NOFOLLOW"):
-        raise CycloError("safe project definition reads require O_NOFOLLOW")
+        raise CycloError(f"safe {label} reads require O_NOFOLLOW")
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError as exc:
-        raise CycloError(f"project definition not found: {path}") from exc
+        raise CycloError(f"{label} not found: {path}") from exc
     except OSError as exc:
         if exc.errno == errno.ELOOP:
-            raise CycloError(f"project definition must not be a symlink: {path}") from exc
-        raise CycloError(f"cannot open project definition {path}: {exc}") from exc
+            raise CycloError(f"{label} must not be a symlink: {path}") from exc
+        raise CycloError(f"cannot open {label} {path}: {exc}") from exc
 
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
-            raise CycloError(f"project definition is not a regular file: {path}")
+            raise CycloError(f"{label} is not a regular file: {path}")
         with os.fdopen(descriptor, "rb", closefd=True) as stream:
             descriptor = -1
             content = stream.read(MAX_PROJECT_FILE_BYTES + 1)
     except CycloError:
         raise
     except OSError as exc:
-        raise CycloError(f"cannot read project definition {path}: {exc}") from exc
+        raise CycloError(f"cannot read {label} {path}: {exc}") from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
 
     if len(content) > MAX_PROJECT_FILE_BYTES:
         raise CycloError(
-            f"project definition exceeds the {MAX_PROJECT_FILE_BYTES}-byte limit: "
-            f"{path}"
+            f"{label} exceeds the {MAX_PROJECT_FILE_BYTES}-byte limit: {path}"
         )
     return content
 
 
-def _decode_project_file(content: bytes, path: Path) -> str:
+def _decode_text_file(content: bytes, path: Path, label: str) -> str:
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise CycloError(f"project definition is not valid UTF-8: {path}") from exc
+        raise CycloError(f"{label} is not valid UTF-8: {path}") from exc
 
     # Accept ordinary Unix and Windows line endings, but no embedded control
     # characters. Tabs are deliberately not an alternate quoting/separation
@@ -146,9 +147,21 @@ def _decode_project_file(content: bytes, path: Path) -> str:
     for character in text:
         codepoint = ord(character)
         if character != "\n" and (codepoint < 0x20 or codepoint == 0x7F):
-            raise CycloError(
-                f"project definition contains a control character: {path}"
-            )
+            raise CycloError(f"{label} contains a control character: {path}")
+    return text
+
+
+def read_project_context(value: str | os.PathLike[str]) -> str:
+    """Read one literal context file through the project trust boundary."""
+
+    source = _selected_path(value)
+    text = _decode_text_file(
+        _read_regular_file(source, "project context"),
+        source,
+        "project context",
+    ).strip("\n")
+    if not text.strip():
+        raise CycloError(f"project context must not be empty: {source}")
     return text
 
 
@@ -222,17 +235,19 @@ def _paths_overlap(left: Path, right: Path) -> bool:
 def _definition_sha256(
     name: str,
     description: str,
+    context: str,
     teams: tuple[ProjectTeam, ...],
     mounts: tuple[ProjectMount, ...],
 ) -> str:
     payload = {
+        "context": context,
         "description": description,
         "mounts": [
             {"mode": mount.mode, "name": mount.name, "path": str(mount.path)}
             for mount in mounts
         ],
         "name": name,
-        "schema": 2,
+        "schema": 3,
         "teams": [
             {"mode": team.mode, "path": str(team.path)} for team in teams
         ],
@@ -250,10 +265,15 @@ def load_project(value: str | os.PathLike[str]) -> ProjectDefinition:
     """Parse and validate one strict, line-oriented project definition."""
 
     source = _selected_path(value)
-    text = _decode_project_file(_read_project_file(source), source)
+    text = _decode_text_file(
+        _read_regular_file(source, "project definition"),
+        source,
+        "project definition",
+    )
 
     name: str | None = None
     description: str | None = None
+    context: str | None = None
     teams: list[ProjectTeam] = []
     mounts: list[ProjectMount] = []
     team_paths: dict[Path, int] = {}
@@ -261,7 +281,8 @@ def load_project(value: str | os.PathLike[str]) -> ProjectDefinition:
     mount_names: dict[str, int] = {}
     mount_paths: dict[Path, int] = {}
 
-    for line_number, raw in enumerate(text.splitlines(), 1):
+    line_iterator = iter(enumerate(text.splitlines(), 1))
+    for line_number, raw in line_iterator:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -295,6 +316,45 @@ def load_project(value: str | os.PathLike[str]) -> ProjectDefinition:
                     f"{source}:{line_number}: duplicate description directive"
                 )
             description = remainder.strip()
+            continue
+
+        if directive == "context":
+            fields = line.split()
+            if (
+                len(fields) != 2
+                or not fields[1].startswith("<<")
+                or not CONTEXT_MARKER_RE.fullmatch(fields[1][2:])
+            ):
+                raise CycloError(
+                    f"{source}:{line_number}: expected context <<MARKER"
+                )
+            if context is not None:
+                raise CycloError(
+                    f"{source}:{line_number}: duplicate context directive"
+                )
+            marker = fields[1][2:]
+            context_lines: list[str] = []
+            for _context_line_number, context_line in line_iterator:
+                if context_line == marker:
+                    break
+                context_lines.append(context_line)
+            else:
+                raise CycloError(
+                    f"{source}:{line_number}: unterminated context block; "
+                    f"expected {marker!r}"
+                )
+            first = 0
+            last = len(context_lines)
+            while first < last and not context_lines[first].strip():
+                first += 1
+            while last > first and not context_lines[last - 1].strip():
+                last -= 1
+            context_lines = context_lines[first:last]
+            if not context_lines:
+                raise CycloError(
+                    f"{source}:{line_number}: project context must not be empty"
+                )
+            context = "\n".join(context_lines)
             continue
 
         fields = line.split()
@@ -373,7 +433,7 @@ def load_project(value: str | os.PathLike[str]) -> ProjectDefinition:
             )
         raise CycloError(
             f"{source}:{line_number}: unknown project directive {directive!r}; "
-            "expected name, description, team, or mount"
+            "expected name, description, context, team, or mount"
         )
 
     if name is None:
@@ -407,63 +467,59 @@ def load_project(value: str | os.PathLike[str]) -> ProjectDefinition:
         path=source,
         name=name,
         description=description,
+        context=context or "",
         teams=team_tuple,
         mounts=mount_tuple,
         definition_sha256=_definition_sha256(
             name,
             description,
+            context or "",
             team_tuple,
             mount_tuple,
         ),
     )
 
 
-def render_project_manifest(
+def project_context_marker(context: str) -> str:
+    """Choose a deterministic heredoc marker absent from literal context."""
+
+    lines = set(context.splitlines())
+    marker = "CYCLO_CONTEXT"
+    suffix = 1
+    while marker in lines:
+        suffix += 1
+        marker = f"CYCLO_CONTEXT_{suffix}"
+    return marker
+
+
+def render_container_project(
     project: ProjectDefinition,
     *,
-    team: ProjectTeam | None = None,
+    team: ProjectTeam,
 ) -> str:
-    """Return deterministic agent context without exposing host source paths."""
+    """Render the selected team's project definition in its container namespace."""
 
-    if team is not None and team not in project.teams:
+    if team not in project.teams:
         raise ValueError("selected team is not part of this project definition")
 
     lines = [
-        "# Cyclo project",
-        "",
-        f"Name: {project.name}",
-        f"Description: {project.description}",
-        f"Definition: {project.definition_sha256}",
-        "",
-        "The current working directory is /workspace.",
-        "Writable work lives below /workspace; read-only inputs live below /readonly.",
-        "Use the named paths below; host filesystem paths are not available here.",
-        "",
-        "## Writable workspace mounts",
-        "",
+        "# Generated by Cyclo for this team container.",
+        "# Team and mount paths are container paths; host paths are omitted.",
+        f"name {project.name}",
+        f"description {project.description}",
     ]
-    writable = tuple(mount for mount in project.mounts if mount.writable)
-    readonly = tuple(mount for mount in project.mounts if mount.read_only)
-    if writable:
-        for mount in writable:
-            lines.append(f"- {mount.container_path} (read-write)")
-    else:
-        lines.append("- none")
-
-    lines.extend(["", "## Read-only mounts", ""])
-    if readonly:
-        for mount in readonly:
-            lines.append(f"- {mount.container_path} (read-only)")
-    else:
-        lines.append("- none")
-
-    lines.extend(["", "## Team definition", ""])
-    if team is not None:
-        access = "read-write" if team.writable else "read-only"
-        lines.append(f"- /team ({access}; {team.name})")
-    else:
-        lines.append("Each running team sees its own definition at /team:")
-        for configured_team in project.teams:
-            access = "read-write" if configured_team.writable else "read-only"
-            lines.append(f"- {configured_team.name} ({access})")
-    return "\n".join(lines) + "\n"
+    if project.context:
+        marker = project_context_marker(project.context)
+        lines.extend(["", f"context <<{marker}", project.context, marker])
+    lines.extend(["", f"team /team {team.mode}", ""])
+    lines.extend(
+        f"mount {mount.name} {mount.container_path} {mount.mode}"
+        for mount in project.mounts
+    )
+    rendered = "\n".join(lines) + "\n"
+    if len(rendered.encode("utf-8")) > MAX_PROJECT_FILE_BYTES:
+        raise CycloError(
+            "container project configuration exceeds the "
+            f"{MAX_PROJECT_FILE_BYTES}-byte project.cyclo limit"
+        )
+    return rendered

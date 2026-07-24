@@ -18,6 +18,7 @@ from .installation import installation_id, team_container_name, team_network_nam
 
 
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+LAUNCH_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 DEFAULT_AGENTWS_HOST = "127.0.0.1"
 
 
@@ -71,6 +72,7 @@ class Instance:
     image: str
     team_write: bool
     offline: bool
+    launch_id: str
     image_override: str = ""
     agentws_host: str = DEFAULT_AGENTWS_HOST
     active: bool = False
@@ -82,7 +84,6 @@ class Instance:
     project_description: str = ""
     project_generation: str = ""
     project_mounts: list[dict[str, str]] = field(default_factory=list)
-    launch_id: str = ""
     provider_socket_path: str = ""
     provider_generation: str = ""
 
@@ -135,6 +136,8 @@ class Instance:
             raise TypeError("port must be null or an integer from 1 to 65535")
         instance = cls(**payload)  # type: ignore[arg-type]
         validate_instance_id(instance.id)
+        if not LAUNCH_ID_RE.fullmatch(instance.launch_id):
+            raise TypeError("launch_id must be a 32-character lowercase hex value")
         if instance.provider_socket_path:
             provider_socket = Path(instance.provider_socket_path)
             if not provider_socket.is_absolute():
@@ -379,6 +382,41 @@ class StateStore:
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
 
+    def remove_instance(
+        self, identifier: str, *, expected_launch_id: str
+    ) -> bool:
+        """Delete one retired instance record and all of its durable queue state."""
+
+        if not LAUNCH_ID_RE.fullmatch(expected_launch_id):
+            raise CycloError(
+                f"invalid launch identity for Cyclo instance: {identifier}"
+            )
+        directory = self.instance_dir(identifier)
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise CycloError(
+                f"cannot inspect Cyclo instance state {directory}: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(metadata.st_mode) or directory.is_symlink():
+            raise CycloError(
+                f"refusing invalid Cyclo instance directory: {directory}"
+            )
+        current = self.load(identifier)
+        if current.launch_id != expected_launch_id:
+            raise CycloError(
+                f"instance {identifier!r} was replaced before it could be removed"
+            )
+        try:
+            shutil.rmtree(directory)
+        except OSError as exc:
+            raise CycloError(
+                f"cannot remove Cyclo instance state {directory}: {exc}"
+            ) from exc
+        return True
+
     @staticmethod
     def _remove_tree(path: Path) -> None:
         try:
@@ -427,8 +465,10 @@ class StateStore:
         template: Path,
         runtime_script: Path,
         *,
-        project_manifest: str | None = None,
+        project_config: str,
     ) -> Path:
+        if not project_config.strip():
+            raise CycloError("Cyclo project configuration must not be empty")
         runtime = self.runtime_root(identifier)
         temporary = self.new_tree(runtime)
 
@@ -457,14 +497,13 @@ class StateStore:
                 runtime_destination.unlink()
             runtime_destination.write_bytes(runtime_bytes)
             os.chmod(runtime_destination, 0o555)
-            if project_manifest is not None:
-                manifest_destination = temporary / "PROJECT.md"
-                if manifest_destination.exists() or manifest_destination.is_symlink():
-                    manifest_destination.unlink()
-                manifest_destination.write_text(
-                    project_manifest.rstrip() + "\n", encoding="utf-8"
-                )
-                os.chmod(manifest_destination, 0o444)
+            project_destination = temporary / "project.cyclo"
+            if project_destination.exists() or project_destination.is_symlink():
+                project_destination.unlink()
+            project_destination.write_text(
+                project_config.rstrip() + "\n", encoding="utf-8"
+            )
+            os.chmod(project_destination, 0o444)
             self.replace_tree(temporary, runtime)
         except Exception:
             self._remove_tree(temporary)

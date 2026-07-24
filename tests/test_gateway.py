@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -82,6 +83,18 @@ def test_gateway_usage_mounts_credential_store_read_only(
     mount = command[command.index("--mount") + 1]
     assert mount.endswith("/var/lib/cyclo-gateway,readonly")
 
+    gateway._tool(["login", "openai"], volume=True, config=True)
+    login_command = controller.commands[-1]
+    mounts = [
+        login_command[index + 1]
+        for index, item in enumerate(login_command)
+        if item == "--mount"
+    ]
+    assert (
+        f"type=bind,src={gateway.config_dir},"
+        "dst=/etc/cyclo-gateway,readonly"
+    ) in mounts
+
 
 def test_gateway_login_builds_then_restarts_after_credential_change(
     tmp_path: Path,
@@ -139,7 +152,7 @@ def test_gateway_login_builds_then_restarts_after_credential_change(
         gateway,
         "_tool",
         lambda command, **_options: events.append(
-            ("tool", tuple(command))
+            ("tool", tuple(command), _options.get("config"))
         ),
     )
     monkeypatch.setattr(
@@ -158,10 +171,70 @@ def test_gateway_login_builds_then_restarts_after_credential_change(
         "build",
         "status",
         ("exclusive", CONTAINER_ID),
-        ("tool", ("login", "anthropic")),
+        ("tool", ("login", "anthropic"), True),
         "stop",
         "start-built",
     ]
+
+
+def test_gateway_failed_login_does_not_stop_the_running_gateway(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = Mock()
+    gateway = Gateway(
+        tmp_path / "components",
+        controller=controller,
+    )
+    controller.status.return_value = _status(gateway)
+    monkeypatch.setattr(gateway, "_prepare", Mock())
+    monkeypatch.setattr(gateway, "build", Mock(return_value=IMAGE_ID))
+    monkeypatch.setattr(gateway, "store_ready", Mock(return_value=True))
+    monkeypatch.setattr(gateway, "_require_exclusive_store", Mock())
+    monkeypatch.setattr(
+        gateway,
+        "_tool",
+        Mock(side_effect=CycloError("candidate catalogue is invalid")),
+    )
+    stop = Mock()
+    monkeypatch.setattr(gateway, "stop", stop)
+
+    with pytest.raises(CycloError, match="candidate catalogue"):
+        gateway.login(["unknown", "--api-key-stdin"])
+
+    stop.assert_not_called()
+    controller.start_built.assert_not_called()
+
+
+def test_gateway_readiness_failure_reports_cleanup_failure(
+    tmp_path: Path,
+) -> None:
+    controller = Mock()
+    gateway = Gateway(
+        tmp_path / "components",
+        controller=controller,
+    )
+    status = ComponentStatus(
+        "gateway",
+        "gateway",
+        IMAGE_ID,
+        CONTAINER_ID,
+        True,
+        "running",
+        "healthy",
+        True,
+        "not-ready",
+        "invalid gateway socket",
+    )
+    controller.stop.side_effect = CycloError("Docker removal failed")
+
+    with pytest.raises(
+        CycloError,
+        match="invalid gateway socket; cleanup failed: Docker removal failed",
+    ):
+        gateway._require_working(status)
+
+    controller.stop.assert_called_once_with(gateway.component, CONTAINER_ID)
 
 
 def test_destroy_store_rejects_a_foreign_volume_user_before_stopping(

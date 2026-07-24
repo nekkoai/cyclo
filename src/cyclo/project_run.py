@@ -8,6 +8,7 @@ import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 from .dashboard import dashboard_host_is_loopback
 from .docker import ContainerSpec, Docker, overlaps, overlaps_lexically
@@ -22,8 +23,9 @@ from .project import (
     ProjectDefinition,
     ProjectMount,
     ProjectTeam,
-    render_project_manifest,
+    render_container_project,
 )
+from .pi_runtime import model_incompatibility
 from .project_state import decode_instance_project, encode_project_mounts
 from .state import Instance, StateStore, validate_instance_id
 from .team import (
@@ -78,7 +80,7 @@ def new_instance(
         project_description=definition.description,
         project_generation=definition.definition_sha256,
         project_mounts=encode_project_mounts(definition.mounts),
-        launch_id="" if args.dry_run else secrets.token_hex(16),
+        launch_id=secrets.token_hex(16),
     )
 
 
@@ -94,7 +96,7 @@ class RunBinding:
     team: Team
     project_root: Path
     instance: Instance
-    manifest: str
+    project_config: str
     project_mounts: tuple[ProjectMount, ...] = ()
     source_identities: tuple[SourceIdentity, ...] = ()
 
@@ -189,7 +191,7 @@ def validate_running_mount_boundaries(
 ) -> None:
     selected_sources = _binding_mount_sources(binding)
     for running in store.list():
-        if not docker.container_lifecycle_active(running.container_name):
+        if not docker.container_lifecycle_active(running, system=store.system):
             continue
         active_sources = _stored_mount_sources(running)
         for selected_path, selected_kind, selected_label in selected_sources:
@@ -281,7 +283,10 @@ def project_run_bindings(
                 team=team,
                 project_root=definition.path.parent,
                 instance=instance,
-                manifest=render_project_manifest(definition, team=selected),
+                project_config=render_container_project(
+                    definition,
+                    team=selected,
+                ),
                 project_mounts=definition.mounts,
                 source_identities=capture_source_identities(
                     (team.root, *(mount.path for mount in definition.mounts))
@@ -331,7 +336,9 @@ def binding_matches(previous: Instance, binding: RunBinding) -> bool:
 def preflight_binding(binding: RunBinding, store: StateStore, docker: Docker) -> None:
     instance = binding.instance
     verify_source_identities(binding)
-    state = docker.container_lifecycle_state(instance.container_name)
+    state = docker.previous_launch_lifecycle_state(
+        instance, system=store.system
+    )
     if state.lifecycle_active:
         raise CycloError(
             f"Cyclo instance is already active ({state.value}): {instance.id}"
@@ -346,12 +353,31 @@ def preflight_binding(binding: RunBinding, store: StateStore, docker: Docker) ->
     validate_running_mount_boundaries(binding, store, docker)
 
 
-def validate_team_models(team: Team, available_models: set[str]) -> None:
+def validate_pi_team_models(
+    team: Team,
+    catalogue: Mapping[str, object],
+) -> None:
+    raw_models = catalogue.get("models")
+    if not isinstance(raw_models, list):
+        raise CycloError("provider system returned an invalid model catalogue")
+    models = {
+        model.get("id"): model
+        for model in raw_models
+        if isinstance(model, dict) and isinstance(model.get("id"), str)
+    }
     for agent in team.agents:
-        if agent.model not in available_models:
+        model = models.get(agent.model)
+        if model is None:
             raise CycloError(
                 f"agent {agent.name} requests unavailable provider model "
                 f"{agent.model!r}"
+            )
+        incompatibility = model_incompatibility(model)
+        if incompatibility:
+            raise CycloError(
+                f"agent {agent.name} requests provider model {agent.model!r} "
+                f"that is incompatible with the {agent.engine} runtime: "
+                f"{incompatibility}"
             )
 
 
@@ -387,77 +413,80 @@ def materialize_pi_settings(
     return target
 
 
-def start_binding(
+def start_binding_locked(
     args: argparse.Namespace,
     binding: RunBinding,
     source: Path,
     store: StateStore,
     docker: Docker,
 ) -> None:
+    """Start one team while the caller holds the installation control lock."""
+
     instance = binding.instance
     spec = container_spec(binding, store, args)
-    with store.locked():
-        preflight_binding(binding, store, docker)
-        store.materialize_agentws(
+    preflight_binding(binding, store, docker)
+    store.materialize_agentws(
+        instance.id,
+        source / "template",
+        Path(__file__).with_name("container_runtime.py"),
+        project_config=binding.project_config,
+    )
+    if binding.project_mounts:
+        store.materialize_workspace_layout(
             instance.id,
-            source / "template",
-            Path(__file__).with_name("container_runtime.py"),
-            project_manifest=binding.manifest,
+            [mount.name for mount in binding.project_mounts if mount.writable],
         )
-        if binding.project_mounts:
-            store.materialize_workspace_layout(
-                instance.id,
-                [mount.name for mount in binding.project_mounts if mount.writable],
-            )
-            store.materialize_readonly_layout(
-                instance.id,
-                [mount.name for mount in binding.project_mounts if mount.read_only],
-            )
-        materialize_pi_settings(store, instance, binding.team)
+        store.materialize_readonly_layout(
+            instance.id,
+            [mount.name for mount in binding.project_mounts if mount.read_only],
+        )
+    materialize_pi_settings(store, instance, binding.team)
+    try:
+        store.save(instance)
+        docker.ensure_network(
+            instance.network_name,
+            instance.id,
+            system=store.system,
+            offline=instance.offline,
+        )
+        verify_source_identities(binding)
+        validate_running_mount_boundaries(binding, store, docker)
+        instance.port = docker.start(spec)
+        docker.wait_ready(
+            instance,
+            instance.port,
+            system=store.system,
+            host=instance.agentws_host,
+        )
+        store.save(instance)
+    except BaseException as start_error:
+        instance.active = False
+        instance.port = None
+        cleanup_errors: list[str] = []
         try:
             store.save(instance)
-            docker.ensure_network(
-                instance.network_name,
-                instance.id,
+        except Exception as cleanup_error:
+            cleanup_errors.append(
+                f"inactive state rollback failed: {cleanup_error}"
+            )
+        try:
+            stop_remove_instance_container(
+                docker,
+                instance,
                 system=store.system,
-                offline=instance.offline,
             )
-            verify_source_identities(binding)
-            validate_running_mount_boundaries(binding, store, docker)
-            instance.port = docker.start(spec)
-            docker.wait_ready(
-                instance.container_name,
-                instance.port,
-                host=instance.agentws_host,
+        except Exception as cleanup_error:
+            cleanup_errors.append(f"container rollback failed: {cleanup_error}")
+        try:
+            docker.remove_network(
+                instance.network_name, instance.id, system=store.system
             )
-            store.save(instance)
-        except BaseException as start_error:
-            instance.active = False
-            instance.port = None
-            cleanup_errors: list[str] = []
-            try:
-                store.save(instance)
-            except Exception as cleanup_error:
-                cleanup_errors.append(f"inactive state rollback failed: {cleanup_error}")
-            try:
-                stop_remove_instance_container(
-                    docker,
-                    instance,
-                    system=store.system,
-                    expected_launch_id=instance.launch_id or None,
-                )
-            except Exception as cleanup_error:
-                cleanup_errors.append(f"container rollback failed: {cleanup_error}")
-            try:
-                docker.remove_network(
-                    instance.network_name, instance.id, system=store.system
-                )
-            except Exception as cleanup_error:
-                cleanup_errors.append(f"network rollback failed: {cleanup_error}")
-            if cleanup_errors:
-                reason = str(start_error) or type(start_error).__name__
-                raise CycloError(
-                    f"Cyclo instance {instance.id!r} failed to start ({reason}); "
-                    "rollback incomplete: " + "; ".join(cleanup_errors)
-                ) from start_error
-            raise
+        except Exception as cleanup_error:
+            cleanup_errors.append(f"network rollback failed: {cleanup_error}")
+        if cleanup_errors:
+            reason = str(start_error) or type(start_error).__name__
+            raise CycloError(
+                f"Cyclo instance {instance.id!r} failed to start ({reason}); "
+                "rollback incomplete: " + "; ".join(cleanup_errors)
+            ) from start_error
+        raise

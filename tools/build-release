@@ -136,7 +136,7 @@ docker build --pull \
     --file "$source_tree/src/cyclo/components/team-runtime/Dockerfile" \
     "$source_tree/src/cyclo/components"
 "$venv/bin/python" -c \
-    'import pathlib, sys; from cyclo.team_runtime_image import docker_runner, ensure_derived, image_id; base = docker_runner.inspect("image", sys.argv[1], missing=False); assert base is not None; root = pathlib.Path(sys.argv[2]); ensure_derived(sys.argv[3], root, image_id(base), build=True)' \
+    'import pathlib, sys; from cyclo.team_runtime_image import docker_runner, ensure_derived, image_id; base = docker_runner.inspect("image", sys.argv[1], missing=False); assert base is not None; root = pathlib.Path(sys.argv[2]); ensure_derived(sys.argv[3], root, image_id(base))' \
     "cyclo-team:release-$short_commit" \
     "$source_tree/tests/fixtures/derived-team" \
     "cyclo-derived-team:release-$short_commit"

@@ -57,12 +57,19 @@ def test_packaged_agentws_preserves_executable_modes() -> None:
 
 def test_packaged_agentws_has_no_provider_runtime_policy() -> None:
     tools = packaged_agentws_template() / "tools"
+    protocol = (packaged_agentws_template() / "AGENTS.md").read_text(
+        encoding="utf-8"
+    )
 
     for name in ("agent", "agent-pi-interactive", "run_agentws"):
         source = (tools / name).read_text(encoding="utf-8")
         assert "CYCLO_PROVIDER_RUNTIME" not in source
         assert "provider_runtime" not in source
         assert "X-Cyclo-Runtime" not in source
+
+    assert "Read `/agentws/project.cyclo`" in protocol
+    assert "PROJECT.md" not in protocol
+    assert "CYCLO_PROJECT_MANIFEST" not in protocol
 
 
 def test_packaged_agentws_materializes_as_an_executable_runtime(tmp_path: Path) -> None:
@@ -73,6 +80,12 @@ def test_packaged_agentws_materializes_as_an_executable_runtime(tmp_path: Path) 
         "standalone",
         packaged_agentws_template(),
         runtime_script,
+        project_config=(
+            "name standalone\n"
+            "description Packaged AgentWS test.\n"
+            "team /team ro\n"
+            "mount source /workspace/source rw\n"
+        ),
     )
 
     assert (runtime / "tools" / "run_agentws").stat().st_mode & stat.S_IXUSR

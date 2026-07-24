@@ -48,16 +48,18 @@ unique, and at least one agent must have the `planner` role. The model is an
 exact identifier from the outer Provider catalogue. The roster selects a
 model; it is not by itself an authorization boundary.
 
-The intended prompt composition is:
+Each agent receives four instruction inputs:
 
 1. the system-owned generic AgentWS protocol;
-2. the generated, host-path-free project manifest;
+2. the fixed, generated `/agentws/project.cyclo` file;
 3. optional team-wide policy from `AGENTS.md`; and
 4. the selected `roles/<role>.md`.
 
-The system-owned protocol is always included. A repository `AGENTS.md` is
-layered after it as team-specific policy, so a team never needs to copy
-Cyclo's generic filesystem and job-loop rules merely to add local behavior.
+The system protocol, optional team policy, and selected role are composed into
+the launch prompt. The project snapshot remains a separate instance-wide file
+that the system protocol requires agents to read. A team therefore never needs
+to copy Cyclo's generic filesystem and job-loop rules merely to add local
+behavior.
 For a writable team, changes to `/team/AGENTS.md` affect subsequently launched
 agents without modifying the system protocol.
 
@@ -69,18 +71,28 @@ Four separate inputs have separate owners:
 |---|---|
 | Installation `host.conf` | Installation-wide provider composition and available models |
 | Team repository | Agent roster, role behavior, optional team policy, and optionally the execution-image delta |
-| `project.cyclo` | Which teams run, which directories they receive, and each mount mode |
+| Host `project.cyclo` | Which teams run, which projects and inputs they receive, each mount mode, and authored instance-wide description/context |
 | Cyclo state root | Tasks, jobs, comments, results, transcripts, Pi state, generated runtime files, and instance metadata |
 
 At runtime, one generic team container receives:
 
 ```text
 /team                   selected team repository, read-only or read-write
-/workspace/<name>       declared writable project repositories
+/workspace/<name>       one declared writable project per rw mount
 /readonly/<name>        declared read-only supporting inputs
 /agentws                Cyclo-supplied AgentWS tools and per-instance queue
+/agentws/project.cyclo  generated, read-only container-facing project snapshot
 $CYCLO_PROVIDER_SOCKET  outer Provider Unix socket
 ```
+
+The generated snapshot uses the host `project.cyclo` grammar but its structured
+paths contain only the selected `team /team MODE` and container-visible
+mounts. Cyclo maps `mount NAME ... rw` to `/workspace/NAME` and
+`mount NAME ... ro` to `/readonly/NAME`; it copies the authored name,
+description, and optional context literally. Several `rw` declarations
+therefore expose several writable projects. Cyclo assigns none of them hidden
+priority: the description and context tell agents what each project is and how
+they relate. Do not put host paths or secrets in those authored text fields.
 
 Cyclo validates the repository, records its generation, selects its execution
 image, and launches the agents in the roster. Agents coordinate through the
@@ -165,6 +177,12 @@ base image ID, validates the completed candidate, and transactionally promotes
 it before starting any team. `cyclo refresh` stops and restarts the selected
 system through the same build path. Only the latest successfully promoted image
 is operational state; Cyclo keeps no registry of historical local builds.
+
+The final image must also leave the effective container user as root (the base
+image default, `USER root`, or `USER 0`). Cyclo's fixed entrypoint starts as
+root only long enough to prepare the host-mapped user and group, then drops
+privileges before starting AgentWS. A derived Dockerfile may switch users in
+builder stages, but must switch back to root in its final stage.
 
 Running or refreshing a team with a Dockerfile authorizes Cyclo to execute that
 repository's build through the Docker daemon and is therefore a

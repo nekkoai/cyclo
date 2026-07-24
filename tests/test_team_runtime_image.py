@@ -3,13 +3,20 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from cyclo import team_runtime_image
 
 
 IMAGE_ID = "sha256:" + "a" * 64
 
 
-def image_info(*, image_id: str = IMAGE_ID, base_image: str | None = None) -> dict[str, object]:
+def image_info(
+    *,
+    image_id: str = IMAGE_ID,
+    base_image: str | None = None,
+    user: object = "",
+) -> dict[str, object]:
     labels = (
         {team_runtime_image.BASE_IMAGE_LABEL: base_image}
         if base_image is not None
@@ -20,8 +27,17 @@ def image_info(*, image_id: str = IMAGE_ID, base_image: str | None = None) -> di
         "Config": {
             "Entrypoint": list(team_runtime_image.TEAM_RUNTIME_ENTRYPOINT),
             "Labels": labels,
+            "User": user,
         },
     }
+
+
+def image_info_without_user() -> dict[str, object]:
+    info = image_info()
+    config = info["Config"]
+    assert isinstance(config, dict)
+    del config["User"]
+    return info
 
 
 def test_packaged_team_image_uses_docker_build_context() -> None:
@@ -40,7 +56,10 @@ def test_packaged_team_image_uses_docker_build_context() -> None:
 
     dockerfile = team_runtime_image.dockerfile_path().read_text(encoding="utf-8")
     assert "COPY --from=agent-tools /opt/cyclo /opt/cyclo" in dockerfile
-    assert "/opt/cyclo/pi-provider/node_modules/@earendil-works/pi-ai" in dockerfile
+    assert (
+        "ln -s /opt/cyclo-agent-tools/lib/node_modules/@earendil-works/"
+        "pi-coding-agent/node_modules/@earendil-works/pi-ai"
+    ) in dockerfile
 
     command = team_runtime_image.build_command()
     assert command[-1] == str(root.parent)
@@ -61,6 +80,55 @@ def test_team_runtime_image_always_delegates_freshness_to_docker(monkeypatch) ->
     assert commands == [
         ("cyclo-runtime:test", team_runtime_image.build_command())
     ]
+
+
+def test_team_runtime_image_rejects_non_root_user(monkeypatch) -> None:
+    monkeypatch.setattr(
+        team_runtime_image.docker_runner,
+        "inspect",
+        lambda *_args, **_kwargs: image_info(user="1000:1000"),
+    )
+
+    with pytest.raises(
+        team_runtime_image.CycloError,
+        match="runtime ENTRYPOINT as root",
+    ):
+        team_runtime_image.require("cyclo-runtime:test")
+
+
+@pytest.mark.parametrize("user", ["", "0", "0:1000", "root", "root:cyclo"])
+def test_team_runtime_image_accepts_root_user(user: str, monkeypatch) -> None:
+    monkeypatch.setattr(
+        team_runtime_image.docker_runner,
+        "inspect",
+        lambda *_args, **_kwargs: image_info(user=user),
+    )
+
+    assert team_runtime_image.require("cyclo-runtime:test") == IMAGE_ID
+
+
+def test_team_runtime_image_accepts_docker_default_root_user(monkeypatch) -> None:
+    monkeypatch.setattr(
+        team_runtime_image.docker_runner,
+        "inspect",
+        lambda *_args, **_kwargs: image_info_without_user(),
+    )
+
+    assert team_runtime_image.require("cyclo-runtime:test") == IMAGE_ID
+
+
+def test_team_runtime_image_rejects_malformed_present_user(monkeypatch) -> None:
+    monkeypatch.setattr(
+        team_runtime_image.docker_runner,
+        "inspect",
+        lambda *_args, **_kwargs: image_info(user=None),
+    )
+
+    with pytest.raises(
+        team_runtime_image.CycloError,
+        match="cannot parse Cyclo team image user",
+    ):
+        team_runtime_image.require("cyclo-runtime:test")
 
 
 def test_derived_team_image_tracks_exact_base(
