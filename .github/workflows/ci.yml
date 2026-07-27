@@ -80,10 +80,7 @@ jobs:
             npm test --prefix "src/cyclo/components/$package"
           done
       - name: Audit shipped component dependencies
-        run: |
-          for package in protocol/component protocol/provider gateway passthrough pi-provider team-runtime; do
-            npm audit --omit=dev --package-lock-only --audit-level=high --prefix "src/cyclo/components/$package"
-          done
+        run: python3 tools/dependency-audit
       - name: Check POSIX shell syntax
         shell: bash
         run: |

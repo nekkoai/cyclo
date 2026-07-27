@@ -52,6 +52,7 @@ done
 [ -n "$AGENT_ID" ] || die "--agent-id <agent-id> is required"
 validate_agent_id "$AGENT_ID"
 require_jobs_dir
+require_tasks_dir
 
 claim_job() {
     job_id="$1"
@@ -79,6 +80,8 @@ claim_job() {
         release_job_control_lock
         return 1
     fi
+
+    finalize_pending_task_creation_locked "$job_dir"
 
     if ! repair_pending_ownership_locked "$job_dir"; then
         release_job_control_lock

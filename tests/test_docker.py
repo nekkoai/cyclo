@@ -171,6 +171,37 @@ def test_container_argv_has_only_scoped_runtime_mounts(
     assert "AGENTWS_UNSAFE_UNDOCUMENTED" not in rendered
 
 
+def test_container_argv_preserves_host_supplementary_groups(
+    tmp_path: Path,
+    team_repo: Path,
+    project_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "getuid", lambda: 1200)
+    monkeypatch.setattr(os, "getgid", lambda: 120)
+    monkeypatch.setattr(os, "getgroups", lambda: [900, 120, 42, 900, 42])
+    selected_instance = instance(team_repo, project_repo)
+    spec = ContainerSpec(
+        instance=selected_instance,
+        team=load_team(team_repo),
+        project=project_repo,
+        runtime_root=tmp_path / "runtime",
+        tasks_dir=tmp_path / "tasks",
+        jobs_dir=tmp_path / "jobs",
+        agents_dir=tmp_path / "agents",
+        pi_root=tmp_path / "pi",
+        provider_socket_dir=Path(selected_instance.provider_socket_path).parent,
+        system=SYSTEM,
+        port=0,
+    )
+
+    command = container_command(spec)
+
+    assert "CYCLO_HOST_UID=1200" in command
+    assert "CYCLO_HOST_GID=120" in command
+    assert command.count("CYCLO_EXTRA_GROUPS=42:900") == 1
+
+
 def test_legacy_project_mount_is_always_writable(
     tmp_path: Path, team_repo: Path, project_repo: Path
 ) -> None:
@@ -422,23 +453,35 @@ def test_team_commands_use_the_verified_immutable_container_id(
 ) -> None:
     docker = Docker()
     selected = instance(tmp_path / "team", tmp_path / "project")
+    source = tmp_path / "task.md"
+    source.write_text("Create a UART.\n", encoding="utf-8")
+    source.chmod(0o644)
     commands: list[list[str]] = []
     monkeypatch.setattr(
         docker,
         "_inspect_container",
         lambda _name: owned_container_info(selected),
     )
-    monkeypatch.setattr(
-        docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
-    )
+
+    def record(command, **_kwargs):
+        recorded = list(command)
+        if recorded[:3] == ["docker", "cp", "--archive"]:
+            staged = Path(recorded[3])
+            assert staged != source
+            assert staged.read_text(encoding="utf-8") == "Create a UART.\n"
+            assert staged.stat().st_uid == os.getuid()
+            assert staged.stat().st_gid == os.getgid()
+            assert staged.stat().st_mode & 0o777 == 0o600
+            recorded[3] = "<private-task-spec>"
+        commands.append(recorded)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker, "_run", record)
 
     docker.logs(selected, system=SYSTEM, follow=False)
     docker.copy_to(
         selected,
-        tmp_path / "task.md",
+        source,
         "/tmp/task.md",
         system=SYSTEM,
     )
@@ -454,7 +497,8 @@ def test_team_commands_use_the_verified_immutable_container_id(
         [
             "docker",
             "cp",
-            str(tmp_path / "task.md"),
+            "--archive",
+            "<private-task-spec>",
             "verified-container-id:/tmp/task.md",
         ],
         [

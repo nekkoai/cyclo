@@ -211,6 +211,73 @@ require_task_record_locked() {
         || die "task '$(basename "$_task_record_dir")' has invalid state '$_task_record_state'"
 }
 
+# `task-create` holds the initial planner job's control lock from publishing
+# status=pending until removing the task's .creating marker. SIGKILL releases
+# that lock. The next startup, waiter, or claimant finishes the same transaction
+# only after proving that the task and planner job carry the same token.
+finalize_pending_task_creation_locked() {
+    _creation_job_dir="$1"
+    _creation_job_marker="$_creation_job_dir/.task-create-transaction"
+
+    if [ ! -e "$_creation_job_marker" ] && [ ! -L "$_creation_job_marker" ]; then
+        return 0
+    fi
+    [ -f "$_creation_job_marker" ] && [ ! -L "$_creation_job_marker" ] \
+        && [ -s "$_creation_job_marker" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid task-create transaction"
+    [ "$(read_status "$_creation_job_dir")" = "pending" ] || return 0
+
+    _creation_task_id_file="$_creation_job_dir/task-id"
+    [ -f "$_creation_task_id_file" ] && [ ! -L "$_creation_task_id_file" ] \
+        && [ -s "$_creation_task_id_file" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid task-id"
+    _creation_task_id="$(cat "$_creation_task_id_file" 2>/dev/null || true)"
+    validate_task_id "$_creation_task_id"
+    [ "$(basename "$_creation_job_dir")" = "$_creation_task_id-plan" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' does not match task '$_creation_task_id'"
+    [ -f "$_creation_job_dir/role" ] && [ ! -L "$_creation_job_dir/role" ] \
+        && [ "$(cat "$_creation_job_dir/role" 2>/dev/null || true)" = "planner" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid role"
+    [ -f "$_creation_job_dir/spec.md" ] && [ ! -L "$_creation_job_dir/spec.md" ] \
+        && [ -s "$_creation_job_dir/spec.md" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid spec.md"
+    [ -f "$_creation_job_dir/log.md" ] && [ ! -L "$_creation_job_dir/log.md" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid log.md"
+    [ -d "$_creation_job_dir/workspace" ] && [ ! -L "$_creation_job_dir/workspace" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid workspace"
+
+    _creation_task_dir="$TASKS_DIR/$_creation_task_id"
+    _creation_task_marker="$_creation_task_dir/.creating"
+    acquire_task_control_lock "$_creation_task_dir"
+    if [ ! -e "$_creation_task_marker" ] && [ ! -L "$_creation_task_marker" ]; then
+        release_task_control_lock
+        return 0
+    fi
+    [ -f "$_creation_task_marker" ] && [ ! -L "$_creation_task_marker" ] \
+        && [ -s "$_creation_task_marker" ] \
+        || die "task '$_creation_task_id' has an invalid creation marker"
+    for _creation_name in spec.md state log.md; do
+        _creation_path="$_creation_task_dir/$_creation_name"
+        [ -f "$_creation_path" ] && [ ! -L "$_creation_path" ] \
+            || die "task '$_creation_task_id' has an invalid $_creation_name"
+    done
+    [ -s "$_creation_task_dir/spec.md" ] \
+        || die "task '$_creation_task_id' has an empty spec.md"
+    [ "$(cat "$_creation_task_dir/state" 2>/dev/null || true)" = "open" ] \
+        || die "task '$_creation_task_id' has invalid state during creation recovery"
+    [ "$(cat "$_creation_task_marker" 2>/dev/null || true)" = \
+        "$(cat "$_creation_job_marker" 2>/dev/null || true)" ] \
+        || die "task '$_creation_task_id' does not match its initial planner transaction"
+
+    rm -f -- "$_creation_task_marker" \
+        || die "cannot recover task '$_creation_task_id' creation"
+    [ ! -e "$_creation_task_marker" ] && [ ! -L "$_creation_task_marker" ] \
+        || die "cannot recover task '$_creation_task_id' creation"
+    release_task_control_lock
+    append_log "$_creation_job_dir" "Recovered interrupted task creation" \
+        "Finalized task '$_creation_task_id' before exposing its planner job."
+}
+
 # A pending job cannot have a committed owner.  If a claimant or releaser died
 # between its atomic status write and removing lock/, finish that interrupted
 # transition while the caller holds .control.lock.  A non-empty lock is treated

@@ -89,10 +89,7 @@ printf '%s\n' '==> source tests'
 )
 
 printf '%s\n' '==> dependency audits'
-for package in protocol/component protocol/provider gateway passthrough pi-provider team-runtime; do
-    npm audit --package-lock-only --omit=dev --audit-level=high \
-        --prefix "$source_tree/src/cyclo/components/$package"
-done
+"$venv/bin/python" "$source_tree/tools/dependency-audit" "$source_tree"
 
 printf '%s\n' '==> wheel-only acceptance'
 CYCLO_RELEASE_BUILD_PYTHON="$venv/bin/python" \

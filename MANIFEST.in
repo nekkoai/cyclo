@@ -5,6 +5,7 @@ include SECURITY.md
 include pyproject.toml
 include tools/release-acceptance
 include tools/build-release
+include tools/dependency-audit
 include tools/runtime-write-acceptance
 include tools/normalize-distributions
 include tools/release-manifest

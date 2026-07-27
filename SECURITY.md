@@ -44,6 +44,29 @@ These are extension points, not claims that every such policy is built in.
 The normative threat model, capability semantics, and policy composition points
 are documented in [Security architecture](docs/architecture.md#security-architecture).
 
+## Temporary upstream dependency exception
+
+The 0.2 team runtime includes
+`@earendil-works/pi-coding-agent@0.81.1`. Its published npm shrinkwrap pins a
+nested `brace-expansion@5.0.7` dependency affected by
+[GHSA-mh99-v99m-4gvg](https://github.com/advisories/GHSA-mh99-v99m-4gvg):
+a crafted brace expression can exhaust memory and terminate the team process.
+This is an accepted workload-availability risk, not an expansion of authority.
+It exposes no gateway credentials, Docker control, undeclared mounts, unrelated
+Provider sockets, or other team state. Cyclo already treats agent-controlled
+code as arbitrary execution inside the team container; deployments requiring
+host-level availability must impose container or VM memory ceilings.
+
+No fixed upstream Pi release was available when this exception was accepted on
+2026-07-27. The independently resolvable `pi-lens` copy is fixed at
+`brace-expansion@5.0.8`; the audit exception covers only Pi 0.81.1, advisory
+GHSA-mh99-v99m-4gvg, version 5.0.7, and the exact nested path
+`node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion`.
+It covers no other package, path, version, advisory, or critical finding. CI
+and the release audit inspect the latest published Pi dependency lock and fail
+once a fixed release is available, forcing this exception to be removed and the
+aligned Pi dependencies to be updated.
+
 ## Reporting a vulnerability
 
 Please do not disclose a suspected vulnerability in a public issue, discussion,

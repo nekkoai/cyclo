@@ -1525,6 +1525,48 @@ def test_task_cleanup_failure_does_not_mask_creation_failure(
     assert "status 9" in error
 
 
+def test_task_copy_failure_removes_any_partial_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = instance("silicon-rtl", tmp_path, active=True)
+    persist(store, selected)
+    specification = tmp_path / "task.md"
+    specification.write_text("Create a UART.\n", encoding="utf-8")
+    commands: list[tuple[str, ...]] = []
+
+    class FakeDocker:
+        def container_running(self, instance, *, system):
+            return True
+
+        def copy_to(self, instance, source, destination, *, system):
+            raise CycloError("injected copy failure")
+
+        def exec(self, instance, command, *, system, check=True, user=None):
+            commands.append(tuple(command))
+            return 0
+
+    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
+
+    assert main(
+        [
+            "--state-root",
+            str(store.root),
+            "task",
+            "run",
+            selected.id,
+            "uart",
+            str(specification),
+        ]
+    ) == 1
+    assert len(commands) == 1
+    assert commands[0][:2] == ("rm", "-f")
+    assert commands[0][2].startswith("/tmp/cyclo-task-uart-")
+    assert "injected copy failure" in capsys.readouterr().err
+
+
 def test_task_cleanup_failure_does_not_overturn_committed_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

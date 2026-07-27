@@ -107,8 +107,11 @@ planner_job_has_complete_base() {
 planner_job_is_staged() {
     directory="$1"
     transaction="$2"
-    planner_job_has_complete_base "$directory" "$transaction" \
-        && ! path_exists "$directory/status"
+    planner_job_has_complete_base "$directory" "$transaction" || return 1
+    if ! path_exists "$directory/status"; then
+        return 0
+    fi
+    file_equals "$directory/status" "pending"
 }
 
 planner_job_is_complete() {
@@ -166,30 +169,42 @@ finish_commit() {
     # no-clobber renames; the transaction markers handle SIGKILL recovery.
     COMMIT_STARTED=1
     mask_commit_signals
+    if [ "$publish_job" -eq 1 ]; then
+        commit_job_dir="$PLAN_JOB_STAGE"
+    else
+        commit_job_dir="$PLAN_JOB_DIR"
+    fi
+    # The lock is inode-based and remains held if the staged job is renamed.
+    # Write pending while the job is still hidden, then publish it already
+    # locked so no claimant can observe the task's .creating marker.
+    acquire_job_control_lock "$commit_job_dir"
     if [ "$publish_task" -eq 1 ]; then
         publish_noreplace "$TASK_STAGE" "$TASK_DIR" "task"
         OWN_TASK_STAGE=0
     fi
-    if [ "$publish_job" -eq 1 ]; then
-        publish_noreplace "$PLAN_JOB_STAGE" "$PLAN_JOB_DIR" "initial planner job"
-        OWN_PLAN_STAGE=0
-    fi
     task_is_complete "$TASK_DIR" "$TRANSACTION_ID" \
         || die "published task '$TASK_ID' is incomplete"
-    planner_job_has_complete_base "$PLAN_JOB_DIR" "$TRANSACTION_ID" \
+    planner_job_has_complete_base "$commit_job_dir" "$TRANSACTION_ID" \
         || die "published initial planner job '$PLAN_JOB_ID' is incomplete"
     # New stages already contain this persistent mutex. Acquiring it here also
     # upgrades a recoverable task staged by an older AgentWS version before the
     # initial planner job becomes claimable.
     acquire_task_control_lock "$TASK_DIR"
     release_task_control_lock
-    if ! path_exists "$PLAN_JOB_DIR/status"; then
-        write_file_atomic "$PLAN_JOB_DIR/status" "pending"
+    if ! path_exists "$commit_job_dir/status"; then
+        write_file_atomic "$commit_job_dir/status" "pending"
+    fi
+    planner_job_is_complete "$commit_job_dir" "$TRANSACTION_ID" \
+        || die "published initial planner job '$PLAN_JOB_ID' is incomplete"
+    if [ "$publish_job" -eq 1 ]; then
+        publish_noreplace "$PLAN_JOB_STAGE" "$PLAN_JOB_DIR" "initial planner job"
+        OWN_PLAN_STAGE=0
     fi
     planner_job_is_complete "$PLAN_JOB_DIR" "$TRANSACTION_ID" \
         || die "published initial planner job '$PLAN_JOB_ID' is incomplete"
     rm -f -- "$TASK_DIR/.creating" \
         || die "cannot finalize task '$TASK_ID' creation"
+    release_job_control_lock
     COMMIT_STARTED=0
     catch_signals
 }

@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Audit shipped npm locks, allowing one exact temporary Pi finding."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+COMPONENTS = (
+    "protocol/component",
+    "protocol/provider",
+    "gateway",
+    "passthrough",
+    "pi-provider",
+    "team-runtime",
+)
+PI_PACKAGE = "@earendil-works/pi-coding-agent"
+PI_VERSION = "0.81.1"
+PI_LOCK_PATH = f"node_modules/{PI_PACKAGE}"
+WAIVED_PACKAGE = "brace-expansion"
+WAIVED_VERSION = "5.0.7"
+WAIVED_NODE = f"{PI_LOCK_PATH}/node_modules/{WAIVED_PACKAGE}"
+WAIVED_ADVISORY = "https://github.com/advisories/GHSA-mh99-v99m-4gvg"
+FIXED_BRACE_VERSION = (5, 0, 8)
+
+
+class AuditPolicyError(RuntimeError):
+    pass
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise AuditPolicyError(f"cannot read {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise AuditPolicyError(f"{path} is not a JSON object")
+    return value
+
+
+def parse_audit_output(output: str, *, source: str) -> dict[str, Any]:
+    try:
+        report = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise AuditPolicyError(f"{source} returned malformed JSON") from error
+    if (
+        not isinstance(report, dict)
+        or report.get("auditReportVersion") != 2
+        or "error" in report
+        or not isinstance(report.get("vulnerabilities"), dict)
+        or not isinstance(report.get("metadata"), dict)
+        or not isinstance(report["metadata"].get("vulnerabilities"), dict)
+    ):
+        raise AuditPolicyError(f"{source} returned an invalid or failed audit report")
+    return report
+
+
+def run_audit(package_dir: Path) -> tuple[dict[str, Any], int]:
+    completed = subprocess.run(
+        [
+            "npm",
+            "audit",
+            "--json",
+            "--omit=dev",
+            "--package-lock-only",
+            "--audit-level=high",
+            "--prefix",
+            str(package_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    report = parse_audit_output(completed.stdout, source=f"npm audit ({package_dir})")
+    if completed.returncode not in (0, 1):
+        raise AuditPolicyError(
+            f"npm audit ({package_dir}) failed with status {completed.returncode}"
+        )
+    return report, completed.returncode
+
+
+def high_findings(report: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    findings = []
+    for name, finding in report["vulnerabilities"].items():
+        if not isinstance(name, str) or not isinstance(finding, dict):
+            raise AuditPolicyError("npm audit returned an invalid finding")
+        severity = finding.get("severity")
+        if severity not in {"info", "low", "moderate", "high", "critical"}:
+            raise AuditPolicyError(f"npm audit returned an invalid severity for {name}")
+        if severity in {"high", "critical"}:
+            findings.append((name, finding))
+
+    counts = report["metadata"]["vulnerabilities"]
+    if (
+        not isinstance(counts.get("high"), int)
+        or not isinstance(counts.get("critical"), int)
+        or counts["high"] < 0
+        or counts["critical"] < 0
+        or counts["high"] + counts["critical"] != len(findings)
+    ):
+        raise AuditPolicyError("npm audit findings disagree with its metadata")
+    return findings
+
+
+def version_is_fixed(value: object) -> bool:
+    if not isinstance(value, str):
+        raise AuditPolicyError(f"invalid package version {value!r}")
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.*)?", value)
+    if match is None:
+        raise AuditPolicyError(f"invalid package version {value!r}")
+    version = tuple(int(part) for part in match.group(1, 2, 3))
+    return version > FIXED_BRACE_VERSION or (
+        version == FIXED_BRACE_VERSION and match.group(4) is None
+    )
+
+
+def validate_waiver_lock(package_dir: Path) -> None:
+    package = read_json(package_dir / "package.json")
+    packages = read_json(package_dir / "package-lock.json").get("packages")
+    if not isinstance(packages, dict):
+        raise AuditPolicyError("team-runtime lock has no package map")
+    root = packages.get("")
+    pi = packages.get(PI_LOCK_PATH)
+    nested = packages.get(WAIVED_NODE)
+    declared = package.get("dependencies")
+    locked = root.get("dependencies") if isinstance(root, dict) else None
+    if (
+        not isinstance(declared, dict)
+        or declared.get(PI_PACKAGE) != PI_VERSION
+        or not isinstance(root, dict)
+        or not isinstance(locked, dict)
+        or locked.get(PI_PACKAGE) != PI_VERSION
+        or not isinstance(pi, dict)
+        or pi.get("version") != PI_VERSION
+        or pi.get("hasShrinkwrap") is not True
+        or not isinstance(nested, dict)
+        or nested.get("version") != WAIVED_VERSION
+    ):
+        raise AuditPolicyError(
+            f"temporary waiver requires shrinkwrapped {PI_PACKAGE}@{PI_VERSION} "
+            f"with only {WAIVED_NODE}@{WAIVED_VERSION}"
+        )
+    independent = packages.get(f"node_modules/{WAIVED_PACKAGE}")
+    if isinstance(independent, dict) and not version_is_fixed(
+        independent.get("version")
+    ):
+        raise AuditPolicyError(f"independent {WAIVED_PACKAGE} copy remains vulnerable")
+
+
+def validate_team_runtime(
+    report: dict[str, Any], returncode: int, package_dir: Path
+) -> None:
+    findings = high_findings(report)
+    if len(findings) != 1:
+        raise AuditPolicyError(
+            "team-runtime does not have exactly the documented temporary finding"
+        )
+    name, finding = findings[0]
+    via = finding.get("via")
+    nodes = finding.get("nodes")
+    exact = (
+        name == WAIVED_PACKAGE
+        and finding.get("name") == WAIVED_PACKAGE
+        and finding.get("severity") == "high"
+        and isinstance(via, list)
+        and len(via) == 1
+        and isinstance(via[0], dict)
+        and via[0].get("name") == WAIVED_PACKAGE
+        and via[0].get("dependency") == WAIVED_PACKAGE
+        and via[0].get("severity") == "high"
+        and via[0].get("url") == WAIVED_ADVISORY
+        and nodes == [WAIVED_NODE]
+        and report["metadata"]["vulnerabilities"]["high"] == 1
+        and report["metadata"]["vulnerabilities"]["critical"] == 0
+        and returncode == 1
+    )
+    if not exact:
+        raise AuditPolicyError(
+            "team-runtime finding does not exactly match the documented Pi exception"
+        )
+    validate_waiver_lock(package_dir)
+
+
+def latest_pi_lock() -> tuple[str, dict[str, Any]]:
+    with tempfile.TemporaryDirectory(prefix="cyclo-pi-audit-") as temporary:
+        completed = subprocess.run(
+            [
+                "npm",
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                "--prefix",
+                temporary,
+                f"{PI_PACKAGE}@latest",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AuditPolicyError("cannot inspect the latest published Pi package")
+        lock = read_json(Path(temporary) / "package-lock.json")
+        packages = lock.get("packages")
+        pi = packages.get(PI_LOCK_PATH) if isinstance(packages, dict) else None
+        if not isinstance(pi, dict) or not isinstance(pi.get("version"), str):
+            raise AuditPolicyError("latest published Pi produced an invalid lock")
+        return pi["version"], lock
+
+
+def validate_no_fixed_pi_release(version: str, lock: dict[str, Any]) -> list[str]:
+    packages = lock.get("packages")
+    if not isinstance(packages, dict):
+        raise AuditPolicyError(f"latest {PI_PACKAGE}@{version} has no package map")
+    versions = [
+        value.get("version")
+        for path, value in packages.items()
+        if isinstance(path, str)
+        and (
+            path == f"node_modules/{WAIVED_PACKAGE}"
+            or path.endswith(f"/node_modules/{WAIVED_PACKAGE}")
+        )
+        and isinstance(value, dict)
+    ]
+    affected = [value for value in versions if not version_is_fixed(value)]
+    if not versions or not affected:
+        raise AuditPolicyError(
+            f"latest {PI_PACKAGE}@{version} fixes {WAIVED_PACKAGE}; "
+            "remove the waiver and update Pi"
+        )
+    return affected
+
+
+def audit_repository(root: Path) -> None:
+    component_root = root / "src" / "cyclo" / "components"
+    for name in COMPONENTS:
+        package_dir = component_root / name
+        report, returncode = run_audit(package_dir)
+        if name == "team-runtime":
+            validate_team_runtime(report, returncode, package_dir)
+        else:
+            findings = high_findings(report)
+            if findings or returncode != 0:
+                packages = ", ".join(name for name, _ in findings)
+                raise AuditPolicyError(f"{name}: high/critical findings: {packages}")
+            print(f"{name}: no high or critical vulnerabilities")
+
+    latest_version, latest_lock = latest_pi_lock()
+    affected = validate_no_fixed_pi_release(latest_version, latest_lock)
+    versions = ", ".join(sorted({str(value) for value in affected}))
+    print(
+        "team-runtime: TEMPORARY WAIVER "
+        f"{WAIVED_ADVISORY} at {WAIVED_NODE}@{WAIVED_VERSION}; "
+        f"latest {PI_PACKAGE}@{latest_version} remains affected ({versions})"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "root", nargs="?", type=Path, default=Path(__file__).resolve().parents[1]
+    )
+    arguments = parser.parse_args(argv)
+    try:
+        audit_repository(arguments.root.resolve())
+    except AuditPolicyError as error:
+        print(f"dependency audit: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
