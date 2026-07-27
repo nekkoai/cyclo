@@ -80,13 +80,18 @@ names. A user-selected custom image is explicit shared authority and is not
 renamed.
 
 The provider graph belongs to the installation rather than being selected
-independently. The default installation reads `/etc/cyclo/host.conf`; setting
-`CYCLO_STATE_ROOT` or `--state-root` selects `host.conf` inside that root.
-Status and lifecycle commands therefore cannot accidentally pair one
-installation's state with another installation's provider graph. This is
-namespace separation inside one trusted Docker host, not a claim of protection
-from that host's administrator; mutually distrustful administrators still
-require separate OS/VM boundaries.
+independently. When the provider graph is first applied, an implicitly selected
+state root binds to `/etc/cyclo/host.conf`; a root selected through
+`CYCLO_STATE_ROOT` or `--state-root` binds to `host.conf` inside that root. The
+binding is persisted under the same state lock as provider lifecycle changes.
+Read-only validation and inspection may parse an unbound graph but do not create
+state; gateway-only operations neither read nor create the binding. Later
+processes honor it even if their environment or spelling of the canonical root
+differs; two processes racing cannot apply different provider graphs to one
+root.
+This is namespace separation inside one trusted Docker host, not a claim of
+protection from that host's administrator; mutually distrustful administrators
+still require separate OS/VM boundaries.
 
 ### Capability model
 
@@ -316,7 +321,12 @@ The gateway rejects only invalid framing at this boundary. It does not validate
 inference contents. Credential and process controls remain out of band:
 `apiKey`, arbitrary headers/environment, callback/client objects, the abort
 signal, and native transport/timeout/retry controls cannot be supplied through
-the payload. All other JSON Pi options pass without a Cyclo allowlist.
+the payload. All other JSON Pi options pass without a Cyclo allowlist. Before a
+native event leaves the credential boundary, the gateway makes one
+schema-independent containment check over its serialized JSON strings and
+property names. An event that exactly reflects gateway-injected authentication
+material is suppressed and becomes a generic transport error; every other
+event remains unchanged.
 
 The normative details are in [Provider protocol v1](provider-protocol.md).
 

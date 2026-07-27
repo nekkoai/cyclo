@@ -26,6 +26,11 @@ the pinned `pi-ai` `streamSimple` implementation with the gateway-owned native
 model and credential. It does not interpret or validate prompt content,
 history, tools, JSON Schema, reasoning, tool arguments, or returned Pi events.
 Every native Pi event is serialized immediately into one response payload.
+The one gateway-specific egress check is schema-independent: if a serialized
+event exactly reflects an API key or authentication-header value injected by
+the gateway, the event is discarded and inference fails with a generic
+`DATA_LOSS` error. Events without gateway authentication material remain
+unchanged.
 
 The caller cannot choose credentials or gateway process controls. `apiKey`,
 arbitrary headers/environment, injected clients, callbacks, and the abort

@@ -20,6 +20,7 @@ from .installation import installation_id, team_container_name, team_network_nam
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LAUNCH_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 DEFAULT_AGENTWS_HOST = "127.0.0.1"
+HOST_CONFIG_SCOPES = frozenset({"system", "state"})
 
 
 def utc_now() -> str:
@@ -175,11 +176,116 @@ class Instance:
 
 
 class StateStore:
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        *,
+        requested_host_config_scope: str | None = None,
+    ) -> None:
+        scope = requested_host_config_scope
+        if scope is None:
+            scope = "state" if root is not None else "system"
+        if scope not in HOST_CONFIG_SCOPES:
+            raise CycloError(
+                "host configuration scope must be 'system' or 'state'"
+            )
         self.root = (root or default_state_root()).expanduser().resolve()
         self.instances_dir = self.root / "instances"
         self.components_root = self.root / "components"
         self.lock_path = self.root / "control.lock"
+        self.host_config_scope_path = self.root / "host-config.scope"
+        self._requested_host_config_scope = scope
+        self._selected_host_config_scope: str | None = None
+
+    @property
+    def host_config_scope(self) -> str:
+        if self._selected_host_config_scope is None:
+            self._selected_host_config_scope = (
+                self._read_host_config_scope()
+                or self._requested_host_config_scope
+            )
+        return self._selected_host_config_scope
+
+    def _read_host_config_scope(self) -> str | None:
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                self.host_config_scope_path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise CycloError(
+                    f"host configuration scope is not a regular file: "
+                    f"{self.host_config_scope_path}"
+                )
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise CycloError(
+                    f"host configuration scope is not private: "
+                    f"{self.host_config_scope_path}"
+                )
+            if metadata.st_size > 8:
+                raise CycloError(
+                    f"invalid host configuration scope: "
+                    f"{self.host_config_scope_path}"
+                )
+            with os.fdopen(descriptor, "r", encoding="ascii") as stream:
+                descriptor = -1
+                content = stream.read(9)
+        except FileNotFoundError:
+            return None
+        except CycloError:
+            raise
+        except (OSError, UnicodeError) as exc:
+            raise CycloError(
+                f"cannot read host configuration scope "
+                f"{self.host_config_scope_path}: {exc}"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if content not in {"system\n", "state\n"}:
+            raise CycloError(
+                f"invalid host configuration scope: "
+                f"{self.host_config_scope_path}"
+            )
+        return content.rstrip("\n")
+
+    def _bind_host_config_scope(self) -> None:
+        if self._selected_host_config_scope is None:
+            return
+        persisted = self._read_host_config_scope()
+        if persisted == self._selected_host_config_scope:
+            return
+        if persisted is not None:
+            raise CycloError(
+                "Cyclo installation configuration was initialized by another "
+                "process; retry the command"
+            )
+        temporary = self.host_config_scope_path.with_name(
+            f".{self.host_config_scope_path.name}.tmp."
+            f"{os.getpid()}.{os.urandom(6).hex()}"
+        )
+        try:
+            temporary.write_text(
+                self._selected_host_config_scope + "\n",
+                encoding="ascii",
+            )
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, self.host_config_scope_path)
+        except OSError as exc:
+            raise CycloError(
+                f"cannot persist host configuration scope "
+                f"{self.host_config_scope_path}: {exc}"
+            ) from exc
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @property
     def system(self) -> str:
@@ -215,6 +321,7 @@ class StateStore:
                 os.chmod(self.lock_path, 0o600)
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
                 try:
+                    self._bind_host_config_scope()
                     yield
                 finally:
                     fcntl.flock(stream.fileno(), fcntl.LOCK_UN)

@@ -133,8 +133,11 @@ the browser link uses the host that served the page, not the bind wildcard.
 ## Multiple installations
 
 One installed `cyclo` command can operate several independent installations on
-the same Docker host. The default installation reads `/etc/cyclo/host.conf`.
-An explicit state root instead reads `host.conf` from that root:
+the same Docker host. When the provider graph is first applied, the implicit
+state root uses `/etc/cyclo/host.conf`; a root selected with `--state-root` or
+`CYCLO_STATE_ROOT` uses `host.conf` inside that root. Cyclo records this choice
+in the state root, so another spelling or environment cannot later pair the
+same installation with a different provider graph:
 
 ```sh
 mkdir -p ~/.local/state/cyclo-work ~/.local/state/cyclo-lab

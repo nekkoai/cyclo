@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { createClient } from "@connectrpc/connect";
+import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { HealthStatus } from "@cyclo/component/contract";
 import { closeComponentServer, listenComponentServer } from "@cyclo/component/server";
 import { createUnixTransport } from "@cyclo/component/transport";
@@ -74,6 +76,94 @@ test("routes only on model and passes the opaque payload to the endpoint", async
     assert.equal(audit.at(-1).input_tokens, 7);
   } finally {
     await closeComponentServer(server);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("never returns a gateway credential reflected by a native upstream", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "cyclo-gateway-secret-boundary-"));
+  const socketPath = join(directory, "gateway.sock");
+  const authPath = join(directory, "auth.json");
+  const modelsPath = join(directory, "models.json");
+  const usagePath = join(directory, "usage.jsonl");
+  const secret = "test-private-secret-9e0a";
+  let receivedAuthorization;
+  const upstream = createServer((request, response) => {
+    receivedAuthorization = request.headers.authorization;
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      error: {
+        message: `upstream rejected ${receivedAuthorization}`,
+        type: "invalid_request_error",
+      },
+    }));
+  });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  const { port } = upstream.address();
+
+  await writeFile(authPath, JSON.stringify({
+    work: { type: "api_key", provider: "echo", key: secret },
+  }), { mode: 0o600 });
+  await writeFile(modelsPath, JSON.stringify({
+    providers: {
+      echo: {
+        api: "openai-responses",
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        models: [{
+          id: "gpt-test",
+          input: ["text"],
+          contextWindow: 4096,
+          maxTokens: 1024,
+        }],
+      },
+    },
+  }), { mode: 0o600 });
+
+  const services = createGatewayServices({
+    env: {
+      CYCLO_GATEWAY_AUTH_JSON: authPath,
+      CYCLO_GATEWAY_MODELS_JSON: modelsPath,
+      CYCLO_GATEWAY_USAGE_JSONL: usagePath,
+    },
+  });
+  const server = await createGatewayServer({ services });
+
+  try {
+    await listenComponentServer(server, { socketPath });
+    const client = createClient(Provider, createUnixTransport(socketPath));
+    const payloads = [];
+    let failure;
+    try {
+      for await (const response of client.infer({
+        model: "work/gpt-test",
+        payload: JSON.stringify({
+          context: {
+            messages: [{ role: "user", content: "hello", timestamp: 0 }],
+          },
+          options: { maxTokens: 32 },
+        }),
+      })) payloads.push(response.payload);
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(receivedAuthorization, `Bearer ${secret}`);
+    assert.equal(payloads.length, 0);
+    assert.ok(failure instanceof ConnectError);
+    assert.equal(failure.code, Code.DataLoss);
+    const visibleFailure = [
+      failure.message,
+      failure.rawMessage,
+      ...Array.from(failure.metadata.entries()).flat(),
+    ].join("\n");
+    assert.equal(visibleFailure.includes(secret), false);
+    assert.equal(visibleFailure.includes(`Bearer ${secret}`), false);
+  } finally {
+    await closeComponentServer(server);
+    await new Promise((resolve, reject) => upstream.close((error) => (
+      error ? reject(error) : resolve()
+    )));
     await rm(directory, { recursive: true, force: true });
   }
 });

@@ -74,6 +74,7 @@ printf '%s\n' '==> source tests'
     GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree \
         "$venv/bin/python" -m pytest -q \
         tests/test_release_manifest.py tests/test_secret_scan.py
+    node --test tests/*.mjs
     for package in protocol/component protocol/provider gateway passthrough pi-provider; do
         npm test --prefix "src/cyclo/components/$package"
     done

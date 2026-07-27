@@ -172,6 +172,7 @@ class RecordingStore:
     def __init__(self, root: Path, instances: list[object] | None = None) -> None:
         self.root = root
         self.components_root = root / "components"
+        self.host_config_scope = "state"
         self.instances = instances or []
         self.lock_entries = 0
 
@@ -302,24 +303,60 @@ def test_state_root_selects_the_host_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    first_xdg = tmp_path / "first-xdg"
+    monkeypatch.setenv("XDG_STATE_HOME", str(first_xdg))
     monkeypatch.delenv("CYCLO_STATE_ROOT", raising=False)
+
     default_args = build_parser().parse_args(["doctor"])
     default_store = state_store(default_args)
-    assert host_config(default_args, default_store) == DEFAULT_HOST_CONFIG
+    assert default_store.root == first_xdg / "cyclo"
+    assert host_config(default_store) == DEFAULT_HOST_CONFIG
+    with default_store.locked():
+        pass
+    assert default_store.host_config_scope_path.read_text(
+        encoding="ascii"
+    ) == "system\n"
+    assert (
+        default_store.host_config_scope_path.stat().st_mode & 0o777
+    ) == 0o600
 
-    selected = tmp_path / "installation"
-    explicit_args = build_parser().parse_args(
-        ["--state-root", str(selected), "doctor"]
+    # The persisted installation identity wins over a later explicit spelling
+    # or a different process environment.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "second-xdg"))
+    explicit_default_args = build_parser().parse_args(
+        ["--state-root", str(default_store.root), "doctor"]
     )
-    explicit_store = state_store(explicit_args)
-    assert host_config(explicit_args, explicit_store) == selected / "host.conf"
-    assert not hasattr(explicit_args, "host_config")
+    explicit_default_store = state_store(explicit_default_args)
+    assert explicit_default_store.root == default_store.root
+    assert explicit_default_store.system == default_store.system
+    assert host_config(explicit_default_store) == DEFAULT_HOST_CONFIG
 
-    configured = tmp_path / "environment-installation"
-    monkeypatch.setenv("CYCLO_STATE_ROOT", str(configured))
-    environment_args = build_parser().parse_args(["doctor"])
-    environment_store = state_store(environment_args)
-    assert host_config(environment_args, environment_store) == configured / "host.conf"
+    monkeypatch.setenv("CYCLO_STATE_ROOT", str(default_store.root))
+    environment_default_args = build_parser().parse_args(["doctor"])
+    environment_default_store = state_store(environment_default_args)
+    assert environment_default_store.root == default_store.root
+    assert environment_default_store.system == default_store.system
+    assert host_config(environment_default_store) == DEFAULT_HOST_CONFIG
+
+    # The reverse alias is stable too: a root first selected explicitly keeps
+    # its local host.conf when it later becomes the implicit XDG default.
+    local_xdg = tmp_path / "local-xdg"
+    local_root = local_xdg / "cyclo"
+    explicit_local_args = build_parser().parse_args(
+        ["--state-root", str(local_root), "doctor"]
+    )
+    explicit_local_store = state_store(explicit_local_args)
+    assert host_config(explicit_local_store) == local_root / "host.conf"
+    with explicit_local_store.locked():
+        pass
+
+    monkeypatch.delenv("CYCLO_STATE_ROOT")
+    monkeypatch.setenv("XDG_STATE_HOME", str(local_xdg))
+    implicit_local_args = build_parser().parse_args(["doctor"])
+    implicit_local_store = state_store(implicit_local_args)
+    assert implicit_local_store.root == local_root
+    assert implicit_local_store.system == explicit_local_store.system
+    assert host_config(implicit_local_store) == local_root / "host.conf"
 
 
 def test_team_commands_own_initialization_and_template_discovery() -> None:
@@ -1207,6 +1244,11 @@ class ProviderSystemDouble:
         self.calls.append(("stop",))
         return ("pass", "old-component")
 
+    def component_logs(self, name, lines):
+        self.calls.append(("component_logs", name, lines))
+        return "component output"
+
+
 def test_component_list_reports_each_component_without_failing_for_health(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1292,6 +1334,51 @@ def test_component_gateway_status_does_not_parse_host_configuration(
     assert loads == [False]
 
 
+def test_component_logs_are_observational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "state"
+    store = StateStore(root, requested_host_config_scope="state")
+    providers = ProviderSystemDouble(tmp_path / "component.sock")
+
+    def make_system(_args, selected_store, *, load_config=True):
+        assert selected_store is store
+        assert load_config is True
+        assert host_config(selected_store) == root / "host.conf"
+        return providers
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.provider_system", make_system)
+
+    assert main(["component", "logs", "pass", "--lines", "4"]) == 0
+    assert providers.calls == [("component_logs", "pass", 4)]
+    assert capsys.readouterr().out == "component output\n"
+    assert not store.host_config_scope_path.exists()
+    assert not store.lock_path.exists()
+
+
+def test_invalid_component_log_count_does_not_initialize_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "state"
+    store = StateStore(root, requested_host_config_scope="state")
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr(
+        "cyclo.cli.provider_system",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid log arguments must be rejected before provider inspection"
+        ),
+    )
+
+    assert main(["component", "logs", "pass", "--lines", "0"]) == 1
+    assert "--lines must be a positive integer" in capsys.readouterr().err
+    assert not root.exists()
+
+
 @pytest.mark.parametrize(
     ("arguments", "call", "locks", "output"),
     (
@@ -1342,7 +1429,7 @@ def test_provider_stop_does_not_parse_an_invalid_host_configuration(
 
     def make_stack(args, selected_store, *, load_config=True):
         assert selected_store is store
-        assert host_config(args, selected_store) == invalid
+        assert host_config(selected_store) == invalid
         loads.append(load_config)
         return stack
 
@@ -1917,8 +2004,15 @@ def test_repair_marks_stale_records_and_removes_inactive_resources(
     store = RecordingStore(tmp_path / "state", [stale, inactive])
     calls: list[tuple[str, str]] = []
 
-    def inspect(selected_store, _docker, *, stale: list[Instance]):
+    def inspect(
+        selected_store,
+        _docker,
+        *,
+        stale: list[Instance],
+        recovered: list[Instance],
+    ):
         assert selected_store is store
+        assert recovered == []
         store.instances[0].active = False
         stale.append(store.instances[0])
         return []
@@ -1953,7 +2047,69 @@ def test_repair_marks_stale_records_and_removes_inactive_resources(
         "cyclo-stale-net",
         "cyclo-inactive-net",
     }
-    assert "repaired 1 stale record(s); removed 2 inactive container(s)" in capsys.readouterr().out
+    assert (
+        "repaired 1 stale record(s); recovered 0 interrupted start(s); "
+        "removed 2 inactive container(s)"
+        in capsys.readouterr().out
+    )
+
+
+def test_repair_continues_after_independent_cleanup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first = instance("first", tmp_path, active=False)
+    second = instance("second", tmp_path, active=False)
+    third = instance("third", tmp_path, active=False)
+    store = RecordingStore(tmp_path / "state", [first, second, third])
+    calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        "cyclo.cli.active_instances",
+        lambda selected_store, _docker, *, stale, recovered: [],
+    )
+
+    class FakeDocker:
+        @staticmethod
+        def stop_remove(
+            name, identifier, *, expected_system, expected_launch
+        ):
+            assert expected_system == store.system
+            assert expected_launch == "0" * 32
+            calls.append(("container", identifier))
+            if identifier == "first":
+                raise CycloError("container failure")
+            return True
+
+        @staticmethod
+        def remove_network(name, identifier, *, system):
+            assert system == store.system
+            calls.append(("network", identifier))
+            if identifier == "second":
+                raise CycloError("network failure")
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
+
+    assert main(["repair"]) == 1
+    assert store.lock_entries == 1
+    assert calls == [
+        ("container", "first"),
+        ("network", "first"),
+        ("container", "second"),
+        ("network", "second"),
+        ("container", "third"),
+        ("network", "third"),
+    ]
+    streams = capsys.readouterr()
+    assert (
+        "repaired 0 stale record(s); recovered 0 interrupted start(s); "
+        "removed 2 inactive container(s)"
+        in streams.out
+    )
+    assert "first container cleanup: container failure" in streams.err
+    assert "second network cleanup: network failure" in streams.err
 
 
 def test_ps_distinguishes_container_and_metadata_state(

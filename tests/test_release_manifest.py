@@ -11,6 +11,7 @@ import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
+import cyclo
 import pytest
 
 
@@ -141,6 +142,10 @@ def test_built_distributions_contain_component_sources_without_installs(
         }
         archive_names = {member.name for member in archive.getmembers()}
     assert expected <= sdist_names
+    assert (
+        f"cyclo_agent-{cyclo.__version__}/tests/fixtures/derived-team/Dockerfile"
+        in archive_names
+    )
     assert not any(
         "node_modules" in PurePosixPath(name).parts for name in archive_names
     )

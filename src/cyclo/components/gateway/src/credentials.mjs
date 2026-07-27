@@ -142,6 +142,13 @@ function authenticatedModel(model, auth, provider) {
   }));
 }
 
+function secretValues(auth) {
+  return Object.freeze([...new Set([
+    auth.apiKey,
+    ...Object.values(auth.headers ?? {}),
+  ].filter((value) => typeof value === "string" && value))]);
+}
+
 export function createCredentialResolver({ authPath, getProvider = getPiProvider }) {
   if (typeof authPath !== "string" || !authPath) {
     throw new TypeError("authPath must be a non-empty path");
@@ -211,12 +218,16 @@ export function createCredentialResolver({ authPath, getProvider = getPiProvider
       }
       return Object.freeze({
         apiKey,
+        secretValues: secretValues(auth),
         ...(effectiveModel === undefined ? {} : { effectiveModel }),
       });
     } else {
       throw new Error(`credential ${account} has an invalid type`);
     }
-    return Object.freeze({ apiKey });
+    return Object.freeze({
+      apiKey,
+      secretValues: Object.freeze([apiKey]),
+    });
   }
 
   function check(routes) {

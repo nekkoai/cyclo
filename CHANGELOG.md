@@ -59,6 +59,9 @@ interface.
 - Keep credentials outside all team and intermediate-provider mounts. A mounted
   provider socket is the authority to use the configured model catalogue; no
   internal bearer or administrator token is used.
+- Fail closed if a native upstream response exactly reflects an API key or
+  authentication-header value inserted by the gateway, without imposing Pi
+  event semantics on the opaque Provider transport.
 - Validate real, non-overlapping mount trees and recheck bind-source identity at
   launch. Multi-team runs preflight the full project and roll back only the
   containers started by a failed invocation.
@@ -96,6 +99,10 @@ interface.
 - Require system, kind, instance, and current launch identity before team
   status, task, log, copy, exec, or readiness operations; Docker names alone
   are never authority.
+- Keep component log reads observational. Recover the published port of an
+  exact lifecycle-active launch after interrupted startup, and let
+  `cyclo repair` continue independent cleanup attempts before reporting any
+  failures.
 - Add `cyclo forget INSTANCE --confirm INSTANCE` as the explicit way to retire
   stopped durable state before reusing a logical instance name.
 - Scope gateway, provider, and team Docker resources to the canonical state

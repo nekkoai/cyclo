@@ -127,6 +127,87 @@ def test_state_rejects_namespaced_resources_from_another_installation(
     assert first.load("alpha").container_name == selected.container_name
 
 
+def test_host_configuration_scope_binding_is_atomic_and_conflict_safe(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    system = StateStore(root, requested_host_config_scope="system")
+    state_scoped = StateStore(root, requested_host_config_scope="state")
+
+    assert system.host_config_scope == "system"
+    assert state_scoped.host_config_scope == "state"
+    with system.locked():
+        pass
+
+    assert system.host_config_scope_path.read_text(encoding="ascii") == "system\n"
+    assert system.host_config_scope_path.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(CycloError, match="retry the command"):
+        with state_scoped.locked():
+            pass
+
+    # A new process adopts the existing binding, regardless of how the same
+    # canonical state root was selected.
+    reopened = StateStore(root, requested_host_config_scope="state")
+    assert reopened.host_config_scope == "system"
+    with reopened.locked():
+        pass
+
+
+def test_host_configuration_scope_rejects_invalid_state(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    binding = root / "host-config.scope"
+    binding.write_text("elsewhere\n", encoding="ascii")
+    binding.chmod(0o600)
+
+    store = StateStore(root, requested_host_config_scope="system")
+    with pytest.raises(CycloError, match="invalid host configuration scope"):
+        _ = store.host_config_scope
+
+
+def test_host_configuration_scope_rejects_public_state(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    binding = root / "host-config.scope"
+    binding.write_text("system\n", encoding="ascii")
+    binding.chmod(0o644)
+
+    store = StateStore(root, requested_host_config_scope="system")
+    with pytest.raises(CycloError, match="not private"):
+        _ = store.host_config_scope
+
+
+def test_host_configuration_scope_rejects_a_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    target = tmp_path / "outside"
+    target.write_text("system\n", encoding="ascii")
+    target.chmod(0o600)
+    (root / "host-config.scope").symlink_to(target)
+
+    store = StateStore(root, requested_host_config_scope="system")
+    with pytest.raises(CycloError, match="cannot read host configuration scope"):
+        _ = store.host_config_scope
+
+
+def test_state_lock_does_not_bind_an_unused_provider_configuration(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(
+        tmp_path / "state",
+        requested_host_config_scope="system",
+    )
+
+    with store.locked():
+        pass
+
+    assert not store.host_config_scope_path.exists()
+
+
 def test_state_rejects_pre_0_2_team_resource_names(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     selected = make_instance("alpha", store)

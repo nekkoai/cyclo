@@ -75,4 +75,5 @@ def test_release_documents_and_sdist_manifest_match_the_version() -> None:
         "recursive-include docs *.md",
         "recursive-include requirements *.in *.txt",
         "recursive-include tests *.py *.mjs",
+        "include tests/fixtures/derived-team/Dockerfile",
     } <= manifest_entries

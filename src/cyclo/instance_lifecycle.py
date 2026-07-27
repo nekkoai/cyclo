@@ -28,14 +28,24 @@ def active_instances(
     docker: Docker,
     *,
     stale: list[Instance] | None = None,
+    recovered: list[Instance] | None = None,
 ) -> list[Instance]:
-    """Return active team containers and persist records that became stale."""
+    """Reconcile active records with their exact team containers."""
 
     result: list[Instance] = []
     for instance in store.list():
         if not instance.active:
             continue
-        if docker.container_lifecycle_active(instance, system=store.system):
+        state = docker.container_lifecycle_state(instance, system=store.system)
+        if state.lifecycle_active:
+            if not instance.offline and instance.port is None:
+                instance.port = docker.current_published_port(
+                    instance,
+                    system=store.system,
+                )
+                store.save(instance)
+                if recovered is not None:
+                    recovered.append(instance)
             result.append(instance)
         else:
             instance.active = False
