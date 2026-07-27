@@ -614,6 +614,17 @@ class Docker:
             instance, system=system
         ).lifecycle_active
 
+    def current_published_port(
+        self,
+        instance: Instance,
+        *,
+        system: str,
+    ) -> int:
+        """Return AgentWS's port for the exact launch recorded by Cyclo."""
+
+        container_id = self._required_current_container_id(instance, system)
+        return self.published_port(container_id)
+
     def ensure_network(
         self,
         name: str,

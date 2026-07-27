@@ -10,9 +10,12 @@ const DEFAULT_STREAMERS = Object.freeze({
   "openai-responses": streamOpenAI,
 });
 
+class GatewayResponseError extends Error {}
+
 // The gateway terminates the opaque transport because this is where a Pi call
 // becomes a native provider request. It understands only the Pi call frame; it
-// does not inspect messages, tools, schemas, arguments, or emitted events.
+// does not interpret messages, tools, schemas, arguments, or emitted events.
+// It does enforce its own credential boundary on serialized native events.
 export function createPiAdapter({ streamers = DEFAULT_STREAMERS } = {}) {
   return Object.freeze({
     infer(route, payload, credential, signal) {
@@ -53,15 +56,20 @@ async function* dispatch(route, payload, credential, signal, streamers) {
       try {
         encoded = encodePayload(event);
       } catch {
-        throw new ConnectError("upstream emitted a non-JSON Pi event", Code.DataLoss);
+        throw new GatewayResponseError(
+          "upstream emitted a non-JSON Pi event",
+        );
       }
+      assertNoCredentialReflection(encoded, credential);
       yield {
         payload: encoded,
         usage: eventUsage(event),
       };
     }
   } catch (error) {
-    if (error instanceof ConnectError) throw error;
+    if (error instanceof GatewayResponseError) {
+      throw new ConnectError(error.message, Code.DataLoss);
+    }
     throw upstreamFailure(error, signal);
   } finally {
     localAbort.abort(new Error("gateway native dispatch stopped"));
@@ -130,6 +138,40 @@ function eventUsage(event) {
 
 function safeTokens(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function assertNoCredentialReflection(payload, credential) {
+  const secrets = [...new Set([
+    credential.apiKey,
+    ...(Array.isArray(credential.secretValues) ? credential.secretValues : []),
+  ].filter((value) => typeof value === "string" && value))];
+  const candidates = secrets.filter((secret) => (
+    payload.includes(JSON.stringify(secret).slice(1, -1))
+  ));
+  if (candidates.length === 0) return;
+
+  if (containsCredential(JSON.parse(payload), candidates)) {
+    throw new GatewayResponseError(
+      "upstream response contained gateway authentication material",
+    );
+  }
+}
+
+function containsCredential(document, secrets) {
+  const pending = [document];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value === "string") {
+      if (secrets.some((secret) => value.includes(secret))) return true;
+      continue;
+    }
+    if (value === null || typeof value !== "object") continue;
+    for (const [key, child] of Object.entries(value)) {
+      if (secrets.some((secret) => key.includes(secret))) return true;
+      pending.push(child);
+    }
+  }
+  return false;
 }
 
 function upstreamFailure(_error, signal) {

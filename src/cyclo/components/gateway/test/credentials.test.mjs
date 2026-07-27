@@ -32,14 +32,21 @@ test("API keys are read dynamically and legacy records remain compatible", async
   const resolver = createCredentialResolver({ authPath, getProvider: () => undefined });
   const route = { account: "openai", provider: "openai" };
   const first = await resolver.resolve(route);
-  assert.deepEqual(first, { apiKey: "first-secret" });
+  assert.deepEqual(first, {
+    apiKey: "first-secret",
+    secretValues: ["first-secret"],
+  });
 
   await writeFile(authPath, JSON.stringify({
     openai: { type: "api_key", key: "second-secret" },
   }));
   const second = await resolver.resolve(route);
-  assert.deepEqual(second, { apiKey: "second-secret" });
+  assert.deepEqual(second, {
+    apiKey: "second-secret",
+    secretValues: ["second-secret"],
+  });
   assert.equal(Object.isFrozen(second), true);
+  assert.equal(Object.isFrozen(second.secretValues), true);
 });
 
 test("separate resolvers serialize OAuth refresh and reuse the winner", async (t) => {
@@ -150,4 +157,5 @@ test("OAuth may derive an account-specific native model route", async (t) => {
   assert.equal(resolved.effectiveModel.baseUrl, "https://api.account.example/v1");
   assert.equal(resolved.effectiveModel.headers["x-account"], "copilot");
   assert.equal(resolved.apiKey, "fresh-access");
+  assert.deepEqual(resolved.secretValues, ["fresh-access", "copilot"]);
 });

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -103,6 +104,7 @@ def test_active_instances_preserves_temporary_lifecycle_states(
 ) -> None:
     store = StateStore(tmp_path / "state")
     selected = _instance("team", tmp_path / "team", tmp_path / "project")
+    selected.port = 4137
     _persist(store, selected)
     docker = Docker()
     monkeypatch.setattr(
@@ -117,6 +119,78 @@ def test_active_instances_preserves_temporary_lifecycle_states(
     assert [instance.id for instance in retained] == [selected.id]
     assert store.load(selected.id).active is True
     assert stale == []
+
+
+@pytest.mark.parametrize("flag", ["Running", "Paused", "Restarting"])
+def test_active_instances_recovers_an_interrupted_online_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = _instance("team", tmp_path / "team", tmp_path / "project")
+    _persist(store, selected)
+    docker = Docker()
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        docker,
+        "_inspect_container",
+        lambda _name: _lifecycle_info(flag, selected, system=store.system),
+    )
+
+    def run(command, **_kwargs):
+        commands.append(list(command))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="0.0.0.0:4317\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(docker, "_run", run)
+    recovered: list[Instance] = []
+
+    retained = active_instances(store, docker, recovered=recovered)
+
+    assert [instance.id for instance in retained] == [selected.id]
+    assert [instance.id for instance in recovered] == [selected.id]
+    persisted = store.load(selected.id)
+    assert persisted.active is True
+    assert persisted.port == 4317
+    assert commands == [
+        ["docker", "port", "team-container-id", "4137/tcp"],
+    ]
+
+
+def test_active_instances_preserves_offline_portless_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = _instance("team", tmp_path / "team", tmp_path / "project")
+    selected.offline = True
+    _persist(store, selected)
+    docker = Docker()
+    monkeypatch.setattr(
+        docker,
+        "_inspect_container",
+        lambda _name: _lifecycle_info("Running", selected, system=store.system),
+    )
+    monkeypatch.setattr(
+        docker,
+        "current_published_port",
+        lambda *_args, **_kwargs: pytest.fail(
+            "offline instances have no published AgentWS port"
+        ),
+        raising=False,
+    )
+    recovered: list[Instance] = []
+
+    retained = active_instances(store, docker, recovered=recovered)
+
+    assert [instance.id for instance in retained] == [selected.id]
+    assert recovered == []
+    assert store.load(selected.id).port is None
 
 
 def test_active_instances_rejects_a_foreign_same_name_container(
@@ -262,7 +336,18 @@ def test_repair_does_not_revoke_or_delete_lifecycle_active_team(
         "_inspect_container",
         lambda _name: _lifecycle_info(flag, selected, system=store.system),
     )
-    events: list[object] = []
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        docker,
+        "_run",
+        lambda command, **_kwargs: commands.append(list(command))
+        or subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="127.0.0.1:4317\n",
+            stderr="",
+        ),
+    )
     monkeypatch.setattr(
         docker,
         "stop_remove",
@@ -283,8 +368,12 @@ def test_repair_does_not_revoke_or_delete_lifecycle_active_team(
 
     assert cmd_repair(SimpleNamespace()) == 0
 
-    assert store.load(selected.id).active is True
-    assert events == []
+    repaired = store.load(selected.id)
+    assert repaired.active is True
+    assert repaired.port == 4317
+    assert commands == [
+        ["docker", "port", "team-container-id", "4137/tcp"],
+    ]
 
 
 @pytest.mark.parametrize("flag", ["Paused", "Restarting"])

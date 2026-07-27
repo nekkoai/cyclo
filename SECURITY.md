@@ -20,7 +20,9 @@ limited to declared mounts; and Provider authority is conveyed by explicitly
 mounted Unix sockets rather than an internal administrator token. Installed
 provider components are trusted with the inference streams and upstream sockets
 assigned to them, but not with physical gateway credentials or unrelated
-component sockets.
+component sockets. The gateway also suppresses any native event that exactly
+reflects authentication material it injected into the upstream request, and
+returns only a generic transport error.
 
 Host compromise is outside this boundary because the host necessarily defines
 images, containers, and mounts. Deployments needing a stronger administrative

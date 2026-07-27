@@ -17,6 +17,7 @@ include docs/assets/cyclo-logo.svg
 recursive-include requirements *.in *.txt
 recursive-include template README.md team *.md
 recursive-include tests *.py *.mjs
+include tests/fixtures/derived-team/Dockerfile
 
 include src/cyclo/components/__init__.py
 include src/cyclo/components/README.md

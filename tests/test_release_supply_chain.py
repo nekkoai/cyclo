@@ -222,6 +222,7 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert 'sh -n "$script" || exit 1' in release
     assert "tools/release-acceptance" in release
     assert "tools/runtime-write-acceptance" in release
+    assert "node --test tests/*.mjs" in release
     assert "npm ci --force --ignore-scripts --prefix src/cyclo/components/team-runtime" in release
     assert "docker build --pull" in release
     assert "src/cyclo/components/team-runtime" in release

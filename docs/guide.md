@@ -93,8 +93,9 @@ it.
 
 The gateway is the fixed root Provider. Optional intermediate providers are an
 ordered component graph declared by the installation's `host.conf`. The
-default installation uses `/etc/cyclo/host.conf`; an explicit state root uses
-`STATE_ROOT/host.conf`:
+implicit state root initially uses `/etc/cyclo/host.conf`; a state root selected
+explicitly uses `STATE_ROOT/host.conf`. Cyclo keeps that association with the
+installation after the provider graph is first applied:
 
 ```text
 # provider INSTANCE SOURCE [context=PATH] REQUIREMENT=TARGET ... [-- ARGUMENT ...]
@@ -437,18 +438,25 @@ bindings, and the selected model catalogue.
 can be running while its model path is unavailable; the health reason makes
 that explicit.
 
-After an interrupted team stop, repair only stale owned resources with:
+After an interrupted team start or stop, reconcile launch-pinned metadata and
+clean only stale owned resources with:
 
 ```sh
 cyclo repair
 ```
 
+Repair attempts every independent inactive container and network cleanup. It
+reports all remaining failures and exits nonzero if any cleanup was incomplete.
+
 ## Persistent state
 
 The state root is `$XDG_STATE_HOME/cyclo` or `~/.local/state/cyclo` by default.
-Override it with `--state-root` or `CYCLO_STATE_ROOT`. The default installation
-uses `/etc/cyclo/host.conf`; an override uses `host.conf` inside the selected
-state root.
+Select it explicitly with `--state-root` or `CYCLO_STATE_ROOT`. When the
+provider graph is first applied, the implicit root uses `/etc/cyclo/host.conf`;
+an explicitly selected root uses `host.conf` inside that root. Cyclo persists
+this association in the state root, so later environment changes cannot switch
+the provider configuration for an existing installation. Read-only checks do
+not create the binding, and gateway-only commands do not depend on it.
 
 ### Multiple installations on one host
 
@@ -543,9 +551,10 @@ npm --prefix src/cyclo/components/gateway test
 npm --prefix src/cyclo/components/passthrough test
 npm --prefix src/cyclo/components/pi-provider test
 tools/build-release
-tools/release-acceptance dist
+tools/release-acceptance
 ```
 
-Release acceptance additionally builds the real gateway, pass-through, and
+`tools/release-acceptance` builds and exercises an isolated wheel.
+`tools/build-release` additionally builds the real gateway, pass-through, and
 team images. The source tests exercise real ConnectRPC Unix sockets across the
 gateway endpoint, relay, and team-side Pi adapter without external credentials.

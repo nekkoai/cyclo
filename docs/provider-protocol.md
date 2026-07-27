@@ -144,7 +144,12 @@ All other JSON options are forwarded without a Cyclo allowlist.
 For each native Pi `AssistantMessageEvent`, the gateway serializes one response
 payload. The team-side endpoint parses that string and pushes the event directly
 into Pi. Cyclo does not impose another event state machine or finish-reason
-enumeration.
+enumeration. Because the root gateway inserts physical authentication material,
+it also makes an exact, schema-independent containment check across JSON string
+values and property names before emitting an event. If the event reflects an
+inserted API key or authentication-header value, the gateway emits no payload
+and fails with a generic `DATA_LOSS` error. This check belongs only to the
+credential-owning endpoint; relays remain opaque.
 
 ## Errors
 
@@ -155,6 +160,8 @@ The error boundary is simple:
   `INVALID_ARGUMENT`;
 - unavailable component, credential, or concrete service: Connect
   `UNAVAILABLE`;
+- upstream response reflecting gateway authentication material: Connect
+  `DATA_LOSS`, with the response suppressed;
 - cancellation or deadline: the corresponding Connect error;
 - a provider/model failure already represented as a Pi event: an opaque response
   payload.
@@ -186,5 +193,6 @@ A Provider implementation should test:
 - streamed delivery without buffering;
 - cancellation propagation and cleanup;
 - isolation from incoming HTTP authorization/cookie headers;
+- suppression of gateway authentication material reflected by an upstream;
 - catalogue inference-format compatibility; and
 - generic health behavior when an upstream disappears and returns.

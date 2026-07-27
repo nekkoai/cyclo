@@ -512,6 +512,35 @@ def test_team_commands_use_the_verified_immutable_container_id(
     ]
 
 
+def test_current_published_port_uses_the_verified_immutable_container_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker = Docker()
+    selected = instance(tmp_path / "team", tmp_path / "project")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        docker,
+        "_inspect_container",
+        lambda _name: owned_container_info(selected),
+    )
+
+    def record(command, **_kwargs):
+        commands.append(list(command))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="127.0.0.1:4317\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(docker, "_run", record)
+
+    assert docker.current_published_port(selected, system=SYSTEM) == 4317
+    assert commands == [
+        ["docker", "port", "verified-container-id", "4137/tcp"],
+    ]
+
+
 def test_every_team_operation_rejects_a_foreign_same_name_container(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -530,6 +559,7 @@ def test_every_team_operation_rejects_a_foreign_same_name_container(
     operations = (
         lambda: docker.container_running(selected, system=SYSTEM),
         lambda: docker.container_lifecycle_active(selected, system=SYSTEM),
+        lambda: docker.current_published_port(selected, system=SYSTEM),
         lambda: docker.logs(selected, system=SYSTEM, follow=False),
         lambda: docker.copy_to(
             selected, tmp_path / "task.md", "/tmp/task.md", system=SYSTEM
@@ -572,6 +602,7 @@ def test_current_team_operations_reject_a_replaced_launch(
     )
     operations = (
         lambda: docker.container_running(selected, system=SYSTEM),
+        lambda: docker.current_published_port(selected, system=SYSTEM),
         lambda: docker.logs(selected, system=SYSTEM, follow=False),
         lambda: docker.copy_to(
             selected, tmp_path / "task.md", "/tmp/task.md", system=SYSTEM

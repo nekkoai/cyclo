@@ -78,14 +78,23 @@ DEFAULT_HOST_CONFIG = Path("/etc/cyclo/host.conf")
 
 
 def state_store(args: argparse.Namespace) -> StateStore:
-    root = Path(args.state_root).expanduser().resolve() if args.state_root else None
-    return StateStore(root)
+    selected = args.state_root
+    root = Path(selected).expanduser().resolve() if selected else None
+    return StateStore(
+        root,
+        requested_host_config_scope="state" if selected else "system",
+    )
 
 
-def host_config(args: argparse.Namespace, store: StateStore) -> Path:
+def host_config(store: StateStore) -> Path:
     """Select provider configuration from the installation identity."""
 
-    return store.root / "host.conf" if args.state_root else DEFAULT_HOST_CONFIG
+    scope = store.host_config_scope
+    if scope == "system":
+        return DEFAULT_HOST_CONFIG
+    if scope == "state":
+        return store.root / "host.conf"
+    raise CycloError("Cyclo installation has no host configuration scope")
 
 
 def gateway(args: argparse.Namespace, store: StateStore) -> Gateway:
@@ -105,7 +114,7 @@ def provider_system(
     proxy = Gateway(store.components_root, controller=controller)
     return ProviderSystem(
         store.components_root,
-        host_config(args, store),
+        host_config(store) if load_config else DEFAULT_HOST_CONFIG,
         gateway=proxy,
         controller=controller,
         load_config=load_config,
@@ -174,7 +183,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         source = agentws_root()
         store = state_store(args)
         _validate_project_mounts(
-            definition, teams, store, source, host_config(args, store)
+            definition, teams, store, source, host_config(store)
         )
         print(f"project: {definition.name}")
         print(f"description: {definition.description}")
@@ -361,7 +370,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         configured_teams,
         store,
         source,
-        host_config(args, store),
+        host_config(store),
     )
     bindings = project_run_bindings(
         args,
@@ -1150,12 +1159,14 @@ def _print_gateway_status(
 def cmd_component(args: argparse.Namespace) -> int:
     store = state_store(args)
     name = getattr(args, "name", None)
+    action = args.component_action
+    if action == "logs" and args.lines <= 0:
+        raise CycloError("--lines must be a positive integer")
     providers = provider_system(
         args,
         store,
         load_config=name != "gateway",
     )
-    action = args.component_action
     if action in {"list", "status"}:
         statuses = (
             (providers.status_component(args.name),)
@@ -1168,6 +1179,12 @@ def cmd_component(args: argparse.Namespace) -> int:
         return 0 if all(status.works for status in statuses) else 1
 
     assert isinstance(name, str)
+    if action == "logs":
+        output = providers.component_logs(name, args.lines)
+        if output:
+            print(output)
+        return 0
+
     with store.locked():
         if action == "build":
             print(providers.build_component(name))
@@ -1182,13 +1199,6 @@ def cmd_component(args: argparse.Namespace) -> int:
                 if providers.stop_component(name)
                 else f"{name} was not running"
             )
-            return 0
-        elif action == "logs":
-            if args.lines <= 0:
-                raise CycloError("--lines must be a positive integer")
-            output = providers.component_logs(name, args.lines)
-            if output:
-                print(output)
             return 0
         else:
             raise CycloError(f"unknown component action: {action}")
@@ -1243,24 +1253,40 @@ def cmd_repair(args: argparse.Namespace) -> int:
     store = state_store(args)
     docker = Docker()
     repaired = 0
+    recovered: list[Instance] = []
     removed = 0
+    failures: list[str] = []
     with store.locked():
         stale: list[Instance] = []
-        active_instances(store, docker, stale=stale)
+        active_instances(store, docker, stale=stale, recovered=recovered)
         repaired += len(stale)
         for instance in store.list():
             if instance.active:
                 continue
-            if stop_remove_instance_container(
-                docker,
-                instance,
-                system=store.system,
-            ):
-                removed += 1
-            docker.remove_network(
-                instance.network_name, instance.id, system=store.system
-            )
-    print(f"repaired {repaired} stale record(s); removed {removed} inactive container(s)")
+            try:
+                if stop_remove_instance_container(
+                    docker,
+                    instance,
+                    system=store.system,
+                ):
+                    removed += 1
+            except Exception as exc:
+                failures.append(f"{instance.id} container cleanup: {exc}")
+            try:
+                docker.remove_network(
+                    instance.network_name,
+                    instance.id,
+                    system=store.system,
+                )
+            except Exception as exc:
+                failures.append(f"{instance.id} network cleanup: {exc}")
+    print(
+        f"repaired {repaired} stale record(s); "
+        f"recovered {len(recovered)} interrupted start(s); "
+        f"removed {removed} inactive container(s)"
+    )
+    if failures:
+        raise CycloError("repair incomplete: " + "; ".join(failures))
     return 0
 
 
@@ -1361,8 +1387,9 @@ def add_common_options(parser: argparse.ArgumentParser) -> None:
         "--state-root",
         default=os.environ.get("CYCLO_STATE_ROOT"),
         help=(
-            "Cyclo installation directory; also selects STATE_ROOT/host.conf "
-            "(default state uses /etc/cyclo/host.conf)"
+            "Cyclo installation directory; when the provider graph is first "
+            "applied, explicit roots use STATE_ROOT/host.conf and the "
+            "implicit root uses /etc/cyclo/host.conf"
         ),
     )
 
@@ -1551,10 +1578,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     repair = commands.add_parser(
         "repair",
-        help="clean interrupted team-container stops",
+        help="reconcile interrupted team starts and stops",
         description=(
-            "Mark stale active records stopped and remove inactive Cyclo containers "
-            "and networks. Durable task and job state is preserved."
+            "Recover exact published ports after interrupted starts, mark stale "
+            "active records stopped, and remove inactive Cyclo containers and "
+            "networks. Durable task and job state is preserved."
         ),
     )
     repair.set_defaults(func=cmd_repair)

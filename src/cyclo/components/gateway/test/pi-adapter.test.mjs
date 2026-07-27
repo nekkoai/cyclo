@@ -82,7 +82,7 @@ test("decodes only the Pi call frame and preserves every native event", async ()
   });
 });
 
-test("does not redact or reinterpret Pi event content", async () => {
+test("preserves Pi event content that contains no gateway credential", async () => {
   const event = {
     type: "done",
     reason: "future-reason",
@@ -105,6 +105,87 @@ test("does not redact or reinterpret Pi event content", async () => {
     new AbortController().signal,
   ));
   assert.equal(response.payload, JSON.stringify(event));
+});
+
+test("fails closed when a native event reflects gateway authentication material", async () => {
+  const apiKey = "comma,key";
+  const headerSecret = "quote\"slash\\line\nsnowman\u2603";
+  const event = {
+    type: "error",
+    [`header-${headerSecret}`]: "credential in a property name",
+    error: {
+      errorMessage: `upstream rejected Bearer ${apiKey} twice: ${apiKey}`,
+    },
+  };
+  const original = structuredClone(event);
+  const adapter = createPiAdapter({
+    streamers: { "openai-responses": () => stream([event]) },
+  });
+
+  await assert.rejects(
+    collect(adapter.infer(
+      route(),
+      JSON.stringify({ context: {}, options: {} }),
+      { apiKey, secretValues: [apiKey, headerSecret] },
+      new AbortController().signal,
+    )),
+    (error) => error instanceof ConnectError
+      && error.code === Code.DataLoss
+      && !error.rawMessage.includes(apiKey)
+      && !error.rawMessage.includes(headerSecret),
+  );
+  assert.deepEqual(event, original);
+});
+
+test("protects an authentication-header value independently of the API key", async () => {
+  const apiKey = "unreflected-api-key";
+  const headerSecret = "private-auth-header-value";
+  const adapter = createPiAdapter({
+    streamers: {
+      "openai-responses": () => stream([{
+        type: "error",
+        error: { errorMessage: `upstream reflected ${headerSecret}` },
+      }]),
+    },
+  });
+
+  await assert.rejects(
+    collect(adapter.infer(
+      route(),
+      JSON.stringify({ context: {}, options: {} }),
+      { apiKey, secretValues: [apiKey, headerSecret] },
+      new AbortController().signal,
+    )),
+    (error) => error instanceof ConnectError
+      && error.code === Code.DataLoss
+      && !error.rawMessage.includes(headerSecret),
+  );
+});
+
+test("sanitizes Connect errors thrown by a native iterator", async () => {
+  const secret = "private-native-error-secret";
+  const adapter = createPiAdapter({
+    streamers: {
+      "openai-responses": () => failingStream(new ConnectError(
+        `native error reflected ${secret}`,
+        Code.Internal,
+        { "x-upstream-error": secret },
+      )),
+    },
+  });
+
+  await assert.rejects(
+    collect(adapter.infer(
+      route(),
+      JSON.stringify({ context: {}, options: {} }),
+      { apiKey: secret },
+      new AbortController().signal,
+    )),
+    (error) => error instanceof ConnectError
+      && error.code === Code.Unavailable
+      && error.rawMessage === "upstream inference failed"
+      && !Array.from(error.metadata.entries()).flat().join("\n").includes(secret),
+  );
 });
 
 test("rejects malformed framing but never validates context contents", async () => {
@@ -169,6 +250,10 @@ function usage() {
 
 async function* stream(events) {
   for (const event of events) yield event;
+}
+
+async function* failingStream(error) {
+  throw error;
 }
 
 async function collect(values) {
