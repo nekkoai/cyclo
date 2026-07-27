@@ -19,6 +19,7 @@ and examples in `README.md`, the installed-version expectations in
 ```sh
 python3 -m pytest -q
 node --test tests/*.mjs
+tools/dependency-audit
 while IFS= read -r script; do sh -n "$script"; done < <(git grep -l '^#!/bin/sh$')
 git diff --check
 tools/release-acceptance
@@ -78,6 +79,16 @@ Docker with a running daemon, and network access to the configured Python and
 npm package indexes and Docker registry. It never reads or changes a Git
 remote. Registry access is used only to install the locked verification tools,
 run dependency audits, and fetch pinned Docker image/package layers.
+
+The high-severity dependency gate is implemented once in
+`tools/dependency-audit` and used unchanged by CI and `tools/build-release`.
+Every high or critical finding fails except the exact temporary Pi exception
+documented in `SECURITY.md`. The exception is bound to one Pi pin, shrinkwrapped
+dependency version, advisory, and nested package path. Malformed audit output,
+registry failure, policy drift, an additional affected path, any other high or
+critical finding, or a latest Pi release with a corrected shrinkwrap all fail
+the gate. The finding remains visible as `TEMPORARY WAIVER`; it is never hidden
+by a lower audit threshold or a successful-command override.
 
 The script refuses a dirty tree, archives the exact local commit, installs the
 hash-locked release tools into a temporary environment, and disables PEP 517

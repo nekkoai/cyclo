@@ -911,7 +911,6 @@ def cmd_task_run(args: argparse.Namespace) -> int:
         raise CycloError(f"task specification not found: {spec}")
     instance, docker, system = _task_target(args)
     container_spec_path = f"/tmp/cyclo-task-{args.task_id}-{secrets.token_hex(8)}.md"
-    docker.copy_to(instance, spec, container_spec_path, system=system)
 
     def remove_copied_spec() -> None:
         cleanup_status = docker.exec(
@@ -936,6 +935,7 @@ def cmd_task_run(args: argparse.Namespace) -> int:
             )
 
     try:
+        docker.copy_to(instance, spec, container_spec_path, system=system)
         result = docker.exec(
             instance,
             ["/agentws/bin/task-create", args.task_id, container_spec_path],

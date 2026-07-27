@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -266,6 +268,13 @@ def container_command(spec: ContainerSpec) -> list[str]:
     instance = spec.instance
     provider_socket_dir = spec.provider_socket_dir
     provider_socket = provider_socket_dir / "component.sock"
+    host_uid = os.getuid()
+    host_gid = os.getgid()
+    extra_groups = ":".join(
+        str(group)
+        for group in sorted(set(os.getgroups()))
+        if group != host_gid
+    )
     if instance.provider_socket_path != str(provider_socket):
         raise CycloError(
             "Cyclo instance provider socket does not match its launch configuration"
@@ -327,9 +336,11 @@ def container_command(spec: ContainerSpec) -> list[str]:
             "--workdir",
             str(CONTAINER_WORKSPACE),
             "-e",
-            f"CYCLO_HOST_UID={os.getuid()}",
+            f"CYCLO_HOST_UID={host_uid}",
             "-e",
-            f"CYCLO_HOST_GID={os.getgid()}",
+            f"CYCLO_HOST_GID={host_gid}",
+            "-e",
+            f"CYCLO_EXTRA_GROUPS={extra_groups}",
             "-e",
             f"PI_CODING_AGENT_DIR={CONTAINER_PI / 'agent'}",
             "-e",
@@ -876,7 +887,19 @@ class Docker:
         system: str,
     ) -> None:
         container_id = self._required_current_container_id(instance, system)
-        self._run(["docker", "cp", str(source), f"{container_id}:{destination}"])
+        with tempfile.TemporaryDirectory(prefix="cyclo-task-copy-") as temporary:
+            staged = Path(temporary) / "spec.md"
+            shutil.copyfile(source, staged)
+            staged.chmod(0o600)
+            self._run(
+                [
+                    "docker",
+                    "cp",
+                    "--archive",
+                    str(staged),
+                    f"{container_id}:{destination}",
+                ]
+            )
 
     def exec(
         self,

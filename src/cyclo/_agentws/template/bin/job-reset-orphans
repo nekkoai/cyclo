@@ -64,6 +64,7 @@ validate_empty_ownership_lock() {
 
 [ "$ALL_ACTIVE" -eq 0 ] || require_runtime_lock
 require_jobs_dir
+require_tasks_dir
 
 count=0
 errors=0
@@ -92,6 +93,7 @@ for job_dir in "$JOBS_DIR"/*; do
         acquire_job_control_lock "$job_dir"
         if [ "$(read_status "$job_dir")" = "pending" ]; then
             if validate_empty_ownership_lock "$job_dir"; then
+                finalize_pending_task_creation_locked "$job_dir"
                 repair_pending_ownership_locked "$job_dir"
             else
                 errors=1

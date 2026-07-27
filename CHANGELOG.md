@@ -2,7 +2,7 @@
 
 All notable changes to Cyclo are documented in this file.
 
-## [0.2.0] - 2026-07-18
+## [0.2.0] - 2026-07-27
 
 Composable providers, explicit project authority, and a redesigned operator
 interface.

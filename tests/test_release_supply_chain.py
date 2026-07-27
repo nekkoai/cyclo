@@ -37,6 +37,12 @@ def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() ->
     assert package["dependencies"] == expected
     assert lock["lockfileVersion"] == 3
     assert lock["packages"][""]["dependencies"] == expected
+    packages = lock["packages"]
+    pi_path = "node_modules/@earendil-works/pi-coding-agent"
+    nested_brace = f"{pi_path}/node_modules/brace-expansion"
+    assert packages[pi_path]["hasShrinkwrap"] is True
+    assert packages[nested_brace]["version"] == "5.0.7"
+    assert packages["node_modules/brace-expansion"]["version"] == "5.0.8"
     for dependency in lock["packages"].values():
         resolved = dependency.get("resolved")
         if resolved:
@@ -164,10 +170,10 @@ def test_ci_uses_and_tests_the_current_component_layout() -> None:
         "pi-provider; do"
     ) in ci
     assert 'npm test --prefix "src/cyclo/components/$package"' in ci
-    assert (
-        "protocol/component protocol/provider gateway passthrough pi-provider "
-        "team-runtime"
-    ) in ci
+    assert "python3 tools/dependency-audit" in ci
+    assert '"$source_tree/tools/dependency-audit"' in release
+    assert "npm audit" not in ci
+    assert "npm audit" not in release
     for component in ("team-runtime", "gateway", "passthrough"):
         assert f"src/cyclo/components/{component}/Dockerfile" in ci
     assert ci.count("src/cyclo/components\n") >= 3

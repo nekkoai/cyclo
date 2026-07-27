@@ -89,6 +89,55 @@ def start_task_create(
     )
 
 
+def prepare_planner_claim(
+    runtime: Path,
+    root: Path,
+) -> tuple[list[str], dict[str, str]]:
+    return (
+        [
+            str(runtime / "bin" / "job-claim"),
+            "-r",
+            "planner",
+            "--agent-id",
+            "planner-1",
+        ],
+        {
+            **os.environ,
+            "JOBS_DIR": str(root / "jobs"),
+            "TASKS_DIR": str(root / "tasks"),
+        },
+    )
+
+
+def run_startup_recovery(
+    runtime: Path,
+    root: Path,
+) -> subprocess.CompletedProcess[str]:
+    runtime_lock = os.open(
+        runtime,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        fcntl.flock(runtime_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return subprocess.run(
+            [str(runtime / "bin" / "job-reset-orphans"), "--all-active"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(runtime_lock,),
+            env={
+                **os.environ,
+                "CYCLO_RUNTIME_LOCK_FD": str(runtime_lock),
+                "JOBS_DIR": str(root / "jobs"),
+                "TASKS_DIR": str(root / "tasks"),
+            },
+            check=False,
+            timeout=10,
+        )
+    finally:
+        os.close(runtime_lock)
+
+
 def executable_script(path: Path, text: str) -> Path:
     path.write_text(text, encoding="utf-8")
     path.chmod(0o755)
@@ -432,13 +481,16 @@ def test_sigkill_between_task_and_job_publication_recovers_staged_pair(
     assert_complete_pair(state)
 
 
-def test_sigkill_after_pair_publication_recovers_only_complete_pair(
+def test_pending_planner_waits_for_task_finalization_before_claim(
     tmp_path: Path,
 ) -> None:
     runtime = runtime_copy(tmp_path)
     state = tmp_path / "state"
     wrappers = tmp_path / "wrappers"
     wrappers.mkdir()
+    entered = tmp_path / "task-finalization-entered"
+    release = tmp_path / "task-finalization-release"
+    marker = state / "tasks" / "change-1" / ".creating"
     real_rm = shutil.which("rm")
     assert real_rm is not None
     executable_script(
@@ -446,30 +498,157 @@ def test_sigkill_after_pair_publication_recovers_only_complete_pair(
         "#!/bin/sh\n"
         'last=""\n'
         'for argument do last="$argument"; done\n'
-        'if [ "$last" = "$KILL_MARKER" ]; then\n'
-        '    kill -KILL "$PPID"\n'
-        "    exit 99\n"
+        'if [ "$last" = "$FINAL_MARKER" ]; then\n'
+        '    : > "$ENTERED"\n'
+        '    while [ ! -e "$RELEASE" ]; do sleep 0.01; done\n'
         "fi\n"
         'exec "$REAL_RM" "$@"\n',
     )
-    environment = {
-        "PATH": f"{wrappers}:{os.environ['PATH']}",
-        "REAL_RM": real_rm,
-        "KILL_MARKER": str(state / "tasks" / "change-1" / ".creating"),
-    }
+    creator = start_task_create(
+        runtime,
+        state,
+        environment={
+            "PATH": f"{wrappers}:{os.environ['PATH']}",
+            "REAL_RM": real_rm,
+            "FINAL_MARKER": str(marker),
+            "ENTERED": str(entered),
+            "RELEASE": str(release),
+        },
+    )
+    claim: subprocess.Popen[str] | None = None
+    try:
+        wait_for(entered, creator)
+        job = state / "jobs" / "change-1-plan"
+        assert marker.is_file()
+        assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
 
-    interrupted = invoke_task_create(runtime, state, environment=environment)
+        claim_command, claim_environment = prepare_planner_claim(runtime, state)
+        claim = subprocess.Popen(
+            claim_command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=claim_environment,
+        )
+        time.sleep(0.2)
+        assert claim.poll() is None
+        assert not (job / "lock").exists()
+    finally:
+        release.touch(exist_ok=True)
+    creator_stdout, creator_stderr = creator.communicate(timeout=10)
+    assert claim is not None
+    claim_stdout, claim_stderr = claim.communicate(timeout=10)
+
+    assert creator.returncode == 0, creator_stderr
+    assert "created task" in creator_stdout
+    assert claim.returncode == 0, claim_stderr
+    assert claim_stdout.strip() == "CLAIMED: change-1-plan"
+    assert not marker.exists()
+
+
+def test_startup_recovers_sigkill_after_planner_job_publication(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_copy(tmp_path)
+    state = tmp_path / "state"
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    marker = state / "tasks" / "change-1" / ".creating"
+    job = state / "jobs" / "change-1-plan"
+    real_mv = shutil.which("mv")
+    assert real_mv is not None
+    executable_script(
+        wrappers / "mv",
+        "#!/bin/sh\n"
+        'last=""\n'
+        'for argument do last="$argument"; done\n'
+        '"$REAL_MV" "$@"\n'
+        "status=$?\n"
+        'if [ "$status" -eq 0 ] && [ "$last" = "$KILL_TARGET" ]; then\n'
+        '    kill -KILL "$PPID"\n'
+        "fi\n"
+        'exit "$status"\n',
+    )
+    interrupted = invoke_task_create(
+        runtime,
+        state,
+        environment={
+            "PATH": f"{wrappers}:{os.environ['PATH']}",
+            "REAL_MV": real_mv,
+            "KILL_TARGET": str(job),
+        },
+    )
 
     assert interrupted.returncode == -signal.SIGKILL
-    task_marker = state / "tasks" / "change-1" / ".creating"
-    assert task_marker.stat().st_size > 0
-    assert (state / "jobs" / "change-1-plan" / ".task-create-transaction").is_file()
+    assert marker.is_file()
+    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
 
-    recovered = invoke_task_create(runtime, state)
+    recovered = run_startup_recovery(runtime, state)
 
     assert recovered.returncode == 0, recovered.stderr
-    assert "recovered completed task creation" in recovered.stdout
     assert_complete_pair(state)
+    assert "Recovered interrupted task creation" in (
+        job / "log.md"
+    ).read_text(encoding="utf-8")
+    claim_command, claim_environment = prepare_planner_claim(runtime, state)
+    claimed = subprocess.run(
+        claim_command,
+        text=True,
+        capture_output=True,
+        env=claim_environment,
+        check=False,
+        timeout=10,
+    )
+    assert claimed.returncode == 0, claimed.stderr
+    assert claimed.stdout.strip() == "CLAIMED: change-1-plan"
+
+
+def test_claim_recovers_only_a_matching_task_creation_transaction(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_copy(tmp_path)
+    state = tmp_path / "state"
+    assert invoke_task_create(runtime, state, "matching").returncode == 0
+    matching_task = state / "tasks" / "matching"
+    matching_job = state / "jobs" / "matching-plan"
+    transaction = (matching_job / ".task-create-transaction").read_text(
+        encoding="utf-8"
+    )
+    (matching_task / ".creating").write_text(transaction, encoding="utf-8")
+
+    claim_command, claim_environment = prepare_planner_claim(runtime, state)
+    claimed = subprocess.run(
+        [claim_command[0], "matching-plan", *claim_command[1:]],
+        text=True,
+        capture_output=True,
+        env=claim_environment,
+        check=False,
+        timeout=10,
+    )
+
+    assert claimed.returncode == 0, claimed.stderr
+    assert claimed.stdout.strip() == "CLAIMED: matching-plan"
+    assert not (matching_task / ".creating").exists()
+
+    assert invoke_task_create(runtime, state, "mismatch").returncode == 0
+    mismatch_task = state / "tasks" / "mismatch"
+    mismatch_job = state / "jobs" / "mismatch-plan"
+    marker = mismatch_task / ".creating"
+    marker.write_text("different-transaction\n", encoding="utf-8")
+    refused = subprocess.run(
+        [claim_command[0], "mismatch-plan", *claim_command[1:]],
+        text=True,
+        capture_output=True,
+        env=claim_environment,
+        check=False,
+        timeout=10,
+    )
+
+    assert refused.returncode != 0
+    assert "does not match" in refused.stderr
+    assert marker.read_text(encoding="utf-8") == "different-transaction\n"
+    assert (mismatch_job / "status").read_text(encoding="utf-8").strip() == "pending"
+    assert not (mismatch_job / "lock").exists()
 
 
 def test_foreign_job_collision_at_commit_boundary_is_never_deleted(
@@ -511,7 +690,7 @@ def test_foreign_job_collision_at_commit_boundary_is_never_deleted(
     assert (state / "tasks" / "change-1" / ".creating").is_file()
     staged_job = state / "jobs" / ".change-1-plan+.task-create-stage"
     assert staged_job.is_dir()
-    assert not (staged_job / "status").exists()
+    assert (staged_job / "status").read_text(encoding="utf-8").strip() == "pending"
     claim = subprocess.run(
         [
             str(runtime / "bin" / "job-claim"),
