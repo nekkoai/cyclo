@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
@@ -10,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Collection, Mapping
 
-from .dashboard import dashboard_host_is_loopback
 from .docker import (
     ContainerSpec,
     Docker,
@@ -258,7 +258,10 @@ def validate_run_options(args: argparse.Namespace, *, team_count: int) -> None:
         raise CycloError(
             "--port cannot be used with --offline because no host UI is published"
         )
-    dashboard_host_is_loopback(args.host)
+    try:
+        ipaddress.IPv4Address(args.host)
+    except ipaddress.AddressValueError as exc:
+        raise CycloError("--host must be a literal IPv4 address") from exc
     if team_count > 1 and args.port:
         raise CycloError("--port is ambiguous for a project with multiple teams")
     if team_count > 1 and args.foreground:

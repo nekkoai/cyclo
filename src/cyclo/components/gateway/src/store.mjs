@@ -1,15 +1,18 @@
 // Shared primitives for the gateway's private JSON stores. A kernel flock
-// serializes processes sharing a volume; atomic rename keeps every read whole.
+// serializes processes sharing a volume; flush + rename + directory fsync makes
+// each replacement both atomic and durable.
 
 import { spawn } from "node:child_process";
 import {
   closeSync,
   constants as fsConstants,
   fchmodSync,
+  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
@@ -136,8 +139,28 @@ export async function withFileLock(path, fn, { timeoutMs = LOCK_TIMEOUT_MS } = {
 }
 
 export function writeJsonAtomic(path, data) {
-  mkdirSync(dirname(path), { recursive: true });
+  const serialized = `${JSON.stringify(data, null, 2)}\n`;
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true });
   const temporary = `${path}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, path);
+  try {
+    writeFileSync(temporary, serialized, {
+      encoding: "utf8",
+      mode: 0o600,
+      flush: true,
+    });
+    renameSync(temporary, path);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+
+  const directoryDescriptor = openSync(
+    directory,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY,
+  );
+  try {
+    fsyncSync(directoryDescriptor);
+  } finally {
+    closeSync(directoryDescriptor);
+  }
 }

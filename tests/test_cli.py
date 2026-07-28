@@ -38,6 +38,7 @@ from cyclo.project_run import (
     load_project_teams,
     project_run_bindings,
     start_binding_locked,
+    validate_run_options,
 )
 from cyclo.state import Instance, StateStore
 from cyclo.team import load_team
@@ -336,6 +337,33 @@ def test_run_parser_has_one_project_argument_and_loopback_default() -> None:
     assert args.host == "127.0.0.1"
 
 
+@pytest.mark.parametrize(
+    ("host", "accepted"),
+    (
+        ("127.0.0.1", True),
+        ("0.0.0.0", True),
+        ("localhost", False),
+        ("::1", False),
+    ),
+)
+def test_run_host_requires_a_literal_ipv4_address(
+    host: str,
+    accepted: bool,
+) -> None:
+    args = SimpleNamespace(
+        port=0,
+        offline=False,
+        foreground=False,
+        host=host,
+    )
+
+    if accepted:
+        validate_run_options(args, team_count=1)
+    else:
+        with pytest.raises(CycloError, match="literal IPv4 address"):
+            validate_run_options(args, team_count=1)
+
+
 def test_run_and_dashboard_help_explain_observation_modes_and_exposure() -> None:
     parser = build_parser()
     root_action = next(
@@ -347,6 +375,7 @@ def test_run_and_dashboard_help_explain_observation_modes_and_exposure() -> None
     run_help = " ".join(root_action.choices["run"].format_help().split())
     assert "rendered transcript" in run_help
     assert "Ctrl-C stops that instance" in run_help
+    assert "literal IPv4 bind address" in run_help
 
     dashboard_help = " ".join(
         root_action.choices["dashboard"].format_help().split()
