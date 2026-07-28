@@ -78,6 +78,21 @@ printf '%s\n' '==> source tests'
     for package in protocol/component protocol/provider gateway passthrough pi-provider; do
         npm test --prefix "src/cyclo/components/$package"
     done
+    # Tests regenerate the checked-in protocol bindings. Refuse to package a
+    # source tree that is no longer byte-for-byte equivalent to the release
+    # commit, including newly generated files that were never added to Git.
+    GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree \
+        git diff --exit-code
+    source_untracked=$(
+        GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree \
+            git ls-files --others --exclude-standard
+    )
+    [ -z "$source_untracked" ] || {
+        printf '%s\n' \
+            "build release: source tests created untracked release files:" \
+            "$source_untracked" >&2
+        exit 1
+    }
     find . -type f -exec sh -c '
         for script do
             first=
@@ -91,12 +106,6 @@ printf '%s\n' '==> source tests'
 
 printf '%s\n' '==> dependency audits'
 "$venv/bin/python" "$source_tree/tools/dependency-audit" "$source_tree"
-
-printf '%s\n' '==> wheel-only acceptance'
-CYCLO_RELEASE_BUILD_PYTHON="$venv/bin/python" \
-    PYTHON="$venv/bin/python" \
-    SOURCE_DATE_EPOCH=$source_date_epoch \
-    "$repo_root/tools/release-acceptance"
 
 printf '%s\n' '==> distributions and release metadata'
 (
@@ -114,6 +123,11 @@ SOURCE_DATE_EPOCH=$source_date_epoch CYCLO_RELEASE_COMMIT=$commit \
 
 wheel=$dist/cyclo_agent-$version-py3-none-any.whl
 [ -f "$wheel" ] || fail "expected wheel was not built: $wheel"
+
+printf '%s\n' '==> exact-wheel acceptance'
+PYTHON="$venv/bin/python" \
+    "$source_tree/tools/release-acceptance" "$wheel"
+
 "$venv/bin/python" -m pip install \
     --disable-pip-version-check --no-deps --force-reinstall "$wheel"
 

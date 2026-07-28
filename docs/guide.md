@@ -20,8 +20,17 @@ Node.js and npm are maintainer requirements, not host runtime requirements.
 The installed Python package contains the component, gateway, Pi, team, and
 AgentWS sources used to build its images.
 
-Install from a source checkout or release artifact using the Python environment
-policy appropriate for the machine:
+Cyclo 0.2 is a fresh-install boundary: it does not adopt or migrate 0.1 state
+or Docker resources. Before the first 0.2 command, select a new state root and
+keep it set for every command:
+
+```sh
+export CYCLO_STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cyclo-0.2"
+```
+
+Do not point 0.2 at a state root used by 0.1. Then install from a source
+checkout or release artifact using the Python environment policy appropriate
+for the machine:
 
 ```sh
 python3 -m pip install .
@@ -394,7 +403,9 @@ cyclo forget INSTANCE --confirm INSTANCE
 This permanently removes that instance's tasks, jobs, transcripts, generated
 runtime, and metadata. It refuses an active container. The explicit operation
 allows a later project at a moved path to reuse the logical instance name
-without silently mixing old queue state into the new project.
+without silently mixing old queue state into the new project. Cyclo removes the
+instance from authoritative inventory before deleting its retired tree, so
+interruption cannot leave a partial inventory record.
 
 ## Dashboards
 
@@ -423,6 +434,7 @@ cyclo usage
 
 Usage is global by account/provider and exact model. The shared socket has no
 trustworthy team identity, so Cyclo does not invent per-team attribution.
+Observation never creates a missing gateway credential store.
 
 Run the non-mutating installation check:
 
@@ -496,11 +508,11 @@ common/derived image selection. Cyclo validates but does not build that
 operator-supplied image. Use the override only when one externally managed
 image is intended for every team in the project.
 
-Cyclo 0.2 is a fresh-install boundary. It does not adopt or migrate 0.1 state,
-containers, networks, images, or provider configuration. Use a new
-state root, build the 0.2 resources, and recreate projects from their
-`project.cyclo` files. A different state root keeps an old installation
-separate if it must remain available during the transition.
+As established at the start of this guide, 0.2 does not adopt or migrate 0.1
+state, containers, networks, images, or provider configuration. Recreate
+projects from their `project.cyclo` files. The separately selected state root
+keeps an old installation isolated if it must remain available during the
+transition.
 
 ```text
 instances/INSTANCE/

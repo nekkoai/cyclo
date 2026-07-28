@@ -349,6 +349,12 @@ test("default construction publishes compatible Pi models", async () => {
     assert.ok(models.every(({ id }) => id.startsWith("openai/")));
     assert.ok(models.every(({ inferenceFormat }) => inferenceFormat === PI_INFERENCE_FORMAT));
 
+    await writeFile(authPath, JSON.stringify({
+      openai: { type: "api_key", provider: "openai", key: "test-only-key" },
+      work: { type: "api_key", provider: "openai", key: "second-test-only-key" },
+    }), { mode: 0o600 });
+    assert.equal(services.component.health({}).status, HealthStatus.NOT_READY);
+
     await writeFile(authPath, "not json\n", { mode: 0o600 });
     assert.equal(services.component.health({}).status, HealthStatus.NOT_READY);
   } finally {

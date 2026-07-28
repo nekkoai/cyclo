@@ -5,6 +5,8 @@ import os
 import re
 import stat
 import subprocess
+import sys
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -37,10 +39,16 @@ from .installation import (
 
 _NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _ENVIRONMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+LABEL_TOOL = "io.cyclo.gateway-tool"
 
 
 class Gateway:
-    """The fixed credential gateway component and its private store."""
+    """The fixed credential gateway component and its private store.
+
+    Lifecycle and one-shot methods require the installation lock at the CLI
+    boundary; that lock is the liveness proof used for orphan reconciliation.
+    """
 
     def __init__(
         self,
@@ -185,7 +193,67 @@ class Gateway:
             )
         return True
 
+    def _tool_component(
+        self,
+        info: Mapping[str, object],
+    ) -> Component | None:
+        labels = ComponentController.labels(info)
+        if labels.get(LABEL_TOOL) != "1":
+            return None
+        raw_name = info.get("Name")
+        name = (
+            raw_name[1:]
+            if isinstance(raw_name, str) and raw_name.startswith("/")
+            else raw_name
+        )
+        prefix = f"{self.component.container}-tool-"
+        if (
+            not isinstance(name, str)
+            or not name.startswith(prefix)
+            or not re.fullmatch(r"[0-9a-f]{32}", name[len(prefix) :])
+            or labels.get(LABEL_TYPE) != self.component.kind
+        ):
+            raise CycloError("refusing malformed gateway tool container")
+        tool = replace(self.component, container=name)
+        self.controller.require_owned(tool, info, image=False)
+        return tool
+
+    def _remove_abandoned_tools(self) -> int:
+        """Remove labeled one-shot tools after their lock owner has exited."""
+
+        result = self.controller.call(
+            [
+                "container",
+                "ls",
+                "--all",
+                "--quiet",
+                "--no-trunc",
+                "--filter",
+                f"label={LABEL_TOOL}=1",
+                "--filter",
+                f"label={LABEL_SYSTEM}={self.component.system}",
+            ]
+        )
+        removed = 0
+        for identifier in sorted(set((result.stdout or "").splitlines())):
+            if not identifier:
+                continue
+            info = self.controller.inspect("container", identifier)
+            if info is None:
+                continue
+            if self.controller.container_id(info) != identifier:
+                raise CycloError("Docker returned an invalid gateway tool")
+            tool = self._tool_component(info)
+            if tool is None:
+                raise CycloError("Docker returned an unlabeled gateway tool")
+            if self.controller.stop(tool, identifier):
+                removed += 1
+        return removed
+
     def _require_exclusive_store(self, allowed: str | None = None) -> None:
+        # Reconcile every kind of abandoned gateway command, including
+        # volume-free provider discovery, before checking store ownership.
+        self._remove_abandoned_tools()
         result = self.controller.call(
             [
                 "container",
@@ -275,6 +343,7 @@ class Gateway:
         return self._activate(self.controller.start)
 
     def stop(self) -> bool:
+        self._remove_abandoned_tools()
         return self.controller.stop(self.component)
 
     def restart(self) -> ComponentStatus:
@@ -296,12 +365,36 @@ class Gateway:
         input_data: str | None = None,
         capture: bool = True,
         volume_read_only: bool = False,
+        create_volume: bool = True,
         config: bool = False,
     ) -> subprocess.CompletedProcess[str]:
+        if volume:
+            if not self.store_ready(create=create_volume):
+                raise CycloError("gateway credential store is absent")
+            current = self.controller.status(self.component)
+            self._require_exclusive_store(current.container_id)
         image_id = self.controller.require_image(self.component)
+        # `docker run --rm` can outlive an interrupted Docker client. Give the
+        # one-shot container an owned identity before attaching to it.
+        tool = replace(
+            self.component,
+            container=(
+                f"{self.component.container}-tool-{uuid.uuid4().hex}"
+            ),
+        )
+        labels = [
+            item
+            for key, value in {
+                **ComponentController.expected_labels(tool),
+                LABEL_TOOL: "1",
+            }.items()
+            for item in ("--label", f"{key}={value}")
+        ]
         arguments = [
-            "run",
-            "--rm",
+            "create",
+            "--name",
+            tool.container,
+            *labels,
             *(["--interactive"] if interactive else []),
             "--security-opt",
             "no-new-privileges",
@@ -322,7 +415,6 @@ class Gateway:
             network,
         ]
         if volume:
-            self.store_ready(create=True)
             arguments.extend(
                 [
                     "--mount",
@@ -344,14 +436,64 @@ class Gateway:
                 ]
             )
         arguments.extend([image_id, *command])
-        return self.controller.call(
-            arguments,
-            capture=capture,
-            input_data=input_data,
-        )
+        identifier: str | None = None
+        try:
+            created = self.controller.call(arguments)
+            created_id = (created.stdout or "").strip()
+            if not _CONTAINER_ID_RE.fullmatch(created_id):
+                raise CycloError(
+                    "Docker create returned an invalid gateway tool container ID"
+                )
+            identifier = created_id
+            if created.stderr and not capture:
+                print(created.stderr, end="", file=sys.stderr)
+            result = self.controller.call(
+                [
+                    "start",
+                    "--attach",
+                    *(["--interactive"] if interactive else []),
+                    identifier,
+                ],
+                capture=capture,
+                input_data=input_data,
+            )
+        except BaseException as cause:
+            self._remove_tool_container(
+                tool,
+                identifier,
+                cause=cause,
+            )
+            raise
+        self._remove_tool_container(tool, identifier)
+        if created.stderr and capture:
+            result = subprocess.CompletedProcess(
+                result.args,
+                result.returncode,
+                result.stdout,
+                created.stderr + (result.stderr or ""),
+            )
+        return result
+
+    def _remove_tool_container(
+        self,
+        tool: Component,
+        identifier: str | None,
+        *,
+        cause: BaseException | None = None,
+    ) -> None:
+        try:
+            self.controller.stop(tool, identifier)
+        except Exception as cleanup:
+            if cause is None:
+                raise
+            primary = str(cause) or cause.__class__.__name__
+            raise CycloError(
+                f"{primary}; gateway tool cleanup failed: {cleanup}"
+            ) from cause
 
     def providers(self) -> str:
         self.ensure_image()
+        self._remove_abandoned_tools()
         return (
             self._tool(["providers"], volume=False).stdout or ""
         ).rstrip()
@@ -361,6 +503,7 @@ class Gateway:
             ["usage"],
             volume=True,
             volume_read_only=True,
+            create_volume=False,
         )
         try:
             document = json.loads(result.stdout or "")
@@ -409,9 +552,6 @@ class Gateway:
             normalized[index : index + 2] = ["--api-key-stdin"]
             input_data = value + "\n"
         api_key = "--api-key-stdin" in normalized
-        current = self.controller.status(self.component)
-        self.store_ready(create=True)
-        self._require_exclusive_store(current.container_id)
         self._tool(
             ["login", *normalized],
             volume=True,

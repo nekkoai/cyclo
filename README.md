@@ -18,6 +18,7 @@ perform an in-place migration from 0.1: install it with a fresh state root and
 newly built gateway, provider, and team resources.
 
 ```sh
+export CYCLO_STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cyclo-0.2"
 python -m pip install .
 cyclo gateway providers
 cyclo gateway login openai-codex --as codex-work
@@ -28,6 +29,8 @@ cyclo doctor
 `gateway providers` is useful before login: it lists providers and explains
 which login method each accepts. The gateway stores OAuth sessions and API
 keys in its Docker-managed state volume; they are never mounted into teams.
+The explicit state root above keeps 0.2 separate from any 0.1 installation.
+Keep that setting for every command belonging to this installation.
 
 ## Host providers
 

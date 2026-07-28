@@ -99,6 +99,18 @@ interface.
 - Require system, kind, instance, and current launch identity before team
   status, task, log, copy, exec, or readiness operations; Docker names alone
   are never authority.
+- Replace a stopped or dead team launch through an exact, fenced handoff:
+  remove the persisted old launch while its identity is still authoritative,
+  then publish and start the replacement. An interruption at either boundary
+  remains repairable and never authorizes deletion of another launch.
+- Publish a new instance's complete metadata directory atomically before
+  materializing child state, so interruption cannot expose an inventory entry
+  without `run.json`.
+- Retire an instance by atomically removing its complete directory from
+  authoritative inventory before recursively deleting the inert state.
+- Give interactive and one-shot gateway commands owned container identities.
+  Interrupted commands are reconciled under the installation lock without
+  exposing or deleting the credential volume.
 - Keep component log reads observational. Recover the published port of an
   exact lifecycle-active launch after interrupted startup, and let
   `cyclo repair` continue independent cleanup attempts before reporting any
@@ -125,9 +137,14 @@ interface.
   observational full-system `doctor`.
 - Add `cyclo refresh` to rebuild gateway and configured provider images plus the
   common and derived team images selected by active projects, then reparse and
-  restart those projects from their recorded definition paths.
+  restart those projects from their recorded definition paths. Serialize the
+  inventory, stop, rebuild, and restart phases as one installation operation.
 - Make gateway login update the private store and automatically restart the
   gateway so the new catalogue is immediately published.
+- Make gateway health detect a committed catalogue newer than its startup
+  snapshot, closing the host-crash window between login and restart.
+- Keep dashboard usage observation nonblocking without creating an absent
+  installation or binding its provider-configuration scope.
 - Derive provider configuration from the installation: the default state root
   uses `/etc/cyclo/host.conf`, while an explicit state root uses
   `STATE_ROOT/host.conf`.
@@ -149,6 +166,9 @@ interface.
 - Pin image bases and npm dependencies, verify release manifests and supply-chain
   metadata, scan the Git history for secrets, and build local wheel/source
   release bundles without publishing them.
+- Regenerate protocol bindings as a checked-source freshness gate and run
+  installation acceptance against the exact normalized wheel placed in the
+  release bundle.
 
 ## [0.1.0] - 2026-07-14
 

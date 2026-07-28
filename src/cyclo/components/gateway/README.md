@@ -41,11 +41,13 @@ Incoming RPC headers are never forwarded. Provider credentials never appear in
 the model catalogue, request payload, Docker arguments, logs, or downstream
 containers. The public catalogue is a startup snapshot; login or model changes
 therefore require a gateway restart, which `cyclo gateway login` performs
-automatically. Login builds the candidate catalogue in memory before atomically
-replacing `auth.json`; an unknown provider or unusable custom catalogue leaves
-the previous credential store and running gateway untouched. Credential values
-and OAuth refreshes are read dynamically and written with kernel locking plus
-atomic replacement.
+automatically. Health detects when the committed non-secret catalogue differs
+from that snapshot, so an interrupted post-login restart is repaired by the
+next ordinary start or model operation. Login builds the candidate catalogue in
+memory before atomically replacing `auth.json`; an unknown provider or unusable
+custom catalogue leaves the previous credential store and running gateway
+untouched. Credential values and OAuth refreshes are read dynamically and
+written with kernel locking plus atomic replacement.
 
 Models using the Pi inference format must publish positive context-window and
 output-token limits. The gateway excludes an unusable model without hiding
@@ -87,4 +89,7 @@ docker build -f gateway/Dockerfile -t cyclo-gateway-component .
 
 The image also performs one-shot login and usage commands against its private
 state volume. `providers` needs no credential store; `login` writes it; `usage`
-reads the audit without exposing credentials.
+requires the existing store and reads the audit without exposing credentials.
+The host labels these command containers and removes a verified abandoned
+command after controller or host failure; the named credential volume is never
+created or removed by usage cleanup.

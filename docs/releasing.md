@@ -7,7 +7,8 @@ and Docker images retain the `cyclo` name.
 
 Version 0.2 is a fresh-install boundary. Release verification does not test or
 claim migration of 0.1 state or Docker resources; a 0.2 installation starts
-with a new state root and newly built resources.
+with a new state root and newly built resources. Installation examples must
+select that new root explicitly rather than silently reusing the 0.1 default.
 
 ## Prepare the release commit
 
@@ -35,6 +36,7 @@ SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
   python3 tools/normalize-distributions dist
 python3 -m twine check dist/*
+tools/release-acceptance "$PWD"/dist/cyclo_agent-*.whl
 tools/release-manifest dist
 git status --short
 ```
@@ -94,8 +96,10 @@ The script refuses a dirty tree, archives the exact local commit, installs the
 hash-locked release tools into a temporary environment, and disables PEP 517
 build isolation so the backend cannot be replaced by an implicit download. It
 runs the Python, Node, shell, dependency, clean-wheel, and three-template
-acceptance suites, builds and smoke-tests all three credential-free Docker
-images, and writes this bundle:
+acceptance suites. Protocol generation must leave the archived commit
+unchanged, and installed-wheel acceptance runs against the exact normalized
+wheel that enters the bundle. It then builds and smoke-tests all three
+credential-free Docker images and writes:
 
 ```text
 release/cyclo-agent-0.2.0/

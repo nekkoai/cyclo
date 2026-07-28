@@ -297,7 +297,9 @@ ordinary image and container work to the component controller.
 `gateway build` rebuilds and restarts the gateway. Global `cyclo refresh`
 stops active team instances, rebuilds and restarts the gateway and configured
 providers, then rebuilds the selected common and derived team images while
-restarting each active project.
+restarting each active project. Inventory, stop, rebuild, and restart execute
+under one installation lock, so another host command cannot change the fleet
+halfway through that operation.
 
 ## Provider protocol
 
@@ -337,6 +339,16 @@ credentials, OAuth sessions, and the usage ledger. No team or intermediate
 component mounts that volume. The public model catalogue exposes account/model
 names and safe capabilities, never native headers, base URLs, or credentials.
 
+Host-only gateway commands run in labeled one-shot containers under the
+installation's kernel lock. If the controlling process is killed or the host
+restarts, the lock is released automatically; the next locked gateway
+operation verifies the abandoned container's installation labels, canonical
+name, and immutable Docker ID before removing the container without removing
+the credential volume. A concurrent dashboard request never waits behind an
+interactive login: usage is reported as temporarily unavailable instead.
+Dashboard observation neither creates an absent installation nor binds its
+provider-configuration scope.
+
 `cyclo gateway login` constructs the candidate credential document under the
 gateway's kernel file lock and validates it through the same configured
 catalogue path before atomically replacing the private store. An unknown or
@@ -344,7 +356,11 @@ misconfigured provider therefore leaves the previous store and running gateway
 intact. The long-running gateway reads credential values dynamically, while its
 model catalogue is a startup snapshot. Successful login restarts the gateway
 automatically and returns only after the updated catalogue is ready. OAuth
-refreshes use the same kernel lock and atomic file replacement.
+refreshes use the same kernel lock and atomic file replacement. Gateway health
+also compares that snapshot with the current non-secret catalogue. If the host
+is killed after the store commit but before restart, the old process becomes
+not-ready; the next ordinary start or model operation replaces it and publishes
+the committed catalogue.
 
 Incoming ConnectRPC headers are not forwarded to native services. The gateway
 chooses the native model from its catalogue, resolves the matching credential,
@@ -383,7 +399,23 @@ selected trees must be real, non-overlapping directories.
 Before the first container starts, Cyclo validates every team, requested model,
 mount, provider connection, and bind-source identity. A partial multi-team
 startup rolls back only containers created by that invocation. Queue history
-remains under the state root.
+remains under the state root. First-instance metadata is built outside the
+authoritative inventory and published as one complete directory before runtime
+materialization, so interruption exposes either no instance or a valid
+launch-pinned record that `cyclo repair` can reconcile.
+Retirement makes the inverse transition: it first renames the complete
+instance out of authoritative inventory, then recursively removes the inert
+tree. Interruption therefore cannot leave an inventory entry without
+`run.json`.
+
+Restarting an instance with a stopped or dead container uses two launch
+identities rather than adopting the old container. Cyclo verifies and removes
+the exact persisted old launch while its metadata is still authoritative, then
+atomically publishes the replacement launch before creating its container.
+An interruption therefore leaves either the old record with no old container,
+or the new record with no old container; both states remain inspectable and
+repairable. A running, paused, restarting, foreign, or differently labeled
+container is never removed by this replacement path.
 
 A team repository contains its behavioral definition and optional execution
 delta:

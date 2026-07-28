@@ -82,7 +82,7 @@ def state_store(args: argparse.Namespace) -> StateStore:
     root = Path(selected).expanduser().resolve() if selected else None
     return StateStore(
         root,
-        requested_host_config_scope="state" if selected else "system",
+        requested_host_config_scope="local" if selected else "system",
     )
 
 
@@ -92,7 +92,7 @@ def host_config(store: StateStore) -> Path:
     scope = store.host_config_scope
     if scope == "system":
         return DEFAULT_HOST_CONFIG
-    if scope == "state":
+    if scope == "local":
         return store.root / "host.conf"
     raise CycloError("Cyclo installation has no host configuration scope")
 
@@ -357,11 +357,12 @@ def _prepare_team_images(
     return selected_base
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    source = agentws_root()
-    store = state_store(args)
+def _prepare_project_run(
+    args: argparse.Namespace,
+    store: StateStore,
+    source: Path,
+) -> tuple[str, tuple[RunBinding, ...]]:
     base_image = team_image_name(store.system, __version__)
-    docker = Docker()
     definition = load_project(args.project)
     configured_teams = load_project_teams(definition)
     validate_run_options(args, team_count=len(configured_teams))
@@ -380,7 +381,90 @@ def cmd_run(args: argparse.Namespace) -> int:
         base_image=base_image,
         version=__version__,
     )
+    return base_image, bindings
 
+
+def _start_project_locked(
+    args: argparse.Namespace,
+    source: Path,
+    store: StateStore,
+    docker: Docker,
+    providers: ProviderSystem,
+    base_image: str,
+    bindings: tuple[RunBinding, ...],
+) -> None:
+    """Start one project while the caller owns the installation lock."""
+
+    connection = providers.start()
+    connection, catalogue = providers.catalogue(connection)
+    _warn_unavailable_providers(connection, providers.gateway.socket_path)
+    for binding in bindings:
+        validate_pi_team_models(binding.team, catalogue)
+        binding.instance.provider_socket_path = str(connection.socket_path)
+        binding.instance.provider_generation = connection.generation
+    for binding in bindings:
+        preflight_binding(binding, store, docker)
+    _prepare_team_images(
+        bindings,
+        base_image=base_image,
+    )
+    started: list[RunBinding] = []
+    current: RunBinding | None = None
+    try:
+        for binding in bindings:
+            current = binding
+            start_binding_locked(
+                args,
+                binding,
+                source,
+                store,
+                docker,
+            )
+            started.append(binding)
+            current = None
+    except BaseException:
+        rollback_errors: list[str] = []
+        rollback = list(started)
+        if current is not None and all(
+            item.instance.id != current.instance.id for item in rollback
+        ):
+            try:
+                persisted = store.load(current.instance.id)
+            except CycloError as exc:
+                if store.metadata_path(current.instance.id).is_file():
+                    rollback_errors.append(
+                        f"{current.instance.id}: "
+                        f"cannot verify in-flight launch: {exc}"
+                    )
+            else:
+                if (
+                    persisted.active
+                    and persisted.launch_id == current.instance.launch_id
+                ):
+                    rollback.append(current)
+        for binding in reversed(rollback):
+            try:
+                stop_managed_instance_locked(
+                    store,
+                    docker,
+                    binding.instance,
+                )
+            except Exception as exc:
+                rollback_errors.append(f"{binding.instance.id}: {exc}")
+        if rollback_errors:
+            print(
+                "warning: project startup rollback was incomplete: "
+                + "; ".join(rollback_errors),
+                file=sys.stderr,
+            )
+        raise
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    source = agentws_root()
+    store = state_store(args)
+    docker = Docker()
+    base_image, bindings = _prepare_project_run(args, store, source)
     providers = provider_system(args, store)
     if args.dry_run:
         for binding in bindings:
@@ -396,69 +480,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     with store.locked():
-        connection = providers.start()
-        connection, catalogue = providers.catalogue(connection)
-        _warn_unavailable_providers(connection, providers.gateway.socket_path)
-        for binding in bindings:
-            validate_pi_team_models(binding.team, catalogue)
-            binding.instance.provider_socket_path = str(connection.socket_path)
-            binding.instance.provider_generation = connection.generation
-        for binding in bindings:
-            preflight_binding(binding, store, docker)
-        _prepare_team_images(
+        _start_project_locked(
+            args,
+            source,
+            store,
+            docker,
+            providers,
+            base_image,
             bindings,
-            base_image=base_image,
         )
-        started: list[RunBinding] = []
-        current: RunBinding | None = None
-        try:
-            for binding in bindings:
-                current = binding
-                start_binding_locked(
-                    args,
-                    binding,
-                    source,
-                    store,
-                    docker,
-                )
-                started.append(binding)
-                current = None
-        except BaseException:
-            rollback_errors: list[str] = []
-            rollback = list(started)
-            if current is not None and all(
-                item.instance.id != current.instance.id for item in rollback
-            ):
-                try:
-                    persisted = store.load(current.instance.id)
-                except CycloError as exc:
-                    if store.metadata_path(current.instance.id).is_file():
-                        rollback_errors.append(
-                            f"{current.instance.id}: "
-                            f"cannot verify in-flight launch: {exc}"
-                        )
-                else:
-                    if (
-                        persisted.active
-                        and persisted.launch_id == current.instance.launch_id
-                    ):
-                        rollback.append(current)
-            for binding in reversed(rollback):
-                try:
-                    stop_managed_instance_locked(
-                        store,
-                        docker,
-                        binding.instance,
-                    )
-                except Exception as exc:
-                    rollback_errors.append(f"{binding.instance.id}: {exc}")
-            if rollback_errors:
-                print(
-                    "warning: project startup rollback was incomplete: "
-                    + "; ".join(rollback_errors),
-                    file=sys.stderr,
-                )
-            raise
 
     for binding in bindings:
         _announce_binding(binding, store)
@@ -552,38 +582,58 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 
     store = state_store(args)
     docker = Docker()
+    source = agentws_root()
+    # Select the installation's provider configuration before lock acquisition
+    # so the same lock transaction can persist that choice.
+    host_config(store)
     with store.locked():
         instances = active_instances(store, docker)
-    projects = _refresh_projects(args, instances)
+        projects = _refresh_projects(args, instances)
+        prepared = [
+            (project_args, *_prepare_project_run(project_args, store, source))
+            for project_args in projects
+        ]
+        providers = provider_system(args, store)
 
-    providers = provider_system(args, store)
-    stop_failures: list[str] = []
-    for instance in instances:
-        try:
-            stop_instance(args, store, instance)
-        except Exception as exc:
-            stop_failures.append(f"{instance.id}: {exc}")
-        else:
-            print(f"stopped Cyclo instance: {instance.id}")
-    if stop_failures:
-        raise CycloError(
-            "refresh could not stop the active fleet: " + "; ".join(stop_failures)
-        )
+        stop_failures: list[str] = []
+        for instance in instances:
+            try:
+                stop_managed_instance_locked(store, docker, instance)
+            except Exception as exc:
+                stop_failures.append(f"{instance.id}: {exc}")
+            else:
+                print(f"stopped Cyclo instance: {instance.id}")
+        if stop_failures:
+            raise CycloError(
+                "refresh could not stop the active fleet: "
+                + "; ".join(stop_failures)
+            )
 
-    print("rebuilding and restarting provider system")
-    with store.locked():
+        print("rebuilding and restarting provider system")
         providers.refresh()
 
-    start_failures: list[str] = []
-    for project_args in projects:
-        try:
-            cmd_run(project_args)
-        except Exception as exc:
-            start_failures.append(f"{project_args.project}: {exc}")
-    if start_failures:
-        raise CycloError(
-            "refresh could not restart every project: " + "; ".join(start_failures)
-        )
+        start_failures: list[str] = []
+        for project_args, base_image, bindings in prepared:
+            try:
+                _start_project_locked(
+                    project_args,
+                    source,
+                    store,
+                    docker,
+                    providers,
+                    base_image,
+                    bindings,
+                )
+            except Exception as exc:
+                start_failures.append(f"{project_args.project}: {exc}")
+            else:
+                for binding in bindings:
+                    _announce_binding(binding, store)
+        if start_failures:
+            raise CycloError(
+                "refresh could not restart every project: "
+                + "; ".join(start_failures)
+            )
     print("Cyclo refresh complete")
     return 0
 
@@ -602,38 +652,45 @@ def stop_instance(
 
 def cmd_stop(args: argparse.Namespace) -> int:
     store = state_store(args)
+    docker = Docker()
     target = args.target
     try:
         candidate_id = validate_instance_id(target)
     except CycloError:
         candidate_id = None
-    if candidate_id is not None and store.metadata_path(candidate_id).is_file():
-        candidate = store.load(candidate_id)
-        stop_instance(args, store, candidate)
-        print(f"stopped Cyclo instance: {candidate_id}")
-        return 0
+    with store.locked():
+        if (
+            candidate_id is not None
+            and store.metadata_path(candidate_id).is_file()
+        ):
+            candidate = store.load(candidate_id)
+            stop_managed_instance_locked(store, docker, candidate)
+            print(f"stopped Cyclo instance: {candidate_id}")
+            return 0
 
-    selected = Path(os.path.abspath(Path(target).expanduser()))
-    canonical = selected.resolve()
-    targets = [
-        instance
-        for instance in store.list()
-        if instance.project_file
-        and Path(instance.project_file).expanduser().resolve() == canonical
-    ]
-    if not targets:
-        raise CycloError(f"no Cyclo instances found for project definition {selected}")
+        selected = Path(os.path.abspath(Path(target).expanduser()))
+        canonical = selected.resolve()
+        targets = [
+            instance
+            for instance in store.list()
+            if instance.project_file
+            and Path(instance.project_file).expanduser().resolve() == canonical
+        ]
+        if not targets:
+            raise CycloError(
+                f"no Cyclo instances found for project definition {selected}"
+            )
 
-    failures: list[str] = []
-    for instance in targets:
-        try:
-            stop_instance(args, store, instance)
-        except Exception as exc:
-            failures.append(f"{instance.id}: {exc}")
-        else:
-            print(f"stopped Cyclo instance: {instance.id}")
-    if failures:
-        raise CycloError(f"project stop incomplete: {'; '.join(failures)}")
+        failures: list[str] = []
+        for instance in targets:
+            try:
+                stop_managed_instance_locked(store, docker, instance)
+            except Exception as exc:
+                failures.append(f"{instance.id}: {exc}")
+            else:
+                print(f"stopped Cyclo instance: {instance.id}")
+        if failures:
+            raise CycloError(f"project stop incomplete: {'; '.join(failures)}")
     return 0
 
 
@@ -809,11 +866,20 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 
 class _GatewayUsageReader:
-    def __init__(self, proxy: Gateway) -> None:
+    def __init__(self, proxy: Gateway, store: StateStore) -> None:
         self.proxy = proxy
+        self.store = store
 
     def usage(self) -> dict[str, object]:
-        return self.proxy.usage()
+        if not self.store.components_root.is_dir():
+            return {}
+        with self.store.locked(
+            blocking=False,
+            bind_host_config=False,
+        ):
+            if not self.proxy.store_ready():
+                return {}
+            return self.proxy.usage()
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
@@ -821,7 +887,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     snapshot = DashboardSnapshot(
         store,
         docker=Docker(),
-        usage_reader=_GatewayUsageReader(gateway(args, store)),
+        usage_reader=_GatewayUsageReader(gateway(args, store), store),
         provider_reader=provider_system(args, store),
     )
     server = make_dashboard_server(
@@ -995,7 +1061,10 @@ def cmd_path(args: argparse.Namespace) -> int:
 
 
 def cmd_usage(args: argparse.Namespace) -> int:
-    print(json.dumps(gateway(args, state_store(args)).usage(), indent=2, sort_keys=True))
+    store = state_store(args)
+    with store.locked():
+        report = gateway(args, store).usage()
+    print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -1497,8 +1566,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--host", default=DEFAULT_DASHBOARD_HOST, help="AgentWS bind address")
     run.add_argument("--port", type=int, default=0, help="AgentWS port; 0 chooses a free port")
-    run.add_argument("--verbose", action="store_true")
-    run.add_argument("--foreground", action="store_true")
+    run.add_argument(
+        "--verbose",
+        action="store_true",
+        help="mirror each agent's rendered transcript into team-container logs",
+    )
+    run.add_argument(
+        "--foreground",
+        action="store_true",
+        help="follow the single team's logs; Ctrl-C stops that instance",
+    )
     run.add_argument("--dry-run", action="store_true", help="print the team Docker command")
     run.set_defaults(func=cmd_run)
 
@@ -1527,9 +1604,28 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("instance", help="instance ID from cyclo ps")
     inspect.set_defaults(func=cmd_inspect)
 
-    dashboard = commands.add_parser("dashboard", help="serve the read-only fleet dashboard")
-    dashboard.add_argument("--host", default=DEFAULT_DASHBOARD_HOST)
-    dashboard.add_argument("--port", type=int, default=0)
+    dashboard = commands.add_parser(
+        "dashboard",
+        help="serve the read-only fleet dashboard",
+        description=(
+            "Serve the fleet dashboard. It is read-only but unauthenticated; "
+            "use a trusted reverse proxy or firewall before non-loopback exposure."
+        ),
+    )
+    dashboard.add_argument(
+        "--host",
+        default=DEFAULT_DASHBOARD_HOST,
+        help=(
+            "bind address (default: 127.0.0.1); non-loopback addresses expose "
+            "unauthenticated fleet data"
+        ),
+    )
+    dashboard.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="listen port; 0 chooses a free port (default: 0)",
+    )
     dashboard.set_defaults(func=cmd_dashboard)
 
     task = commands.add_parser("task", help="inspect and control tasks in an instance")
@@ -1731,8 +1827,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="catalogue provider/account name (default: PROVIDER)",
     )
     key = login.add_mutually_exclusive_group()
-    key.add_argument("--api-key-env")
-    key.add_argument("--api-key-stdin", action="store_true")
+    key.add_argument(
+        "--api-key-env",
+        metavar="NAME",
+        help=(
+            "read the API key from host environment variable NAME and pass it "
+            "to the gateway over standard input"
+        ),
+    )
+    key.add_argument(
+        "--api-key-stdin",
+        action="store_true",
+        help="read an API key from standard input instead of using OAuth login",
+    )
     login.set_defaults(func=cmd_gateway)
 
     doctor = commands.add_parser("doctor", help="check the installed system without changing it")

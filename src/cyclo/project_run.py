@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Mapping
 
 from .dashboard import dashboard_host_is_loopback
-from .docker import ContainerSpec, Docker, overlaps, overlaps_lexically
+from .docker import (
+    ContainerSpec,
+    Docker,
+    DockerContainerState,
+    overlaps,
+    overlaps_lexically,
+)
 from .errors import CycloError
 from .instance_lifecycle import stop_remove_instance_container
 from .installation import (
@@ -333,7 +339,9 @@ def binding_matches(previous: Instance, binding: RunBinding) -> bool:
     )
 
 
-def preflight_binding(binding: RunBinding, store: StateStore, docker: Docker) -> None:
+def preflight_binding(
+    binding: RunBinding, store: StateStore, docker: Docker
+) -> Instance | None:
     instance = binding.instance
     verify_source_identities(binding)
     state = docker.previous_launch_lifecycle_state(
@@ -343,6 +351,7 @@ def preflight_binding(binding: RunBinding, store: StateStore, docker: Docker) ->
         raise CycloError(
             f"Cyclo instance is already active ({state.value}): {instance.id}"
         )
+    previous = None
     if store.metadata_path(instance.id).is_file():
         previous = store.load(instance.id)
         if not binding_matches(previous, binding):
@@ -350,7 +359,13 @@ def preflight_binding(binding: RunBinding, store: StateStore, docker: Docker) ->
                 f"instance name {instance.id!r} is already bound to a "
                 "different team or project"
             )
+    elif state is not DockerContainerState.ABSENT:
+        raise CycloError(
+            f"Cyclo container exists without instance state: "
+            f"{instance.container_name}"
+        )
     validate_running_mount_boundaries(binding, store, docker)
+    return previous
 
 
 def validate_pi_team_models(
@@ -424,25 +439,43 @@ def start_binding_locked(
 
     instance = binding.instance
     spec = container_spec(binding, store, args)
-    preflight_binding(binding, store, docker)
-    store.materialize_agentws(
-        instance.id,
-        source / "template",
-        Path(__file__).with_name("container_runtime.py"),
-        project_config=binding.project_config,
-    )
-    if binding.project_mounts:
-        store.materialize_workspace_layout(
-            instance.id,
-            [mount.name for mount in binding.project_mounts if mount.writable],
-        )
-        store.materialize_readonly_layout(
-            instance.id,
-            [mount.name for mount in binding.project_mounts if mount.read_only],
-        )
-    materialize_pi_settings(store, instance, binding.team)
+    previous = preflight_binding(binding, store, docker)
+    launch_persisted = False
     try:
-        store.save(instance)
+        # A fresh instance must become visible through a complete run.json
+        # before any materializer can create children beneath its state path.
+        # Existing stopped instances retain their authoritative metadata while
+        # their exact old launch is removed and the replacement is prepared.
+        if not store.instance_dir(instance.id).exists():
+            store.save(instance)
+            launch_persisted = True
+        elif previous is not None:
+            docker.remove_inactive_launch(
+                previous.container_name,
+                previous.id,
+                expected_system=store.system,
+                expected_launch=previous.launch_id,
+            )
+        store.materialize_agentws(
+            instance.id,
+            source / "template",
+            Path(__file__).with_name("container_runtime.py"),
+            project_config=binding.project_config,
+        )
+        if binding.project_mounts:
+            store.materialize_workspace_layout(
+                instance.id,
+                [mount.name for mount in binding.project_mounts if mount.writable],
+            )
+            store.materialize_readonly_layout(
+                instance.id,
+                [mount.name for mount in binding.project_mounts if mount.read_only],
+            )
+        materialize_pi_settings(store, instance, binding.team)
+        if not launch_persisted:
+            assert previous is not None
+            store.save(instance)
+            launch_persisted = True
         docker.ensure_network(
             instance.network_name,
             instance.id,
@@ -460,6 +493,8 @@ def start_binding_locked(
         )
         store.save(instance)
     except BaseException as start_error:
+        if not launch_persisted:
+            raise
         instance.active = False
         instance.port = None
         cleanup_errors: list[str] = []
