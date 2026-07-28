@@ -1771,7 +1771,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="block direct network access; the mounted model-provider socket remains available",
     )
-    run.add_argument("--host", default=DEFAULT_DASHBOARD_HOST, help="AgentWS bind address")
+    run.add_argument(
+        "--host",
+        default=DEFAULT_DASHBOARD_HOST,
+        help="AgentWS literal IPv4 bind address",
+    )
     run.add_argument("--port", type=int, default=0, help="AgentWS port; 0 chooses a free port")
     run.add_argument(
         "--verbose",
