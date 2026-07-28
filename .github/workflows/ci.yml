@@ -79,6 +79,20 @@ jobs:
           for package in protocol/component protocol/provider gateway passthrough pi-provider; do
             npm test --prefix "src/cyclo/components/$package"
           done
+      - name: Confirm generated protocol sources are current
+        run: |
+          generated_paths="
+          src/cyclo/components/protocol/component/gen
+          src/cyclo/components/protocol/provider/gen
+          "
+          git diff --exit-code -- $generated_paths
+          generated_untracked=$(git ls-files --others --exclude-standard -- $generated_paths)
+          if [ -n "$generated_untracked" ]; then
+            printf '%s\n' \
+              "untracked generated protocol files:" \
+              "$generated_untracked" >&2
+            exit 1
+          fi
       - name: Audit shipped component dependencies
         run: python3 tools/dependency-audit
       - name: Check POSIX shell syntax
@@ -90,6 +104,7 @@ jobs:
 
   package:
     name: Package and clean-wheel audit
+    needs: node-and-shell
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -109,8 +124,8 @@ jobs:
           python -m build --no-isolation
           python tools/normalize-distributions dist
           python -m twine check dist/*
-      - name: Exercise a clean-copy wheel installation
-        run: tools/release-acceptance
+      - name: Exercise the built wheel installation
+        run: tools/release-acceptance "$PWD"/dist/cyclo_agent-*.whl
       - name: Confirm acceptance did not modify tracked files
         run: git diff --exit-code
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

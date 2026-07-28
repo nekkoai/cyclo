@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
+import signal
 from pathlib import Path
 
 import pytest
 
+import cyclo.state as state_module
 from cyclo.agentws_bundle import packaged_agentws_template
 from cyclo.errors import CycloError
 from cyclo.installation import team_container_name, team_network_name
@@ -61,6 +64,90 @@ def test_metadata_round_trip_has_no_token(tmp_path: Path) -> None:
     assert loaded == instance
     assert "token" not in text.lower()
     assert store.metadata_path("alpha").stat().st_mode & 0o777 == 0o600
+
+
+def test_sigkill_during_first_metadata_publication_cannot_poison_inventory(
+    tmp_path: Path,
+) -> None:
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError:
+        pytest.skip("requires fork to stop a save at the publication boundary")
+
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    ready = context.Event()
+
+    def save_until_killed() -> None:
+        real_rename = state_module.os.rename
+
+        def block_publication(source, destination) -> None:
+            if Path(destination) == store.instance_dir("alpha"):
+                ready.set()
+                signal.pause()
+            real_rename(source, destination)
+
+        state_module.os.rename = block_publication
+        store.save(selected)
+
+    process = context.Process(target=save_until_killed)
+    process.start()
+    try:
+        assert ready.wait(5), "child did not reach metadata publication"
+        process.kill()
+        process.join(5)
+        assert process.exitcode == -signal.SIGKILL
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+
+    assert not store.instance_dir("alpha").exists()
+    assert store.list() == []
+
+
+def test_sigkill_during_instance_retirement_cannot_poison_inventory(
+    tmp_path: Path,
+) -> None:
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError:
+        pytest.skip("requires fork to stop retirement after its atomic rename")
+
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    store.save(selected)
+    ready = context.Event()
+
+    def retire_until_killed() -> None:
+        real_rmtree = state_module.shutil.rmtree
+
+        def block_removal(path, *args, **kwargs) -> None:
+            if ".retired." in Path(path).name:
+                ready.set()
+                signal.pause()
+            real_rmtree(path, *args, **kwargs)
+
+        state_module.shutil.rmtree = block_removal
+        store.remove_instance(
+            selected.id,
+            expected_launch_id=selected.launch_id,
+        )
+
+    process = context.Process(target=retire_until_killed)
+    process.start()
+    try:
+        assert ready.wait(5), "child did not reach retired-state cleanup"
+        process.kill()
+        process.join(5)
+        assert process.exitcode == -signal.SIGKILL
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+
+    assert not store.instance_dir("alpha").exists()
+    assert store.list() == []
 
 
 def test_persisted_instance_requires_a_launch_identity(tmp_path: Path) -> None:
@@ -132,34 +219,59 @@ def test_host_configuration_scope_binding_is_atomic_and_conflict_safe(
 ) -> None:
     root = tmp_path / "state"
     system = StateStore(root, requested_host_config_scope="system")
-    state_scoped = StateStore(root, requested_host_config_scope="state")
+    local = StateStore(root, requested_host_config_scope="local")
 
     assert system.host_config_scope == "system"
-    assert state_scoped.host_config_scope == "state"
+    assert local.host_config_scope == "local"
     with system.locked():
         pass
 
     assert system.host_config_scope_path.read_text(encoding="ascii") == "system\n"
     assert system.host_config_scope_path.stat().st_mode & 0o777 == 0o600
     with pytest.raises(CycloError, match="retry the command"):
-        with state_scoped.locked():
+        with local.locked():
             pass
 
     # A new process adopts the existing binding, regardless of how the same
     # canonical state root was selected.
-    reopened = StateStore(root, requested_host_config_scope="state")
+    reopened = StateStore(root, requested_host_config_scope="local")
     assert reopened.host_config_scope == "system"
     with reopened.locked():
         pass
 
 
-def test_host_configuration_scope_rejects_invalid_state(
+def test_nonblocking_state_lock_reports_a_busy_installation(
     tmp_path: Path,
+) -> None:
+    owner = StateStore(tmp_path / "state")
+    observer = StateStore(tmp_path / "state")
+
+    with owner.locked():
+        with pytest.raises(CycloError, match="state is busy"):
+            with observer.locked(blocking=False):
+                pytest.fail("acquired an installation lock held elsewhere")
+
+
+def test_state_lock_does_not_translate_operation_oserror(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    failure = OSError("operation failed")
+
+    with pytest.raises(OSError) as raised:
+        with store.locked():
+            raise failure
+
+    assert raised.value is failure
+
+
+@pytest.mark.parametrize("content", ("elsewhere\n", "state\n"))
+def test_host_configuration_scope_rejects_invalid_value(
+    tmp_path: Path,
+    content: str,
 ) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
     binding = root / "host-config.scope"
-    binding.write_text("elsewhere\n", encoding="ascii")
+    binding.write_text(content, encoding="ascii")
     binding.chmod(0o600)
 
     store = StateStore(root, requested_host_config_scope="system")
@@ -629,6 +741,38 @@ def test_save_rejects_symlinked_instance_directory(tmp_path: Path) -> None:
         store.save(make_instance("alpha", store))
 
     assert not (outside / "run.json").exists()
+
+
+@pytest.mark.parametrize("metadata_kind", ("missing", "symlink", "fifo"))
+def test_save_never_adopts_incomplete_instance_state(
+    tmp_path: Path,
+    metadata_kind: str,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    store.ensure()
+    directory = store.instance_dir("alpha")
+    directory.mkdir()
+    sentinel = directory / "foreign-state"
+    sentinel.write_text("untouched\n", encoding="utf-8")
+    metadata = directory / "run.json"
+    if metadata_kind == "symlink":
+        target = tmp_path / "outside"
+        target.write_text("outside\n", encoding="utf-8")
+        metadata.symlink_to(target)
+    elif metadata_kind == "fifo":
+        os.mkfifo(metadata)
+
+    with pytest.raises(CycloError, match="Cyclo instance"):
+        store.save(make_instance("alpha", store))
+
+    assert sentinel.read_text(encoding="utf-8") == "untouched\n"
+    if metadata_kind == "missing":
+        assert not metadata.exists()
+    elif metadata_kind == "symlink":
+        assert metadata.is_symlink()
+        assert (tmp_path / "outside").read_text(encoding="utf-8") == "outside\n"
+    else:
+        assert metadata.is_fifo()
 
 
 def test_rematerialize_does_not_follow_persisted_symlink(tmp_path: Path) -> None:

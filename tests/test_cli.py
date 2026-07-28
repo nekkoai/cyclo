@@ -13,6 +13,7 @@ from cyclo.agentws_bundle import packaged_agentws_root
 from cyclo.agentws_queue import AgentSupervisorStatus
 from cyclo.cli import (
     DEFAULT_HOST_CONFIG,
+    _GatewayUsageReader,
     _prepare_team_images,
     build_parser,
     host_config,
@@ -31,6 +32,11 @@ from cyclo.installation import (
     team_network_name,
 )
 from cyclo.project import MAX_PROJECT_FILE_BYTES, load_project
+from cyclo.project_run import (
+    load_project_teams,
+    project_run_bindings,
+    start_binding_locked,
+)
 from cyclo.state import Instance, StateStore
 from cyclo.team import load_team
 
@@ -172,7 +178,7 @@ class RecordingStore:
     def __init__(self, root: Path, instances: list[object] | None = None) -> None:
         self.root = root
         self.components_root = root / "components"
-        self.host_config_scope = "state"
+        self.host_config_scope = "local"
         self.instances = instances or []
         self.lock_entries = 0
 
@@ -181,7 +187,14 @@ class RecordingStore:
         return StateStore(self.root).system
 
     @contextmanager
-    def locked(self):
+    def locked(
+        self,
+        *,
+        blocking: bool = True,
+        bind_host_config: bool = True,
+    ):
+        assert isinstance(blocking, bool)
+        assert isinstance(bind_host_config, bool)
         self.lock_entries += 1
         yield
 
@@ -299,6 +312,29 @@ def test_run_parser_has_one_project_argument_and_loopback_default() -> None:
     assert args.host == "127.0.0.1"
 
 
+def test_run_and_dashboard_help_explain_observation_modes_and_exposure() -> None:
+    parser = build_parser()
+    root_action = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+
+    run_help = " ".join(root_action.choices["run"].format_help().split())
+    assert "rendered transcript" in run_help
+    assert "Ctrl-C stops that instance" in run_help
+
+    dashboard_help = " ".join(
+        root_action.choices["dashboard"].format_help().split()
+    )
+    assert "read-only but unauthenticated" in dashboard_help
+    assert (
+        "non-loopback addresses expose unauthenticated fleet data"
+        in dashboard_help
+    )
+    assert "0 chooses a free port" in dashboard_help
+
+
 def test_state_root_selects_the_host_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -349,6 +385,9 @@ def test_state_root_selects_the_host_configuration(
     assert host_config(explicit_local_store) == local_root / "host.conf"
     with explicit_local_store.locked():
         pass
+    assert explicit_local_store.host_config_scope_path.read_text(
+        encoding="ascii"
+    ) == "local\n"
 
     monkeypatch.delenv("CYCLO_STATE_ROOT")
     monkeypatch.setenv("XDG_STATE_HOME", str(local_xdg))
@@ -515,42 +554,83 @@ def test_refresh_stops_then_refreshes_provider_system_and_active_projects(
     )
     selected.agentws_host = "0.0.0.0"
     selected.offline = True
-    selected.port = 4317
-    store = RecordingStore(tmp_path / "state", [selected])
+    selected.port = None
+
+    class RefreshStore(RecordingStore):
+        def __init__(self, root: Path, instances: list[object]) -> None:
+            super().__init__(root, instances)
+            self.lock_depth = 0
+
+        @contextmanager
+        def locked(self, *, blocking: bool = True):
+            assert blocking
+            assert self.lock_depth == 0
+            self.lock_entries += 1
+            self.lock_depth = 1
+            try:
+                yield
+            finally:
+                self.lock_depth = 0
+
+    store = RefreshStore(tmp_path / "state", [selected])
     events: list[str] = []
 
     class RefreshStack:
         @staticmethod
         def refresh():
+            assert store.lock_depth == 1
             events.append("provider-system-refresh")
 
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
     monkeypatch.setattr("cyclo.cli.Docker", lambda: object())
     monkeypatch.setattr(
         "cyclo.cli.active_instances",
-        lambda selected_store, _docker: list(selected_store.instances),
+        lambda selected_store, _docker: (
+            pytest.fail("refresh inventory escaped the installation lock")
+            if selected_store.lock_depth != 1
+            else list(selected_store.instances)
+        ),
     )
     monkeypatch.setattr(
         "cyclo.cli.provider_system",
         lambda _args, _store: RefreshStack(),
     )
     monkeypatch.setattr(
-        "cyclo.cli.stop_instance",
-        lambda _args, _store, instance: events.append(f"stop:{instance.id}"),
+        "cyclo.cli.stop_managed_instance_locked",
+        lambda selected_store, _docker, instance: (
+            pytest.fail("refresh stop escaped the installation lock")
+            if selected_store.lock_depth != 1
+            else events.append(f"stop:{instance.id}")
+        ),
     )
 
-    def run(project_args):
+    def start(
+        project_args,
+        _source,
+        selected_store,
+        _docker,
+        providers,
+        _base_image,
+        bindings,
+    ):
+        assert selected_store is store
+        assert selected_store.lock_depth == 1
+        assert providers.__class__ is RefreshStack
         assert project_args.project == str(definition)
         assert project_args.image is None
         assert project_args.offline is True
         assert project_args.host == "0.0.0.0"
-        assert project_args.port == 4317
+        assert project_args.port == 0
+        assert [binding.instance.id for binding in bindings] == [
+            "integration-project-review-team"
+        ]
         events.append(f"run:{project_args.project}")
-        return 0
 
-    monkeypatch.setattr("cyclo.cli.cmd_run", run)
+    monkeypatch.setattr("cyclo.cli._start_project_locked", start)
 
     assert main(["refresh"]) == 0
+    assert store.lock_entries == 1
+    assert store.lock_depth == 0
     stopped = "stop:integration-project-review-team"
     assert events.index(stopped) < events.index("provider-system-refresh")
     assert events.index("provider-system-refresh") < events.index(f"run:{definition}")
@@ -955,6 +1035,264 @@ def test_run_materializes_each_teams_container_project(
         assert not (runtime / "PROJECT.md").exists()
 
 
+def test_first_start_is_recoverable_when_materialization_fails(
+    tmp_path: Path,
+    team_repo: Path,
+    project_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = load_project(
+        write_project(tmp_path / "project.cyclo", team_repo, project_repo)
+    )
+    store = StateStore(tmp_path / "state")
+    args = SimpleNamespace(
+        image=None,
+        offline=False,
+        host="127.0.0.1",
+        port=0,
+        verbose=False,
+    )
+    binding = project_run_bindings(
+        args,
+        definition,
+        load_project_teams(definition),
+        system=store.system,
+        base_image="cyclo-team:test",
+        version="0.2.0",
+    )[0]
+    provider = tmp_path / "provider"
+    provider.mkdir()
+    binding.instance.provider_socket_path = str(provider / "component.sock")
+    binding.instance.provider_generation = "provider-generation"
+    observed: list[Instance] = []
+
+    def fail_after_publication(*_args, **_kwargs):
+        observed.append(store.load(binding.instance.id))
+        raise RuntimeError("injected materialization failure")
+
+    monkeypatch.setattr(store, "materialize_agentws", fail_after_publication)
+
+    class DockerDouble:
+        @staticmethod
+        def previous_launch_lifecycle_state(_instance, *, system):
+            assert system == store.system
+            return DockerContainerState.ABSENT
+
+        @staticmethod
+        def container_lifecycle_active(_instance, *, system):
+            assert system == store.system
+            return False
+
+        @staticmethod
+        def stop_remove(
+            _name,
+            _identifier,
+            *,
+            expected_system,
+            expected_launch,
+        ):
+            assert expected_system == store.system
+            assert expected_launch == binding.instance.launch_id
+            return False
+
+        @staticmethod
+        def remove_network(_name, _identifier, *, system):
+            assert system == store.system
+            return False
+
+    with pytest.raises(RuntimeError, match="injected materialization failure"):
+        start_binding_locked(
+            args,
+            binding,
+            packaged_agentws_root(),
+            store,
+            DockerDouble(),  # type: ignore[arg-type]
+        )
+
+    assert len(observed) == 1
+    assert observed[0].active
+    persisted = store.load(binding.instance.id)
+    assert not persisted.active
+    assert persisted.launch_id == binding.instance.launch_id
+    assert store.list() == [persisted]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [None, "remove", "publish", "start"],
+    ids=("success", "remove-fails", "publish-fails", "start-fails"),
+)
+def test_restart_launch_transition_is_exact_and_repairable(
+    tmp_path: Path,
+    team_repo: Path,
+    project_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    definition = load_project(
+        write_project(tmp_path / "project.cyclo", team_repo, project_repo)
+    )
+    store = StateStore(tmp_path / "state")
+    args = SimpleNamespace(
+        image=None,
+        offline=False,
+        host="127.0.0.1",
+        port=0,
+        verbose=False,
+    )
+    binding = project_run_bindings(
+        args,
+        definition,
+        load_project_teams(definition),
+        system=store.system,
+        base_image="cyclo-team:test",
+        version="0.2.0",
+    )[0]
+    provider = tmp_path / "provider"
+    provider.mkdir()
+    binding.instance.provider_socket_path = str(provider / "component.sock")
+    binding.instance.provider_generation = "provider-generation"
+    previous = Instance.from_json(binding.instance.as_json())
+    previous.launch_id = "1" * 32
+    previous.active = False
+    store.save(previous)
+    events: list[tuple[str, str]] = []
+    save = store.save
+
+    def save_with_failure(instance: Instance) -> None:
+        if failure == "publish" and instance.launch_id == binding.instance.launch_id:
+            events.append(("publish", instance.launch_id))
+            raise OSError("injected publish failure")
+        save(instance)
+
+    monkeypatch.setattr(store, "save", save_with_failure)
+
+    class DockerDouble:
+        old_launch_present = True
+
+        @classmethod
+        def previous_launch_lifecycle_state(cls, instance, *, system):
+            assert system == store.system
+            events.append(("preflight", instance.launch_id))
+            return (
+                DockerContainerState.STOPPED
+                if cls.old_launch_present
+                else DockerContainerState.ABSENT
+            )
+
+        @classmethod
+        def container_lifecycle_active(cls, instance, *, system):
+            assert system == store.system
+            events.append(("boundary", instance.launch_id))
+            if cls.old_launch_present and instance.launch_id != previous.launch_id:
+                raise CycloError("launch identity changed")
+            return False
+
+        @classmethod
+        def remove_inactive_launch(
+            cls,
+            container,
+            identifier,
+            *,
+            expected_system,
+            expected_launch,
+        ):
+            assert container == previous.container_name
+            assert identifier == previous.id
+            assert expected_system == store.system
+            assert expected_launch == previous.launch_id
+            assert cls.old_launch_present
+            events.append(("remove", expected_launch))
+            if failure == "remove":
+                raise RuntimeError("injected remove failure")
+            cls.old_launch_present = False
+            return True
+
+        @staticmethod
+        def ensure_network(_name, _identifier, *, system, offline):
+            assert system == store.system
+            assert offline is False
+            events.append(("network", binding.instance.launch_id))
+
+        @staticmethod
+        def start(spec):
+            assert store.load(spec.instance.id).launch_id == spec.instance.launch_id
+            events.append(("start", spec.instance.launch_id))
+            if failure == "start":
+                raise RuntimeError("injected start failure")
+            return 4317
+
+        @staticmethod
+        def wait_ready(instance, port, *, system, host):
+            assert system == store.system
+            assert port == 4317
+            assert host == "127.0.0.1"
+            events.append(("ready", instance.launch_id))
+
+        @staticmethod
+        def stop_remove(
+            _container,
+            _identifier,
+            *,
+            expected_system,
+            expected_launch,
+        ):
+            assert expected_system == store.system
+            assert expected_launch == binding.instance.launch_id
+            events.append(("rollback", expected_launch))
+            return False
+
+        @staticmethod
+        def remove_network(_name, _identifier, *, system):
+            assert system == store.system
+            events.append(("remove-network", binding.instance.launch_id))
+            return True
+
+    if failure is not None:
+        with pytest.raises(
+            (OSError, RuntimeError),
+            match=rf"injected {failure} failure",
+        ):
+            start_binding_locked(
+                args,
+                binding,
+                packaged_agentws_root(),
+                store,
+                DockerDouble(),  # type: ignore[arg-type]
+            )
+    else:
+        start_binding_locked(
+            args,
+            binding,
+            packaged_agentws_root(),
+            store,
+            DockerDouble(),  # type: ignore[arg-type]
+        )
+
+    old_boundary = events.index(("boundary", previous.launch_id))
+    removal = events.index(("remove", previous.launch_id))
+    assert old_boundary < removal
+    persisted = store.load(binding.instance.id)
+    if failure in {"remove", "publish"}:
+        assert persisted.launch_id == previous.launch_id
+        assert not any(event == "rollback" for event, _launch in events)
+        assert ("network", binding.instance.launch_id) not in events
+        assert ("start", binding.instance.launch_id) not in events
+        assert DockerDouble.old_launch_present is (failure == "remove")
+        return
+
+    new_boundary = events.index(("boundary", binding.instance.launch_id))
+    start = events.index(("start", binding.instance.launch_id))
+    assert removal < new_boundary < start
+    assert persisted.launch_id == binding.instance.launch_id
+    if failure == "start":
+        assert not persisted.active
+        assert ("rollback", binding.instance.launch_id) in events
+    else:
+        assert persisted.active
+        assert persisted.port == 4317
+
+
 def test_project_startup_interrupt_rolls_back_current_and_started_teams(
     tmp_path: Path,
     team_repo: Path,
@@ -1048,6 +1386,10 @@ class GatewayDouble:
         self.calls.append(("usage",))
         return {"requests": 3, "by_provider": {"openai": {"requests": 3}}}
 
+    def store_ready(self) -> bool:
+        self.calls.append(("store_ready",))
+        return True
+
 
 @pytest.mark.parametrize(
     ("arguments", "call", "locks", "output"),
@@ -1132,6 +1474,12 @@ def test_gateway_help_describes_store_and_credential_free_discovery() -> None:
     login_help = " ".join(gateway_action.choices["login"].format_help().split())
     assert "catalogue provider/account name" in login_help
     assert "default: PROVIDER" in login_help
+    assert "read the API key from host environment variable NAME" in login_help
+    assert "pass it to the gateway over standard input" in login_help
+    assert (
+        "read an API key from standard input instead of using OAuth login"
+        in login_help
+    )
     destroy_help = " ".join(gateway_action.choices["destroy-store"].format_help().split())
     assert "--confirm VOLUME" in destroy_help
     assert "credentials, subscriptions, and retained usage history" in destroy_help
@@ -1340,7 +1688,7 @@ def test_component_logs_are_observational(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     root = tmp_path / "state"
-    store = StateStore(root, requested_host_config_scope="state")
+    store = StateStore(root, requested_host_config_scope="local")
     providers = ProviderSystemDouble(tmp_path / "component.sock")
 
     def make_system(_args, selected_store, *, load_config=True):
@@ -1365,7 +1713,7 @@ def test_invalid_component_log_count_does_not_initialize_state(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     root = tmp_path / "state"
-    store = StateStore(root, requested_host_config_scope="state")
+    store = StateStore(root, requested_host_config_scope="local")
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
     monkeypatch.setattr(
         "cyclo.cli.provider_system",
@@ -1489,7 +1837,9 @@ def test_usage_is_the_gateway_global_report(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    store = RecordingStore(tmp_path / "state")
     proxy = GatewayDouble()
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
     monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: proxy)
     monkeypatch.setattr(
         "cyclo.cli.provider_system",
@@ -1504,6 +1854,86 @@ def test_usage_is_the_gateway_global_report(
         "by_provider": {"openai": {"requests": 3}},
     }
     assert proxy.calls == [("usage",)]
+    assert store.lock_entries == 1
+
+
+def test_dashboard_usage_never_waits_for_the_installation_lock(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class Store(RecordingStore):
+        @contextmanager
+        def locked(
+            self,
+            *,
+            blocking: bool = True,
+            bind_host_config: bool = True,
+        ):
+            assert not blocking
+            assert not bind_host_config
+            self.lock_entries += 1
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+
+    store = Store(tmp_path / "state")
+    store.components_root.mkdir(parents=True)
+    proxy = GatewayDouble()
+    real_store_ready = proxy.store_ready
+    real_usage = proxy.usage
+
+    def store_ready() -> bool:
+        assert events == ["lock-enter"]
+        return real_store_ready()
+
+    def usage():
+        assert events == ["lock-enter"]
+        return real_usage()
+
+    proxy.store_ready = store_ready  # type: ignore[method-assign]
+    proxy.usage = usage  # type: ignore[method-assign]
+    reader = _GatewayUsageReader(proxy, store)  # type: ignore[arg-type]
+
+    assert reader.usage()["requests"] == 3
+    assert store.lock_entries == 1
+    assert events == ["lock-enter", "lock-exit"]
+    assert proxy.calls == [("store_ready",), ("usage",)]
+
+
+def test_dashboard_usage_does_not_initialize_or_bind_observed_state(
+    tmp_path: Path,
+) -> None:
+    absent = StateStore(tmp_path / "absent")
+
+    class Proxy:
+        def store_ready(self) -> bool:
+            pytest.fail("an absent installation queried its gateway volume")
+
+        def usage(self):
+            pytest.fail("an absent installation ran a gateway tool")
+
+    assert _GatewayUsageReader(Proxy(), absent).usage() == {}  # type: ignore[arg-type]
+    assert not absent.root.exists()
+
+    selected = StateStore(tmp_path / "selected")
+    selected.components_root.mkdir(parents=True)
+    assert selected.host_config_scope == "local"
+
+    class ReadyProxy:
+        @staticmethod
+        def store_ready() -> bool:
+            return True
+
+        @staticmethod
+        def usage() -> dict[str, object]:
+            return {"totals": {}}
+
+    reader = _GatewayUsageReader(ReadyProxy(), selected)  # type: ignore[arg-type]
+    assert reader.usage() == {"totals": {}}
+    assert not selected.host_config_scope_path.exists()
 
 
 @pytest.mark.parametrize("task_status", (0, 7))
@@ -1817,9 +2247,19 @@ def test_stop_by_instance_id_does_not_consult_project_files(
     selected = instance("alpha", tmp_path, active=True)
     persist(store, selected)
     stopped: list[str] = []
+    observer = StateStore(store.root)
+
+    def stop(selected_store, _docker, instance):
+        assert selected_store.root == store.root
+        with pytest.raises(CycloError, match="state is busy"):
+            with observer.locked(blocking=False):
+                pytest.fail("instance stop escaped the installation lock")
+        stopped.append(instance.id)
+
+    monkeypatch.setattr("cyclo.cli.Docker", lambda: object())
     monkeypatch.setattr(
-        "cyclo.cli.stop_instance",
-        lambda _args, _store, instance: stopped.append(instance.id),
+        "cyclo.cli.stop_managed_instance_locked",
+        stop,
     )
 
     assert main(["--state-root", str(store.root), "stop", selected.id]) == 0
@@ -1839,13 +2279,19 @@ def test_stop_project_uses_persisted_bindings_and_continues_after_failure(
     persist(store, first)
     persist(store, second)
     attempted: list[str] = []
+    observer = StateStore(store.root)
 
-    def stop(_args, _store, instance):
+    def stop(selected_store, _docker, instance):
+        assert selected_store.root == store.root
+        with pytest.raises(CycloError, match="state is busy"):
+            with observer.locked(blocking=False):
+                pytest.fail("project stop escaped the installation lock")
         attempted.append(instance.id)
         if instance.id == first.id:
             raise CycloError("injected cleanup failure")
 
-    monkeypatch.setattr("cyclo.cli.stop_instance", stop)
+    monkeypatch.setattr("cyclo.cli.Docker", lambda: object())
+    monkeypatch.setattr("cyclo.cli.stop_managed_instance_locked", stop)
 
     result = main(["--state-root", str(store.root), "stop", str(definition)])
 

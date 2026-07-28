@@ -20,7 +20,7 @@ from .installation import installation_id, team_container_name, team_network_nam
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LAUNCH_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 DEFAULT_AGENTWS_HOST = "127.0.0.1"
-HOST_CONFIG_SCOPES = frozenset({"system", "state"})
+HOST_CONFIG_SCOPES = frozenset({"system", "local"})
 
 
 def utc_now() -> str:
@@ -184,10 +184,10 @@ class StateStore:
     ) -> None:
         scope = requested_host_config_scope
         if scope is None:
-            scope = "state" if root is not None else "system"
+            scope = "local" if root is not None else "system"
         if scope not in HOST_CONFIG_SCOPES:
             raise CycloError(
-                "host configuration scope must be 'system' or 'state'"
+                "host configuration scope must be 'system' or 'local'"
             )
         self.root = (root or default_state_root()).expanduser().resolve()
         self.instances_dir = self.root / "instances"
@@ -247,7 +247,7 @@ class StateStore:
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
-        if content not in {"system\n", "state\n"}:
+        if content not in {"system\n", "local\n"}:
             raise CycloError(
                 f"invalid host configuration scope: "
                 f"{self.host_config_scope_path}"
@@ -314,19 +314,51 @@ class StateStore:
             os.chmod(path, 0o700)
 
     @contextmanager
-    def locked(self) -> Iterator[None]:
+    def locked(
+        self,
+        *,
+        blocking: bool = True,
+        bind_host_config: bool = True,
+    ) -> Iterator[None]:
         self.ensure()
+        stream = None
         try:
-            with self.lock_path.open("a+", encoding="utf-8") as stream:
-                os.chmod(self.lock_path, 0o600)
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-                try:
-                    self._bind_host_config_scope()
-                    yield
-                finally:
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            stream = self.lock_path.open("a+", encoding="utf-8")
+            os.chmod(self.lock_path, 0o600)
+            operation = fcntl.LOCK_EX
+            if not blocking:
+                operation |= fcntl.LOCK_NB
+            fcntl.flock(stream.fileno(), operation)
+        except BlockingIOError as exc:
+            if stream is not None:
+                stream.close()
+            raise CycloError("Cyclo state is busy") from exc
         except OSError as exc:
+            if stream is not None:
+                stream.close()
             raise CycloError(f"cannot lock Cyclo state {self.lock_path}: {exc}") from exc
+        operation_failed = False
+        try:
+            if bind_host_config:
+                self._bind_host_config_scope()
+            yield
+        except BaseException:
+            operation_failed = True
+            raise
+        finally:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            except OSError as exc:
+                if not operation_failed:
+                    raise CycloError(
+                        f"cannot unlock Cyclo state {self.lock_path}: {exc}"
+                    ) from exc
+            finally:
+                try:
+                    stream.close()
+                except OSError:
+                    if not operation_failed:
+                        raise
 
     def instance_dir(self, identifier: str) -> Path:
         path = self.instances_dir / validate_instance_id(identifier)
@@ -476,18 +508,57 @@ class StateStore:
             raise CycloError(
                 f"invalid Cyclo instance metadata for {instance.id!r}: {exc}"
             ) from exc
+        self.ensure()
         directory = self.instance_dir(instance.id)
-        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(directory, 0o700)
         if not instance.created_at:
             instance.created_at = utc_now()
         instance.updated_at = utc_now()
-        path = self.metadata_path(instance.id)
-        temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
         payload = instance.as_json()
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        if directory.exists():
+            if directory.is_symlink() or not directory.is_dir():
+                raise CycloError(
+                    f"refusing invalid Cyclo instance directory: {directory}"
+                )
+            # Updating state is not an adoption path. Unknown or incomplete
+            # directories remain visible to strict inventory and untouched.
+            self.load(instance.id)
+            os.chmod(directory, 0o700)
+            self._write_metadata(directory / "run.json", payload)
+            return
+
+        # A direct child of instances/ is authoritative inventory. Construct a
+        # first record beside instances/ and publish the complete directory in
+        # one rename, so interruption cannot expose an ID without run.json.
+        staging = self.root / (
+            f".instance.{instance.id}.new.{os.getpid()}."
+            f"{os.urandom(6).hex()}"
+        )
+        try:
+            staging.mkdir(mode=0o700)
+            self._write_metadata(staging / "run.json", payload)
+            if directory.exists() or directory.is_symlink():
+                raise CycloError(
+                    f"Cyclo instance state appeared during publication: "
+                    f"{instance.id}"
+                )
+            os.rename(staging, directory)
+        finally:
+            self._remove_tree(staging)
+
+    @staticmethod
+    def _write_metadata(path: Path, payload: dict[str, object]) -> None:
+        temporary = path.with_name(
+            f".{path.name}.tmp.{os.getpid()}.{os.urandom(6).hex()}"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def remove_instance(
         self, identifier: str, *, expected_launch_id: str
@@ -516,11 +587,22 @@ class StateStore:
             raise CycloError(
                 f"instance {identifier!r} was replaced before it could be removed"
             )
+        retired = self.root / (
+            f".instance.{identifier}.retired.{os.getpid()}."
+            f"{os.urandom(6).hex()}"
+        )
         try:
-            shutil.rmtree(directory)
+            os.rename(directory, retired)
         except OSError as exc:
             raise CycloError(
-                f"cannot remove Cyclo instance state {directory}: {exc}"
+                f"cannot retire Cyclo instance state {directory}: {exc}"
+            ) from exc
+        try:
+            shutil.rmtree(retired)
+        except OSError as exc:
+            raise CycloError(
+                f"Cyclo instance {identifier!r} was retired, but its inert "
+                f"state could not be removed at {retired}: {exc}"
             ) from exc
         return True
 

@@ -1,5 +1,6 @@
 #!/bin/sh
-# Exercise Cyclo as a wheel-installed application in an otherwise empty home.
+# Exercise a supplied Cyclo wheel, or build one for a standalone source check,
+# as an installed application in an otherwise empty home.
 set -eu
 
 fail() {
@@ -11,6 +12,10 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 python=${PYTHON:-python3}
 build_python=${CYCLO_RELEASE_BUILD_PYTHON:-}
+provided_wheel=${1:-}
+
+[ "$#" -le 1 ] \
+    || fail "usage: tools/release-acceptance [WHEEL]"
 
 command -v "$python" >/dev/null 2>&1 || fail "Python not found: $python"
 command -v git >/dev/null 2>&1 || fail "Git is required"
@@ -48,16 +53,19 @@ doctor_log=$work_root/doctor.log
 
 mkdir -p "$dist" "$source_tree" "$empty_home" "$project" "$documentation"
 
-# Build from exactly the files that could enter a source publication. This
-# prevents setuptools from reusing ignored build/lib files deleted from source.
-(
-    cd "$repo_root"
-    git ls-files --cached --others --exclude-standard |
-        while IFS= read -r path; do
-            [ -e "$path" ] || continue
-            cp -a --parents -- "$path" "$source_tree"
-        done
-)
+if [ -z "$provided_wheel" ]; then
+    # Build from exactly the files that could enter a source publication. This
+    # prevents setuptools from reusing ignored build/lib files deleted from
+    # source.
+    (
+        cd "$repo_root"
+        git ls-files --cached --others --exclude-standard |
+            while IFS= read -r path; do
+                [ -e "$path" ] || continue
+                cp -a --parents -- "$path" "$source_tree"
+            done
+    )
+fi
 export HOME=$empty_home
 export XDG_STATE_HOME=$empty_home/.local/state
 unset PYTHONHOME PYTHONPATH \
@@ -67,18 +75,29 @@ unset PYTHONHOME PYTHONPATH \
     AGENTWS_RETRY_INITIAL_SECONDS AGENTWS_RETRY_MAX_SECONDS
 "$python" -m venv "$venv"
 
-if [ -z "$build_python" ]; then
-    printf '%s\n' '==> installing hash-locked build backend'
-    "$python" -m venv "$build_venv"
-    "$build_venv/bin/python" -m pip install \
-        --disable-pip-version-check \
-        --require-hashes \
-        --requirement "$repo_root/requirements/release.txt"
-    build_python=$build_venv/bin/python
-fi
-command -v "$build_python" >/dev/null 2>&1 \
-    || fail "build Python not found: $build_python"
-"$build_python" - "$repo_root/pyproject.toml" <<'PY'
+if [ -n "$provided_wheel" ]; then
+    wheel_directory=$(CDPATH= cd -- "$(dirname -- "$provided_wheel")" && pwd) \
+        || fail "wheel directory does not exist: $(dirname -- "$provided_wheel")"
+    wheel=$wheel_directory/$(basename -- "$provided_wheel")
+    [ -f "$wheel" ] || fail "wheel does not exist: $wheel"
+    case $(basename -- "$wheel") in
+        cyclo_agent-*.whl) ;;
+        *) fail "unexpected Cyclo wheel filename: $wheel" ;;
+    esac
+    printf '%s\n' "==> using supplied release wheel: $wheel"
+else
+    if [ -z "$build_python" ]; then
+        printf '%s\n' '==> installing hash-locked build backend'
+        "$python" -m venv "$build_venv"
+        "$build_venv/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --require-hashes \
+            --requirement "$repo_root/requirements/release.txt"
+        build_python=$build_venv/bin/python
+    fi
+    command -v "$build_python" >/dev/null 2>&1 \
+        || fail "build Python not found: $build_python"
+    "$build_python" - "$repo_root/pyproject.toml" <<'PY'
 from importlib.metadata import version
 from pathlib import Path
 import sys
@@ -101,17 +120,19 @@ if actual != expected:
     raise SystemExit(f"release build backend mismatch: expected {expected}, found {actual}")
 PY
 
-printf '%s\n' '==> building release wheel'
-"$build_python" -m pip wheel \
-    --disable-pip-version-check \
-    --no-build-isolation \
-    --no-deps \
-    --wheel-dir "$dist" \
-    "$source_tree"
+    printf '%s\n' '==> building release wheel'
+    "$build_python" -m pip wheel \
+        --disable-pip-version-check \
+        --no-build-isolation \
+        --no-deps \
+        --wheel-dir "$dist" \
+        "$source_tree"
 
-set -- "$dist"/cyclo_agent-*.whl
-[ "$#" -eq 1 ] && [ -f "$1" ] || fail "expected exactly one Cyclo wheel in $dist"
-wheel=$1
+    set -- "$dist"/cyclo_agent-*.whl
+    [ "$#" -eq 1 ] && [ -f "$1" ] \
+        || fail "expected exactly one Cyclo wheel in $dist"
+    wheel=$1
+fi
 
 printf '%s\n' '==> auditing wheel contents'
 "$venv/bin/python" - "$wheel" "$repo_root" <<'PY'

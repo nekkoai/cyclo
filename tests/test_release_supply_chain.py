@@ -183,6 +183,42 @@ def test_ci_uses_and_tests_the_current_component_layout() -> None:
     assert "build=True" not in release
 
 
+def test_release_accepts_the_exact_built_wheel_and_rejects_generated_drift() -> None:
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    release = (ROOT / "tools" / "build-release").read_text(encoding="utf-8")
+    acceptance = (ROOT / "tools" / "release-acceptance").read_text(
+        encoding="utf-8"
+    )
+    generated = (
+        "src/cyclo/components/protocol/component/gen",
+        "src/cyclo/components/protocol/provider/gen",
+    )
+
+    assert "Confirm generated protocol sources are current" in ci
+    assert "git diff --exit-code -- $generated_paths" in ci
+    assert "git ls-files --others --exclude-standard -- $generated_paths" in ci
+    assert all(path in ci for path in generated)
+    assert "needs: node-and-shell" in ci
+    assert (
+        'tools/release-acceptance "$PWD"/dist/cyclo_agent-*.whl'
+        in ci
+    )
+
+    source_check = "git diff --exit-code"
+    distribution_build = "==> distributions and release metadata"
+    exact_acceptance = "==> exact-wheel acceptance"
+    assert release.index(source_check) < release.index(distribution_build)
+    assert release.index(distribution_build) < release.index(exact_acceptance)
+    assert '"$source_tree/tools/release-acceptance" "$wheel"' in release
+    assert 'CYCLO_RELEASE_BUILD_PYTHON="$venv/bin/python"' not in release
+    assert "git ls-files --others --exclude-standard" in release
+
+    assert "provided_wheel=${1:-}" in acceptance
+    assert "==> using supplied release wheel:" in acceptance
+    assert 'if [ -z "$provided_wheel" ]; then' in acceptance
+    assert 'wheel=$wheel_directory/$(basename -- "$provided_wheel")' in acceptance
+
+
 def test_build_backend_dependencies_are_available_in_test_and_release_envs() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     build_requirements = set(project["build-system"]["requires"])

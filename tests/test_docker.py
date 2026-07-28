@@ -717,6 +717,90 @@ def test_start_force_removes_a_dead_previous_launch(
     assert commands[1][:3] == ["docker", "run", "--detach"]
 
 
+def test_start_never_replaces_a_different_stopped_launch(
+    tmp_path: Path,
+    team_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = Docker()
+    project = tmp_path / "project"
+    project.mkdir()
+    selected = instance(team_repo, project)
+    selected.launch_id = "1" * 32
+    spec = ContainerSpec(
+        instance=selected,
+        team=load_team(team_repo),
+        project=project,
+        runtime_root=tmp_path / "runtime",
+        tasks_dir=tmp_path / "tasks",
+        jobs_dir=tmp_path / "jobs",
+        agents_dir=tmp_path / "agents",
+        pi_root=tmp_path / "pi",
+        provider_socket_dir=Path(selected.provider_socket_path).parent,
+        system=SYSTEM,
+        port=0,
+    )
+    monkeypatch.setattr(
+        docker,
+        "_inspect_container",
+        lambda _name: owned_container_info(
+            selected,
+            launch_id="2" * 32,
+            running=False,
+        ),
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        docker,
+        "_run",
+        lambda command, **_kwargs: commands.append(list(command))
+        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    with pytest.raises(CycloError, match="launch identity changed"):
+        docker.start(spec)
+
+    assert commands == []
+
+
+def test_inactive_launch_removal_is_exact_and_never_stops_an_active_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = Docker()
+    selected = instance(tmp_path / "team", tmp_path / "project")
+    selected.launch_id = "1" * 32
+    info = owned_container_info(selected)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(docker, "_inspect_container", lambda _name: info)
+    monkeypatch.setattr(
+        docker,
+        "_run",
+        lambda command, **_kwargs: commands.append(list(command))
+        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    with pytest.raises(CycloError, match="refusing to replace active"):
+        docker.remove_inactive_launch(
+            selected.container_name,
+            selected.id,
+            expected_system=SYSTEM,
+            expected_launch=selected.launch_id,
+        )
+    assert commands == []
+
+    info["State"] = {"Running": False, "Dead": True, "Status": "dead"}
+    assert docker.remove_inactive_launch(
+        selected.container_name,
+        selected.id,
+        expected_system=SYSTEM,
+        expected_launch=selected.launch_id,
+    )
+    assert commands == [
+        ["docker", "rm", "--force", "verified-container-id"],
+    ]
+
+
 def test_start_validates_the_complete_command_before_replacing_a_container(
     tmp_path: Path,
     team_repo: Path,

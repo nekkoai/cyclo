@@ -20,11 +20,16 @@ export function createGatewayServices(options = {}) {
     modelsPath: env.CYCLO_GATEWAY_MODELS_JSON ?? DEFAULTS.modelsPath,
     usagePath: env.CYCLO_GATEWAY_USAGE_JSONL ?? DEFAULTS.usagePath,
   };
-  const catalogue = options.catalogue ?? buildCatalogue({
+  const loadCatalogue = options.loadCatalogue ?? (() => buildCatalogue({
     authPath: paths.authPath,
     modelsPath: paths.modelsPath,
     getApiProvider,
-  });
+  }));
+  if (typeof loadCatalogue !== "function") {
+    throw new TypeError("loadCatalogue must be a function");
+  }
+  const catalogue = options.catalogue ?? loadCatalogue();
+  const loadedCatalogueSignature = catalogueSignature(catalogue);
   const warn = options.warn ?? console.warn;
   if (typeof warn !== "function") throw new TypeError("warn must be a function");
   for (const diagnostic of catalogue.diagnostics ?? []) {
@@ -54,6 +59,12 @@ export function createGatewayServices(options = {}) {
     component: Object.freeze({
       health() {
         try {
+          if (
+            options.catalogue === undefined
+            && catalogueSignature(loadCatalogue()) !== loadedCatalogueSignature
+          ) {
+            throw new Error("gateway catalogue changed");
+          }
           credentials.check?.(Object.values(catalogue.routes));
           audit.check?.();
           return {
@@ -135,6 +146,27 @@ export function createGatewayServices(options = {}) {
       },
     }),
   });
+}
+
+function catalogueSignature(catalogue) {
+  const routes = Object.keys(catalogue.routes ?? {})
+    .sort()
+    .map((id) => {
+      const {
+        apiProvider: _apiProvider,
+        publicModel: _publicModel,
+        ...route
+      } = catalogue.routes[id];
+      return [id, route];
+    });
+  return JSON.stringify(
+    {
+      models: catalogue.models,
+      routes,
+      diagnostics: catalogue.diagnostics ?? [],
+    },
+    (_key, value) => typeof value === "bigint" ? value.toString() : value,
+  );
 }
 
 async function record(audit, value) {

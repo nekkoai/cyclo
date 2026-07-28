@@ -561,22 +561,40 @@ class Docker:
     def _current_container(
         self, instance: Instance, system: str
     ) -> dict[str, object] | None:
-        info = self._owned_container(instance.container_name, instance.id, system)
+        return self._container_for_launch(
+            instance.container_name,
+            instance.id,
+            expected_system=system,
+            expected_launch=instance.launch_id,
+        )
+
+    def _container_for_launch(
+        self,
+        container: str,
+        expected_instance: str,
+        *,
+        expected_system: str,
+        expected_launch: str,
+    ) -> dict[str, object] | None:
+        if not LAUNCH_ID_RE.fullmatch(expected_launch):
+            raise CycloError(
+                f"invalid launch identity for Cyclo instance: {expected_instance}"
+            )
+        info = self._owned_container(
+            container,
+            expected_instance,
+            expected_system,
+        )
         if info is None:
             return info
-        if not LAUNCH_ID_RE.fullmatch(instance.launch_id):
-            raise CycloError(
-                f"invalid launch identity for Cyclo instance: {instance.id}"
-            )
         config = info.get("Config")
         labels = config.get("Labels") if isinstance(config, dict) else None
         actual_launch = (
             labels.get("cyclo.launch") if isinstance(labels, dict) else None
         )
-        if actual_launch != instance.launch_id:
+        if actual_launch != expected_launch:
             raise CycloError(
-                f"Cyclo container launch identity changed: "
-                f"{instance.container_name}"
+                f"Cyclo container launch identity changed: {container}"
             )
         return info
 
@@ -699,9 +717,7 @@ class Docker:
     def start(self, spec: ContainerSpec) -> int | None:
         validate_container_spec(spec)
         command = container_command(spec)
-        info = self._owned_container(
-            spec.instance.container_name, spec.instance.id, spec.system
-        )
+        info = self._current_container(spec.instance, spec.system)
         if info is not None:
             state = docker_container_state(
                 info, name=spec.instance.container_name
@@ -727,6 +743,34 @@ class Docker:
         if spec.instance.offline:
             return None
         return self.published_port(resource_id)
+
+    def remove_inactive_launch(
+        self,
+        container: str,
+        expected_instance: str,
+        *,
+        expected_system: str,
+        expected_launch: str,
+    ) -> bool:
+        """Remove one exact stopped/dead launch without stopping an active one."""
+
+        info = self._container_for_launch(
+            container,
+            expected_instance,
+            expected_system=expected_system,
+            expected_launch=expected_launch,
+        )
+        if info is None:
+            return False
+        state = docker_container_state(info, name=container)
+        if state.lifecycle_active:
+            raise CycloError(
+                f"refusing to replace active Cyclo instance "
+                f"({state.value}): {expected_instance}"
+            )
+        resource_id = self._resource_id(info, kind="container", name=container)
+        self._remove_container(resource_id, state)
+        return True
 
     def _remove_container(
         self,
@@ -832,22 +876,14 @@ class Docker:
         expected_system: str,
         expected_launch: str,
     ) -> bool:
-        if not LAUNCH_ID_RE.fullmatch(expected_launch):
-            raise CycloError(
-                f"invalid launch identity for Cyclo instance: {expected_instance}"
-            )
-        info = self._owned_container(container, expected_instance, expected_system)
+        info = self._container_for_launch(
+            container,
+            expected_instance,
+            expected_system=expected_system,
+            expected_launch=expected_launch,
+        )
         if info is None:
             return False
-        config = info.get("Config")
-        labels = config.get("Labels") if isinstance(config, dict) else None
-        actual_launch = (
-            labels.get("cyclo.launch") if isinstance(labels, dict) else None
-        )
-        if actual_launch != expected_launch:
-            raise CycloError(
-                f"Cyclo container launch identity changed: {container}"
-            )
         resource_id = self._resource_id(info, kind="container", name=container)
         state = docker_container_state(info, name=container)
         self._remove_container(resource_id, state)
