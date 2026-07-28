@@ -26,7 +26,12 @@ from .dashboard import (
     make_dashboard_server,
     packaged_dashboard_assets,
 )
-from .docker import Docker, container_command, validate_mount_collection
+from .docker import (
+    Docker,
+    DockerContainerState,
+    container_command,
+    validate_mount_collection,
+)
 from .errors import CycloError
 from .gateway import Gateway
 from .health import (
@@ -37,7 +42,7 @@ from .health import (
     team_health,
 )
 from .instance_lifecycle import (
-    active_instances,
+    intended_running_instances,
     instance_lifecycle_label,
     stop_instance as stop_managed_instance,
     stop_instance_locked as stop_managed_instance_locked,
@@ -364,7 +369,10 @@ def _prepare_project_run(
 ) -> tuple[str, tuple[RunBinding, ...]]:
     base_image = team_image_name(store.system, __version__)
     definition = load_project(args.project)
-    configured_teams = load_project_teams(definition)
+    configured_teams = load_project_teams(
+        definition,
+        instance_ids=getattr(args, "instance_ids", None),
+    )
     validate_run_options(args, team_count=len(configured_teams))
     _validate_project_mounts(
         definition,
@@ -389,75 +397,50 @@ def _start_project_locked(
     source: Path,
     store: StateStore,
     docker: Docker,
-    providers: ProviderSystem,
     base_image: str,
     bindings: tuple[RunBinding, ...],
+    *,
+    images_prepared: bool = False,
 ) -> None:
-    """Start one project while the caller owns the installation lock."""
+    """Start provider-configured project bindings under the installation lock."""
 
-    connection = providers.start()
-    connection, catalogue = providers.catalogue(connection)
-    _warn_unavailable_providers(connection, providers.gateway.socket_path)
+    for binding in bindings:
+        preflight_binding(binding, store, docker)
+    if not images_prepared:
+        _prepare_team_images(
+            bindings,
+            base_image=base_image,
+        )
+    for binding in bindings:
+        start_binding_locked(
+            args,
+            binding,
+            source,
+            store,
+            docker,
+        )
+
+
+def _configure_provider_bindings(
+    bindings: tuple[RunBinding, ...],
+    connection: ProviderConnection,
+    catalogue: dict[str, object],
+) -> None:
+    """Validate and bind launches to one already selected provider view."""
+
     for binding in bindings:
         validate_pi_team_models(binding.team, catalogue)
         binding.instance.provider_socket_path = str(connection.socket_path)
         binding.instance.provider_generation = connection.generation
-    for binding in bindings:
-        preflight_binding(binding, store, docker)
-    _prepare_team_images(
-        bindings,
-        base_image=base_image,
-    )
-    started: list[RunBinding] = []
-    current: RunBinding | None = None
-    try:
-        for binding in bindings:
-            current = binding
-            start_binding_locked(
-                args,
-                binding,
-                source,
-                store,
-                docker,
-            )
-            started.append(binding)
-            current = None
-    except BaseException:
-        rollback_errors: list[str] = []
-        rollback = list(started)
-        if current is not None and all(
-            item.instance.id != current.instance.id for item in rollback
-        ):
-            try:
-                persisted = store.load(current.instance.id)
-            except CycloError as exc:
-                if store.metadata_path(current.instance.id).is_file():
-                    rollback_errors.append(
-                        f"{current.instance.id}: "
-                        f"cannot verify in-flight launch: {exc}"
-                    )
-            else:
-                if (
-                    persisted.active
-                    and persisted.launch_id == current.instance.launch_id
-                ):
-                    rollback.append(current)
-        for binding in reversed(rollback):
-            try:
-                stop_managed_instance_locked(
-                    store,
-                    docker,
-                    binding.instance,
-                )
-            except Exception as exc:
-                rollback_errors.append(f"{binding.instance.id}: {exc}")
-        if rollback_errors:
-            print(
-                "warning: project startup rollback was incomplete: "
-                + "; ".join(rollback_errors),
-                file=sys.stderr,
-            )
-        raise
+
+
+def _provider_catalogue(
+    providers: ProviderSystem,
+    connection: ProviderConnection,
+) -> tuple[ProviderConnection, dict[str, object]]:
+    selected, catalogue = providers.catalogue(connection)
+    _warn_unavailable_providers(selected, providers.gateway.socket_path)
+    return selected, catalogue
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -480,12 +463,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     with store.locked():
+        connection, catalogue = _provider_catalogue(
+            providers,
+            providers.start(),
+        )
+        _configure_provider_bindings(bindings, connection, catalogue)
         _start_project_locked(
             args,
             source,
             store,
             docker,
-            providers,
             base_image,
             bindings,
         )
@@ -530,46 +517,38 @@ def _refresh_projects(
         expected_ids = {
             project_instance_id(definition, team) for team in definition.teams
         }
-        active_ids = {instance.id for instance in selected}
-        if active_ids != expected_ids:
-            missing = sorted(expected_ids - active_ids)
-            unexpected = sorted(active_ids - expected_ids)
-            details = []
-            if missing:
-                details.append("inactive: " + ", ".join(missing))
-            if unexpected:
-                details.append("no longer configured: " + ", ".join(unexpected))
+        intended_ids = {instance.id for instance in selected}
+        unexpected = sorted(intended_ids - expected_ids)
+        if unexpected:
             raise CycloError(
-                f"cannot refresh partially active project {path}: "
-                + "; ".join(details)
+                f"cannot recreate instances no longer configured by {path}: "
+                + ", ".join(unexpected)
             )
         launch_settings = {
             (
                 instance.image_override or None,
                 instance.offline,
                 instance.agentws_host,
+                instance.verbose,
+                instance.requested_port,
             )
             for instance in selected
         }
         if len(launch_settings) != 1:
             raise CycloError(
-                f"active instances for {path} have inconsistent launch settings"
+                f"running instances for {path} have inconsistent launch settings"
             )
-        image, offline, host = launch_settings.pop()
-        port = (
-            selected[0].port or 0
-            if len(definition.teams) == 1 and len(selected) == 1
-            else 0
-        )
+        image, offline, host, verbose, requested_port = launch_settings.pop()
         result.append(
             argparse.Namespace(
                 state_root=args.state_root,
                 project=str(path),
+                instance_ids=tuple(sorted(intended_ids)),
                 image=image,
                 offline=offline,
                 host=host,
-                port=port,
-                verbose=False,
+                port=requested_port,
+                verbose=verbose,
                 foreground=False,
                 dry_run=False,
             )
@@ -577,40 +556,99 @@ def _refresh_projects(
     return result
 
 
+def _prepare_recorded_projects(
+    args: argparse.Namespace,
+    store: StateStore,
+    source: Path,
+    instances: list[Instance],
+) -> list[tuple[argparse.Namespace, str, tuple[RunBinding, ...]]]:
+    """Recreate current bindings for exactly the persisted running instances."""
+
+    prepared: list[tuple[argparse.Namespace, str, tuple[RunBinding, ...]]] = []
+    for project_args in _refresh_projects(args, instances):
+        base_image, bindings = _prepare_project_run(
+            project_args, store, source
+        )
+        prepared.append((project_args, base_image, bindings))
+    return prepared
+
+
+def _recorded_instance_groups(
+    instances: list[Instance],
+) -> list[list[Instance]]:
+    """Group one project's team instances without validating its definition."""
+
+    grouped: dict[tuple[str, str], list[Instance]] = {}
+    for instance in instances:
+        key = (
+            ("project", instance.project_file)
+            if instance.project_file
+            else ("legacy", instance.id)
+        )
+        grouped.setdefault(key, []).append(instance)
+    return [
+        grouped[key]
+        for key in sorted(grouped)
+    ]
+
+
 def cmd_refresh(args: argparse.Namespace) -> int:
-    """Rebuild installed images and restart the active Cyclo system."""
+    """Rebuild images and recreate every instance with running intent."""
 
     store = state_store(args)
-    docker = Docker()
-    source = agentws_root()
     # Select the installation's provider configuration before lock acquisition
     # so the same lock transaction can persist that choice.
     host_config(store)
+    docker = Docker()
+    source = agentws_root()
     with store.locked():
-        instances = active_instances(store, docker)
-        projects = _refresh_projects(args, instances)
-        prepared = [
-            (project_args, *_prepare_project_run(project_args, store, source))
-            for project_args in projects
-        ]
+        instances = intended_running_instances(store)
+        prepared = _prepare_recorded_projects(args, store, source, instances)
         providers = provider_system(args, store)
+
+        # Build team images before stopping a working team. Provider refresh has
+        # the same build-before-replace contract inside ProviderSystem.
+        base_image_id: str | None = None
+        for _project_args, base_image, bindings in prepared:
+            base_image_id = _prepare_team_images(
+                bindings,
+                base_image=base_image,
+                base_image_id=base_image_id,
+            )
+
+        # Refresh the independent provider system while teams are still
+        # running. Provider builds are fallible; a build failure must not take
+        # an otherwise healthy team fleet offline.
+        print("rebuilding and restarting provider system")
+        connection, catalogue = _provider_catalogue(
+            providers,
+            providers.refresh(),
+        )
+        for _project_args, _base_image, bindings in prepared:
+            _configure_provider_bindings(bindings, connection, catalogue)
 
         stop_failures: list[str] = []
         for instance in instances:
             try:
-                stop_managed_instance_locked(store, docker, instance)
+                stop_remove_instance_container(
+                    docker,
+                    instance,
+                    system=store.system,
+                )
+                docker.remove_network(
+                    instance.network_name,
+                    instance.id,
+                    system=store.system,
+                )
             except Exception as exc:
                 stop_failures.append(f"{instance.id}: {exc}")
             else:
                 print(f"stopped Cyclo instance: {instance.id}")
         if stop_failures:
             raise CycloError(
-                "refresh could not stop the active fleet: "
+                "refresh could not stop the running fleet: "
                 + "; ".join(stop_failures)
             )
-
-        print("rebuilding and restarting provider system")
-        providers.refresh()
 
         start_failures: list[str] = []
         for project_args, base_image, bindings in prepared:
@@ -620,9 +658,9 @@ def cmd_refresh(args: argparse.Namespace) -> int:
                     source,
                     store,
                     docker,
-                    providers,
                     base_image,
                     bindings,
+                    images_prepared=True,
                 )
             except Exception as exc:
                 start_failures.append(f"{project_args.project}: {exc}")
@@ -705,20 +743,19 @@ def cmd_forget(args: argparse.Namespace) -> int:
         )
     docker = Docker()
     with store.locked():
-        instance = store.load(args.instance)
-        if instance.active:
+        instance = store.load_for_removal(args.instance, missing_ok=True)
+        if instance is None:
+            print(f"forgot Cyclo instance: {args.instance} (already absent)")
+            return 0
+        if instance.intent == "running":
             raise CycloError(
-                f"Cyclo instance is still active: {instance.id}; stop it first"
+                f"Cyclo instance still has running intent: {instance.id}; "
+                "stop it first"
             )
-        state = docker.container_lifecycle_state(
-            instance,
-            system=store.system,
-        )
-        if state.lifecycle_active:
-            raise CycloError(
-                f"Cyclo instance container is still {state.value}: "
-                f"{instance.id}; stop it first"
-            )
+        if instance.intent == "stopped":
+            instance.intent = "deleting"
+            instance.port = None
+            store.save(instance)
         stop_remove_instance_container(
             docker,
             instance,
@@ -770,12 +807,40 @@ def _running_instance_health(
         return team_health(provider, supervisor_error=str(exc)).label()
 
 
+def _visible_instances(store: StateStore) -> list[Instance]:
+    """Return ordinary and pending-deletion records without hiding either."""
+
+    instances = store.list()
+    identifiers = {instance.id for instance in instances}
+    for instance in store.list_deletions():
+        if instance.id in identifiers:
+            raise CycloError(
+                f"Cyclo instance {instance.id!r} exists in both active and "
+                "deletion state"
+            )
+        identifiers.add(instance.id)
+        instances.append(instance)
+    return instances
+
+
+def _instance_queue_root(store: StateStore, instance: Instance) -> Path:
+    """Locate queue state on either side of the deletion-state rename."""
+
+    ordinary = store.queue_root(instance.id)
+    if ordinary.parent.exists():
+        return ordinary
+    deletion = store.deletion_dir(instance.id)
+    if deletion.exists():
+        return deletion / "agentws-state"
+    return ordinary
+
+
 def cmd_ps(args: argparse.Namespace) -> int:
     store = state_store(args)
     docker = Docker()
     rows = []
     shared: tuple[ProviderHealth, ProviderConnection | None] | None = None
-    for instance in store.list():
+    for instance in _visible_instances(store):
         try:
             state = _instance_lifecycle_state(
                 instance,
@@ -786,11 +851,12 @@ def cmd_ps(args: argparse.Namespace) -> int:
             rows.append(
                 (
                     instance.id,
+                    instance.intent,
                     "unknown",
                     f"unknown ({exc})",
                     instance.team_name,
                     instance.project_name or Path(instance.project_path).name,
-                    str(instance.port or ""),
+                    "",
                 )
             )
             continue
@@ -804,17 +870,18 @@ def cmd_ps(args: argparse.Namespace) -> int:
         rows.append(
             (
                 instance.id,
+                instance.intent,
                 state,
                 health,
                 instance.team_name,
                 instance.project_name or Path(instance.project_path).name,
-                str(instance.port or ""),
+                str(instance.port or "") if state == "running" else "",
             )
         )
     if not rows:
         print("no Cyclo instances")
         return 0
-    header = ("INSTANCE", "STATE", "HEALTH", "TEAM", "PROJECT", "PORT")
+    header = ("INSTANCE", "INTENT", "STATE", "HEALTH", "TEAM", "PROJECT", "PORT")
     widths = [max(len(row[index]) for row in [header, *rows]) for index in range(len(header))]
     print("  ".join(value.ljust(widths[index]) for index, value in enumerate(header)))
     for row in rows:
@@ -824,7 +891,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
 
 def cmd_inspect(args: argparse.Namespace) -> int:
     store = state_store(args)
-    instance = store.load(args.instance)
+    instance = store.load_for_removal(args.instance)
     docker = Docker()
     state = _instance_lifecycle_state(instance, docker, system=store.system)
     health = INACTIVE_TEAM_HEALTH.label()
@@ -834,6 +901,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         health = _running_instance_health(store, instance, provider)
 
     print(f"instance: {instance.id}")
+    print(f"intent: {instance.intent}")
     print(f"state: {state}")
     print(f"health: {health}")
     print(f"team: {instance.team_name}")
@@ -845,13 +913,15 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     print(f"models: {', '.join(instance.models) or 'none'}")
     print(f"providers: {', '.join(instance.providers) or 'none'}")
     print(f"network: {'offline' if instance.offline else 'online'}")
-    if instance.port is None:
+    if state != "running":
+        print(f"AgentWS: unavailable ({state})")
+    elif instance.port is None:
         print("AgentWS: not published")
     elif instance.agentws_host in {"0.0.0.0", "::"}:
         print(f"AgentWS listening on {instance.agentws_host}:{instance.port}")
     else:
         print(f"AgentWS: http://{instance.agentws_host}:{instance.port}")
-    print(f"queue: {store.queue_root(instance.id)}")
+    print(f"queue: {_instance_queue_root(store, instance)}")
     if instance.project_mounts:
         print("mounts:")
         for mount in instance.project_mounts:
@@ -944,7 +1014,10 @@ def _task_target(args: argparse.Namespace) -> tuple[Instance, Docker, str]:
     store = state_store(args)
     instance = store.load(args.instance)
     docker = Docker()
-    if not docker.container_running(instance, system=store.system):
+    if (
+        instance.intent != "running"
+        or not docker.container_running(instance, system=store.system)
+    ):
         raise CycloError(f"Cyclo instance is not running: {instance.id}")
     return instance, docker, store.system
 
@@ -1321,17 +1394,68 @@ def cmd_gateway(args: argparse.Namespace) -> int:
 def cmd_repair(args: argparse.Namespace) -> int:
     store = state_store(args)
     docker = Docker()
-    repaired = 0
-    recovered: list[Instance] = []
+    restarted = 0
+    recovered_ports = 0
     removed = 0
+    deleted = 0
     failures: list[str] = []
     with store.locked():
-        stale: list[Instance] = []
-        active_instances(store, docker, stale=stale, recovered=recovered)
-        repaired += len(stale)
+        needs_start: list[Instance] = []
         for instance in store.list():
-            if instance.active:
+            try:
+                state = docker.container_lifecycle_state(
+                    instance,
+                    system=store.system,
+                )
+            except Exception as exc:
+                failures.append(f"{instance.id} inspection: {exc}")
                 continue
+
+            if instance.intent == "running":
+                if state is not DockerContainerState.RUNNING:
+                    if state.lifecycle_active:
+                        try:
+                            if stop_remove_instance_container(
+                                docker,
+                                instance,
+                                system=store.system,
+                            ):
+                                removed += 1
+                            docker.remove_network(
+                                instance.network_name,
+                                instance.id,
+                                system=store.system,
+                            )
+                        except Exception as exc:
+                            failures.append(
+                                f"{instance.id} restart cleanup: {exc}"
+                            )
+                            continue
+                    needs_start.append(instance)
+                    continue
+                try:
+                    recovered_port = False
+                    port = None if instance.offline else instance.port
+                    if not instance.offline and port is None:
+                        port = docker.current_published_port(
+                            instance,
+                            system=store.system,
+                        )
+                        recovered_port = True
+                    docker.wait_ready(
+                        instance,
+                        port,
+                        system=store.system,
+                        host=instance.agentws_host,
+                    )
+                    if recovered_port:
+                        instance.port = port
+                        store.save(instance)
+                        recovered_ports += 1
+                except Exception as exc:
+                    failures.append(f"{instance.id} readiness: {exc}")
+                continue
+
             try:
                 if stop_remove_instance_container(
                     docker,
@@ -1339,20 +1463,103 @@ def cmd_repair(args: argparse.Namespace) -> int:
                     system=store.system,
                 ):
                     removed += 1
-            except Exception as exc:
-                failures.append(f"{instance.id} container cleanup: {exc}")
-            try:
                 docker.remove_network(
                     instance.network_name,
                     instance.id,
                     system=store.system,
                 )
+                if instance.intent == "deleting" and store.remove_instance(
+                    instance.id,
+                    expected_launch_id=instance.launch_id,
+                ):
+                    deleted += 1
             except Exception as exc:
-                failures.append(f"{instance.id} network cleanup: {exc}")
+                failures.append(f"{instance.id} cleanup: {exc}")
+
+        for instance in store.list_deletions():
+            try:
+                if stop_remove_instance_container(
+                    docker,
+                    instance,
+                    system=store.system,
+                ):
+                    removed += 1
+                docker.remove_network(
+                    instance.network_name,
+                    instance.id,
+                    system=store.system,
+                )
+                if store.remove_instance(
+                    instance.id,
+                    expected_launch_id=instance.launch_id,
+                ):
+                    deleted += 1
+            except Exception as exc:
+                failures.append(f"{instance.id} deletion: {exc}")
+
+        if needs_start:
+            source = agentws_root()
+            prepared: list[
+                tuple[argparse.Namespace, str, tuple[RunBinding, ...]]
+            ] = []
+            for group in _recorded_instance_groups(needs_start):
+                try:
+                    prepared.extend(
+                        _prepare_recorded_projects(
+                            args,
+                            store,
+                            source,
+                            group,
+                        )
+                    )
+                except Exception as exc:
+                    identifiers = ", ".join(
+                        sorted(instance.id for instance in group)
+                    )
+                    failures.append(
+                        f"{identifiers} preparation: {exc}"
+                    )
+            if prepared:
+                try:
+                    providers = provider_system(args, store)
+                    connection, catalogue = _provider_catalogue(
+                        providers,
+                        providers.start(),
+                    )
+                except Exception as exc:
+                    failures.append(f"provider preparation: {exc}")
+                    prepared = []
+            if prepared:
+                base_image_id: str | None = None
+                for project_args, base_image, bindings in prepared:
+                    try:
+                        base_image_id = _prepare_team_images(
+                            bindings,
+                            base_image=base_image,
+                            base_image_id=base_image_id,
+                        )
+                        _configure_provider_bindings(
+                            bindings,
+                            connection,
+                            catalogue,
+                        )
+                        _start_project_locked(
+                            project_args,
+                            source,
+                            store,
+                            docker,
+                            base_image,
+                            bindings,
+                            images_prepared=True,
+                        )
+                        restarted += len(bindings)
+                    except Exception as exc:
+                        failures.append(f"{project_args.project}: {exc}")
     print(
-        f"repaired {repaired} stale record(s); "
-        f"recovered {len(recovered)} interrupted start(s); "
-        f"removed {removed} inactive container(s)"
+        f"restarted {restarted} missing instance(s); "
+        f"recovered {recovered_ports} published port(s); "
+        f"removed {removed} unwanted container(s); "
+        f"finished {deleted} deletion(s)"
     )
     if failures:
         raise CycloError("repair incomplete: " + "; ".join(failures))
@@ -1548,7 +1755,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     refresh = commands.add_parser(
         "refresh",
-        help="rebuild installed images and restart the active Cyclo system",
+        help="rebuild images and recreate every instance with running intent",
     )
     refresh.set_defaults(func=cmd_refresh)
 
@@ -1674,11 +1881,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     repair = commands.add_parser(
         "repair",
-        help="reconcile interrupted team starts and stops",
+        help="make each instance's persisted intent true",
         description=(
-            "Recover exact published ports after interrupted starts, mark stale "
-            "active records stopped, and remove inactive Cyclo containers and "
-            "networks. Durable task and job state is preserved."
+            "Restart missing instances whose intent is running, remove Docker "
+            "resources for stopped instances, and finish interrupted deletion. "
+            "Durable task and job state is preserved unless deletion was requested."
         ),
     )
     repair.set_defaults(func=cmd_repair)

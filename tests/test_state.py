@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import signal
+import stat
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,10 @@ import cyclo.state as state_module
 from cyclo.agentws_bundle import packaged_agentws_template
 from cyclo.errors import CycloError
 from cyclo.installation import team_container_name, team_network_name
-from cyclo.state import Instance, StateStore, instance_id
+from cyclo.state import (
+    Instance,
+    StateStore,
+)
 
 
 CONTAINER_PROJECT_CONFIG = (
@@ -44,26 +48,192 @@ def make_instance(identifier: str, store: StateStore) -> Instance:
     )
 
 
-def test_instance_id_is_stable_and_path_specific(tmp_path: Path) -> None:
-    team = tmp_path / "team"
-    one = tmp_path / "one"
-    two = tmp_path / "two"
-
-    assert instance_id(team, one) == instance_id(team, one)
-    assert instance_id(team, one) != instance_id(team, two)
-
-
 def test_metadata_round_trip_has_no_token(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     instance = make_instance("alpha", store)
-    instance.active = True
+    instance.intent = "running"
     store.save(instance)
 
     loaded = store.load("alpha")
     text = store.metadata_path("alpha").read_text(encoding="utf-8")
     assert loaded == instance
     assert "token" not in text.lower()
+    assert '"intent": "running"' in text
+    assert '"active"' not in text
     assert store.metadata_path("alpha").stat().st_mode & 0o777 == 0o600
+
+
+def test_metadata_requires_requested_port(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    path = store.metadata_path("legacy-port")
+    path.parent.mkdir(parents=True)
+    payload = make_instance("legacy-port", store).as_json()
+    payload.pop("requested_port")
+    payload["port"] = 49152
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CycloError, match="requested_port is required"):
+        store.load("legacy-port")
+
+
+@pytest.mark.parametrize("value", (-1, 65536, None, True, "8123"))
+def test_instance_metadata_rejects_invalid_requested_port(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    path = store.metadata_path("invalid-requested-port")
+    path.parent.mkdir(parents=True)
+    payload = make_instance("invalid-requested-port", store).as_json()
+    payload["requested_port"] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CycloError, match="requested_port"):
+        store.load("invalid-requested-port")
+
+
+def test_instance_launch_metadata_is_durable_before_container_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    store.ensure()
+    selected = make_instance("alpha", store)
+    synced: list[int] = []
+    monkeypatch.setattr(
+        state_module.os,
+        "fsync",
+        lambda descriptor: synced.append(
+            stat.S_IFMT(os.fstat(descriptor).st_mode)
+        ),
+    )
+
+    store.save(selected)
+    assert synced == [stat.S_IFREG, stat.S_IFDIR, stat.S_IFDIR]
+
+    synced.clear()
+    selected.launch_id = "1" * 32
+    store.save(selected)
+    assert synced == [stat.S_IFREG, stat.S_IFDIR]
+
+
+def test_first_state_directory_publication_is_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "new-parent" / "state")
+    synced: list[Path] = []
+    monkeypatch.setattr(
+        store,
+        "_sync_directory",
+        lambda path: synced.append(path),
+    )
+
+    store.ensure()
+
+    ancestry = [store.root]
+    while ancestry[-1] != ancestry[-1].parent:
+        ancestry.append(ancestry[-1].parent)
+    expected = [
+        *ancestry,
+        store.instances_dir,
+        store.deletions_dir,
+        store.components_root,
+        store.root,
+    ]
+    assert synced == expected
+    synced.clear()
+    store.ensure()
+    assert synced == []
+
+
+def test_state_directory_sync_failure_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "new-parent" / "state")
+    attempts = 0
+    synced: list[Path] = []
+
+    def fail_once(path: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("injected directory sync failure")
+        synced.append(path)
+
+    monkeypatch.setattr(store, "_sync_directory", fail_once)
+
+    with pytest.raises(CycloError, match="injected directory sync failure"):
+        store.ensure()
+    store.ensure()
+
+    assert synced[:3] == [
+        store.root,
+        store.root.parent,
+        store.root.parent.parent,
+    ]
+    assert store.instances_dir in synced
+    assert store.deletions_dir in synced
+    assert store.components_root in synced
+
+
+def test_host_configuration_scope_is_synced_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(
+        tmp_path / "state",
+        requested_host_config_scope="local",
+    )
+    store.ensure()
+    _ = store.host_config_scope
+    synced: list[int] = []
+    monkeypatch.setattr(
+        state_module.os,
+        "fsync",
+        lambda descriptor: synced.append(
+            stat.S_IFMT(os.fstat(descriptor).st_mode)
+        ),
+    )
+
+    with store.locked():
+        pass
+
+    assert synced == [stat.S_IFREG, stat.S_IFDIR]
+
+
+def test_metadata_rejects_legacy_active(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    path = store.metadata_path("legacy")
+    path.parent.mkdir(parents=True)
+    payload = make_instance("legacy", store).as_json()
+    payload.pop("intent")
+    payload["active"] = True
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CycloError, match="active is not supported"):
+        store.load("legacy")
+
+
+@pytest.mark.parametrize("value", ("active", "", None, True))
+def test_instance_metadata_rejects_invalid_intent(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    path = store.metadata_path("invalid-intent")
+    path.parent.mkdir(parents=True)
+    payload = make_instance("invalid-intent", store).as_json()
+    payload["intent"] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CycloError, match="intent must"):
+        store.load("invalid-intent")
 
 
 def test_sigkill_during_first_metadata_publication_cannot_poison_inventory(
@@ -106,7 +276,7 @@ def test_sigkill_during_first_metadata_publication_cannot_poison_inventory(
     assert store.list() == []
 
 
-def test_sigkill_during_instance_retirement_cannot_poison_inventory(
+def test_sigkill_during_instance_purge_is_discoverable_and_retryable(
     tmp_path: Path,
 ) -> None:
     try:
@@ -117,13 +287,16 @@ def test_sigkill_during_instance_retirement_cannot_poison_inventory(
     store = StateStore(tmp_path / "state")
     selected = make_instance("alpha", store)
     store.save(selected)
+    task = store.tasks_dir("alpha") / "task"
+    task.mkdir(parents=True)
+    (task / "spec.md").write_text("durable work\n", encoding="utf-8")
     ready = context.Event()
 
     def retire_until_killed() -> None:
         real_rmtree = state_module.shutil.rmtree
 
         def block_removal(path, *args, **kwargs) -> None:
-            if ".retired." in Path(path).name:
+            if Path(path) == store.deletion_dir("alpha") / "agentws-state":
                 ready.set()
                 signal.pause()
             real_rmtree(path, *args, **kwargs)
@@ -147,7 +320,20 @@ def test_sigkill_during_instance_retirement_cannot_poison_inventory(
             process.join(5)
 
     assert not store.instance_dir("alpha").exists()
+    assert store.deletion_dir("alpha").is_dir()
     assert store.list() == []
+    assert [item.id for item in store.list_deletions()] == ["alpha"]
+    deleting = store.load_for_removal("alpha")
+    assert deleting.intent == "deleting"
+    assert deleting.launch_id == selected.launch_id
+
+    assert store.remove_instance(
+        "alpha",
+        expected_launch_id=selected.launch_id,
+    )
+    assert not store.deletion_dir("alpha").exists()
+    with pytest.raises(CycloError, match="not found"):
+        store.load_for_removal("alpha")
 
 
 def test_persisted_instance_requires_a_launch_identity(tmp_path: Path) -> None:
@@ -174,10 +360,273 @@ def test_remove_instance_deletes_its_complete_durable_state(
         expected_launch_id=selected.launch_id,
     )
     assert not store.instance_dir("alpha").exists()
+    assert not store.deletion_dir("alpha").exists()
     assert not store.remove_instance(
         "alpha",
         expected_launch_id=selected.launch_id,
     )
+
+
+def test_remove_instance_persists_deleting_before_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    store.save(selected)
+    real_rename = state_module.os.rename
+
+    def fail_retirement(source, destination) -> None:
+        if (
+            Path(source) == store.instance_dir("alpha")
+            and Path(destination) == store.deletion_dir("alpha")
+        ):
+            persisted = store.load("alpha")
+            assert persisted.intent == "deleting"
+            raise OSError("injected retirement failure")
+        real_rename(source, destination)
+
+    monkeypatch.setattr(state_module.os, "rename", fail_retirement)
+
+    with pytest.raises(CycloError, match="injected retirement failure"):
+        store.remove_instance(
+            "alpha",
+            expected_launch_id=selected.launch_id,
+        )
+
+    persisted = store.load_for_removal("alpha")
+    assert persisted.intent == "deleting"
+    assert persisted.port is None
+    assert not store.deletion_dir("alpha").exists()
+
+
+def test_retirement_sync_failure_keeps_destination_record_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    store.save(selected)
+    deletion = store.deletion_dir(selected.id)
+    real_sync = store._sync_directory
+
+    def fail_after_destination(path: Path) -> None:
+        real_sync(path)
+        if path == store.deletions_dir and deletion.exists():
+            raise OSError("injected power boundary")
+
+    monkeypatch.setattr(store, "_sync_directory", fail_after_destination)
+
+    with pytest.raises(CycloError, match="injected power boundary"):
+        store.remove_instance(
+            selected.id,
+            expected_launch_id=selected.launch_id,
+        )
+
+    pending = store.load_for_removal(selected.id)
+    assert pending is not None
+    assert pending.intent == "deleting"
+    assert deletion.is_dir()
+
+
+def test_remove_instance_retry_from_deletion_is_exact_launch_fenced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    store.save(selected)
+    state = store.queue_root("alpha") / "durable"
+    state.mkdir(parents=True)
+    real_rmtree = state_module.shutil.rmtree
+
+    def fail_purge(path, *args, **kwargs) -> None:
+        if Path(path) == store.deletion_dir("alpha") / "agentws-state":
+            raise OSError("injected purge failure")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(state_module.shutil, "rmtree", fail_purge)
+    with pytest.raises(CycloError, match="injected purge failure"):
+        store.remove_instance(
+            "alpha",
+            expected_launch_id=selected.launch_id,
+        )
+    monkeypatch.setattr(state_module.shutil, "rmtree", real_rmtree)
+
+    with pytest.raises(CycloError, match="was replaced"):
+        store.remove_instance(
+            "alpha",
+            expected_launch_id="1" * 32,
+        )
+
+    pending = store.load_for_removal("alpha")
+    assert pending.intent == "deleting"
+    assert pending.launch_id == selected.launch_id
+    assert store.list_deletions() == [pending]
+    assert store.remove_instance(
+        "alpha",
+        expected_launch_id=selected.launch_id,
+    )
+    assert not store.deletion_dir("alpha").exists()
+
+
+def test_pending_deletion_blocks_instance_name_reuse(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    selected.intent = "deleting"
+    store.save(selected)
+    os.rename(store.instance_dir("alpha"), store.deletion_dir("alpha"))
+
+    replacement = make_instance("alpha", store)
+    replacement.launch_id = "1" * 32
+    with pytest.raises(CycloError, match="deletion is still pending"):
+        store.save(replacement)
+
+
+def test_remove_instance_retries_a_finalized_exact_launch_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    store.save(selected)
+    finalized = store._final_deletion_path(
+        selected.id, selected.launch_id
+    )
+    real_unlink = Path.unlink
+
+    def fail_final_purge(path: Path, *args, **kwargs) -> None:
+        if path == finalized:
+            raise OSError("injected tombstone purge failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_final_purge)
+    with pytest.raises(CycloError, match="injected tombstone purge failure"):
+        store.remove_instance(
+            selected.id,
+            expected_launch_id=selected.launch_id,
+        )
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+
+    assert not store.instance_dir(selected.id).exists()
+    assert not store.deletion_dir(selected.id).exists()
+    assert finalized.is_file()
+    assert store.list() == []
+    deleting = store.load_for_removal(selected.id)
+    assert store.list_deletions() == [deleting]
+    replacement = make_instance(selected.id, store)
+    replacement.launch_id = "1" * 32
+    with pytest.raises(CycloError, match="deletion is still pending"):
+        store.save(replacement)
+    with pytest.raises(CycloError, match="was replaced"):
+        store.remove_instance(
+            selected.id,
+            expected_launch_id="1" * 32,
+        )
+    assert store.remove_instance(
+        selected.id,
+        expected_launch_id=selected.launch_id,
+    )
+    assert not finalized.exists()
+
+
+def test_sigkill_after_finalizing_deletion_leaves_retryable_tombstone(
+    tmp_path: Path,
+) -> None:
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError:
+        pytest.skip("requires fork to stop deletion at its final boundary")
+
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    store.save(selected)
+    finalized = store._final_deletion_path(
+        selected.id,
+        selected.launch_id,
+    )
+    ready = context.Event()
+
+    def delete_until_killed() -> None:
+        real_rmdir = state_module.os.rmdir
+
+        def block_empty_directory_removal(path, *args, **kwargs) -> None:
+            if Path(path) == store.deletion_dir(selected.id):
+                ready.set()
+                signal.pause()
+            real_rmdir(path, *args, **kwargs)
+
+        state_module.os.rmdir = block_empty_directory_removal
+        store.remove_instance(
+            selected.id,
+            expected_launch_id=selected.launch_id,
+        )
+
+    process = context.Process(target=delete_until_killed)
+    process.start()
+    try:
+        assert ready.wait(5), "child did not finalize the deletion marker"
+        process.kill()
+        process.join(5)
+        assert process.exitcode == -signal.SIGKILL
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+
+    assert not store.instance_dir(selected.id).exists()
+    assert store.deletion_dir(selected.id).is_dir()
+    assert list(store.deletion_dir(selected.id).iterdir()) == []
+    assert finalized.is_file()
+    deleting = store.load_for_removal(selected.id)
+    assert deleting.intent == "deleting"
+    assert deleting.launch_id == selected.launch_id
+    assert store.list_deletions() == [deleting]
+
+    replacement = make_instance(selected.id, store)
+    replacement.launch_id = "1" * 32
+    with pytest.raises(CycloError, match="deletion is still pending"):
+        store.save(replacement)
+
+    assert store.remove_instance(
+        selected.id,
+        expected_launch_id=selected.launch_id,
+    )
+    assert not store.deletion_dir(selected.id).exists()
+    assert not finalized.exists()
+
+
+def test_finalization_sync_failure_keeps_marker_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = make_instance("alpha", store)
+    store.save(selected)
+    finalized = store._final_deletion_path(
+        selected.id,
+        selected.launch_id,
+    )
+    real_sync = store._sync_directory
+
+    def fail_after_destination(path: Path) -> None:
+        real_sync(path)
+        if path == store.deletions_dir and finalized.exists():
+            raise OSError("injected final power boundary")
+
+    monkeypatch.setattr(store, "_sync_directory", fail_after_destination)
+
+    with pytest.raises(CycloError, match="injected final power boundary"):
+        store.remove_instance(
+            selected.id,
+            expected_launch_id=selected.launch_id,
+        )
+
+    deleting = store.load_for_removal(selected.id)
+    assert deleting is not None
+    assert deleting.launch_id == selected.launch_id
+    assert store.deletion_dir(selected.id).is_dir()
+    assert finalized.is_file()
 
 
 def test_remove_instance_rejects_invalid_or_replaced_launch_identity(
@@ -357,6 +806,28 @@ def test_instance_enumeration_reports_bad_records_and_strict_list_refuses_them(
         store.list()
 
 
+def test_instance_listing_ignores_deletions_but_validates_their_root(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    store.ensure()
+    malformed = store.deletions_dir / "malformed"
+    malformed.mkdir()
+
+    assert store.list() == []
+    with pytest.raises(CycloError, match="cannot enumerate Cyclo deletion state"):
+        store.list_deletions()
+
+    malformed.rmdir()
+    store.deletions_dir.rmdir()
+    store.deletions_dir.write_text("not a directory\n", encoding="utf-8")
+
+    with pytest.raises(CycloError, match="invalid Cyclo deletions directory"):
+        store.list()
+    with pytest.raises(CycloError, match="invalid Cyclo deletions directory"):
+        store.list_deletions()
+
+
 def test_direct_instance_load_rejects_undecodable_and_symlinked_metadata(
     tmp_path: Path,
 ) -> None:
@@ -383,7 +854,7 @@ def test_direct_instance_load_rejects_undecodable_and_symlinked_metadata(
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("active", "false", "active must be a boolean"),
+        ("verbose", "false", "verbose must be a boolean"),
         ("providers", "openai", "providers must be a list of strings"),
         ("port", True, "port must be null or an integer"),
         ("project_path", {}, "project_path must be a string"),

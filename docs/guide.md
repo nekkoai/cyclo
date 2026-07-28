@@ -171,12 +171,21 @@ cyclo providers stop
 ```
 
 The validated official tag is the installed component. `component build` and
-`providers build` submit the selected contexts to Docker and validate each
-candidate before promoting that tag; they do not restart containers. `start`,
+`providers build` submit the selected contexts to Docker, validate each
+completed immutable image, and only then promote that tag; they do not restart
+containers. `start`,
 `models`, and project `run` reuse valid current-release installed images,
 building only missing images or images from a different release. `restart`
 requires installed current images and recreates containers without building.
 Use `cyclo refresh` after changing installed component source.
+Global refresh selects instances whose durable intent is `running`; it never
+turns a stopped instance back on. It builds team images and refreshes the
+independent provider system, obtains its model catalogue, and validates every
+selected team before stopping any team. If a later stop, start, or host process
+fails, the running intent remains recorded. Correct the underlying problem and
+run `cyclo refresh` again, or use `cyclo repair` to recreate missing running
+instances from their current `project.cyclo` definitions. There is no separate
+refresh plan to resume or abort.
 
 `stop` removes all provider-lifecycle containers owned by this Cyclo state root
 even if the current configuration is temporarily invalid. The gateway remains
@@ -261,16 +270,19 @@ cyclo validate ./teams/my-team
 ```
 
 After upgrading Cyclo or changing installed component or team source, use one
-command to stop active project runs, rebuild and restart the gateway and
+command to stop running project instances, rebuild and restart the gateway and
 configured providers, then rebuild the selected common and derived team images
-while recreating every active `project.cyclo` run:
+while recreating every instance whose recorded intent is `running`:
 
 ```sh
 cyclo refresh
 ```
 
-Queue state is preserved. Every active instance must retain its `project.cyclo`
-path so Cyclo can reproducibly recreate the same mount and team authority.
+Queue state and lifecycle intent are preserved. Every running instance must
+retain its `project.cyclo` path so Cyclo can reproduce the same mount and team
+authority. If an operation is interrupted, `cyclo repair` recreates missing
+running containers, removes containers for stopped instances, and finishes
+pending deletion.
 
 ## Define a project
 
@@ -401,11 +413,14 @@ cyclo forget INSTANCE --confirm INSTANCE
 ```
 
 This permanently removes that instance's tasks, jobs, transcripts, generated
-runtime, and metadata. It refuses an active container. The explicit operation
-allows a later project at a moved path to reuse the logical instance name
-without silently mixing old queue state into the new project. Cyclo removes the
-instance from authoritative inventory before deleting its retired tree, so
-interruption cannot leave a partial inventory record.
+runtime, and metadata. It requires the instance's recorded intent to be
+`stopped`; use `cyclo stop` first. The explicit operation allows a later project
+at a moved path to reuse the logical instance name without silently mixing old
+queue state into the new project. Cyclo records `deleting`, cleans the exact
+container and network, and moves the state out of ordinary inventory before
+purging it. If interrupted, `cyclo repair` finishes that deletion. Repeating
+the same exactly confirmed command after deletion has completed succeeds as an
+already-absent operation.
 
 ## Dashboards
 
@@ -457,8 +472,12 @@ clean only stale owned resources with:
 cyclo repair
 ```
 
-Repair attempts every independent inactive container and network cleanup. It
-reports all remaining failures and exits nonzero if any cleanup was incomplete.
+Repair makes the recorded lifecycle intent true. It recreates missing
+`running` instances from their current `project.cyclo`, replaces paused or
+restarting instances, verifies AgentWS readiness for every running container
+before saving a recovered published port, removes Docker resources for
+`stopped` instances, and completes `deleting` instances. It reports every
+remaining failure and exits nonzero if any operation was incomplete.
 
 ## Persistent state
 

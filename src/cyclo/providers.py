@@ -717,37 +717,44 @@ class ProviderSystem:
                 missing=False,
             )
             assert info is not None
-            if self.controller.container_id(info) != identifier:
-                raise CycloError(
-                    "Docker returned an invalid component container ID"
-                )
             labels = self.controller.labels(info)
             name = labels.get(LABEL_INSTANCE)
-            raw_container_name = info.get("Name")
-            container_name = (
-                raw_container_name[1:]
-                if isinstance(raw_container_name, str)
-                and raw_container_name.startswith("/")
-                else raw_container_name
-            )
-            if (
-                labels.get(LABEL_OWNED) != "1"
-                or labels.get(LABEL_SYSTEM) != self.system
-                or labels.get(LABEL_COMPONENT_CLASS) != "provider"
-                or not is_component_name(name)
-                or container_name != provider_name(self.system, str(name))
-            ):
-                raise CycloError(
-                    f"invalid Cyclo ownership labels on container {identifier}"
+
+            def verify_orphan(candidate: Mapping[str, object]) -> None:
+                candidate_labels = self.controller.labels(candidate)
+                raw_candidate_name = candidate.get("Name")
+                candidate_name = (
+                    raw_candidate_name[1:]
+                    if isinstance(raw_candidate_name, str)
+                    and raw_candidate_name.startswith("/")
+                    else raw_candidate_name
                 )
+                if (
+                    self.controller.container_id(candidate) != identifier
+                    or candidate_labels.get(LABEL_OWNED) != "1"
+                    or candidate_labels.get(LABEL_SYSTEM) != self.system
+                    or candidate_labels.get(LABEL_COMPONENT_CLASS) != "provider"
+                    or not is_component_name(name)
+                    or candidate_labels.get(LABEL_INSTANCE) != name
+                    or candidate_name != provider_name(self.system, str(name))
+                ):
+                    raise CycloError(
+                        "invalid Cyclo ownership labels on container "
+                        f"{identifier}"
+                    )
+
+            container = self.controller.verify_container(
+                info,
+                verify=verify_orphan,
+            )
             assert isinstance(name, str)
             if name in configured:
                 continue
-            state = self.controller.container_state(info)
-            self.controller.remove_verified_container(
-                identifier,
-                state,
-                preserve_volumes=False,
+            self.controller.remove_container(
+                container,
+                verify=verify_orphan,
+                timeout=10,
+                remove_volumes=True,
             )
             stopped.append(name)
         return tuple(stopped)

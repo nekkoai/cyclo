@@ -108,8 +108,34 @@ class DashboardSnapshot:
         rows: list[dict[str, object]] = []
         shared_provider: tuple[ProviderHealth, object | None] | None = None
         instances, instance_state_errors = self.store.list_report()
+        entries = [
+            (instance, self.store.queue_root(instance.id))
+            for instance in instances
+        ]
+        identifiers = {instance.id for instance in instances}
+        try:
+            deletions = self.store.list_deletions()
+        except Exception as exc:
+            instance_state_errors.append(
+                f"cannot enumerate Cyclo deletion state: {exc}"
+            )
+            deletions = []
+        for instance in deletions:
+            if instance.id in identifiers:
+                instance_state_errors.append(
+                    f"Cyclo instance {instance.id!r} exists in both active "
+                    "and deletion state"
+                )
+                continue
+            identifiers.add(instance.id)
+            entries.append(
+                (
+                    instance,
+                    self.store.deletion_dir(instance.id) / "agentws-state",
+                )
+            )
 
-        for instance in instances:
+        for instance, queue_root in entries:
             errors: list[str] = []
             try:
                 docker_state: DockerContainerState | None = (
@@ -129,7 +155,7 @@ class DashboardSnapshot:
                 )
                 try:
                     supervisor = read_agent_supervisor_status(
-                        self.store.queue_root(instance.id)
+                        queue_root
                     )
                     suspended_agents = supervisor.suspended_agents
                     planner_attention_jobs = supervisor.planner_attention_jobs
@@ -148,7 +174,7 @@ class DashboardSnapshot:
                 health = INACTIVE_TEAM_HEALTH
             try:
                 queue = scan_agentws_queue(
-                    self.store.queue_root(instance.id), limits=self.queue_limits
+                    queue_root, limits=self.queue_limits
                 )
             except Exception as exc:
                 queue = {
@@ -161,8 +187,16 @@ class DashboardSnapshot:
             if isinstance(queue_errors, list):
                 errors.extend(str(item) for item in queue_errors)
             agentws_port = None
-            if state == "running" and not instance.offline and instance.port:
+            if state == "running" and not instance.offline:
                 agentws_port = instance.port
+                if agentws_port is None:
+                    try:
+                        agentws_port = self.docker.current_published_port(
+                            instance,
+                            system=self.store.system,
+                        )
+                    except Exception as exc:
+                        errors.append(f"AgentWS port unavailable: {exc}")
             try:
                 project, project_errors = _project_metadata(instance)
             except Exception as exc:
@@ -182,6 +216,7 @@ class DashboardSnapshot:
                     "id": instance.id,
                     "team": instance.team_name,
                     "project": project,
+                    "intent": instance.intent,
                     "state": state,
                     "health": health.api_value(),
                     "mode": {
@@ -203,8 +238,9 @@ class DashboardSnapshot:
             "paused": 2,
             "stale": 3,
             "orphan": 4,
-            "unknown": 5,
-            "stopped": 6,
+            "deleting": 5,
+            "unknown": 6,
+            "stopped": 7,
         }
         rows.sort(key=lambda item: (state_priority.get(str(item["state"]), 9), str(item["id"])))
         source_errors = [*instance_state_errors]
@@ -229,6 +265,7 @@ class DashboardSnapshot:
                     "paused",
                     "stale",
                     "orphan",
+                    "deleting",
                     "unknown",
                 }
                 or str(item["health"]["state"]).startswith("provider-")  # type: ignore[index]

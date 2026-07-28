@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -12,6 +13,7 @@ from cyclo.docker import (
     ContainerSpec,
     container_command,
     docker_socket_paths,
+    selected_docker_endpoint,
     validate_mount_collection,
     validate_mount_boundaries,
     validate_container_spec,
@@ -24,6 +26,19 @@ from cyclo.team import load_team
 
 
 SYSTEM = "0123456789ab"
+CONTAINER_ID = "a" * 64
+PREVIOUS_CONTAINER_ID = "b" * 64
+REPLACEMENT_CONTAINER_ID = "c" * 64
+NETWORK_ID = "d" * 64
+ATTACHED_CONTAINER_ID = "e" * 64
+
+
+@pytest.fixture
+def standard_docker_endpoint(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "cyclo.docker.selected_docker_endpoint",
+        lambda environment=None: "unix:///var/run/docker.sock",
+    )
 
 
 def instance(team: Path, project: Path) -> Instance:
@@ -52,7 +67,7 @@ def owned_container_info(
     selected: Instance,
     *,
     system: str = SYSTEM,
-    container_id: str = "verified-container-id",
+    container_id: str = CONTAINER_ID,
     launch_id: str | None = None,
     running: bool = True,
 ) -> dict[str, object]:
@@ -66,7 +81,32 @@ def owned_container_info(
         labels["cyclo.launch"] = selected_launch
     return {
         "Id": container_id,
+        "Name": f"/{selected.container_name}",
         "Config": {"Labels": labels},
+        "State": {"Running": running},
+    }
+
+
+def team_container_info(
+    name: str,
+    instance_id: str,
+    *,
+    system: str = SYSTEM,
+    container_id: str = CONTAINER_ID,
+    launch_id: str = "0" * 32,
+    running: bool = True,
+) -> dict[str, object]:
+    return {
+        "Id": container_id,
+        "Name": f"/{name}",
+        "Config": {
+            "Labels": {
+                "io.cyclo.system": system,
+                "io.cyclo.kind": "team",
+                "io.cyclo.instance": instance_id,
+                "cyclo.launch": launch_id,
+            }
+        },
         "State": {"Running": running},
     }
 
@@ -135,8 +175,11 @@ def test_container_argv_has_only_scoped_runtime_mounts(
     command = container_command(spec)
     rendered = " ".join(command)
 
-    assert command[:3] == ["docker", "run", "--detach"]
+    assert command[:3] == ["docker", "create", "--name"]
+    assert command[3] == selected_instance.container_name
     assert "--publish" not in command
+    assert command[command.index("--network") + 1] == "none"
+    assert selected_instance.network_name not in command
     assert "AGENTWS_TEAM_ROSTER=/team/team" in command
     assert "AGENTWS_SYSTEM_PROTOCOL=/agentws/AGENTS.md" in command
     assert "AGENTWS_TEAM_PROTOCOL=/team/AGENTS.md" in command
@@ -169,6 +212,14 @@ def test_container_argv_has_only_scoped_runtime_mounts(
     for name, value in retry_values.items():
         assert f"{name}={value}" in command
     assert "AGENTWS_UNSAFE_UNDOCUMENTED" not in rendered
+
+    selected_instance.offline = False
+    online_command = container_command(spec)
+    assert (
+        online_command[online_command.index("--network") + 1]
+        == selected_instance.network_name
+    )
+    assert "--publish" in online_command
 
 
 def test_container_argv_preserves_host_supplementary_groups(
@@ -356,7 +407,10 @@ def test_team_and_project_must_not_overlap(tmp_path: Path) -> None:
         validate_mount_boundaries(team, project, tmp_path / "state", tmp_path / "pi")
 
 
-def test_mounts_must_not_cover_host_credentials(tmp_path: Path) -> None:
+def test_mounts_must_not_cover_host_credentials(
+    tmp_path: Path,
+    standard_docker_endpoint,
+) -> None:
     team = tmp_path / "team"
     project = tmp_path / "home"
     credentials = project / ".pi" / "agent"
@@ -367,7 +421,7 @@ def test_mounts_must_not_cover_host_credentials(tmp_path: Path) -> None:
         validate_mount_boundaries(team, project, tmp_path / "state", credentials)
 
 
-def test_rootless_and_configured_docker_sockets_are_protected(
+def test_selected_context_and_rootless_docker_sockets_are_protected(
     tmp_path: Path, monkeypatch
 ) -> None:
     team = tmp_path / "team"
@@ -375,10 +429,24 @@ def test_rootless_and_configured_docker_sockets_are_protected(
     team.mkdir()
     project.mkdir()
     socket = project / "runtime" / "docker.sock"
-    monkeypatch.setenv("DOCKER_HOST", f"unix://{socket}")
+    ignored = tmp_path / "ignored" / "docker.sock"
+    monkeypatch.setenv("DOCKER_CONTEXT", "custom")
+    monkeypatch.setenv("DOCKER_HOST", f"unix://{ignored}")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "xdg-runtime"))
 
+    def inspect(command, **options):
+        assert options["env"] is None
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(f"unix://{socket}") + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", inspect)
+
     assert socket.resolve() in docker_socket_paths()
+    assert ignored.resolve() not in docker_socket_paths()
     assert (tmp_path / "xdg-runtime" / "docker.sock").resolve() in docker_socket_paths()
     with pytest.raises(CycloError, match="Docker socket"):
         validate_mount_boundaries(
@@ -389,8 +457,171 @@ def test_rootless_and_configured_docker_sockets_are_protected(
         )
 
 
+def test_selected_docker_endpoint_delegates_precedence_to_context_inspect(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context_socket = tmp_path / "context" / "docker.sock"
+    ignored_host = tmp_path / "host" / "docker.sock"
+    environment = {
+        "DOCKER_CONTEXT": "selected-context",
+        "DOCKER_HOST": f"unix://{ignored_host}",
+        "PATH": os.environ.get("PATH", ""),
+    }
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def inspect(command, **options):
+        calls.append((list(command), dict(options)))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(f"unix://{context_socket}") + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", inspect)
+
+    assert selected_docker_endpoint() == f"unix://{context_socket}"
+    assert selected_docker_endpoint(environment) == f"unix://{context_socket}"
+    assert calls[0][1]["env"] is None
+    assert calls[1][1]["env"] == environment
+    assert calls[1][0] == [
+        "docker",
+        "context",
+        "inspect",
+        "--format",
+        '{{json (index .Endpoints "docker").Host}}',
+    ]
+    assert calls[1][1]["timeout"] == 5.0
+    assert calls[1][1]["check"] is False
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        "",
+        "\n",
+        "not-json\n",
+        "null\n",
+        "123\n",
+        '""\n',
+        '"unix:relative/docker.sock"\n',
+        '"unix://relative/docker.sock"\n',
+        '"unix:///tmp/docker.sock\\nother"\n',
+        '"unix:///tmp/one.sock"\n"unix:///tmp/two.sock"\n',
+    ),
+)
+def test_selected_docker_endpoint_rejects_malformed_responses(
+    response: str,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_options: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=response,
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(CycloError, match="selected Docker endpoint"):
+        selected_docker_endpoint()
+
+
+@pytest.mark.parametrize("failure", ("nonzero", "timeout", "missing"))
+def test_selected_docker_endpoint_fails_closed(
+    failure: str,
+    monkeypatch,
+) -> None:
+    def inspect(command, **options):
+        if failure == "nonzero":
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr="selected context is unavailable\n",
+            )
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, options["timeout"])
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(subprocess, "run", inspect)
+
+    with pytest.raises(CycloError, match="selected Docker endpoint"):
+        selected_docker_endpoint()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "selected_socket"),
+    (
+        (
+            "unix:///tmp/cyclo-custom-context/docker.sock",
+            Path("/tmp/cyclo-custom-context/docker.sock"),
+        ),
+        (
+            f"unix:///run/user/{os.getuid()}/custom/docker.sock",
+            Path(f"/run/user/{os.getuid()}/custom/docker.sock"),
+        ),
+        ("tcp://127.0.0.1:2375", None),
+    ),
+)
+def test_docker_socket_paths_include_only_selected_unix_endpoints(
+    endpoint: str,
+    selected_socket: Path | None,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_options: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(endpoint) + "\n",
+            stderr="",
+        ),
+    )
+
+    paths = docker_socket_paths({})
+
+    if selected_socket is None:
+        assert set(paths) == {
+            Path("/var/run/docker.sock").resolve(),
+            Path(f"/run/user/{os.getuid()}/docker.sock").resolve(),
+            (Path.home() / ".docker" / "run" / "docker.sock").resolve(),
+        }
+    else:
+        assert selected_socket.resolve() in paths
+
+
+def test_docker_socket_paths_reject_an_unresolvable_endpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    loop = tmp_path / "docker.sock"
+    loop.symlink_to(loop.name)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_options: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(f"unix://{loop}") + "\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(CycloError, match="selected Docker endpoint"):
+        docker_socket_paths({})
+
+
 @pytest.mark.parametrize("source", [Path("/proc/self"), Path("/sys"), Path("/dev"), Path("/run")])
-def test_host_pseudo_filesystems_cannot_be_mounted(source: Path, tmp_path: Path) -> None:
+def test_host_pseudo_filesystems_cannot_be_mounted(
+    source: Path,
+    tmp_path: Path,
+    standard_docker_endpoint,
+) -> None:
     team = tmp_path / "team"
     team.mkdir()
 
@@ -409,15 +640,21 @@ def test_lowercase_missing_object_is_not_a_docker_failure(
     docker = Docker()
     selected = instance(tmp_path / "team", tmp_path / "project")
 
-    def missing(command, *, capture=False, check=True):
+    def missing(arguments, **_options):
+        assert list(arguments) == [
+            "container",
+            "inspect",
+            "--",
+            selected.container_name,
+        ]
         return subprocess.CompletedProcess(
-            command,
+            arguments,
             1,
             stdout="",
-            stderr="error: no such object: cyclo-missing\n",
+            stderr=f"error: no such object: {selected.container_name}\n",
         )
 
-    monkeypatch.setattr(docker, "_run", missing)
+    monkeypatch.setattr(docker, "call", missing)
 
     assert docker.container_running(selected, system=SYSTEM) is False
 
@@ -430,17 +667,9 @@ def test_container_running_rejects_nonoperational_docker_states(
     selected = instance(tmp_path / "team", tmp_path / "project")
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: {
-            "Id": "verified-container-id",
-            "Config": {
-                "Labels": {
-                    "io.cyclo.system": SYSTEM,
-                    "io.cyclo.kind": "team",
-                    "io.cyclo.instance": selected.id,
-                    "cyclo.launch": selected.launch_id,
-                }
-            },
+        "inspect",
+        lambda kind, reference, **_options: {
+            **owned_container_info(selected),
             "State": {"Running": True, flag: True},
         },
     )
@@ -459,24 +688,24 @@ def test_team_commands_use_the_verified_immutable_container_id(
     commands: list[list[str]] = []
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: owned_container_info(selected),
+        "inspect",
+        lambda kind, reference, **_options: owned_container_info(selected),
     )
 
-    def record(command, **_kwargs):
-        recorded = list(command)
-        if recorded[:3] == ["docker", "cp", "--archive"]:
-            staged = Path(recorded[3])
+    def record(arguments, **_options):
+        recorded = list(arguments)
+        if recorded[:2] == ["cp", "--archive"]:
+            staged = Path(recorded[2])
             assert staged != source
             assert staged.read_text(encoding="utf-8") == "Create a UART.\n"
             assert staged.stat().st_uid == os.getuid()
             assert staged.stat().st_gid == os.getgid()
             assert staged.stat().st_mode & 0o777 == 0o600
-            recorded[3] = "<private-task-spec>"
+            recorded[2] = "<private-task-spec>"
         commands.append(recorded)
-        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(docker, "_run", record)
+    monkeypatch.setattr(docker, "call", record)
 
     docker.logs(selected, system=SYSTEM, follow=False)
     docker.copy_to(
@@ -493,20 +722,18 @@ def test_team_commands_use_the_verified_immutable_container_id(
     )
 
     assert commands == [
-        ["docker", "logs", "verified-container-id"],
+        ["logs", CONTAINER_ID],
         [
-            "docker",
             "cp",
             "--archive",
             "<private-task-spec>",
-            "verified-container-id:/tmp/task.md",
+            f"{CONTAINER_ID}:/tmp/task.md",
         ],
         [
-            "docker",
             "exec",
             "--user",
             f"{os.getuid()}:{os.getgid()}",
-            "verified-container-id",
+            CONTAINER_ID,
             "/agentws/bin/task-list",
         ],
     ]
@@ -520,24 +747,24 @@ def test_current_published_port_uses_the_verified_immutable_container_id(
     commands: list[list[str]] = []
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: owned_container_info(selected),
+        "inspect",
+        lambda kind, reference, **_options: owned_container_info(selected),
     )
 
-    def record(command, **_kwargs):
-        commands.append(list(command))
+    def record(arguments, **_options):
+        commands.append(list(arguments))
         return subprocess.CompletedProcess(
-            command,
+            arguments,
             0,
             stdout="127.0.0.1:4317\n",
             stderr="",
         )
 
-    monkeypatch.setattr(docker, "_run", record)
+    monkeypatch.setattr(docker, "call", record)
 
     assert docker.current_published_port(selected, system=SYSTEM) == 4317
     assert commands == [
-        ["docker", "port", "verified-container-id", "4137/tcp"],
+        ["port", CONTAINER_ID, "4137/tcp"],
     ]
 
 
@@ -548,12 +775,16 @@ def test_every_team_operation_rejects_a_foreign_same_name_container(
     selected = instance(tmp_path / "team", tmp_path / "project")
     commands: list[list[str]] = []
     foreign = owned_container_info(selected, system="ba9876543210")
-    monkeypatch.setattr(docker, "_inspect_container", lambda _name: foreign)
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "inspect",
+        lambda kind, reference, **_options: foreign,
+    )
+    monkeypatch.setattr(
+        docker,
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
     operations = (
@@ -588,12 +819,16 @@ def test_current_team_operations_reject_a_replaced_launch(
         selected, launch_id="2" * 32, running=False
     )
     commands: list[list[str]] = []
-    monkeypatch.setattr(docker, "_inspect_container", lambda _name: replacement)
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "inspect",
+        lambda kind, reference, **_options: replacement,
+    )
+    monkeypatch.setattr(
+        docker,
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
     assert (
@@ -621,18 +856,19 @@ def test_current_team_operations_reject_a_replaced_launch(
     assert commands == []
 
 
-def test_start_rejects_a_container_with_the_wrong_launch_identity(
+def test_start_creates_inspects_and_starts_verified_immutable_id(
     tmp_path: Path,
     team_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     docker = Docker()
-    selected = instance(team_repo, tmp_path / "project")
-    selected.launch_id = "1" * 32
+    project = tmp_path / "project"
+    project.mkdir()
+    selected = instance(team_repo, project)
     spec = ContainerSpec(
         instance=selected,
         team=load_team(team_repo),
-        project=tmp_path / "project",
+        project=project,
         runtime_root=tmp_path / "runtime",
         tasks_dir=tmp_path / "tasks",
         jobs_dir=tmp_path / "jobs",
@@ -642,27 +878,149 @@ def test_start_rejects_a_container_with_the_wrong_launch_identity(
         system=SYSTEM,
         port=0,
     )
-    inspections = iter(
-        (
-            None,
-            owned_container_info(selected, launch_id="2" * 32),
+    inspections = iter((None, owned_container_info(selected, running=False)))
+    events: list[tuple[str, object]] = []
+
+    def inspect(kind, reference, **_options):
+        events.append(
+            ("inspect", (kind, reference, _options["missing"]))
         )
+        return next(inspections)
+
+    def call(arguments, **_options):
+        command = list(arguments)
+        events.append(("call", command))
+        stdout = f"{CONTAINER_ID}\n" if command[0] == "create" else ""
+        return subprocess.CompletedProcess(arguments, 0, stdout, "")
+
+    monkeypatch.setattr(docker, "inspect", inspect)
+    monkeypatch.setattr(docker, "call", call)
+
+    assert docker.start(spec) is None
+    assert events == [
+        ("inspect", ("container", selected.container_name, True)),
+        ("call", container_command(spec)[1:]),
+        ("inspect", ("container", CONTAINER_ID, False)),
+        ("call", ["start", CONTAINER_ID]),
+    ]
+
+
+def test_start_rejects_a_created_container_with_the_wrong_launch_identity(
+    tmp_path: Path,
+    team_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = Docker()
+    project = tmp_path / "project"
+    project.mkdir()
+    selected = instance(team_repo, project)
+    selected.launch_id = "1" * 32
+    spec = ContainerSpec(
+        instance=selected,
+        team=load_team(team_repo),
+        project=project,
+        runtime_root=tmp_path / "runtime",
+        tasks_dir=tmp_path / "tasks",
+        jobs_dir=tmp_path / "jobs",
+        agents_dir=tmp_path / "agents",
+        pi_root=tmp_path / "pi",
+        provider_socket_dir=Path(selected.provider_socket_path).parent,
+        system=SYSTEM,
+        port=0,
     )
+    wrong_launch = owned_container_info(
+        selected,
+        launch_id="2" * 32,
+        running=False,
+    )
+    inspections = iter((None, wrong_launch))
+    inspection_calls: list[tuple[str, str, bool]] = []
     commands: list[list[str]] = []
-    monkeypatch.setattr(
-        docker, "_inspect_container", lambda _name: next(inspections)
-    )
-    monkeypatch.setattr(
-        docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
-    )
+
+    def inspect(kind, reference, **options):
+        inspection_calls.append((kind, reference, options["missing"]))
+        return next(inspections)
+
+    def call(arguments, **_options):
+        command = list(arguments)
+        commands.append(command)
+        stdout = f"{CONTAINER_ID}\n" if command[0] == "create" else ""
+        return subprocess.CompletedProcess(arguments, 0, stdout, "")
+
+    monkeypatch.setattr(docker, "inspect", inspect)
+    monkeypatch.setattr(docker, "call", call)
 
     with pytest.raises(CycloError, match="launch identity changed"):
         docker.start(spec)
 
-    assert commands and commands[0][:2] == ["docker", "run"]
+    assert commands == [container_command(spec)[1:]]
+    assert inspection_calls == [
+        ("container", selected.container_name, True),
+        ("container", CONTAINER_ID, False),
+    ]
+
+
+def test_start_failure_reinspects_and_force_removes_exact_created_id(
+    tmp_path: Path,
+    team_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = Docker()
+    project = tmp_path / "project"
+    project.mkdir()
+    selected = instance(team_repo, project)
+    spec = ContainerSpec(
+        instance=selected,
+        team=load_team(team_repo),
+        project=project,
+        runtime_root=tmp_path / "runtime",
+        tasks_dir=tmp_path / "tasks",
+        jobs_dir=tmp_path / "jobs",
+        agents_dir=tmp_path / "agents",
+        pi_root=tmp_path / "pi",
+        provider_socket_dir=Path(selected.provider_socket_path).parent,
+        system=SYSTEM,
+        port=0,
+    )
+    created = owned_container_info(selected, running=False)
+    inspections = iter((None, created, created, created))
+    events: list[tuple[str, object]] = []
+
+    def inspect(kind, reference, **_options):
+        events.append(
+            ("inspect", (kind, reference, _options["missing"]))
+        )
+        return next(inspections)
+
+    def call(arguments, **_options):
+        command = list(arguments)
+        events.append(("call", command))
+        if command[0] == "create":
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                f"{CONTAINER_ID}\n",
+                "",
+            )
+        if command[0] == "start":
+            raise CycloError("simulated start failure")
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(docker, "inspect", inspect)
+    monkeypatch.setattr(docker, "call", call)
+
+    with pytest.raises(CycloError, match="simulated start failure"):
+        docker.start(spec)
+
+    assert events == [
+        ("inspect", ("container", selected.container_name, True)),
+        ("call", container_command(spec)[1:]),
+        ("inspect", ("container", CONTAINER_ID, False)),
+        ("call", ["start", CONTAINER_ID]),
+        ("inspect", ("container", CONTAINER_ID, True)),
+        ("inspect", ("container", CONTAINER_ID, True)),
+        ("call", ["rm", "--force", CONTAINER_ID]),
+    ]
 
 
 def test_start_force_removes_a_dead_previous_launch(
@@ -688,33 +1046,48 @@ def test_start_force_removes_a_dead_previous_launch(
         port=0,
     )
     previous = owned_container_info(selected, running=False)
+    previous["Id"] = PREVIOUS_CONTAINER_ID
     previous["State"] = {
         "Running": False,
         "Dead": True,
         "Status": "dead",
     }
-    inspections = iter((previous, owned_container_info(selected)))
+    created = owned_container_info(selected, running=False)
     commands: list[list[str]] = []
-    monkeypatch.setattr(
-        docker,
-        "_inspect_container",
-        lambda _name: next(inspections),
-    )
-    monkeypatch.setattr(
-        docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
-    )
+    create_seen = False
+
+    def inspect(kind, reference, **_options):
+        if reference == PREVIOUS_CONTAINER_ID:
+            return previous
+        if reference == CONTAINER_ID:
+            return created
+        if reference == selected.container_name:
+            return created if create_seen else previous
+        pytest.fail(f"unexpected Docker inspection: {kind} {reference}")
+
+    def call(arguments, **_options):
+        nonlocal create_seen
+        command = list(arguments)
+        commands.append(command)
+        if command[0] == "create":
+            create_seen = True
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                f"{CONTAINER_ID}\n",
+                "",
+            )
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(docker, "inspect", inspect)
+    monkeypatch.setattr(docker, "call", call)
 
     assert docker.start(spec) is None
-    assert commands[0] == [
-        "docker",
-        "rm",
-        "--force",
-        "verified-container-id",
+    assert commands == [
+        ["rm", "--force", PREVIOUS_CONTAINER_ID],
+        container_command(spec)[1:],
+        ["start", CONTAINER_ID],
     ]
-    assert commands[1][:3] == ["docker", "run", "--detach"]
 
 
 def test_start_never_replaces_a_different_stopped_launch(
@@ -742,9 +1115,10 @@ def test_start_never_replaces_a_different_stopped_launch(
     )
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: owned_container_info(
+        "inspect",
+        lambda kind, reference, **_options: owned_container_info(
             selected,
+            container_id=REPLACEMENT_CONTAINER_ID,
             launch_id="2" * 32,
             running=False,
         ),
@@ -752,9 +1126,9 @@ def test_start_never_replaces_a_different_stopped_launch(
     commands: list[list[str]] = []
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
     with pytest.raises(CycloError, match="launch identity changed"):
@@ -772,15 +1146,19 @@ def test_inactive_launch_removal_is_exact_and_never_stops_an_active_launch(
     selected.launch_id = "1" * 32
     info = owned_container_info(selected)
     commands: list[list[str]] = []
-    monkeypatch.setattr(docker, "_inspect_container", lambda _name: info)
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "inspect",
+        lambda kind, reference, **_options: info,
+    )
+    monkeypatch.setattr(
+        docker,
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
-    with pytest.raises(CycloError, match="refusing to replace active"):
+    with pytest.raises(CycloError, match="refusing to remove active"):
         docker.remove_inactive_launch(
             selected.container_name,
             selected.id,
@@ -797,7 +1175,7 @@ def test_inactive_launch_removal_is_exact_and_never_stops_an_active_launch(
         expected_launch=selected.launch_id,
     )
     assert commands == [
-        ["docker", "rm", "--force", "verified-container-id"],
+        ["rm", "--force", CONTAINER_ID],
     ]
 
 
@@ -828,8 +1206,8 @@ def test_start_validates_the_complete_command_before_replacing_a_container(
     )
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: pytest.fail(
+        "inspect",
+        lambda kind, reference, **_options: pytest.fail(
             "invalid launch must not inspect or replace the old container"
         ),
     )
@@ -840,110 +1218,87 @@ def test_start_validates_the_complete_command_before_replacing_a_container(
 
 def test_container_removal_uses_verified_immutable_id(monkeypatch) -> None:
     docker = Docker()
+    name = f"cyclo-{SYSTEM}-team-alpha"
     commands: list[list[str]] = []
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: {
-            "Id": "verified-container-id",
-            "Config": {
-                "Labels": {
-                    "io.cyclo.system": SYSTEM,
-                    "io.cyclo.kind": "team",
-                    "io.cyclo.instance": "alpha",
-                    "cyclo.launch": "0" * 32,
-                }
-            },
-            "State": {"Running": True},
-        },
+        "inspect",
+        lambda kind, reference, **_options: team_container_info(name, "alpha"),
     )
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
     docker.stop_remove(
-        f"cyclo-{SYSTEM}-team-alpha",
+        name,
         "alpha",
         expected_system=SYSTEM,
         expected_launch="0" * 32,
     )
 
     assert commands == [
-        ["docker", "stop", "--timeout", "30", "verified-container-id"],
-        ["docker", "rm", "verified-container-id"],
+        ["stop", "--timeout", "30", CONTAINER_ID],
+        ["rm", CONTAINER_ID],
     ]
 
 
 def test_dead_container_removal_is_forced(monkeypatch) -> None:
     docker = Docker()
+    name = f"cyclo-{SYSTEM}-team-alpha"
     commands: list[list[str]] = []
+    info = team_container_info(name, "alpha", running=False)
+    info["State"] = {"Running": False, "Dead": True, "Status": "dead"}
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: {
-            "Id": "verified-container-id",
-            "Config": {
-                "Labels": {
-                    "io.cyclo.system": SYSTEM,
-                    "io.cyclo.kind": "team",
-                    "io.cyclo.instance": "alpha",
-                    "cyclo.launch": "0" * 32,
-                }
-            },
-            "State": {"Running": False, "Dead": True, "Status": "dead"},
-        },
+        "inspect",
+        lambda kind, reference, **_options: info,
     )
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
     docker.stop_remove(
-        f"cyclo-{SYSTEM}-team-alpha",
+        name,
         "alpha",
         expected_system=SYSTEM,
         expected_launch="0" * 32,
     )
 
     assert commands == [
-        ["docker", "rm", "--force", "verified-container-id"],
+        ["rm", "--force", CONTAINER_ID],
     ]
 
 
 def test_container_removal_rejects_reused_instance_launch(monkeypatch) -> None:
     docker = Docker()
+    name = f"cyclo-{SYSTEM}-team-alpha"
     commands: list[list[str]] = []
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: {
-            "Id": "replacement-container-id",
-            "Config": {
-                "Labels": {
-                    "io.cyclo.system": SYSTEM,
-                    "io.cyclo.kind": "team",
-                    "io.cyclo.instance": "alpha",
-                    "cyclo.launch": "1" * 32,
-                }
-            },
-            "State": {"Running": True},
-        },
+        "inspect",
+        lambda kind, reference, **_options: team_container_info(
+            name,
+            "alpha",
+            container_id=REPLACEMENT_CONTAINER_ID,
+            launch_id="1" * 32,
+        ),
     )
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
     with pytest.raises(CycloError, match="launch identity changed"):
         docker.stop_remove(
-            f"cyclo-{SYSTEM}-team-alpha",
+            name,
             "alpha",
             expected_system=SYSTEM,
             expected_launch="0" * 32,
@@ -954,26 +1309,28 @@ def test_container_removal_rejects_reused_instance_launch(monkeypatch) -> None:
 
 def test_container_removal_rejects_foreign_label(monkeypatch) -> None:
     docker = Docker()
+    name = f"cyclo-{SYSTEM}-team-alpha"
     commands: list[list[str]] = []
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: {
-            "Id": "foreign-container-id",
+        "inspect",
+        lambda kind, reference, **_options: {
+            "Id": REPLACEMENT_CONTAINER_ID,
+            "Name": f"/{name}",
             "Config": {"Labels": {"cyclo.instance": "someone-else"}},
             "State": {"Running": False},
         },
     )
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
     with pytest.raises(CycloError, match="non-Cyclo container"):
         docker.stop_remove(
-            f"cyclo-{SYSTEM}-team-alpha",
+            name,
             "alpha",
             expected_system=SYSTEM,
             expected_launch="0" * 32,
@@ -984,48 +1341,62 @@ def test_container_removal_rejects_foreign_label(monkeypatch) -> None:
 
 def test_container_removal_rejects_another_installation(monkeypatch) -> None:
     docker = Docker()
+    name = f"cyclo-{SYSTEM}-team-alpha"
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: {
-            "Id": "foreign-container-id",
-            "Config": {
-                "Labels": {
-                    "io.cyclo.system": "ba9876543210",
-                    "io.cyclo.kind": "team",
-                    "io.cyclo.instance": "alpha",
-                }
-            },
-            "State": {"Running": False},
-        },
+        "inspect",
+        lambda kind, reference, **_options: team_container_info(
+            name,
+            "alpha",
+            system="ba9876543210",
+            container_id=REPLACEMENT_CONTAINER_ID,
+            running=False,
+        ),
     )
 
     with pytest.raises(CycloError, match="non-Cyclo container"):
         docker.stop_remove(
-            f"cyclo-{SYSTEM}-team-alpha",
+            name,
             "alpha",
             expected_system=SYSTEM,
             expected_launch="0" * 32,
         )
 
 
-def test_container_removal_rejects_invalid_launch_before_inspection(
+def test_container_removal_rejects_invalid_launch_before_mutation(
     monkeypatch,
 ) -> None:
     docker = Docker()
+    name = f"cyclo-{SYSTEM}-team-alpha"
+    inspections: list[tuple[str, str]] = []
+    commands: list[list[str]] = []
+
+    def inspect(kind, reference, **_options):
+        inspections.append((kind, reference))
+        return team_container_info(name, "alpha", running=False)
+
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: pytest.fail("invalid identity must fail before inspection"),
+        "inspect",
+        inspect,
+    )
+    monkeypatch.setattr(
+        docker,
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
     with pytest.raises(CycloError, match="invalid launch identity"):
         docker.stop_remove(
-            f"cyclo-{SYSTEM}-team-alpha",
+            name,
             "alpha",
             expected_system=SYSTEM,
             expected_launch="",
         )
+
+    assert inspections == [("container", name)]
+    assert commands == []
 
 
 def test_network_removal_refuses_attached_containers(monkeypatch) -> None:
@@ -1033,24 +1404,24 @@ def test_network_removal_refuses_attached_containers(monkeypatch) -> None:
     commands: list[list[str]] = []
     monkeypatch.setattr(
         docker,
-        "_inspect_network",
-        lambda _name: {
-            "Id": "verified-network-id",
+        "inspect",
+        lambda kind, reference, **_options: {
+            "Id": NETWORK_ID,
             "Labels": {
                 "io.cyclo.system": SYSTEM,
                 "io.cyclo.kind": "team-network",
                 "io.cyclo.instance": "alpha",
             },
             "Containers": {
-                "verified-gateway-id": {"Name": "cyclo-gateway-test"}
+                ATTACHED_CONTAINER_ID: {"Name": "cyclo-gateway-test"}
             },
         },
     )
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
     with pytest.raises(CycloError, match="containers remain attached"):
@@ -1061,7 +1432,7 @@ def test_network_removal_refuses_attached_containers(monkeypatch) -> None:
     assert commands == []
 
 
-def test_network_creation_uses_installation_identity(monkeypatch) -> None:
+def test_online_network_creation_uses_installation_identity(monkeypatch) -> None:
     docker = Docker()
     name = f"cyclo-{SYSTEM}-team-alpha-net"
     commands: list[list[str]] = []
@@ -1069,31 +1440,32 @@ def test_network_creation_uses_installation_identity(monkeypatch) -> None:
         (
             None,
             {
-                "Id": "verified-network-id",
+                "Id": NETWORK_ID,
                 "Labels": {
                     "io.cyclo.system": SYSTEM,
                     "io.cyclo.kind": "team-network",
                     "io.cyclo.instance": "alpha",
                 },
-                "Internal": True,
+                "Internal": False,
                 "Containers": {},
             },
         )
     )
-    monkeypatch.setattr(docker, "_inspect_network", lambda _name: next(inspections))
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "inspect",
+        lambda kind, reference, **_options: next(inspections),
+    )
+    monkeypatch.setattr(
+        docker,
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
-    assert docker.ensure_network(name, "alpha", system=SYSTEM, offline=True) == (
-        "verified-network-id"
-    )
+    assert docker.ensure_network(name, "alpha", system=SYSTEM) == NETWORK_ID
     assert commands == [
         [
-            "docker",
             "network",
             "create",
             "--label",
@@ -1102,10 +1474,31 @@ def test_network_creation_uses_installation_identity(monkeypatch) -> None:
             "io.cyclo.kind=team-network",
             "--label",
             "io.cyclo.instance=alpha",
-            "--internal",
             name,
         ]
     ]
+
+
+def test_online_network_rejects_internal_bridge(monkeypatch) -> None:
+    docker = Docker()
+    name = f"cyclo-{SYSTEM}-team-alpha-net"
+    monkeypatch.setattr(
+        docker,
+        "inspect",
+        lambda kind, reference, **_options: {
+            "Id": NETWORK_ID,
+            "Labels": {
+                "io.cyclo.system": SYSTEM,
+                "io.cyclo.kind": "team-network",
+                "io.cyclo.instance": "alpha",
+            },
+            "Internal": True,
+            "Containers": {},
+        },
+    )
+
+    with pytest.raises(CycloError, match="internal mode"):
+        docker.ensure_network(name, "alpha", system=SYSTEM)
 
 
 def test_network_removal_uses_verified_resource_id(monkeypatch) -> None:
@@ -1113,9 +1506,9 @@ def test_network_removal_uses_verified_resource_id(monkeypatch) -> None:
     commands: list[list[str]] = []
     monkeypatch.setattr(
         docker,
-        "_inspect_network",
-        lambda _name: {
-            "Id": "verified-network-id",
+        "inspect",
+        lambda kind, reference, **_options: {
+            "Id": NETWORK_ID,
             "Labels": {
                 "io.cyclo.system": SYSTEM,
                 "io.cyclo.kind": "team-network",
@@ -1126,9 +1519,9 @@ def test_network_removal_uses_verified_resource_id(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         docker,
-        "_run",
-        lambda command, **_kwargs: commands.append(list(command))
-        or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        "call",
+        lambda arguments, **_options: commands.append(list(arguments))
+        or subprocess.CompletedProcess(arguments, 0, stdout="", stderr=""),
     )
 
     docker.remove_network(
@@ -1136,5 +1529,5 @@ def test_network_removal_uses_verified_resource_id(monkeypatch) -> None:
     )
 
     assert commands == [
-        ["docker", "network", "rm", "verified-network-id"]
+        ["network", "rm", NETWORK_ID]
     ]

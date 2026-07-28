@@ -159,6 +159,7 @@ forbidden_names = {
 required_names = {
     "cyclo/component.py",
     "cyclo/component_runtime.py",
+    "cyclo/docker_engine.py",
     "cyclo/gateway.py",
     "cyclo/project.py",
     "cyclo/providers.py",

@@ -39,7 +39,6 @@ from .installation import (
 
 _NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _ENVIRONMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 LABEL_TOOL = "io.cyclo.gateway-tool"
 
 
@@ -368,14 +367,21 @@ class Gateway:
         create_volume: bool = True,
         config: bool = False,
     ) -> subprocess.CompletedProcess[str]:
+        allocate_tty = (
+            interactive
+            and not capture
+            and input_data is None
+            and sys.stdin.isatty()
+        )
         if volume:
             if not self.store_ready(create=create_volume):
                 raise CycloError("gateway credential store is absent")
             current = self.controller.status(self.component)
             self._require_exclusive_store(current.container_id)
         image_id = self.controller.require_image(self.component)
-        # `docker run --rm` can outlive an interrupted Docker client. Give the
-        # one-shot container an owned identity before attaching to it.
+        # A one-shot container can outlive an interrupted Docker client. Give
+        # it an owned identity, inspect the immutable ID returned by create,
+        # and only then attach while starting it.
         tool = replace(
             self.component,
             container=(
@@ -391,11 +397,9 @@ class Gateway:
             for item in ("--label", f"{key}={value}")
         ]
         arguments = [
-            "create",
-            "--name",
-            tool.container,
             *labels,
             *(["--interactive"] if interactive else []),
+            *(["--tty"] if allocate_tty else []),
             "--security-opt",
             "no-new-privileges",
             "--cap-drop",
@@ -438,21 +442,26 @@ class Gateway:
         arguments.extend([image_id, *command])
         identifier: str | None = None
         try:
-            created = self.controller.call(arguments)
-            created_id = (created.stdout or "").strip()
-            if not _CONTAINER_ID_RE.fullmatch(created_id):
-                raise CycloError(
-                    "Docker create returned an invalid gateway tool container ID"
-                )
-            identifier = created_id
+            def verify_tool(info: Mapping[str, object]) -> None:
+                selected = self._tool_component(info)
+                if selected is None or selected.container != tool.container:
+                    raise CycloError(
+                        "Docker created an invalid gateway tool container"
+                    )
+
+            container, created = self.controller.create_container(
+                tool.container,
+                arguments,
+                verify=verify_tool,
+            )
+            identifier = container.id
             if created.stderr and not capture:
                 print(created.stderr, end="", file=sys.stderr)
-            result = self.controller.call(
-                [
-                    "start",
+            result = self.controller.start_container(
+                container,
+                arguments=[
                     "--attach",
                     *(["--interactive"] if interactive else []),
-                    identifier,
                 ],
                 capture=capture,
                 input_data=input_data,
@@ -481,6 +490,11 @@ class Gateway:
         *,
         cause: BaseException | None = None,
     ) -> None:
+        # A failed create may have left a container behind without returning a
+        # verified immutable ID.  Do not select that residue by its reusable
+        # name; the next locked gateway operation reconciles labeled tools.
+        if identifier is None:
+            return
         try:
             self.controller.stop(tool, identifier)
         except Exception as cleanup:

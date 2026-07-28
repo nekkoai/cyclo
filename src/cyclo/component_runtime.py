@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import time
-import uuid
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from . import __version__
-from .component import Component, ComponentStatus, Mount, probe_component
+from .component import Component, ComponentStatus, probe_component
+from .docker_engine import DockerEngine
 from .errors import CycloError
 from .installation import LABEL_INSTANCE, LABEL_SYSTEM
 
@@ -22,10 +20,6 @@ LABEL_TYPE = "io.cyclo.component-type"
 LABEL_RELEASE = "io.cyclo.release"
 # Keep the persisted label key stable; its value names the component class.
 LABEL_COMPONENT_CLASS = "io.cyclo.lifecycle"
-
-_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
-
 
 def ensure_directory(path: Path, mode: int) -> Path:
     """Create one private component-state directory without following a symlink."""
@@ -44,118 +38,8 @@ def ensure_directory(path: Path, mode: int) -> Path:
     return path
 
 
-class ComponentController:
+class ComponentController(DockerEngine):
     """Build and run one declared component through Docker."""
-
-    def call(
-        self,
-        arguments: Sequence[str],
-        *,
-        capture: bool = True,
-        check: bool = True,
-        input_data: str | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        try:
-            process = subprocess.run(
-                ["docker", *arguments],
-                text=True,
-                input=input_data,
-                stdout=subprocess.PIPE if capture else None,
-                stderr=subprocess.PIPE if capture else None,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise CycloError("Docker is not installed or not on PATH") from exc
-        if check and process.returncode != 0:
-            detail = ((process.stderr or "") + (process.stdout or "")).strip()
-            raise CycloError(
-                f"Docker command failed ({process.returncode}): "
-                f"{detail or 'docker ' + ' '.join(arguments)}"
-            )
-        return process
-
-    def available(self) -> tuple[bool, str]:
-        try:
-            result = self.call(
-                ["info", "--format", "{{.ServerVersion}}"],
-                capture=True,
-                check=False,
-            )
-        except CycloError as exc:
-            return False, str(exc)
-        detail = ((result.stdout or "") + (result.stderr or "")).strip()
-        return result.returncode == 0, detail
-
-    def inspect(
-        self,
-        kind: str,
-        reference: str,
-        *,
-        missing: bool = True,
-    ) -> dict[str, object] | None:
-        result = self.call(
-            [kind, "inspect", "--", reference],
-            capture=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            detail = ((result.stderr or "") + (result.stdout or "")).strip()
-            lowered = detail.lower()
-            markers = {
-                "container": ("no such container", "no such object"),
-                "image": ("no such image", "no such object"),
-                "volume": ("no such volume",),
-            }.get(kind, ())
-            if (
-                missing
-                and reference.lower() in lowered
-                and any(marker in lowered for marker in markers)
-            ):
-                return None
-            raise CycloError(
-                f"cannot inspect Docker {kind} {reference}: "
-                f"{detail or 'unknown Docker error'}"
-            )
-        try:
-            document = json.loads(result.stdout or "")
-        except json.JSONDecodeError as exc:
-            raise CycloError(
-                f"cannot parse Docker {kind} inspection for {reference}"
-            ) from exc
-        if (
-            not isinstance(document, list)
-            or len(document) != 1
-            or not isinstance(document[0], dict)
-        ):
-            raise CycloError(f"invalid Docker {kind} inspection for {reference}")
-        return document[0]
-
-    @staticmethod
-    def labels(info: Mapping[str, object]) -> dict[str, str]:
-        config = info.get("Config")
-        labels = config.get("Labels") if isinstance(config, Mapping) else None
-        if labels is None:
-            return {}
-        if not isinstance(labels, Mapping) or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in labels.items()
-        ):
-            raise CycloError("cannot parse Docker resource labels")
-        return dict(labels)
-
-    @staticmethod
-    def image_id(info: Mapping[str, object]) -> str:
-        value = info.get("Id")
-        if not isinstance(value, str) or not _IMAGE_ID_RE.fullmatch(value):
-            raise CycloError("cannot parse Docker image ID")
-        return value
-
-    @staticmethod
-    def container_id(info: Mapping[str, object]) -> str:
-        value = info.get("Id")
-        if not isinstance(value, str) or not _CONTAINER_ID_RE.fullmatch(value):
-            raise CycloError("cannot parse Docker container ID")
-        return value
 
     @staticmethod
     def expected_labels(component: Component) -> dict[str, str]:
@@ -205,6 +89,15 @@ class ComponentController:
             raise CycloError(
                 f"refusing mislabeled Docker container: {component.container}"
             )
+
+    def _container_verifier(
+        self,
+        component: Component,
+    ) -> Callable[[Mapping[str, object]], None]:
+        def verify(info: Mapping[str, object]) -> None:
+            self.require_owned(component, info, image=False)
+
+        return verify
 
     def _validate_image(
         self,
@@ -287,16 +180,12 @@ class ComponentController:
             raise CycloError(
                 "Cyclo image build arguments must start with 'build'"
             )
-        repository = image.rsplit(":", 1)[0]
-        candidate = f"{repository}:candidate-{os.getpid()}-{uuid.uuid4()}"
         directory = Path(tempfile.mkdtemp(prefix="cyclo-image-build-"))
         iidfile = directory / "image-id"
         try:
             self.call(
                 [
                     "build",
-                    "--tag",
-                    candidate,
                     "--iidfile",
                     str(iidfile),
                     *arguments[1:],
@@ -309,15 +198,14 @@ class ComponentController:
                 raise CycloError(
                     "Docker build did not publish an image ID"
                 ) from exc
-            if not _IMAGE_ID_RE.fullmatch(built_id):
-                raise CycloError("Docker build returned an invalid image ID")
-            built = self.inspect("image", built_id, missing=False)
-            tagged = self.inspect("image", candidate, missing=False)
-            assert built is not None and tagged is not None
-            if self.image_id(tagged) != built_id:
+            try:
+                self.require_image_id(built_id)
+            except CycloError as exc:
                 raise CycloError(
-                    "Docker candidate tag does not reference the completed build"
-                )
+                    "Docker build returned an invalid image ID"
+                ) from exc
+            built = self.inspect("image", built_id, missing=False)
+            assert built is not None
             validate(built)
             if before_promote is not None:
                 before_promote()
@@ -330,7 +218,6 @@ class ComponentController:
                 )
             return built_id
         finally:
-            self.call(["image", "rm", "--", candidate], check=False)
             shutil.rmtree(directory, ignore_errors=True)
 
     def build(self, component: Component) -> str:
@@ -373,22 +260,6 @@ class ComponentController:
         return self.image_id(image)
 
     @staticmethod
-    def container_state(container: Mapping[str, object]) -> str:
-        state = container.get("State")
-        if not isinstance(state, Mapping):
-            raise CycloError("cannot parse Docker container state")
-        status = str(state.get("Status") or "").lower()
-        if state.get("Dead") is True or status == "dead":
-            return "dead"
-        if state.get("Restarting") is True or status == "restarting":
-            return "restarting"
-        if state.get("Paused") is True or status == "paused":
-            return "paused"
-        if state.get("Running") is True or status == "running":
-            return "running"
-        return "stopped"
-
-    @staticmethod
     def engine_health(container: Mapping[str, object]) -> str:
         state = container.get("State")
         health = state.get("Health") if isinstance(state, Mapping) else None
@@ -398,19 +269,6 @@ class ComponentController:
             if status in {"starting", "healthy", "unhealthy"}
             else "missing"
         )
-
-    @staticmethod
-    def mount_argument(mount: Mount) -> str:
-        if mount.type not in {"bind", "volume"}:
-            raise CycloError(f"unsupported Docker mount type: {mount.type}")
-        if "," in mount.source or "," in mount.destination:
-            raise CycloError(
-                f"Docker mount paths cannot contain a comma: {mount.source}"
-            )
-        result = (
-            f"type={mount.type},src={mount.source},dst={mount.destination}"
-        )
-        return result + (",readonly" if mount.read_only else "")
 
     def _configuration_current(
         self,
@@ -566,9 +424,18 @@ class ComponentController:
         component: Component,
         *,
         error: str = "",
+        expected_id: str | None = None,
     ) -> ComponentStatus:
+        if expected_id is not None:
+            try:
+                self.require_container_id(expected_id)
+            except CycloError as exc:
+                raise CycloError("invalid expected container ID") from exc
         image = self.inspect("image", component.image)
-        container = self.inspect("container", component.container)
+        container = self.inspect(
+            "container",
+            expected_id or component.container,
+        )
         valid_image = False
         image_diagnostic = ""
         if image is not None:
@@ -596,12 +463,15 @@ class ComponentController:
             )
 
         container_id = self.container_id(container)
+        if expected_id is not None and container_id != expected_id:
+            raise CycloError("Docker returned a different container than requested")
         container_image = container.get("Image")
-        if (
-            not isinstance(container_image, str)
-            or not _IMAGE_ID_RE.fullmatch(container_image)
-        ):
+        if not isinstance(container_image, str):
             raise CycloError("cannot parse Docker container image ID")
+        try:
+            self.require_image_id(container_image)
+        except CycloError as exc:
+            raise CycloError("cannot parse Docker container image ID") from exc
         container_state = self.container_state(container)
         current = bool(
             image is not None
@@ -644,44 +514,43 @@ class ComponentController:
             for mount in component.mounts
             for item in ("--mount", self.mount_argument(mount))
         ]
-        result = self.call(
-            [
-                "run",
-                "--detach",
-                "--name",
-                component.container,
-                *labels,
-                "--restart",
-                "unless-stopped",
-                "--stop-timeout",
-                "10",
-                "--security-opt",
-                "no-new-privileges",
-                "--cap-drop",
-                "ALL",
-                "--ipc",
-                "private",
-                "--cgroupns",
-                "private",
-                "--pids-limit",
-                "256",
-                "--ulimit",
-                "nofile=1024:1024",
-                "--read-only",
-                "--tmpfs",
-                "/tmp:rw,noexec,nosuid,nodev,size=64m",
-                "--network",
-                component.network,
-                *mounts,
-                image_id,
-                *component.arguments,
-            ]
-        )
-        container_id = (result.stdout or "").strip()
-        if not _CONTAINER_ID_RE.fullmatch(container_id):
-            raise CycloError("Docker run returned an invalid container ID")
+        verify = self._container_verifier(component)
+        container_id: str | None = None
         try:
-            status = self.status(component)
+            created, _result = self.create_container(
+                component.container,
+                [
+                    *labels,
+                    "--restart",
+                    "unless-stopped",
+                    "--stop-timeout",
+                    "10",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--cap-drop",
+                    "ALL",
+                    "--ipc",
+                    "private",
+                    "--cgroupns",
+                    "private",
+                    "--pids-limit",
+                    "256",
+                    "--ulimit",
+                    "nofile=1024:1024",
+                    "--read-only",
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,nodev,size=64m",
+                    "--network",
+                    component.network,
+                    *mounts,
+                    image_id,
+                    *component.arguments,
+                ],
+                verify=verify,
+            )
+            container_id = created.id
+            self.start_container(created)
+            status = self.status(component, expected_id=container_id)
             if (
                 status.container_id != container_id
                 or not status.running
@@ -694,29 +563,40 @@ class ComponentController:
         except BaseException as exc:
             self._rollback_started(component, container_id, exc)
             raise
+        assert container_id is not None
         return container_id
-
-    def _remove_started(self, component: Component, identifier: str) -> None:
-        container = self.inspect("container", identifier)
-        if container is None:
-            return
-        self.require_owned(component, container, image=False)
-        command = ["rm", "--force"]
-        if not component.preserve_volumes:
-            command.append("--volumes")
-        command.append(identifier)
-        self.call(command)
 
     def _rollback_started(
         self,
         component: Component,
-        identifier: str,
+        identifier: str | None,
         cause: BaseException,
     ) -> None:
-        """Remove a failed launch and retain both failures if cleanup fails."""
+        """Remove a verified failed launch and retain both failures if needed.
+
+        If creation did not return a verified immutable ID, leave any possible
+        residue untouched.  The next locked reconciliation may identify it by
+        ownership; rollback must never mutate a container selected only by a
+        reusable name.
+        """
+
+        if identifier is None:
+            return
 
         try:
-            self._remove_started(component, identifier)
+            verify = self._container_verifier(component)
+            container = self.inspect_container(
+                identifier,
+                verify=verify,
+            )
+            if container is not None:
+                self.remove_container(
+                    container,
+                    verify=verify,
+                    timeout=10,
+                    remove_volumes=not component.preserve_volumes,
+                    force=True,
+                )
         except Exception as cleanup:
             detail = (
                 f"component {component.name} rollback failed: {cleanup}"
@@ -727,23 +607,24 @@ class ComponentController:
     def wait_ready(
         self,
         component: Component,
+        expected_id: str,
         *,
         timeout: float = 20.0,
     ) -> ComponentStatus:
         deadline = time.monotonic() + timeout
-        last = self.status(component)
+        last = self.status(component, expected_id=expected_id)
         while time.monotonic() < deadline:
-            last = self.status(component)
+            last = self.status(component, expected_id=expected_id)
             if last.works:
                 return last
             if not last.running or not last.current:
-                logs = self.logs(component)
+                logs = self.logs(component, expected_id=expected_id)
                 raise CycloError(
                     f"component {component.name} stopped or changed during startup"
                     + (f"\n{logs}" if logs else "")
                 )
             time.sleep(0.1)
-        logs = self.logs(component)
+        logs = self.logs(component, expected_id=expected_id)
         detail = f": {last.error}" if last.error else ""
         raise CycloError(
             f"timed out waiting for component {component.name}{detail}"
@@ -765,7 +646,7 @@ class ComponentController:
             self.stop(component, current.container_id)
         identifier = self._run(component)
         try:
-            return self.wait_ready(component)
+            return self.wait_ready(component, identifier)
         except BaseException as exc:
             self._rollback_started(component, identifier, exc)
             raise
@@ -790,58 +671,51 @@ class ComponentController:
         component: Component,
         expected_id: str | None = None,
     ) -> bool:
-        if expected_id is not None and not _CONTAINER_ID_RE.fullmatch(expected_id):
-            raise CycloError("invalid expected container ID")
-        container = self.inspect(
-            "container",
+        if expected_id is not None:
+            try:
+                self.require_container_id(expected_id)
+            except CycloError as exc:
+                raise CycloError("invalid expected container ID") from exc
+        verify = self._container_verifier(component)
+        container = self.inspect_container(
             expected_id or component.container,
+            verify=verify,
         )
         if container is None:
             return False
-        self.require_owned(component, container, image=False)
-        container_id = self.container_id(container)
-        if expected_id is not None and expected_id != container_id:
+        if expected_id is not None and expected_id != container.id:
             raise CycloError("Docker returned a different container than requested")
-        state = self.container_state(container)
-        self.remove_verified_container(
-            container_id,
-            state,
-            preserve_volumes=component.preserve_volumes,
+        return self.remove_container(
+            container,
+            verify=verify,
+            timeout=10,
+            remove_volumes=not component.preserve_volumes,
         )
-        return True
 
-    def remove_verified_container(
+    def logs(
         self,
-        container_id: str,
-        state: str,
+        component: Component,
+        lines: int = 80,
         *,
-        preserve_volumes: bool,
-    ) -> None:
-        """Remove a container after its ownership and immutable ID were verified."""
-
-        if not _CONTAINER_ID_RE.fullmatch(container_id):
-            raise CycloError("invalid verified container ID")
-        if state not in {"running", "paused", "restarting", "stopped", "dead"}:
-            raise CycloError(f"invalid verified container state: {state}")
-        if state == "paused":
-            self.call(["unpause", container_id])
-            state = "running"
-        if state not in {"stopped", "dead"}:
-            self.call(["stop", "--timeout", "10", container_id])
-        command = ["rm", container_id]
-        if state == "dead":
-            command.insert(1, "--force")
-        if not preserve_volumes:
-            command.insert(1, "--volumes")
-        self.call(command)
-
-    def logs(self, component: Component, lines: int = 80) -> str:
-        info = self.inspect("container", component.container)
+        expected_id: str | None = None,
+    ) -> str:
+        if expected_id is not None:
+            try:
+                self.require_container_id(expected_id)
+            except CycloError as exc:
+                raise CycloError("invalid expected container ID") from exc
+        info = self.inspect(
+            "container",
+            expected_id or component.container,
+        )
         if info is None:
             return ""
         self.require_owned(component, info, image=False)
+        container_id = self.container_id(info)
+        if expected_id is not None and container_id != expected_id:
+            raise CycloError("Docker returned a different container than requested")
         result = self.call(
-            ["logs", "--tail", str(lines), self.container_id(info)],
+            ["logs", "--tail", str(lines), container_id],
             check=False,
         )
         return ((result.stdout or "") + (result.stderr or "")).strip()

@@ -13,47 +13,25 @@ def instance_lifecycle_label(
 
     if state is None:
         return "unknown"
+    if instance.intent == "deleting":
+        return "deleting"
+    if instance.intent == "stopped":
+        return (
+            "stopped"
+            if state is DockerContainerState.ABSENT
+            else "orphan"
+        )
     if state is DockerContainerState.RUNNING:
-        return "running" if instance.active else "orphan"
-    if state in {
-        DockerContainerState.PAUSED,
-        DockerContainerState.RESTARTING,
-    }:
+        return "running"
+    if state in {DockerContainerState.PAUSED, DockerContainerState.RESTARTING}:
         return state.value
-    return "stale" if instance.active else "stopped"
+    return "stale"
 
 
-def active_instances(
-    store: StateStore,
-    docker: Docker,
-    *,
-    stale: list[Instance] | None = None,
-    recovered: list[Instance] | None = None,
-) -> list[Instance]:
-    """Reconcile active records with their exact team containers."""
+def intended_running_instances(store: StateStore) -> list[Instance]:
+    """Return durable running intent without consulting or changing Docker."""
 
-    result: list[Instance] = []
-    for instance in store.list():
-        if not instance.active:
-            continue
-        state = docker.container_lifecycle_state(instance, system=store.system)
-        if state.lifecycle_active:
-            if not instance.offline and instance.port is None:
-                instance.port = docker.current_published_port(
-                    instance,
-                    system=store.system,
-                )
-                store.save(instance)
-                if recovered is not None:
-                    recovered.append(instance)
-            result.append(instance)
-        else:
-            instance.active = False
-            instance.port = None
-            store.save(instance)
-            if stale is not None:
-                stale.append(instance)
-    return result
+    return [instance for instance in store.list() if instance.intent == "running"]
 
 
 def stop_remove_instance_container(
@@ -94,18 +72,19 @@ def stop_instance_locked(
         raise CycloError(
             f"invalid launch identity for Cyclo instance: {expected.id}"
         )
-    inventory = store.list()
-    instance = next((item for item in inventory if item.id == expected.id), None)
-    if instance is None:
-        raise CycloError(f"Cyclo instance not found: {expected.id}")
+    instance = store.load(expected.id)
     if instance.launch_id != expected.launch_id:
         raise CycloError(
             f"instance {expected.id!r} was replaced before it could be stopped"
         )
+    if instance.intent == "deleting":
+        raise CycloError(
+            f"Cyclo instance is being deleted: {instance.id}; run cyclo repair"
+        )
 
     # Persist the stopped intent first. If Docker cleanup fails, a later
     # `cyclo repair` can finish removing the owned container and network.
-    instance.active = False
+    instance.intent = "stopped"
     instance.port = None
     store.save(instance)
 

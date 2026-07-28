@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 import re
@@ -19,8 +18,12 @@ from .installation import installation_id, team_container_name, team_network_nam
 
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LAUNCH_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+FINAL_DELETION_RE = re.compile(
+    r"^\.purged-([A-Za-z0-9][A-Za-z0-9._-]{0,63})-([0-9a-f]{32})\.json$"
+)
 DEFAULT_AGENTWS_HOST = "127.0.0.1"
 HOST_CONFIG_SCOPES = frozenset({"system", "local"})
+INSTANCE_INTENTS = frozenset({"running", "stopped", "deleting"})
 
 
 def utc_now() -> str:
@@ -35,16 +38,6 @@ def default_state_root() -> Path:
 def slug(value: str, limit: int = 28) -> str:
     result = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-._").lower()
     return (result or "team")[:limit]
-
-
-def instance_id(team: Path, project: Path, name: str | None = None) -> str:
-    if name:
-        cleaned = slug(name, 48)
-        if cleaned != name.lower():
-            raise CycloError("instance name may use only letters, numbers, dot, underscore, and hyphen")
-        return validate_instance_id(cleaned)
-    digest = hashlib.sha256(f"{team.resolve()}\0{project.resolve()}".encode("utf-8")).hexdigest()[:12]
-    return validate_instance_id(f"{slug(team.name)}-{digest}")
 
 
 def validate_instance_id(value: str) -> str:
@@ -74,9 +67,11 @@ class Instance:
     team_write: bool
     offline: bool
     launch_id: str
+    verbose: bool = False
     image_override: str = ""
     agentws_host: str = DEFAULT_AGENTWS_HOST
-    active: bool = False
+    intent: str = "stopped"
+    requested_port: int = 0
     port: int | None = None
     created_at: str = ""
     updated_at: str = ""
@@ -91,6 +86,12 @@ class Instance:
     @classmethod
     def from_json(cls, data: dict[str, object]) -> "Instance":
         payload = dict(data)
+        if "active" in payload:
+            raise TypeError("active is not supported; intent is required")
+        if "intent" not in payload:
+            raise TypeError("intent is required")
+        if "requested_port" not in payload:
+            raise TypeError("requested_port is required")
         string_fields = (
             "id",
             "team_name",
@@ -111,6 +112,7 @@ class Instance:
             "launch_id",
             "provider_socket_path",
             "provider_generation",
+            "intent",
         )
         for name in string_fields:
             if name in payload and not isinstance(payload[name], str):
@@ -118,10 +120,14 @@ class Instance:
         for name in (
             "team_write",
             "offline",
-            "active",
+            "verbose",
         ):
             if name in payload and type(payload[name]) is not bool:
                 raise TypeError(f"{name} must be a boolean")
+        if payload["intent"] not in INSTANCE_INTENTS:
+            raise TypeError(
+                "intent must be one of running, stopped, or deleting"
+            )
         for name in ("providers", "models"):
             if name not in payload:
                 continue
@@ -130,6 +136,15 @@ class Instance:
                 isinstance(item, str) for item in value
             ):
                 raise TypeError(f"{name} must be a list of strings")
+        requested_port = payload["requested_port"]
+        if (
+            type(requested_port) is not int
+            or requested_port < 0
+            or requested_port > 65535
+        ):
+            raise TypeError(
+                "requested_port must be an integer from 0 to 65535"
+            )
         port = payload.get("port")
         if port is not None and (
             type(port) is not int or port < 1 or port > 65535
@@ -191,11 +206,13 @@ class StateStore:
             )
         self.root = (root or default_state_root()).expanduser().resolve()
         self.instances_dir = self.root / "instances"
+        self.deletions_dir = self.root / "deletions"
         self.components_root = self.root / "components"
         self.lock_path = self.root / "control.lock"
         self.host_config_scope_path = self.root / "host-config.scope"
         self._requested_host_config_scope = scope
         self._selected_host_config_scope: str | None = None
+        self._ensured = False
 
     @property
     def host_config_scope(self) -> str:
@@ -259,6 +276,13 @@ class StateStore:
             return
         persisted = self._read_host_config_scope()
         if persisted == self._selected_host_config_scope:
+            try:
+                self._sync_directory(self.root)
+            except OSError as exc:
+                raise CycloError(
+                    f"cannot persist host configuration scope "
+                    f"{self.host_config_scope_path}: {exc}"
+                ) from exc
             return
         if persisted is not None:
             raise CycloError(
@@ -275,7 +299,10 @@ class StateStore:
                 encoding="ascii",
             )
             os.chmod(temporary, 0o600)
+            with temporary.open("rb") as stream:
+                os.fsync(stream.fileno())
             os.replace(temporary, self.host_config_scope_path)
+            self._sync_directory(self.root)
         except OSError as exc:
             raise CycloError(
                 f"cannot persist host configuration scope "
@@ -305,13 +332,56 @@ class StateStore:
             )
 
     def ensure(self) -> None:
-        for path in (self.root, self.instances_dir, self.components_root):
-            if path.is_symlink():
-                raise CycloError(f"refusing symlinked Cyclo state directory: {path}")
-            if path.exists() and not path.is_dir():
-                raise CycloError(f"Cyclo state path is not a directory: {path}")
-            path.mkdir(parents=True, mode=0o700, exist_ok=True)
-            os.chmod(path, 0o700)
+        if self._ensured:
+            return
+        ancestry = [self.root]
+        while ancestry[-1] != ancestry[-1].parent:
+            ancestry.append(ancestry[-1].parent)
+        try:
+            # Create one level at a time instead of using parents=True. A retry
+            # re-syncs the complete chain even when an earlier failed attempt
+            # left every name visible but not yet power-durable.
+            for path in reversed(ancestry):
+                if path.is_symlink():
+                    raise CycloError(
+                        f"refusing symlinked Cyclo state directory: {path}"
+                    )
+                if path.exists() and not path.is_dir():
+                    raise CycloError(
+                        f"Cyclo state path is not a directory: {path}"
+                    )
+                path.mkdir(
+                    mode=0o700 if path == self.root else 0o777,
+                    exist_ok=True,
+                )
+            os.chmod(self.root, 0o700)
+            for path in ancestry:
+                self._sync_directory(path)
+
+            for path in (
+                self.instances_dir,
+                self.deletions_dir,
+                self.components_root,
+            ):
+                if path.is_symlink():
+                    raise CycloError(
+                        f"refusing symlinked Cyclo state directory: {path}"
+                    )
+                if path.exists() and not path.is_dir():
+                    raise CycloError(
+                        f"Cyclo state path is not a directory: {path}"
+                    )
+                path.mkdir(mode=0o700, exist_ok=True)
+                os.chmod(path, 0o700)
+                self._sync_directory(path)
+            self._sync_directory(self.root)
+        except CycloError:
+            raise
+        except OSError as exc:
+            raise CycloError(
+                f"cannot prepare Cyclo state directory {self.root}: {exc}"
+            ) from exc
+        self._ensured = True
 
     @contextmanager
     def locked(
@@ -369,6 +439,12 @@ class StateStore:
     def metadata_path(self, identifier: str) -> Path:
         return self.instance_dir(identifier) / "run.json"
 
+    def deletion_dir(self, identifier: str) -> Path:
+        path = self.deletions_dir / validate_instance_id(identifier)
+        if path.is_symlink():
+            raise CycloError(f"refusing symlinked Cyclo deletion directory: {path}")
+        return path
+
     def runtime_root(self, identifier: str) -> Path:
         return self.instance_dir(identifier) / "runtime"
 
@@ -413,6 +489,48 @@ class StateStore:
             )
         return instance
 
+    def load_for_removal(
+        self,
+        identifier: str,
+        *,
+        missing_ok: bool = False,
+    ) -> Instance | None:
+        """Load one exact instance from ordinary or retryable deletion state."""
+
+        identifier = validate_instance_id(identifier)
+        directory = self.instance_dir(identifier)
+        deletion = self.deletion_dir(identifier)
+        finalized = self._final_deletion_paths(identifier)
+        if len(finalized) > 1:
+            raise CycloError(
+                f"Cyclo instance {identifier!r} has multiple finalized "
+                "deletion tombstones"
+            )
+        if directory.exists() and (deletion.exists() or finalized):
+            raise CycloError(
+                f"Cyclo instance {identifier!r} exists in both active and "
+                "deletion state"
+            )
+        if finalized:
+            instance = self._load_final_deletion(finalized[0])
+            if deletion.exists():
+                self._validate_deletion_transition(
+                    identifier,
+                    deletion,
+                    instance,
+                )
+            return instance
+        if deletion.exists():
+            return self._load_deletion(identifier, deletion)
+        if (
+            missing_ok
+            and not directory.exists()
+            and not directory.is_symlink()
+            and not deletion.is_symlink()
+        ):
+            return None
+        return self.load(identifier)
+
     @staticmethod
     def _read_metadata(path: Path) -> dict[str, object]:
         """Read one regular, non-symlink JSON object without following links."""
@@ -448,9 +566,94 @@ class StateStore:
             )
         return instances
 
+    def list_deletions(self) -> list[Instance]:
+        """Return every exact, validated deletion tombstone or fail closed."""
+
+        if self.deletions_dir.is_symlink():
+            raise CycloError(
+                f"invalid Cyclo deletions directory: {self.deletions_dir}"
+            )
+        if not self.deletions_dir.exists():
+            return []
+        if not self.deletions_dir.is_dir():
+            raise CycloError(
+                f"invalid Cyclo deletions directory: {self.deletions_dir}"
+            )
+        try:
+            directories = sorted(self.deletions_dir.iterdir())
+        except OSError as exc:
+            raise CycloError(
+                f"cannot enumerate Cyclo deletions directory "
+                f"{self.deletions_dir}: {exc}"
+            ) from exc
+        result: dict[str, Instance] = {}
+        errors: list[str] = []
+        for path in directories:
+            if FINAL_DELETION_RE.fullmatch(path.name) is None:
+                continue
+            try:
+                instance = self._load_final_deletion(path)
+                if instance.id in result:
+                    raise CycloError(
+                        f"multiple finalized tombstones for {instance.id!r}"
+                    )
+                result[instance.id] = instance
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                RecursionError,
+                CycloError,
+            ) as exc:
+                detail = str(exc) or type(exc).__name__
+                errors.append(
+                    f"invalid Cyclo deletion state {path}: {detail}"
+                )
+        for directory in directories:
+            if FINAL_DELETION_RE.fullmatch(directory.name):
+                continue
+            try:
+                identifier = validate_instance_id(directory.name)
+                finalized = result.get(identifier)
+                if finalized is None:
+                    result[identifier] = self._load_deletion(
+                        identifier,
+                        directory,
+                    )
+                else:
+                    self._validate_deletion_transition(
+                        identifier,
+                        directory,
+                        finalized,
+                    )
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                RecursionError,
+                CycloError,
+            ) as exc:
+                detail = str(exc) or type(exc).__name__
+                errors.append(
+                    f"invalid Cyclo deletion state {directory}: {detail}"
+                )
+        if errors:
+            raise CycloError(
+                "cannot enumerate Cyclo deletion state: " + "; ".join(errors)
+            )
+        return [result[identifier] for identifier in sorted(result)]
+
     def list_report(self) -> tuple[list[Instance], list[str]]:
         """Return readable instances and a separate error for every bad record."""
 
+        if self.deletions_dir.is_symlink():
+            return [], [
+                f"invalid Cyclo deletions directory: {self.deletions_dir}"
+            ]
+        if self.deletions_dir.exists() and not self.deletions_dir.is_dir():
+            return [], [
+                f"invalid Cyclo deletions directory: {self.deletions_dir}"
+            ]
         if self.instances_dir.is_symlink():
             return [], [
                 f"invalid Cyclo instances directory: {self.instances_dir}"
@@ -510,6 +713,12 @@ class StateStore:
             ) from exc
         self.ensure()
         directory = self.instance_dir(instance.id)
+        deletion = self.deletion_dir(instance.id)
+        if deletion.exists() or self._final_deletion_paths(instance.id):
+            raise CycloError(
+                f"Cyclo instance deletion is still pending: {instance.id}; "
+                "run cyclo repair before reusing the name"
+            )
         if not instance.created_at:
             instance.created_at = utc_now()
         instance.updated_at = utc_now()
@@ -542,11 +751,28 @@ class StateStore:
                     f"{instance.id}"
                 )
             os.rename(staging, directory)
+            self._sync_directory(directory.parent)
         finally:
             self._remove_tree(staging)
 
     @staticmethod
-    def _write_metadata(path: Path, payload: dict[str, object]) -> None:
+    def _sync_directory(path: Path) -> None:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _write_metadata(
+        path: Path,
+        payload: dict[str, object],
+    ) -> None:
         temporary = path.with_name(
             f".{path.name}.tmp.{os.getpid()}.{os.urandom(6).hex()}"
         )
@@ -556,20 +782,76 @@ class StateStore:
                 encoding="utf-8",
             )
             os.chmod(temporary, 0o600)
+            with temporary.open("rb") as stream:
+                os.fsync(stream.fileno())
             os.replace(temporary, path)
+            StateStore._sync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
 
     def remove_instance(
         self, identifier: str, *, expected_launch_id: str
     ) -> bool:
-        """Delete one retired instance record and all of its durable queue state."""
+        """Idempotently retire and purge one exact stopped launch.
 
+        Deletion intent is persisted in the ordinary instance record before its
+        directory moves to the deterministic deletions/INSTANCE path. A retry
+        can therefore continue from either side of the rename.
+        """
+
+        identifier = validate_instance_id(identifier)
         if not LAUNCH_ID_RE.fullmatch(expected_launch_id):
             raise CycloError(
                 f"invalid launch identity for Cyclo instance: {identifier}"
             )
         directory = self.instance_dir(identifier)
+        deletion = self.deletion_dir(identifier)
+        self.ensure()
+        finalized = self._final_deletion_paths(identifier)
+        if len(finalized) > 1:
+            raise CycloError(
+                f"instance {identifier!r} was replaced before it could be removed"
+            )
+        if finalized:
+            current = self._load_final_deletion(finalized[0])
+            if current.launch_id != expected_launch_id:
+                raise CycloError(
+                    f"instance {identifier!r} was replaced before it could be removed"
+                )
+            if directory.exists():
+                raise CycloError(
+                    f"Cyclo instance {identifier!r} exists in both active and "
+                    "deletion state"
+                )
+            if deletion.exists():
+                self._remove_empty_deletion_directory(
+                    identifier,
+                    deletion,
+                    current,
+                )
+            self._purge_final_deletion(
+                identifier,
+                finalized[0],
+                expected_launch_id=expected_launch_id,
+            )
+            return True
+        if directory.exists() and deletion.exists():
+            raise CycloError(
+                f"Cyclo instance {identifier!r} exists in both active and "
+                "deletion state"
+            )
+        if deletion.exists():
+            current = self._load_deletion(identifier, deletion)
+            if current.launch_id != expected_launch_id:
+                raise CycloError(
+                    f"instance {identifier!r} was replaced before it could be removed"
+                )
+            self._purge_deletion(
+                identifier,
+                deletion,
+                expected_launch_id=current.launch_id,
+            )
+            return True
         try:
             metadata = directory.lstat()
         except FileNotFoundError:
@@ -587,24 +869,251 @@ class StateStore:
             raise CycloError(
                 f"instance {identifier!r} was replaced before it could be removed"
             )
-        retired = self.root / (
-            f".instance.{identifier}.retired.{os.getpid()}."
-            f"{os.urandom(6).hex()}"
-        )
+        if current.intent == "running":
+            raise CycloError(
+                f"Cyclo instance is still intended to run: {identifier}"
+            )
+        if current.intent != "deleting":
+            current.intent = "deleting"
+            current.port = None
+            self.save(current)
         try:
-            os.rename(directory, retired)
+            os.rename(directory, deletion)
+            # Make the destination durable before the source removal.  A power
+            # loss may then expose both names, which fails closed; it must not
+            # lose the only authoritative launch record.
+            self._sync_directory(self.deletions_dir)
+            self._sync_directory(self.instances_dir)
         except OSError as exc:
             raise CycloError(
                 f"cannot retire Cyclo instance state {directory}: {exc}"
             ) from exc
+        self._purge_deletion(
+            identifier,
+            deletion,
+            expected_launch_id=current.launch_id,
+        )
+        return True
+
+    def _final_deletion_paths(self, identifier: str) -> list[Path]:
+        """Return finalized tombstones belonging to one instance ID."""
+
+        identifier = validate_instance_id(identifier)
+        if self.deletions_dir.is_symlink():
+            raise CycloError(
+                f"invalid Cyclo deletions directory: {self.deletions_dir}"
+            )
+        if not self.deletions_dir.exists():
+            return []
+        if not self.deletions_dir.is_dir():
+            raise CycloError(
+                f"invalid Cyclo deletions directory: {self.deletions_dir}"
+            )
         try:
-            shutil.rmtree(retired)
+            paths = sorted(self.deletions_dir.iterdir())
+        except OSError as exc:
+            raise CycloError(
+                f"cannot enumerate Cyclo deletions directory "
+                f"{self.deletions_dir}: {exc}"
+            ) from exc
+        return [
+            path
+            for path in paths
+            if (
+                (match := FINAL_DELETION_RE.fullmatch(path.name))
+                and match.group(1) == identifier
+            )
+        ]
+
+    def _load_deletion(self, identifier: str, directory: Path) -> Instance:
+        try:
+            metadata = directory.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or directory.is_symlink():
+                raise CycloError("deletion state entry is not a directory")
+            instance = Instance.from_json(
+                self._read_metadata(directory / "run.json")
+            )
+            self._validate_resource_namespace(instance)
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            RecursionError,
+            CycloError,
+        ) as exc:
+            detail = str(exc) or type(exc).__name__
+            raise CycloError(
+                f"invalid Cyclo deletion state {directory}: {detail}"
+            ) from exc
+        if instance.id != identifier:
+            raise CycloError(
+                f"Cyclo deletion metadata ID mismatch: requested "
+                f"{identifier!r}, found {instance.id!r}"
+            )
+        if instance.intent != "deleting":
+            raise CycloError(
+                f"Cyclo deletion state is not marked deleting: {identifier}"
+            )
+        return instance
+
+    def _final_deletion_path(
+        self, identifier: str, expected_launch_id: str
+    ) -> Path:
+        return self.deletions_dir / (
+            f".purged-{identifier}-{expected_launch_id}.json"
+        )
+
+    def _load_final_deletion(self, path: Path) -> Instance:
+        match = FINAL_DELETION_RE.fullmatch(path.name)
+        if match is None:
+            raise CycloError(f"invalid finalized Cyclo deletion name: {path}")
+        identifier, launch_id = match.groups()
+        try:
+            instance = Instance.from_json(self._read_metadata(path))
+            self._validate_resource_namespace(instance)
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            RecursionError,
+            CycloError,
+        ) as exc:
+            detail = str(exc) or type(exc).__name__
+            raise CycloError(
+                f"invalid finalized Cyclo deletion state {path}: {detail}"
+            ) from exc
+        if instance.id != identifier:
+            raise CycloError(
+                f"Cyclo deletion metadata ID mismatch: tombstone "
+                f"{identifier!r}, found {instance.id!r}"
+            )
+        if instance.launch_id != launch_id:
+            raise CycloError(
+                f"Cyclo deletion launch mismatch: tombstone "
+                f"{launch_id!r}, found {instance.launch_id!r}"
+            )
+        if instance.intent != "deleting":
+            raise CycloError(
+                f"Cyclo deletion state is not marked deleting: {identifier}"
+            )
+        return instance
+
+    def _validate_deletion_transition(
+        self,
+        identifier: str,
+        deletion: Path,
+        finalized: Instance,
+    ) -> None:
+        try:
+            metadata = deletion.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or deletion.is_symlink():
+                raise CycloError("deletion state entry is not a directory")
+            children = list(deletion.iterdir())
+        except (OSError, CycloError) as exc:
+            detail = str(exc) or type(exc).__name__
+            raise CycloError(
+                f"invalid Cyclo deletion state {deletion}: {detail}"
+            ) from exc
+        if children:
+            raise CycloError(
+                f"invalid Cyclo deletion state {deletion}: finalized "
+                "tombstone has a non-empty pending directory"
+            )
+        if finalized.id != identifier:
+            raise CycloError(
+                f"Cyclo deletion metadata ID mismatch: requested "
+                f"{identifier!r}, found {finalized.id!r}"
+            )
+
+    def _remove_empty_deletion_directory(
+        self,
+        identifier: str,
+        deletion: Path,
+        finalized: Instance,
+    ) -> None:
+        self._validate_deletion_transition(
+            identifier,
+            deletion,
+            finalized,
+        )
+        try:
+            os.rmdir(deletion)
+            self._sync_directory(self.deletions_dir)
+        except OSError as exc:
+            raise CycloError(
+                f"Cyclo instance {identifier!r} was deleted, but its empty "
+                f"deletion directory could not be removed at {deletion}: {exc}"
+            ) from exc
+
+    def _purge_deletion(
+        self,
+        identifier: str,
+        deletion: Path,
+        *,
+        expected_launch_id: str,
+    ) -> None:
+        try:
+            # Keep the exact-launch marker until every other child is gone.
+            # SIGKILL during recursive cleanup therefore leaves enough
+            # authoritative metadata for a retry to revalidate the launch.
+            for child in sorted(deletion.iterdir()):
+                if child.name == "run.json":
+                    continue
+                if child.is_symlink() or not child.is_dir():
+                    child.unlink()
+                else:
+                    shutil.rmtree(child)
+            self._sync_directory(deletion)
+            current = self._load_deletion(identifier, deletion)
+            if current.launch_id != expected_launch_id:
+                raise CycloError(
+                    f"instance {identifier!r} was replaced before it could be removed"
+                )
+            finalized = self._final_deletion_path(
+                identifier, expected_launch_id
+            )
+            os.rename(deletion / "run.json", finalized)
+            # As above, persist the destination before the source removal.
+            self._sync_directory(self.deletions_dir)
+            self._sync_directory(deletion)
+            self._remove_empty_deletion_directory(
+                identifier,
+                deletion,
+                current,
+            )
+            self._purge_final_deletion(
+                identifier,
+                finalized,
+                expected_launch_id=expected_launch_id,
+            )
+        except CycloError:
+            raise
         except OSError as exc:
             raise CycloError(
                 f"Cyclo instance {identifier!r} was retired, but its inert "
-                f"state could not be removed at {retired}: {exc}"
+                f"state could not be removed at {deletion}: {exc}"
             ) from exc
-        return True
+
+    def _purge_final_deletion(
+        self,
+        identifier: str,
+        finalized: Path,
+        *,
+        expected_launch_id: str,
+    ) -> None:
+        current = self._load_final_deletion(finalized)
+        if current.id != identifier or current.launch_id != expected_launch_id:
+            raise CycloError(
+                f"instance {identifier!r} was replaced before it could be removed"
+            )
+        try:
+            finalized.unlink()
+            self._sync_directory(self.deletions_dir)
+        except OSError as exc:
+            raise CycloError(
+                f"Cyclo instance {identifier!r} was deleted, but its inert "
+                f"tombstone could not be removed at {finalized}: {exc}"
+            ) from exc
 
     @staticmethod
     def _remove_tree(path: Path) -> None:
