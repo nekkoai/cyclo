@@ -375,6 +375,85 @@ def test_status_requires_official_image_and_exact_ownership(
         Controller(foreign, _container()).status(_component())
 
 
+def test_startup_status_and_logs_stay_bound_to_the_expected_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    references: list[tuple[str, str]] = []
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "probe_component",
+        lambda _path: ("ready", ""),
+    )
+
+    class Controller(ComponentController):
+        def inspect(
+            self,
+            kind: str,
+            reference: str,
+            *,
+            missing: bool = True,
+        ):
+            references.append((kind, reference))
+            if kind == "image":
+                return _image()
+            assert kind == "container"
+            assert reference == CONTAINER_ID
+            return _container()
+
+        def call(self, arguments, **_options):
+            commands.append(list(arguments))
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    controller = Controller()
+    assert controller.status(
+        _component(),
+        expected_id=CONTAINER_ID,
+    ).works
+    assert controller.logs(
+        _component(),
+        expected_id=CONTAINER_ID,
+    ) == ""
+    assert references == [
+        ("image", _component().image),
+        ("container", CONTAINER_ID),
+        ("container", CONTAINER_ID),
+    ]
+    assert commands == [["logs", "--tail", "80", CONTAINER_ID]]
+
+
+def test_wait_ready_uses_the_expected_id_for_status_and_diagnostics() -> None:
+    observed: list[tuple[str, str | None]] = []
+
+    class Controller(ComponentController):
+        def status(
+            self,
+            component: Component,
+            *,
+            error: str = "",
+            expected_id: str | None = None,
+        ) -> ComponentStatus:
+            observed.append(("status", expected_id))
+            return _ready_status(component)
+
+        def logs(
+            self,
+            component: Component,
+            lines: int = 80,
+            *,
+            expected_id: str | None = None,
+        ) -> str:
+            observed.append(("logs", expected_id))
+            return ""
+
+    status = Controller().wait_ready(_component(), CONTAINER_ID)
+    assert status.works
+    assert observed == [
+        ("status", CONTAINER_ID),
+        ("status", CONTAINER_ID),
+    ]
+
+
 @pytest.mark.parametrize("valid", [True, False])
 def test_build_promotes_only_a_completed_valid_image(valid: bool) -> None:
     class Controller(ComponentController):
@@ -419,10 +498,14 @@ def test_build_promotes_only_a_completed_valid_image(valid: bool) -> None:
         with pytest.raises(CycloError, match="HEALTHCHECK"):
             controller.build(_component())
         assert not controller.official
-    assert controller.events[-1][:2] == ["image", "rm"]
+    build = controller.events[0]
+    assert build[0] == "build"
+    assert "--iidfile" in build
+    assert "--tag" not in build
+    assert not any(event[:2] == ["image", "rm"] for event in controller.events)
 
 
-def test_run_rolls_back_exact_container_on_keyboard_interrupt() -> None:
+def test_interrupted_create_never_cleans_up_by_a_reusable_name() -> None:
     class Controller(ComponentController):
         def __init__(self) -> None:
             self.calls: list[list[str]] = []
@@ -443,6 +526,7 @@ def test_run_rolls_back_exact_container_on_keyboard_interrupt() -> None:
                 "Id": CONTAINER_ID,
                 "Name": f"/{_component().container}",
                 "Config": {"Labels": _labels()},
+                "State": {"Running": False, "Status": "created"},
             }
 
         def require_image(self, component: Component) -> str:
@@ -451,13 +535,8 @@ def test_run_rolls_back_exact_container_on_keyboard_interrupt() -> None:
 
         def call(self, arguments, **_kwargs):
             self.calls.append(list(arguments))
-            if arguments[0] == "run":
-                return subprocess.CompletedProcess(
-                    arguments,
-                    0,
-                    f"{CONTAINER_ID}\n",
-                    "",
-                )
+            if arguments[0] == "create":
+                raise KeyboardInterrupt
             return subprocess.CompletedProcess(arguments, 0, "", "")
 
         def status(
@@ -466,17 +545,20 @@ def test_run_rolls_back_exact_container_on_keyboard_interrupt() -> None:
             *,
             error: str = "",
         ) -> ComponentStatus:
-            raise KeyboardInterrupt
+            pytest.fail("an interrupted create must never start the container")
 
     controller = Controller()
     with pytest.raises(KeyboardInterrupt):
         controller._run(_component())
-    assert [
-        "rm",
-        "--force",
-        "--volumes",
-        CONTAINER_ID,
-    ] in controller.calls
+    assert len(controller.calls) == 1
+    assert controller.calls[0][:3] == [
+        "create",
+        "--name",
+        _component().container,
+    ]
+    assert controller.inspect_count == 1
+    assert not any(command[0] == "start" for command in controller.calls)
+    assert not any(command[0] == "rm" for command in controller.calls)
 
 
 class _LegacyRuntimeError(RuntimeError):
@@ -514,19 +596,22 @@ def test_failed_start_reports_an_incomplete_container_rollback(
                 "Id": CONTAINER_ID,
                 "Name": f"/{_component().container}",
                 "Config": {"Labels": _labels()},
+                "State": {"Running": False, "Status": "created"},
             }
 
         def require_image(self, _component: Component) -> str:
             return IMAGE_ID
 
         def call(self, arguments, **_options):
-            if arguments[0] == "run":
+            if arguments[0] == "create":
                 return subprocess.CompletedProcess(
                     arguments,
                     0,
                     f"{CONTAINER_ID}\n",
                     "",
                 )
+            if arguments[0] == "start":
+                return subprocess.CompletedProcess(arguments, 0, "", "")
             raise CycloError("Docker refused cleanup")
 
         def status(
@@ -534,7 +619,9 @@ def test_failed_start_reports_an_incomplete_container_rollback(
             _component: Component,
             *,
             error: str = "",
+            expected_id: str | None = None,
         ) -> ComponentStatus:
+            assert expected_id == CONTAINER_ID
             raise launch_error
 
     with pytest.raises(
@@ -557,7 +644,7 @@ def test_failed_start_reports_an_incomplete_container_rollback(
         ),
         (
             {"Running": False, "Dead": True, "Status": "dead"},
-            [["rm", "--volumes", "--force", CONTAINER_ID]],
+            [["rm", "--force", "--volumes", CONTAINER_ID]],
         ),
     ],
 )
@@ -580,7 +667,7 @@ def test_stop_handles_paused_and_dead_component_containers(
             missing: bool = True,
         ):
             assert kind == "container"
-            assert reference == _component().container
+            assert reference in {_component().container, CONTAINER_ID}
             return container
 
         def call(self, arguments, **_options):
@@ -608,6 +695,7 @@ def test_run_uses_image_command_unless_explicitly_overridden(
     class Controller(ComponentController):
         def __init__(self) -> None:
             self.commands: list[list[str]] = []
+            self.inspect_count = 0
 
         def inspect(
             self,
@@ -617,7 +705,12 @@ def test_run_uses_image_command_unless_explicitly_overridden(
             missing: bool = True,
         ):
             assert kind == "container"
-            return None
+            self.inspect_count += 1
+            if self.inspect_count == 1:
+                return None
+            created = _container()
+            created["State"] = {"Running": False, "Status": "created"}
+            return created
 
         def require_image(self, selected: Component) -> str:
             assert selected is component
@@ -626,10 +719,11 @@ def test_run_uses_image_command_unless_explicitly_overridden(
         def call(self, arguments, **_options):
             command = list(arguments)
             self.commands.append(command)
+            output = f"{CONTAINER_ID}\n" if command[0] == "create" else ""
             return subprocess.CompletedProcess(
                 command,
                 0,
-                f"{CONTAINER_ID}\n",
+                output,
                 "",
             )
 
@@ -638,14 +732,17 @@ def test_run_uses_image_command_unless_explicitly_overridden(
             selected: Component,
             *,
             error: str = "",
+            expected_id: str | None = None,
         ) -> ComponentStatus:
             assert selected is component
+            assert expected_id == CONTAINER_ID
             return _ready_status(selected)
 
     controller = Controller()
     assert controller._run(component) == CONTAINER_ID
-    run = controller.commands[0]
-    assert run[run.index(IMAGE_ID) :] == [IMAGE_ID, *expected_command]
+    create = controller.commands[0]
+    assert create[create.index(IMAGE_ID) :] == [IMAGE_ID, *expected_command]
+    assert controller.commands[1] == ["start", CONTAINER_ID]
 
 
 def test_ensure_image_reuses_a_valid_installed_image() -> None:

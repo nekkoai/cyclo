@@ -165,15 +165,15 @@ The accepted build lifecycle is:
 
 1. Resolve the installed Cyclo team base to an immutable image reference.
 2. Give Docker the team repository as its normal build context.
-3. Build under a temporary candidate tag.
+3. Record and inspect the completed build by its immutable image ID.
 4. Validate the completed image against the team-runtime ABI.
-5. Promote the expected tag only after the candidate succeeds.
+5. Promote the expected tag only after validation succeeds.
 6. Record and run the exact resulting image ID.
 
 An ordinary `cyclo run` asks Docker to build the common runtime and each
 selected derived image. Docker applies the applicable `.dockerignore` or
 `Dockerfile.dockerignore` and reuses cached work. Cyclo passes the exact common
-base image ID, validates the completed candidate, and transactionally promotes
+base image ID, validates the completed image, and transactionally promotes
 it before starting any team. `cyclo refresh` stops and restarts the selected
 system through the same build path. Only the latest successfully promoted image
 is operational state; Cyclo keeps no registry of historical local builds.

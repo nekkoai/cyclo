@@ -205,6 +205,15 @@ bounded PIDs/file descriptors, a small temporary filesystem, and the exact
 socket mounts implied by their declaration. Intermediate components use
 `--network none`. No component receives the Docker socket.
 
+All Cyclo-owned containers use one host-side Docker primitive. Cyclo issues
+`docker create`, inspects the result, verifies its canonical name, ownership
+labels, launch identity, and immutable container ID, and only then issues
+`docker start` with that ID. Later stop, removal, log, copy, and exec operations
+likewise resolve and verify the resource before addressing it by immutable ID.
+The gap between create and start is deliberate: interruption can leave a
+stopped, labeled container, but cannot start an unverified one. A later explicit
+start, refresh, or repair can identify and remove that exact residue.
+
 The validated image under a component's official tag is the installed
 component. Its labels bind it to the installation, component class, and Cyclo
 release. `start`, `models`, project `run`, gateway provider discovery, and login
@@ -213,9 +222,10 @@ absent or contains an owned image from a different release. Foreign or malformed
 tagged images are rejected. Restart requires an already-installed current image
 and strictly recreates the container without building.
 
-An explicit build submits the component's normal context to Docker, builds under
-a temporary candidate tag, validates the completed image, and only then moves
-the official tag to it. Build and refresh are the source-update boundaries:
+An explicit build submits the component's normal context to Docker, obtains and
+validates the completed image by its immutable image ID, and only then moves the
+official tag to it. The build itself needs no temporary Cyclo tag. Build and
+refresh are the source-update boundaries:
 Cyclo keeps no source hash or cache database, and Docker remains the sole
 authority for `.dockerignore` and layer-cache reuse. Runtime status checks that
 the container uses the exact installed image ID, plus container ownership,
@@ -223,14 +233,21 @@ launch configuration, mounts, isolation, engine health, and the component's
 `Health` RPC. Read-only status and doctor commands never build or start
 components. “Container running” alone is not readiness.
 
-The host-side implementation has four boundaries:
+The host-side implementation has five boundaries:
 
 - `component.py` defines declarations, component records, status records, and
   the base ConnectRPC client;
-- `component_runtime.py` implements the generic Docker lifecycle;
+- `docker_engine.py` is the sole owned-resource mutation, inspection,
+  immutable-ID, and create-inspect-start Docker boundary;
+- `component_runtime.py` applies component image, mount, isolation, and health
+  policy through that boundary;
 - `gateway.py` adds only credential-volume and login/catalogue policy; and
 - `providers.py` parses `host.conf`, binds Provider requirements, and chooses a
   usable outer Provider socket.
+
+The one read-only exception is selected-endpoint discovery: mount protection
+asks `docker context inspect` for the daemon URI with an explicit environment
+and timeout before constructing a team container.
 
 `ComponentStatus` describes one component only: its image and container
 identity, running/current state, Docker health, Component health, and concrete
@@ -295,11 +312,53 @@ destruction. Provider commands are list-wide conveniences. Both delegate
 ordinary image and container work to the component controller.
 `component build` and `providers build` update images without restarting them;
 `gateway build` rebuilds and restarts the gateway. Global `cyclo refresh`
-stops active team instances, rebuilds and restarts the gateway and configured
-providers, then rebuilds the selected common and derived team images while
-restarting each active project. Inventory, stop, rebuild, and restart execute
-under one installation lock, so another host command cannot change the fleet
-halfway through that operation.
+first builds the selected team images and refreshes the independent gateway
+and provider components while teams remain online. It then obtains one
+catalogue and validates every selected team's models against it. Only after
+those fallible build and compatibility checks succeed does it replace every
+team whose recorded intent is `running`.
+Inventory, build, stop, and restart execute under one installation lock, so
+another host command cannot change the installation halfway through that
+operation.
+
+There is no separate refresh journal. Each instance's `run.json` is the durable
+record of its desired lifecycle and launch inputs:
+
+- `running` means a matching team container should exist;
+- `stopped` means no matching team container should exist; and
+- `deleting` means its container, network, and durable AgentWS state are being
+  retired.
+
+Docker state is an observation, never a substitute for that intent. Status and
+dashboard reads do not rewrite it. `stop` records `stopped` before removing the
+exact launch. `forget` records `deleting` before retiring state.
+`refresh` leaves `running` intent unchanged while replacing containers.
+`repair` makes these records true: it recreates missing, paused, or restarting
+`running` instances; verifies AgentWS readiness for every running container
+before publishing a recovered port; removes containers belonging to `stopped`
+instances; and finishes `deleting` instances. Consequently, interruption can
+leave incomplete Docker work but does not invent a second source of lifecycle
+truth. Correct the underlying failure and rerun `cyclo refresh` or `cyclo
+repair`.
+
+Launch configuration and runtime observations are stored separately. In
+particular, the requested AgentWS port (`0` means dynamically assigned) is
+reused for recreation; the last published port is only an observation and is
+never promoted into launch intent.
+
+Instance metadata and deletion transitions are atomically replaced and synced
+before the corresponding destructive Docker or filesystem operation.
+Deletion moves the instance tree to `deletions/INSTANCE`, removes its payload
+while retaining `run.json`, then atomically moves that metadata to one
+`.purged-INSTANCE-LAUNCH.json` marker before removing the empty directory and
+marker. Every interruption point is therefore discoverable and exact-launch
+retryable; the instance name cannot be reused while either form remains.
+For cross-directory renames, Cyclo syncs the destination directory before the
+source: a power failure may therefore leave duplicate visible state that fails
+closed, but cannot durably remove the source before publishing the destination.
+Container ownership is additionally fenced by a random launch ID. A command
+that encounters the same name with another installation or launch identity
+fails closed instead of adopting or deleting it.
 
 ## Provider protocol
 
@@ -397,16 +456,18 @@ each project is and how the mounted trees relate. Team mode controls whether
 selected trees must be real, non-overlapping directories.
 
 Before the first container starts, Cyclo validates every team, requested model,
-mount, provider connection, and bind-source identity. A partial multi-team
-startup rolls back only containers created by that invocation. Queue history
-remains under the state root. First-instance metadata is built outside the
-authoritative inventory and published as one complete directory before runtime
-materialization, so interruption exposes either no instance or a valid
-launch-pinned record that `cyclo repair` can reconcile.
-Retirement makes the inverse transition: it first renames the complete
-instance out of authoritative inventory, then recursively removes the inert
-tree. Interruption therefore cannot leave an inventory entry without
-`run.json`.
+mount, provider connection, and bind-source identity. Each team launch is an
+independent operation: a failed launch removes its own exact container, while
+teams already started by the same project command remain running and visible.
+Queue history remains under the state root. First-instance metadata is built
+outside the authoritative inventory and published as one complete directory
+before runtime materialization, so interruption exposes either no instance or
+a valid launch-pinned record that `cyclo repair` can reconcile.
+Retirement makes the inverse transition: it first persists `deleting` intent,
+then renames the complete instance out of authoritative inventory and
+recursively removes the inert tree. Interruption therefore cannot leave an
+inventory entry without `run.json`, and `cyclo repair` can finish either side
+of the rename.
 
 Restarting an instance with a stopped or dead container uses two launch
 identities rather than adopting the old container. Cyclo verifies and removes
@@ -447,11 +508,11 @@ is copied literally.
 A repository Dockerfile must declare `ARG CYCLO_TEAM_BASE` before its first
 `FROM`; its final stage must inherit that exact base. Earlier builder stages
 may use other images. Cyclo labels the derived image with the exact base image
-ID, builds under a candidate tag, validates the inherited runtime entrypoint,
-requires that entrypoint to start as root so it can create and drop to the
-host-mapped runtime identity, and promotes the team tag only after success. A
-normal project run always asks Docker to build the selected context; Docker
-reuses cached layers when appropriate. Teams without a Dockerfile use the
+ID, validates the completed image by immutable ID and the inherited runtime
+entrypoint, requires that entrypoint to start as root so it can create and drop
+to the host-mapped runtime identity, and promotes the team tag only after
+success. A normal project run always asks Docker to build the selected context;
+Docker reuses cached layers when appropriate. Teams without a Dockerfile use the
 common image directly.
 
 ## Team isolation and state
@@ -466,8 +527,9 @@ Team containers mount:
 - the final Provider socket directory read-only.
 
 The provider socket is authority to use the configured model catalogue; no API
-key or subscription session enters the team. `--offline` removes ordinary
-network egress while leaving the Unix provider socket available.
+key or subscription session enters the team. `--offline` starts the team with
+Docker's `--network none`, while leaving the mounted Unix provider socket
+available.
 
 Persistent state defaults to `$XDG_STATE_HOME/cyclo` or
 `~/.local/state/cyclo`:
@@ -477,7 +539,10 @@ instances/INSTANCE/
   agentws-state/          tasks, jobs, agents, comments, and results
   pi/                     Pi settings and runtime metadata
   runtime/                generated read-only AgentWS runtime
-  run.json                persisted instance metadata
+  run.json                launch inputs and running/stopped/deleting intent
+deletions/INSTANCE/       transient state for a retryable explicit deletion
+deletions/.purged-INSTANCE-LAUNCH.json
+                           final retry marker; normally too brief to observe
 components/gateway/socket/       root component socket
 components/sockets/COMPONENT/    intermediate component sockets
 ```

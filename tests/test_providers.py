@@ -19,6 +19,7 @@ from cyclo.component_runtime import (
     LABEL_COMPONENT_CLASS,
     LABEL_OWNED,
 )
+from cyclo.docker_engine import DockerEngine
 from cyclo.errors import CycloError
 from cyclo.installation import (
     LABEL_INSTANCE,
@@ -478,7 +479,7 @@ def test_stop_runs_in_reverse_order_then_removes_owned_stray(
         encoding="utf-8",
     )
 
-    class Controller:
+    class Controller(DockerEngine):
         def __init__(self) -> None:
             self.events: list[tuple[object, ...]] = []
             self.system = ""
@@ -529,22 +530,6 @@ def test_stop_runs_in_reverse_order_then_removes_owned_stray(
         @staticmethod
         def labels(info) -> dict[str, str]:
             return dict(info["Config"]["Labels"])
-
-        @staticmethod
-        def container_state(_info) -> str:
-            return "running"
-
-        def remove_verified_container(
-            self,
-            identifier: str,
-            state: str,
-            *,
-            preserve_volumes: bool,
-        ) -> None:
-            assert state == "running"
-            assert not preserve_volumes
-            self.call(["stop", "--timeout", "10", identifier])
-            self.call(["rm", "--volumes", identifier])
 
     controller = Controller()
     root = tmp_path / "components"

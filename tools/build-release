@@ -32,12 +32,17 @@ case $output in
     /*) ;;
     *) output=$repo_root/$output ;;
 esac
-[ ! -e "$output" ] || fail "output already exists: $output"
+[ ! -e "$output" ] && [ ! -L "$output" ] \
+    || fail "output already exists: $output"
 
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/cyclo-build-release.XXXXXX")
+publication_stage=
 cleanup() {
     status=$?
     trap - 0
+    if [ -n "$publication_stage" ]; then
+        rm -rf -- "$publication_stage"
+    fi
     rm -rf -- "$work_root"
     exit "$status"
 }
@@ -192,7 +197,21 @@ docker run --rm --network none "cyclo-gateway:release-$short_commit" providers >
 
 [ -z "$(git status --porcelain --untracked-files=normal)" ] \
     || fail "release verification modified the committed tree"
-mkdir -p "$(dirname -- "$output")"
-mv "$dist" "$output"
+output_parent=$(dirname -- "$output")
+mkdir -p "$output_parent"
+output_name=$(basename -- "$output")
+[ ! -e "$output" ] && [ ! -L "$output" ] \
+    || fail "output already exists: $output"
+publication_stage=$(
+    mktemp -d "$output_parent/.$output_name.publish.XXXXXX"
+)
+cp -a "$dist"/. "$publication_stage"/
+# A same-filesystem no-replace rename is the publication commit. Ignore
+# catchable termination across the commit and success report so a complete
+# output is never reported as an interrupted, retryable pre-commit operation.
+trap '' HUP INT TERM
+"$venv/bin/python" "$source_tree/tools/publish-release" \
+    "$publication_stage" "$output"
+publication_stage=
 printf '%s\n' "build release: PASS"
 printf '%s\n' "artifacts: $output"

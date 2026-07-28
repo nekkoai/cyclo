@@ -68,6 +68,7 @@ def test_release_documents_and_sdist_manifest_match_the_version() -> None:
         "include tools/build-release",
         "include tools/dependency-audit",
         "include tools/normalize-distributions",
+        "include tools/publish-release",
         "include tools/release-acceptance",
         "include tools/release-manifest",
         "include tools/runtime-write-acceptance",

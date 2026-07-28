@@ -9,13 +9,17 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from enum import Enum
 from itertools import combinations
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 from urllib.parse import unquote, urlsplit
 
 from .errors import CycloError
+from .docker_engine import (
+    DockerContainerState,
+    DockerEngine,
+    docker_container_state as classify_docker_container,
+)
 from .installation import (
     LABEL_INSTANCE,
     LABEL_KIND,
@@ -54,27 +58,8 @@ AGENTWS_RETRY_ENVIRONMENT = (
     "AGENTWS_RETRY_INITIAL_SECONDS",
     "AGENTWS_RETRY_MAX_SECONDS",
 )
-
-
-class DockerContainerState(str, Enum):
-    ABSENT = "absent"
-    RUNNING = "running"
-    PAUSED = "paused"
-    RESTARTING = "restarting"
-    STOPPED = "stopped"
-    DEAD = "dead"
-
-    @property
-    def operational(self) -> bool:
-        return self is DockerContainerState.RUNNING
-
-    @property
-    def lifecycle_active(self) -> bool:
-        return self in {
-            DockerContainerState.RUNNING,
-            DockerContainerState.PAUSED,
-            DockerContainerState.RESTARTING,
-        }
+DOCKER_ENDPOINT_FORMAT = '{{json (index .Endpoints "docker").Host}}'
+DOCKER_ENDPOINT_TIMEOUT_SECONDS = 5.0
 
 
 def docker_container_state(
@@ -84,32 +69,10 @@ def docker_container_state(
 
     if info is None:
         return DockerContainerState.ABSENT
-    state = info.get("State")
-    if not isinstance(state, Mapping):
-        raise CycloError(f"cannot parse Docker container state: {name}")
-    status = state.get("Status")
-    if status is not None and not isinstance(status, str):
-        raise CycloError(f"cannot parse Docker container state: {name}")
-    normalized = status.lower() if isinstance(status, str) else ""
-    if state.get("Dead") is True or normalized == "dead":
-        return DockerContainerState.DEAD
-    if state.get("Restarting") is True or normalized == "restarting":
-        return DockerContainerState.RESTARTING
-    if state.get("Paused") is True or normalized == "paused":
-        return DockerContainerState.PAUSED
-    if state.get("Running") is True or normalized == "running":
-        return DockerContainerState.RUNNING
-    if state.get("Running") is False or normalized in {
-        "",
-        "created",
-        "exited",
-        "removing",
-        "stopped",
-    }:
-        return DockerContainerState.STOPPED
-    raise CycloError(
-        f"cannot parse Docker container state for {name}: {status!r}"
-    )
+    try:
+        return classify_docker_container(info)
+    except CycloError as exc:
+        raise CycloError(f"{exc}: {name}") from exc
 
 
 def overlaps(left: Path, right: Path) -> bool:
@@ -131,6 +94,90 @@ def overlaps_lexically(left: Path, right: Path) -> bool:
     return left == right or left.is_relative_to(right) or right.is_relative_to(left)
 
 
+def _endpoint_error(detail: str) -> CycloError:
+    normalized = " ".join(detail.split())[:512]
+    return CycloError(
+        "cannot resolve selected Docker endpoint"
+        + (f": {normalized}" if normalized else "")
+    )
+
+
+def _unix_socket_from_endpoint(endpoint: str) -> Path | None:
+    try:
+        parsed = urlsplit(endpoint)
+    except ValueError as exc:
+        raise _endpoint_error("Docker returned an invalid endpoint URI") from exc
+    if not parsed.scheme:
+        raise _endpoint_error("Docker returned an endpoint without a URI scheme")
+    if parsed.scheme.lower() != "unix":
+        return None
+    if parsed.netloc or parsed.query or parsed.fragment or not parsed.path:
+        raise _endpoint_error("Docker returned an invalid Unix endpoint URI")
+    try:
+        decoded = unquote(parsed.path, errors="strict")
+    except UnicodeDecodeError as exc:
+        raise _endpoint_error("Docker returned an invalid Unix endpoint path") from exc
+    if (
+        not Path(decoded).is_absolute()
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in decoded)
+    ):
+        raise _endpoint_error("Docker returned an invalid Unix endpoint path")
+    return Path(decoded)
+
+
+def selected_docker_endpoint(
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the effective daemon endpoint through Docker's context logic."""
+
+    command = [
+        "docker",
+        "context",
+        "inspect",
+        "--format",
+        DOCKER_ENDPOINT_FORMAT,
+    ]
+    try:
+        process = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=None if environment is None else dict(environment),
+            timeout=DOCKER_ENDPOINT_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError as exc:
+        raise _endpoint_error("Docker is not installed or not on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise _endpoint_error("Docker context inspection timed out") from exc
+    except (OSError, TypeError, ValueError) as exc:
+        raise _endpoint_error(str(exc) or type(exc).__name__) from exc
+    if process.returncode != 0:
+        detail = (process.stderr or process.stdout or "").strip()
+        raise _endpoint_error(detail or "Docker context inspection failed")
+
+    lines = (process.stdout or "").splitlines()
+    if len(lines) != 1 or lines[0] != lines[0].strip():
+        raise _endpoint_error("Docker returned an invalid endpoint response")
+    try:
+        endpoint = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise _endpoint_error("Docker returned an invalid endpoint response") from exc
+    if (
+        not isinstance(endpoint, str)
+        or not endpoint
+        or endpoint != endpoint.strip()
+        or any(
+            ord(character) < 0x20 or ord(character) == 0x7F
+            for character in endpoint
+        )
+    ):
+        raise _endpoint_error("Docker returned an invalid endpoint response")
+    _unix_socket_from_endpoint(endpoint)
+    return endpoint
+
+
 def docker_socket_paths(
     environment: Mapping[str, str] | None = None,
 ) -> tuple[Path, ...]:
@@ -145,15 +192,20 @@ def docker_socket_paths(
     runtime = env.get("XDG_RUNTIME_DIR")
     if runtime:
         candidates.append(Path(runtime).expanduser() / "docker.sock")
-    configured = env.get("DOCKER_HOST")
-    if configured:
-        parsed = urlsplit(configured)
-        if parsed.scheme == "unix" and parsed.path:
-            candidates.append(Path(unquote(parsed.path)).expanduser())
+    selected = _unix_socket_from_endpoint(
+        selected_docker_endpoint(environment)
+    )
+    if selected is not None:
+        candidates.append(selected)
     result: list[Path] = []
     seen: set[Path] = set()
     for candidate in candidates:
-        resolved = candidate.resolve()
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise _endpoint_error(
+                f"Docker socket path is not resolvable: {exc}"
+            ) from exc
         if resolved not in seen:
             seen.add(resolved)
             result.append(resolved)
@@ -264,7 +316,7 @@ def validate_container_spec(spec: ContainerSpec) -> None:
         )
 
 
-def container_command(spec: ContainerSpec) -> list[str]:
+def container_create_arguments(spec: ContainerSpec) -> list[str]:
     instance = spec.instance
     provider_socket_dir = spec.provider_socket_dir
     provider_socket = provider_socket_dir / "component.sock"
@@ -290,13 +342,7 @@ def container_command(spec: ContainerSpec) -> list[str]:
     ):
         raise CycloError("named layout roots require configured mounts")
     roster = CONTAINER_TEAM / spec.team.roster.name
-    command = [
-        "docker",
-        "run",
-        "--detach",
-        "--name",
-        instance.container_name,
-    ]
+    command: list[str] = []
     for key, value in resource_labels(spec.system, TEAM_KIND, instance.id).items():
         command.extend(["--label", f"{key}={value}"])
     command.extend(
@@ -321,7 +367,7 @@ def container_command(spec: ContainerSpec) -> list[str]:
             "--cap-drop",
             "NET_RAW",
             "--network",
-            instance.network_name,
+            "none" if instance.offline else instance.network_name,
         ]
     )
     if not instance.offline:
@@ -453,83 +499,20 @@ def container_command(spec: ContainerSpec) -> list[str]:
     return command
 
 
-class Docker:
-    def _run(
-        self,
-        command: Sequence[str],
-        *,
-        capture: bool = False,
-        check: bool = True,
-    ) -> subprocess.CompletedProcess[str]:
-        try:
-            proc = subprocess.run(
-                list(command),
-                text=True,
-                stdout=subprocess.PIPE if capture else None,
-                stderr=subprocess.PIPE if capture else None,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise CycloError("Docker is not installed or not on PATH") from exc
-        if check and proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            raise CycloError(f"Docker command failed ({proc.returncode}): {detail or ' '.join(command)}")
-        return proc
+def container_command(spec: ContainerSpec) -> list[str]:
+    """Return the exact Docker create command used for this team launch."""
 
-    def available(self) -> tuple[bool, str]:
-        proc = self._run(["docker", "info", "--format", "{{.ServerVersion}}"], capture=True, check=False)
-        stdout = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-        return proc.returncode == 0, stdout or stderr
+    return [
+        "docker",
+        "create",
+        "--name",
+        spec.instance.container_name,
+        *container_create_arguments(spec),
+    ]
 
-    @staticmethod
-    def _resource_id(info: dict[str, object], *, kind: str, name: str) -> str:
-        resource_id = info.get("Id")
-        if not isinstance(resource_id, str) or not resource_id:
-            raise CycloError(f"cannot inspect Docker {kind} {name}: missing resource ID")
-        return resource_id
 
-    def _inspect_container(self, name: str) -> dict[str, object] | None:
-        proc = self._run(
-            ["docker", "container", "inspect", name], capture=True, check=False
-        )
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            lowered = detail.lower()
-            if "no such object" in lowered or "no such container" in lowered:
-                return None
-            raise CycloError(
-                f"cannot inspect Docker container {name}: {detail or 'unknown Docker error'}"
-            )
-        try:
-            data = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            raise CycloError(f"cannot inspect Docker container: {name}") from exc
-        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
-            raise CycloError(f"cannot inspect Docker container: {name}")
-        self._resource_id(data[0], kind="container", name=name)
-        return data[0]
-
-    def _inspect_network(self, name: str) -> dict[str, object] | None:
-        proc = self._run(
-            ["docker", "network", "inspect", name], capture=True, check=False
-        )
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            lowered = detail.lower()
-            if "no such network" in lowered or f"network {name.lower()} not found" in lowered:
-                return None
-            raise CycloError(
-                f"cannot inspect Docker network {name}: {detail or 'unknown Docker error'}"
-            )
-        try:
-            data = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            raise CycloError(f"cannot inspect Docker network: {name}") from exc
-        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
-            raise CycloError(f"cannot inspect Docker network: {name}")
-        self._resource_id(data[0], kind="network", name=name)
-        return data[0]
+class Docker(DockerEngine):
+    """Team runtime operations built on Cyclo's shared Docker boundary."""
 
     def _owned_container(
         self, name: str, expected_instance: str, expected_system: str
@@ -539,24 +522,72 @@ class Docker:
                 "Cyclo container name does not match the selected installation "
                 f"and instance: {name}"
             )
-        info = self._inspect_container(name)
+        info = self.inspect("container", name)
         if info is None:
             return None
-        config = info.get("Config")
-        labels = config.get("Labels") if isinstance(config, dict) else None
-        current = (
-            isinstance(labels, dict)
-            and all(
-                (
-                    labels.get(LABEL_SYSTEM) == expected_system,
-                    labels.get(LABEL_KIND) == TEAM_KIND,
-                    labels.get(LABEL_INSTANCE) == expected_instance,
-                )
-            )
+        self._verify_owned_container(
+            info,
+            name=name,
+            expected_instance=expected_instance,
+            expected_system=expected_system,
         )
-        if not current:
-            raise CycloError(f"refusing to use non-Cyclo container: {name}")
         return info
+
+    def _verify_owned_container(
+        self,
+        info: Mapping[str, object],
+        *,
+        name: str,
+        expected_instance: str,
+        expected_system: str,
+        expected_launch: str | None = None,
+    ) -> None:
+        labels = self.labels(info)
+        raw_name = info.get("Name")
+        actual_name = (
+            raw_name[1:]
+            if isinstance(raw_name, str) and raw_name.startswith("/")
+            else raw_name
+        )
+        if (
+            actual_name != name
+            or labels.get(LABEL_SYSTEM) != expected_system
+            or labels.get(LABEL_KIND) != TEAM_KIND
+            or labels.get(LABEL_INSTANCE) != expected_instance
+        ):
+            raise CycloError(f"refusing to use non-Cyclo container: {name}")
+        if (
+            expected_launch is not None
+            and labels.get("cyclo.launch") != expected_launch
+        ):
+            raise CycloError(
+                f"Cyclo container launch identity changed: {name}"
+            )
+        self.container_id(info)
+
+    def _launch_verifier(
+        self,
+        container: str,
+        expected_instance: str,
+        *,
+        expected_system: str,
+        expected_launch: str,
+    ) -> Callable[[Mapping[str, object]], None]:
+        if not LAUNCH_ID_RE.fullmatch(expected_launch):
+            raise CycloError(
+                f"invalid launch identity for Cyclo instance: {expected_instance}"
+            )
+
+        def verify(info: Mapping[str, object]) -> None:
+            self._verify_owned_container(
+                info,
+                name=container,
+                expected_instance=expected_instance,
+                expected_system=expected_system,
+                expected_launch=expected_launch,
+            )
+
+        return verify
 
     def _current_container(
         self, instance: Instance, system: str
@@ -576,10 +607,6 @@ class Docker:
         expected_system: str,
         expected_launch: str,
     ) -> dict[str, object] | None:
-        if not LAUNCH_ID_RE.fullmatch(expected_launch):
-            raise CycloError(
-                f"invalid launch identity for Cyclo instance: {expected_instance}"
-            )
         info = self._owned_container(
             container,
             expected_instance,
@@ -587,15 +614,12 @@ class Docker:
         )
         if info is None:
             return info
-        config = info.get("Config")
-        labels = config.get("Labels") if isinstance(config, dict) else None
-        actual_launch = (
-            labels.get("cyclo.launch") if isinstance(labels, dict) else None
-        )
-        if actual_launch != expected_launch:
-            raise CycloError(
-                f"Cyclo container launch identity changed: {container}"
-            )
+        self._launch_verifier(
+            container,
+            expected_instance,
+            expected_system=expected_system,
+            expected_launch=expected_launch,
+        )(info)
         return info
 
     def _required_current_container_id(
@@ -604,9 +628,7 @@ class Docker:
         info = self._current_container(instance, system)
         if info is None:
             raise CycloError(f"Cyclo container not found: {instance.container_name}")
-        return self._resource_id(
-            info, kind="container", name=instance.container_name
-        )
+        return self.container_id(info)
 
     def container_running(self, instance: Instance, *, system: str) -> bool:
         return self.container_lifecycle_state(instance, system=system).operational
@@ -649,13 +671,12 @@ class Docker:
         expected_instance: str,
         *,
         system: str,
-        offline: bool,
     ) -> str:
         if name != team_network_name(system, expected_instance):
             raise CycloError(
                 "Cyclo network name does not match the selected installation"
             )
-        info = self._inspect_network(name)
+        info = self.inspect("network", name)
         if info is not None:
             labels = info.get("Labels") or {}
             internal = bool(info.get("Internal"))
@@ -670,20 +691,19 @@ class Docker:
             )
             if not current:
                 raise CycloError(f"Docker network name is already owned outside Cyclo: {name}")
-            if internal != offline:
-                mode = "offline" if internal else "egress-enabled"
-                raise CycloError(f"Docker network {name} already exists in {mode} mode")
-            return self._resource_id(info, kind="network", name=name)
-        command = ["docker", "network", "create"]
+            if internal:
+                raise CycloError(
+                    f"Docker network {name} already exists in internal mode"
+                )
+            return self.resource_id(info)
+        command = ["network", "create"]
         for key, value in resource_labels(
             system, TEAM_NETWORK_KIND, expected_instance
         ).items():
             command.extend(["--label", f"{key}={value}"])
-        if offline:
-            command.append("--internal")
         command.append(name)
-        self._run(command)
-        info = self._inspect_network(name)
+        self.call(command, capture=False)
+        info = self.inspect("network", name)
         if info is None:
             raise CycloError(f"Docker network disappeared after creation: {name}")
         labels = info.get("Labels") or {}
@@ -695,7 +715,7 @@ class Docker:
             )
         ):
             raise CycloError(f"created Docker network has unexpected ownership: {name}")
-        return self._resource_id(info, kind="network", name=name)
+        return self.resource_id(info)
 
     @staticmethod
     def _network_members(info: dict[str, object]) -> dict[str, str]:
@@ -716,33 +736,69 @@ class Docker:
 
     def start(self, spec: ContainerSpec) -> int | None:
         validate_container_spec(spec)
-        command = container_command(spec)
-        info = self._current_container(spec.instance, spec.system)
-        if info is not None:
-            state = docker_container_state(
-                info, name=spec.instance.container_name
-            )
-            if state.lifecycle_active:
-                raise CycloError(
-                    f"Cyclo instance is already active ({state.value}): "
-                    f"{spec.instance.id}"
-                )
-            resource_id = self._resource_id(
-                info, kind="container", name=spec.instance.container_name
-            )
-            self._remove_container(resource_id, state)
-        self._run(command)
-        info = self._current_container(spec.instance, spec.system)
-        if info is None:
-            raise CycloError(
-                f"Cyclo container disappeared after start: {spec.instance.container_name}"
-            )
-        resource_id = self._resource_id(
-            info, kind="container", name=spec.instance.container_name
+        create_arguments = container_create_arguments(spec)
+        instance = spec.instance
+        verifier = self._launch_verifier(
+            instance.container_name,
+            instance.id,
+            expected_system=spec.system,
+            expected_launch=instance.launch_id,
         )
-        if spec.instance.offline:
+        previous = self.inspect_container(
+            instance.container_name,
+            verify=verifier,
+        )
+        if previous is not None:
+            if previous.state.lifecycle_active:
+                raise CycloError(
+                    f"Cyclo instance is already active "
+                    f"({previous.state.value}): {instance.id}"
+                )
+            self.remove_container(
+                previous,
+                verify=verifier,
+                timeout=30,
+                reject_active=True,
+            )
+
+        created = None
+        try:
+            created, _result = self.create_container(
+                instance.container_name,
+                create_arguments,
+                verify=verifier,
+            )
+            self.start_container(created)
+        except BaseException as cause:
+            if created is None:
+                # Docker may have created an object without returning a
+                # verified immutable ID.  Never clean it up through the
+                # reusable name; locked lifecycle reconciliation can inspect
+                # its launch labels later.
+                raise
+            try:
+                failed = self.inspect_container(
+                    created.id,
+                    verify=verifier,
+                )
+                if failed is not None:
+                    self.remove_container(
+                        failed,
+                        verify=verifier,
+                        timeout=30,
+                        force=True,
+                    )
+            except Exception as cleanup:
+                primary = str(cause) or cause.__class__.__name__
+                raise CycloError(
+                    f"{primary}; launch cleanup failed: {cleanup}"
+                ) from cause
+            raise
+
+        assert created is not None
+        if instance.offline:
             return None
-        return self.published_port(resource_id)
+        return self.published_port(created.id)
 
     def remove_inactive_launch(
         self,
@@ -762,32 +818,22 @@ class Docker:
         )
         if info is None:
             return False
-        state = docker_container_state(info, name=container)
-        if state.lifecycle_active:
-            raise CycloError(
-                f"refusing to replace active Cyclo instance "
-                f"({state.value}): {expected_instance}"
-            )
-        resource_id = self._resource_id(info, kind="container", name=container)
-        self._remove_container(resource_id, state)
-        return True
-
-    def _remove_container(
-        self,
-        resource_id: str,
-        state: DockerContainerState,
-    ) -> None:
-        if state is DockerContainerState.PAUSED:
-            self._run(["docker", "unpause", resource_id])
-        if state.lifecycle_active:
-            self._run(["docker", "stop", "--timeout", "30", resource_id])
-        remove = ["docker", "rm"]
-        if state is DockerContainerState.DEAD:
-            remove.append("--force")
-        self._run([*remove, resource_id])
+        verifier = self._launch_verifier(
+            container,
+            expected_instance,
+            expected_system=expected_system,
+            expected_launch=expected_launch,
+        )
+        verified = self.verify_container(info, verify=verifier)
+        return self.remove_container(
+            verified,
+            verify=verifier,
+            timeout=30,
+            reject_active=True,
+        )
 
     def published_port(self, container: str) -> int:
-        proc = self._run(["docker", "port", container, "4137/tcp"], capture=True)
+        proc = self.call(["port", container, "4137/tcp"])
         line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
         try:
             return int(line.rsplit(":", 1)[1])
@@ -815,12 +861,9 @@ class Docker:
                         "Cyclo container disappeared before AgentWS became "
                         f"ready: {instance.container_name}"
                     )
-                container_id = self._resource_id(
-                    info, kind="container", name=instance.container_name
-                )
-                logs = self._run(
-                    ["docker", "logs", "--tail", "40", container_id],
-                    capture=True,
+                container_id = self.container_id(info)
+                logs = self.call(
+                    ["logs", "--tail", "40", container_id],
                     check=False,
                 )
                 detail = ((logs.stdout or "") + (logs.stderr or "")).strip()
@@ -829,13 +872,10 @@ class Docker:
                     f"{detail or instance.container_name}"
                 )
             assert info is not None
-            container_id = self._resource_id(
-                info, kind="container", name=instance.container_name
-            )
+            container_id = self.container_id(info)
             if port is None:
-                probe = self._run(
+                probe = self.call(
                     [
-                        "docker",
                         "exec",
                         "--user",
                         f"{os.getuid()}:{os.getgid()}",
@@ -844,7 +884,6 @@ class Docker:
                         "-c",
                         "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4137/', timeout=1).read(1)",
                     ],
-                    capture=True,
                     check=False,
                 )
                 if probe.returncode == 0:
@@ -884,15 +923,23 @@ class Docker:
         )
         if info is None:
             return False
-        resource_id = self._resource_id(info, kind="container", name=container)
-        state = docker_container_state(info, name=container)
-        self._remove_container(resource_id, state)
-        return True
+        verifier = self._launch_verifier(
+            container,
+            expected_instance,
+            expected_system=expected_system,
+            expected_launch=expected_launch,
+        )
+        verified = self.verify_container(info, verify=verifier)
+        return self.remove_container(
+            verified,
+            verify=verifier,
+            timeout=30,
+        )
 
     def remove_network(
         self, name: str, expected_instance: str, *, system: str
     ) -> None:
-        info = self._inspect_network(name)
+        info = self.inspect("network", name)
         if info is None:
             return
         labels = info.get("Labels") or {}
@@ -907,7 +954,7 @@ class Docker:
         )
         if not current:
             raise CycloError(f"refusing to remove non-Cyclo network: {name}")
-        network_id = self._resource_id(info, kind="network", name=name)
+        network_id = self.resource_id(info)
         members = sorted(self._network_members(info).values())
         if members:
             raise CycloError(
@@ -915,15 +962,15 @@ class Docker:
                 "remain attached: "
                 + ", ".join(members)
             )
-        self._run(["docker", "network", "rm", network_id])
+        self.call(["network", "rm", network_id], capture=False)
 
     def logs(self, instance: Instance, *, system: str, follow: bool) -> int:
         container_id = self._required_current_container_id(instance, system)
-        command = ["docker", "logs"]
+        command = ["logs"]
         if follow:
             command.append("--follow")
         command.append(container_id)
-        return self._run(command, check=False).returncode
+        return self.call(command, capture=False, check=False).returncode
 
     def copy_to(
         self,
@@ -938,14 +985,14 @@ class Docker:
             staged = Path(temporary) / "spec.md"
             shutil.copyfile(source, staged)
             staged.chmod(0o600)
-            self._run(
+            self.call(
                 [
-                    "docker",
                     "cp",
                     "--archive",
                     str(staged),
                     f"{container_id}:{destination}",
-                ]
+                ],
+                capture=False,
             )
 
     def exec(
@@ -959,7 +1006,8 @@ class Docker:
     ) -> int:
         container_id = self._required_current_container_id(instance, system)
         identity = user or f"{os.getuid()}:{os.getgid()}"
-        return self._run(
-            ["docker", "exec", "--user", identity, container_id, *command],
+        return self.call(
+            ["exec", "--user", identity, container_id, *command],
+            capture=False,
             check=check,
         ).returncode

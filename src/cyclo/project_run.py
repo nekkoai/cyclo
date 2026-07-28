@@ -8,7 +8,7 @@ import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Collection, Mapping
 
 from .dashboard import dashboard_host_is_loopback
 from .docker import (
@@ -79,8 +79,11 @@ def new_instance(
         image_override=image_override,
         team_write=team_write,
         offline=args.offline,
+        verbose=args.verbose,
         agentws_host=args.host,
-        active=True,
+        intent="running",
+        requested_port=args.port,
+        port=None,
         project_name=definition.name,
         project_file=str(definition.path.resolve()),
         project_description=definition.description,
@@ -220,12 +223,31 @@ def validate_running_mount_boundaries(
 
 def load_project_teams(
     definition: ProjectDefinition,
+    *,
+    instance_ids: Collection[str] | None = None,
 ) -> tuple[tuple[ProjectTeam, Team], ...]:
+    selected_ids = set(instance_ids) if instance_ids is not None else None
     result = []
     for selected in definition.teams:
+        if (
+            selected_ids is not None
+            and project_instance_id(definition, selected) not in selected_ids
+        ):
+            continue
         team = load_team(selected.path)
         require_team_repository(team)
         result.append((selected, team))
+    if selected_ids is not None:
+        loaded_ids = {
+            project_instance_id(definition, selected)
+            for selected, _team in result
+        }
+        missing = sorted(selected_ids - loaded_ids)
+        if missing:
+            raise CycloError(
+                "project definition no longer provides recorded instance(s): "
+                + ", ".join(missing)
+            )
     return tuple(result)
 
 
@@ -354,6 +376,11 @@ def preflight_binding(
     previous = None
     if store.metadata_path(instance.id).is_file():
         previous = store.load(instance.id)
+        if previous.intent == "deleting":
+            raise CycloError(
+                f"Cyclo instance is being deleted: {instance.id}; "
+                "run cyclo repair before reusing the name"
+            )
         if not binding_matches(previous, binding):
             raise CycloError(
                 f"instance name {instance.id!r} is already bound to a "
@@ -428,6 +455,23 @@ def materialize_pi_settings(
     return target
 
 
+def configure_team_network(
+    docker: Docker,
+    instance: Instance,
+    *,
+    system: str,
+) -> None:
+    """Prepare the Docker network boundary for one team launch."""
+
+    if instance.offline:
+        # Offline teams use Docker's network namespace isolation directly.
+        # Remove an empty network left by an older launch, but never create
+        # or attach a bridge for this launch.
+        docker.remove_network(instance.network_name, instance.id, system=system)
+    else:
+        docker.ensure_network(instance.network_name, instance.id, system=system)
+
+
 def start_binding_locked(
     args: argparse.Namespace,
     binding: RunBinding,
@@ -442,10 +486,9 @@ def start_binding_locked(
     previous = preflight_binding(binding, store, docker)
     launch_persisted = False
     try:
-        # A fresh instance must become visible through a complete run.json
-        # before any materializer can create children beneath its state path.
-        # Existing stopped instances retain their authoritative metadata while
-        # their exact old launch is removed and the replacement is prepared.
+        # The desired launch is durable before Docker can create or start it.
+        # A killed controller therefore leaves either the previous stopped
+        # launch or a complete running intent that `cyclo repair` can finish.
         if not store.instance_dir(instance.id).exists():
             store.save(instance)
             launch_persisted = True
@@ -476,12 +519,7 @@ def start_binding_locked(
             assert previous is not None
             store.save(instance)
             launch_persisted = True
-        docker.ensure_network(
-            instance.network_name,
-            instance.id,
-            system=store.system,
-            offline=instance.offline,
-        )
+        configure_team_network(docker, instance, system=store.system)
         verify_source_identities(binding)
         validate_running_mount_boundaries(binding, store, docker)
         instance.port = docker.start(spec)
@@ -495,15 +533,10 @@ def start_binding_locked(
     except BaseException as start_error:
         if not launch_persisted:
             raise
-        instance.active = False
-        instance.port = None
+        # Failure does not rewrite operator intent. Remove whatever part of the
+        # exact launch became visible; a later run/repair retries the durable
+        # running intent.
         cleanup_errors: list[str] = []
-        try:
-            store.save(instance)
-        except Exception as cleanup_error:
-            cleanup_errors.append(
-                f"inactive state rollback failed: {cleanup_error}"
-            )
         try:
             stop_remove_instance_container(
                 docker,
@@ -522,6 +555,6 @@ def start_binding_locked(
             reason = str(start_error) or type(start_error).__name__
             raise CycloError(
                 f"Cyclo instance {instance.id!r} failed to start ({reason}); "
-                "rollback incomplete: " + "; ".join(cleanup_errors)
+                "launch cleanup incomplete: " + "; ".join(cleanup_errors)
             ) from start_error
         raise

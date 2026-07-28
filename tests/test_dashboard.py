@@ -37,7 +37,7 @@ GATEWAY_SOCKET = Path("/var/lib/cyclo/gateway/component.sock")
 def instance(
     identifier: str,
     *,
-    active: bool = True,
+    intent: str = "running",
     offline: bool = False,
     provider_socket: Path = GATEWAY_SOCKET,
 ) -> Instance:
@@ -55,7 +55,7 @@ def instance(
         team_write=False,
         offline=offline,
         launch_id="0" * 32,
-        active=active,
+        intent=intent,
         port=4100 if not offline else None,
         provider_socket_path=str(provider_socket),
         provider_generation=PROVIDER_GENERATION,
@@ -346,7 +346,7 @@ class FakeDocker:
             return (
                 DockerContainerState.RUNNING
                 if state
-                else DockerContainerState.STOPPED
+                else DockerContainerState.ABSENT
             )
         return state
 
@@ -378,9 +378,10 @@ def test_snapshot_reports_foreign_same_name_container_as_untrusted(
     docker = Docker()
     monkeypatch.setattr(
         docker,
-        "_inspect_container",
-        lambda _name: {
+        "inspect",
+        lambda _kind, _name, **_kwargs: {
             "Id": "foreign-container-id",
+            "Name": f"/{selected.container_name}",
             "Config": {
                 "Labels": {
                     "io.cyclo.system": "ba9876543210",
@@ -512,7 +513,7 @@ def ready_provider() -> FakeProvider:
 def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     alpha = instance("alpha")
-    old = instance("old", active=False, offline=True)
+    old = instance("old", intent="stopped", offline=True)
     persist(store, alpha)
     persist(store, old)
     alpha_queue = queue(store, "alpha")
@@ -552,6 +553,7 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     assert result["usage"] == usage
     running, stopped = result["instances"]
     assert running["id"] == "alpha"
+    assert running["intent"] == "running"
     assert running["state"] == "running"
     assert running["health"] == {"state": "ready", "reason": ""}
     assert running["agentws_port"] == 4100
@@ -573,6 +575,7 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     }
     assert "project_read_only" not in running["mode"]
     assert "usage" not in running
+    assert stopped["intent"] == "stopped"
     assert stopped["state"] == "stopped"
     assert stopped["health"] == {
         "state": "inactive",
@@ -774,7 +777,7 @@ def test_snapshot_exposes_exact_provider_health_and_reads_it_once(
     for identifier in ("alpha", "beta"):
         persist(store, instance(identifier, provider_socket=status.socket_path))
         mark_supervisor_ready(queue(store, identifier))
-    persist(store, instance("stopped", active=False))
+    persist(store, instance("stopped", intent="stopped"))
     queue(store, "stopped")
     provider = FakeProvider(status)
 
@@ -875,10 +878,65 @@ def test_snapshot_reports_nonoperational_lifecycle_without_persisting_it(
         provider_reader=ready_provider(),
     ).build()
 
-    assert result["instances"][0]["state"] == expected_state
-    assert result["instances"][0]["health"]["state"] == "inactive"
+    row = result["instances"][0]
+    assert row["intent"] == "running"
+    assert row["state"] == expected_state
+    assert row["health"]["state"] == "inactive"
     assert result["summary"]["attention"] == 1
-    assert store.load("alpha").active is True
+    assert store.load("alpha").intent == "running"
+
+
+@pytest.mark.parametrize(
+    "docker_state",
+    [DockerContainerState.STOPPED, DockerContainerState.DEAD],
+)
+def test_snapshot_reports_present_container_with_stopped_intent_as_orphan(
+    tmp_path: Path,
+    docker_state: DockerContainerState,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = instance("alpha", intent="stopped")
+    persist(store, selected)
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker({"cyclo-alpha": docker_state}),  # type: ignore[arg-type]
+    ).build()
+
+    row = result["instances"][0]
+    assert row["intent"] == "stopped"
+    assert row["state"] == "orphan"
+    assert row["agentws_port"] is None
+    assert result["summary"]["attention"] == 1
+
+
+def test_snapshot_includes_pending_deletion_from_its_retired_queue(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = instance("retiring", intent="deleting")
+    persist(store, selected)
+    root = queue(store, selected.id)
+    task = root / "tasks" / "saved-task"
+    task.mkdir()
+    (task / "spec.md").write_text("durable work\n", encoding="utf-8")
+    store.instance_dir(selected.id).rename(store.deletion_dir(selected.id))
+
+    result = DashboardSnapshot(
+        store,
+        docker=FakeDocker(
+            {"cyclo-retiring": DockerContainerState.ABSENT}
+        ),  # type: ignore[arg-type]
+    ).build()
+
+    row = result["instances"][0]
+    assert row["id"] == selected.id
+    assert row["intent"] == "deleting"
+    assert row["state"] == "deleting"
+    assert row["agentws_port"] is None
+    assert row["counts"]["tasks"]["total"] == 1
+    assert result["summary"]["instances"] == 1
+    assert result["summary"]["attention"] == 1
 
 
 def test_snapshot_exposes_project_definition_and_named_mounts(tmp_path: Path) -> None:

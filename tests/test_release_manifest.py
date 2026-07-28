@@ -146,6 +146,10 @@ def test_built_distributions_contain_component_sources_without_installs(
         f"cyclo_agent-{cyclo.__version__}/tests/fixtures/derived-team/Dockerfile"
         in archive_names
     )
+    assert (
+        f"cyclo_agent-{cyclo.__version__}/tools/publish-release"
+        in archive_names
+    )
     assert not any(
         "node_modules" in PurePosixPath(name).parts for name in archive_names
     )

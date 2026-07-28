@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 try:
@@ -271,3 +273,89 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert "GITHUB_REF_NAME" not in (ROOT / "tools" / "release-manifest").read_text(
         encoding="utf-8"
     )
+
+
+def test_release_bundle_is_published_by_same_filesystem_rename() -> None:
+    release = (ROOT / "tools" / "build-release").read_text(encoding="utf-8")
+
+    stage_create = 'mktemp -d "$output_parent/.$output_name.publish.XXXXXX"'
+    stage_copy = 'cp -a "$dist"/. "$publication_stage"/'
+    stage_publish = '"$source_tree/tools/publish-release"'
+
+    assert 'mv "$dist" "$output"' not in release
+    assert release.index(stage_create) < release.index(stage_copy)
+    assert release.index(stage_copy) < release.index(stage_publish)
+    assert release.count('[ ! -e "$output" ]') == 2
+    assert release.count('[ ! -L "$output" ]') == 2
+    assert release.index("trap '' HUP INT TERM") < release.index(stage_publish)
+    assert release.index(stage_publish) < release.index(
+        "publication_stage=", release.index(stage_publish)
+    )
+    cleanup = release[
+        release.index("cleanup() {") : release.index("trap cleanup 0")
+    ]
+    assert 'rm -rf -- "$publication_stage"' in cleanup
+
+
+def test_release_publication_is_atomic_and_never_replaces(
+    tmp_path: Path,
+) -> None:
+    tool = ROOT / "tools" / "publish-release"
+    destination = tmp_path / "published"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "winner").write_text("first\n", encoding="utf-8")
+    (second / "winner").write_text("second\n", encoding="utf-8")
+
+    processes = [
+        subprocess.Popen(
+            [sys.executable, str(tool), str(source), str(destination)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for source in (first, second)
+    ]
+    results = [process.communicate() for process in processes]
+
+    assert sorted(process.returncode for process in processes) == [0, 1]
+    assert (destination / "winner").read_text(encoding="utf-8") in {
+        "first\n",
+        "second\n",
+    }
+    assert sum(source.exists() for source in (first, second)) == 1
+    assert any(
+        "destination already exists" in stderr
+        for _stdout, stderr in results
+    )
+
+
+def test_release_publication_rejects_every_existing_destination(
+    tmp_path: Path,
+) -> None:
+    tool = ROOT / "tools" / "publish-release"
+    for kind in ("directory", "symlink"):
+        source = tmp_path / f"source-{kind}"
+        destination = tmp_path / f"destination-{kind}"
+        source.mkdir()
+        if kind == "directory":
+            destination.mkdir()
+        else:
+            destination.symlink_to(tmp_path / "missing")
+
+        completed = subprocess.run(
+            [sys.executable, str(tool), str(source), str(destination)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert completed.returncode == 1
+        assert "destination already exists" in completed.stderr
+        assert source.is_dir()
+        if kind == "directory":
+            assert destination.is_dir()
+        else:
+            assert destination.is_symlink()

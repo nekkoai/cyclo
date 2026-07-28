@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
@@ -9,12 +10,47 @@ import pytest
 
 from cyclo.component import Component, ComponentStatus
 from cyclo.component_runtime import ComponentController
+from cyclo.docker_engine import DockerContainerState, VerifiedContainer
 from cyclo.errors import CycloError
 from cyclo.gateway import LABEL_TOOL, Gateway
 
 
 IMAGE_ID = f"sha256:{'a' * 64}"
 CONTAINER_ID = "b" * 64
+
+
+def _created_tool(
+    name: str,
+    arguments,
+    *,
+    verify,
+) -> tuple[VerifiedContainer, subprocess.CompletedProcess[str]]:
+    labels = {
+        value.split("=", 1)[0]: value.split("=", 1)[1]
+        for index, value in enumerate(arguments)
+        if index > 0 and arguments[index - 1] == "--label"
+    }
+    info = {
+        "Id": CONTAINER_ID,
+        "Name": f"/{name}",
+        "Config": {"Labels": labels},
+        "State": {"Running": False, "Status": "created"},
+    }
+    verify(info)
+    command = ["create", "--name", name, *arguments]
+    return (
+        VerifiedContainer(
+            CONTAINER_ID,
+            DockerContainerState.STOPPED,
+            info,
+        ),
+        subprocess.CompletedProcess(
+            command,
+            0,
+            f"{CONTAINER_ID}\n",
+            "",
+        ),
+    )
 
 
 def _status(
@@ -71,22 +107,37 @@ def test_gateway_usage_mounts_credential_store_read_only(
             assert self.gateway is not None
             return _status(self.gateway)
 
+        def require_owned(self, component, info, *, image):
+            return ComponentController().require_owned(
+                component,
+                info,
+                image=image,
+            )
+
+        def create_container(self, name, arguments, *, verify):
+            created = _created_tool(name, arguments, verify=verify)
+            self.commands.append(list(created[1].args))
+            return created
+
+        def start_container(
+            self,
+            container,
+            *,
+            arguments=(),
+            capture=True,
+            input_data=None,
+        ):
+            command = ["start", *arguments, container.id]
+            self.commands.append(command)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                '{"totals":{"requests":0}}\n',
+                "",
+            )
+
         def call(self, arguments, **_options):
             self.commands.append(list(arguments))
-            if arguments[0] == "create":
-                return subprocess.CompletedProcess(
-                    arguments,
-                    0,
-                    f"{CONTAINER_ID}\n",
-                    "",
-                )
-            if arguments[0] == "start":
-                return subprocess.CompletedProcess(
-                    arguments,
-                    0,
-                    '{"totals":{"requests":0}}\n',
-                    "",
-                )
             return subprocess.CompletedProcess(
                 arguments,
                 0,
@@ -167,15 +218,8 @@ def test_gateway_tool_failure_removes_the_exact_container(
 ) -> None:
     controller = Mock()
     controller.require_image.return_value = IMAGE_ID
-    controller.call.side_effect = [
-        subprocess.CompletedProcess(
-            ["create"],
-            0,
-            f"{CONTAINER_ID}\n",
-            "",
-        ),
-        failure,
-    ]
+    controller.create_container.side_effect = _created_tool
+    controller.start_container.side_effect = failure
     controller.stop.return_value = True
     gateway = Gateway(
         tmp_path / "components",
@@ -191,11 +235,8 @@ def test_gateway_tool_failure_removes_the_exact_container(
         )
 
     assert error.value is failure
-    commands = [
-        call.args[0]
-        for call in controller.call.call_args_list
-    ]
-    create = commands[0]
+    created_name, created_arguments = controller.create_container.call_args.args
+    create = ["create", "--name", created_name, *created_arguments]
     removed, identifier = controller.stop.call_args.args
     assert create[0] == "create"
     assert create[1] == "--name"
@@ -214,15 +255,74 @@ def test_gateway_tool_failure_removes_the_exact_container(
     }
     assert "--interactive" in create
     assert "--rm" not in create
-    assert commands[1] == [
-        "start",
-        "--attach",
-        "--interactive",
-        CONTAINER_ID,
-    ]
+    started = controller.start_container.call_args
+    assert started.args[0].id == CONTAINER_ID
+    assert started.kwargs["arguments"] == ["--attach", "--interactive"]
     assert removed.container == create[2]
     assert identifier == CONTAINER_ID
     assert removed.preserve_volumes
+
+
+@pytest.mark.parametrize(
+    (
+        "interactive",
+        "capture",
+        "input_data",
+        "stdin_is_tty",
+        "stdout_is_tty",
+        "expected_tty",
+    ),
+    (
+        (True, False, None, True, True, True),
+        (True, False, None, False, True, False),
+        (True, False, None, True, False, True),
+        (True, True, None, True, True, False),
+        (True, False, "secret\n", True, True, False),
+        (False, False, None, True, True, False),
+    ),
+)
+def test_gateway_tool_allocates_tty_only_for_an_attached_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive: bool,
+    capture: bool,
+    input_data: str | None,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    expected_tty: bool,
+) -> None:
+    controller = Mock()
+    controller.require_image.return_value = IMAGE_ID
+    controller.create_container.side_effect = _created_tool
+    controller.start_container.return_value = subprocess.CompletedProcess(
+        ["start"], 0, "", ""
+    )
+    controller.stop.return_value = True
+    gateway = Gateway(
+        tmp_path / "components",
+        controller=controller,
+    )
+    fake_sys = Mock(
+        stdin=Mock(isatty=Mock(return_value=stdin_is_tty)),
+        stdout=Mock(isatty=Mock(return_value=stdout_is_tty)),
+        stderr=sys.stderr,
+    )
+    monkeypatch.setattr("cyclo.gateway.sys", fake_sys)
+
+    gateway._tool(
+        ["login", "openai"],
+        volume=False,
+        interactive=interactive,
+        input_data=input_data,
+        capture=capture,
+    )
+
+    _name, create = controller.create_container.call_args.args
+    start = controller.start_container.call_args.kwargs["arguments"]
+    assert ("--tty" in create) is expected_tty
+    assert ("--interactive" in create) is interactive
+    assert ("--interactive" in start) is interactive
+    assert "--tty" not in start
 
 
 @pytest.mark.parametrize(
@@ -230,22 +330,19 @@ def test_gateway_tool_failure_removes_the_exact_container(
     (
         (KeyboardInterrupt(), KeyboardInterrupt),
         (
-            subprocess.CompletedProcess(["create"], 0, "invalid\n", ""),
+            CycloError("Docker create returned an invalid container ID"),
             CycloError,
         ),
     ),
 )
-def test_gateway_tool_create_failure_cleans_up_by_owned_name(
+def test_gateway_tool_create_failure_leaves_unverified_residue_for_reconciliation(
     tmp_path: Path,
-    create_result: BaseException | subprocess.CompletedProcess[str],
+    create_result: BaseException,
     error_type: type[BaseException],
 ) -> None:
     controller = Mock()
     controller.require_image.return_value = IMAGE_ID
-    if isinstance(create_result, BaseException):
-        controller.call.side_effect = create_result
-    else:
-        controller.call.return_value = create_result
+    controller.create_container.side_effect = create_result
     controller.stop.return_value = False
     gateway = Gateway(
         tmp_path / "components",
@@ -255,12 +352,7 @@ def test_gateway_tool_create_failure_cleans_up_by_owned_name(
     with pytest.raises(error_type):
         gateway._tool(["providers"], volume=False)
 
-    removed, identifier = controller.stop.call_args.args
-    assert removed.container.startswith(
-        f"{gateway.component.container}-tool-"
-    )
-    assert identifier is None
-    assert removed.preserve_volumes
+    controller.stop.assert_not_called()
 
 
 def test_gateway_store_guard_removes_a_volume_free_abandoned_tool(
@@ -349,15 +441,8 @@ def test_gateway_tool_cleanup_failure_preserves_both_errors(
 ) -> None:
     controller = Mock()
     controller.require_image.return_value = IMAGE_ID
-    controller.call.side_effect = [
-        subprocess.CompletedProcess(
-            ["create"],
-            0,
-            f"{CONTAINER_ID}\n",
-            "",
-        ),
-        CycloError("login failed"),
-    ]
+    controller.create_container.side_effect = _created_tool
+    controller.start_container.side_effect = CycloError("login failed")
     controller.stop.side_effect = CycloError("Docker removal failed")
     gateway = Gateway(
         tmp_path / "components",

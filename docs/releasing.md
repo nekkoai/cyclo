@@ -117,6 +117,11 @@ distribution files. Docker base images and npm tarballs are pinned, but the
 runtime image also installs packages from the live Debian index and is not
 claimed to be byte-identical across rebuild dates.
 
+The completed bundle is first copied to a private sibling staging directory,
+then published with Linux `renameat2(RENAME_NOREPLACE)`. The release host must
+support that operation; Cyclo fails closed if it does not. An interrupted build
+therefore cannot expose a partial destination or replace an existing release.
+
 The SPDX SBOM enumerates locked Node dependencies from the team runtime,
 credential gateway, component interfaces, Provider interface, Pi extension,
 and bundled example components.
@@ -130,9 +135,12 @@ instead.
 ## Verify from a clean machine
 
 On a disposable Linux host with Git, Python 3.10 or newer, and Docker, copy the
-wheel from the release bundle and first verify its passive commands:
+complete release bundle. Verify the checksummed wheel and source archive before
+installing or executing anything from them:
 
 ```sh
+cd ./cyclo-agent-0.2.0
+sha256sum --check SHA256SUMS
 python3 -m venv /tmp/cyclo-release
 . /tmp/cyclo-release/bin/activate
 python -m pip install ./cyclo_agent-0.2.0-py3-none-any.whl
@@ -167,6 +175,5 @@ installation these commands reuse valid current-release images. `doctor`
 remains an observational check of the resulting installation.
 
 Initialize one packaged team, run `cyclo validate`, and perform a `run
---dry-run` against a disposable project. Compare the copied wheel against
-`SHA256SUMS`; if it differs or installation fails, discard the bundle and build
-a corrected patch version.
+--dry-run` against a disposable project. If checksum verification or
+installation fails, discard the bundle and build a corrected patch version.

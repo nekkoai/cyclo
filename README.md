@@ -34,7 +34,9 @@ Keep that setting for every command belonging to this installation.
 
 ## Host providers
 
-`/etc/cyclo/host.conf` is an ordered, line-oriented configuration:
+With the explicit state root used above, the provider configuration is
+`$CYCLO_STATE_ROOT/host.conf`. Only an installation using the implicit default
+state root reads `/etc/cyclo/host.conf`. The file is ordered and line-oriented:
 
 ```text
 provider first ./providers/passthrough upstream=gateway
@@ -126,7 +128,7 @@ cyclo task list <instance>
 cyclo task show <instance> uart-ip
 cyclo logs <instance>
 cyclo dashboard --host 127.0.0.1
-cyclo refresh                       # rebuild installed images and restart the active fleet
+cyclo refresh                       # rebuild and recreate instances with running intent
 ```
 
 The dashboard is read-only and shows team/job state, provider health, and
