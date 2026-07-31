@@ -2,13 +2,12 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { checkComponentHealth } from "@cyclo/component/health";
-import { componentSocketPath } from "@cyclo/component/paths";
 
 export async function checkGatewayHealth({
-  socketPath = componentSocketPath(),
+  target,
   timeoutMs = 1_000,
 } = {}) {
-  return checkComponentHealth({ socketPath, timeoutMs });
+  return checkComponentHealth({ target, timeoutMs });
 }
 
 function isMain() {

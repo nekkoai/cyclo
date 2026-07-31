@@ -1,14 +1,26 @@
-import { isAbsolute } from "node:path";
-
 import { createConnectTransport } from "@connectrpc/connect-node";
 
-export function createUnixTransport(socketPath) {
-  if (typeof socketPath !== "string" || !isAbsolute(socketPath)) {
-    throw new TypeError("socketPath must be an absolute path");
-  }
+const DOCKER_TARGET = /^dns:\/\/\/([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?):([0-9]+)$/u;
+
+export function createDockerTransport(target) {
+  const { host, port } = parseDockerTarget(target);
   return createConnectTransport({
-    baseUrl: "http://localhost",
+    baseUrl: `http://${host}:${port}`,
     httpVersion: "1.1",
-    nodeOptions: { socketPath },
   });
+}
+
+export function parseDockerTarget(target) {
+  if (typeof target !== "string" || target.trim() !== target || !target) {
+    throw new TypeError("DComp target must be a non-empty canonical string");
+  }
+  const match = DOCKER_TARGET.exec(target);
+  if (!match) {
+    throw new TypeError("DComp target must have the form dns:///host:port");
+  }
+  const port = Number(match[2]);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new TypeError("DComp target port must be between 1 and 65535");
+  }
+  return Object.freeze({ host: match[1], port });
 }

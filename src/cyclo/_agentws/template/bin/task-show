@@ -1,36 +1,13 @@
-#!/bin/sh
+#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-set -eu
+import sys
+from pathlib import Path
 
-AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-. "$AGENTWS_ROOT/bin/lib-agentws"
+AGENTWS_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(AGENTWS_ROOT / "tools"))
 
-usage() {
-    echo "Usage: task-show <task-id>"
-    exit 1
-}
+from task_read import show_main  # noqa: E402
 
-[ "$#" -eq 1 ] || usage
 
-TASK_ID="$1"
-
-validate_task_id "$TASK_ID"
-require_tasks_dir
-
-TASK_DIR="$TASKS_DIR/$TASK_ID"
-
-[ -d "$TASK_DIR" ] || die "task '$TASK_ID' does not exist"
-echo "# Task $TASK_ID"
-echo ""
-printf 'State: %s\n' "$(cat "$TASK_DIR/state" 2>/dev/null || printf 'open')"
-echo ""
-echo "## Spec"
-cat "$TASK_DIR/spec.md"
-echo ""
-echo "## Log"
-cat "$TASK_DIR/log.md"
-if [ -f "$TASK_DIR/result.md" ]; then
-    echo ""
-    echo "## Result"
-    cat "$TASK_DIR/result.md"
-fi
+if __name__ == "__main__":
+    raise SystemExit(show_main(sys.argv[1:]))

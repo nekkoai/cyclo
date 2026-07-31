@@ -54,9 +54,7 @@ def test_controller_has_no_external_agent_runtime_discovery() -> None:
     assert failures == []
 
 
-def test_owned_images_use_cyclo_identity() -> None:
-    from cyclo.docker import CONTAINER_PI
-    from cyclo.installation import team_image_name
+def test_team_runtime_uses_the_fixed_private_pi_home() -> None:
+    from cyclo.runtime import PI_ROOT
 
-    assert team_image_name("0123456789ab", "0.2.0") == "cyclo-0123456789ab-team:0.2.0"
-    assert CONTAINER_PI == Path("/home/cyclo/.pi")
+    assert PI_ROOT == "/home/cyclo/.pi"

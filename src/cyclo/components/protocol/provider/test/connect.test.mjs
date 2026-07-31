@@ -1,18 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 
 import { createClient } from "@connectrpc/connect";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 import { Provider } from "@cyclo/provider/contract";
-import { createUnixTransport } from "@cyclo/component/transport";
+import { createDockerTransport } from "@cyclo/component/transport";
 
 test("ConnectRPC preserves opaque request and streamed response strings", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "cyclo-provider-connect-"));
-  const socketPath = join(directory, "provider.sock");
   const requestPayload = " { \"schema\": {\"anyOf\":[true,false]}, \"order\": 1 } ";
   const responsePayloads = [
     "{\"type\":\"start\",\"unknown\":1}",
@@ -35,8 +30,11 @@ test("ConnectRPC preserves opaque request and streamed response strings", async 
   }));
 
   try {
-    await listen(server, socketPath);
-    const client = createClient(Provider, createUnixTransport(socketPath));
+    const port = await listen(server);
+    const client = createClient(
+      Provider,
+      createDockerTransport(`dns:///127.0.0.1:${port}`),
+    );
     const actual = [];
     for await (const response of client.infer({ model: "route/model", payload: requestPayload })) {
       actual.push(response.payload);
@@ -46,13 +44,10 @@ test("ConnectRPC preserves opaque request and streamed response strings", async 
     assert.deepEqual(actual, responsePayloads);
   } finally {
     await close(server);
-    await rm(directory, { recursive: true, force: true });
   }
 });
 
 test("ConnectRPC propagates cancellation outside the payload", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "cyclo-provider-cancel-"));
-  const socketPath = join(directory, "provider.sock");
   const canceled = deferred();
   const server = createServer(connectNodeAdapter({
     connect: true,
@@ -75,8 +70,11 @@ test("ConnectRPC propagates cancellation outside the payload", async () => {
   }));
 
   try {
-    await listen(server, socketPath);
-    const client = createClient(Provider, createUnixTransport(socketPath));
+    const port = await listen(server);
+    const client = createClient(
+      Provider,
+      createDockerTransport(`dns:///127.0.0.1:${port}`),
+    );
     const controller = new AbortController();
     const iterator = client.infer(
       { model: "route/model", payload: "opaque" },
@@ -88,16 +86,15 @@ test("ConnectRPC propagates cancellation outside the payload", async () => {
     await canceled.promise;
   } finally {
     await close(server);
-    await rm(directory, { recursive: true, force: true });
   }
 });
 
-function listen(server, path) {
+function listen(server) {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(path, () => {
+    server.listen(0, "127.0.0.1", () => {
       server.off("error", reject);
-      resolve();
+      resolve(server.address().port);
     });
   });
 }

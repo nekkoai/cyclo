@@ -26,12 +26,12 @@ RUN npm ci --omit=dev \
 COPY --chown=node:node gateway/component.conf ./component.conf
 COPY --chown=node:node gateway/src ./src
 
-RUN install -d -o node -g node -m 0700 /var/lib/cyclo-gateway \
- && install -d -o node -g node -m 0770 /run/cyclo
+RUN install -d -o node -g node -m 0700 /var/lib/cyclo-gateway
 
 ENV NODE_ENV=production
 
 USER 1000:1000
+EXPOSE 50051
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["node", "src/main.mjs"]
 

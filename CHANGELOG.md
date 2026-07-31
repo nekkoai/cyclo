@@ -2,173 +2,158 @@
 
 All notable changes to Cyclo are documented in this file.
 
-## [0.2.0] - 2026-07-27
+## [0.2.0] - 2026-07-31
 
-Composable providers, explicit project authority, and a redesigned operator
-interface.
+Cyclo 0.2 introduces DComp-backed composition, explicit project authority, and
+a host-oriented operator interface. It is a fresh-install release and does not
+adopt Cyclo 0.1 state or Docker resources.
 
-### Architecture
+### Component architecture
 
-- Define a small component model around declared interfaces and ConnectRPC over
-  Unix sockets. Every component provides health; provider components also
-  provide model discovery and opaque streaming inference.
-- Keep `cyclo` on the host as the control plane. It assembles and inspects the
-  Docker graph but is not a service in the inference data path.
-- Make the credential gateway the fixed root provider. It alone owns the
-  credential volume, OAuth refresh, native model calls, the concrete catalogue,
-  and usage history.
-- Add ordered intermediate providers through `/etc/cyclo/host.conf`. Each
-  component receives only its declared upstream socket; an empty configuration
-  exposes the gateway directly.
-- Transport Pi's native JSON request and event payloads opaquely. Intermediate
-  providers do not interpret, validate, or reserialize inference contents.
+- Make DComp the sole owner of component container, network, volume, and
+  interrupted-operation lifecycle. Cyclo discovers `dcomp` through `PATH` or
+  `CYCLO_DCOMP` and requires machine API version 1.
+- Compile the gateway, configured Provider components, and all desired-running
+  teams into one installation-wide DComp system.
+- Keep Cyclo as a host CLI and domain compiler rather than a daemon or
+  inference proxy. DComp likewise leaves the data path after component startup.
+- Use DComp's direct private TCP link networks for component interfaces.
+  Consumers receive only declared `DCOMP_LINK_*` targets; no service registry,
+  sidecar, internal administrator token, or Docker socket is required.
+- Identify component interfaces by fully qualified protobuf service name.
+  Cyclo's built-in components use ConnectRPC over HTTP/1.1 TCP on port 50051.
+- Give every configured component a literal, independently inspectable status.
+  Make the selected outer Provider the only route; a failed component makes the
+  system non-operational until fixed.
+
+### Gateway and Provider composition
+
+- Keep the credential gateway as the fixed root Provider. It alone owns API
+  keys, OAuth refresh, native provider calls, the source catalogue, and usage
+  history.
+- Store credentials and usage in a private named Docker volume never mounted
+  into team or intermediate Provider components.
+- Define Provider components with `component.dcomp` and install instances from
+  the line-oriented `host.conf` grammar:
+  `provider NAME SOURCE [context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARG...]`.
+- Resolve all host declarations together, allowing explicit forward references,
+  fan-out, and cyclic address wiring. Use the last provider declaration as the
+  outer Provider; an empty configuration exposes the gateway directly.
+- Add a typed `ListModels` control plane and an opaque streaming `Infer` data
+  plane. Transport Pi requests and events as exact JSON strings without
+  intermediate validation or reserialization.
+- Publish only the outer Provider on a dynamic loopback port for host catalogue
+  calls. Restrict the host Provider client to the DComp-reported
+  `127.0.0.1` endpoint.
+- Make gateway login prepare only the fixed gateway/store boundary, commit the
+  credential update, and restart the gateway automatically. A broken unrelated
+  Provider or team therefore cannot block credential administration.
+
+### Images and lifecycle
+
+- Use stable installation/version tags for gateway, Provider, common-team, and
+  per-team images. Invoke Docker build whenever an operation needs a built
+  image, rely on Docker's context, `.dockerignore`, and layer cache, then pass
+  only the inspected immutable image ID to DComp.
+- Keep no Cyclo source-digest cache or generated image-build history. Capture
+  Docker build output and surface bounded diagnostics on failure.
+- Keep image building in Cyclo and container lifecycle in DComp. Provider
+  descriptors may name a prebuilt image or supply a Dockerfile; optional
+  `context=PATH` selects a containing build context.
+- Materialize only the current content-addressed DComp component descriptors
+  under the Cyclo state root and atomically replace `system.dcomp`; obsolete
+  descriptors are removed after the new file is selected.
+- Resume an incomplete DComp operation before applying current intent. Keep
+  DComp's private state below `STATE_ROOT/dcomp` and access it only through the
+  versioned machine API.
+- Persist team instances as domain state only: immutable image ID, project/team
+  generation, mount facts, options, and `running` or `stopped` intent. Remove
+  container IDs, network IDs, and the duplicate Cyclo lifecycle state machine.
+- Make `repair` apply current host configuration and persisted instance intent,
+  including running required host builds. Keep `refresh` as the operation that
+  reparses running project/team definitions and rebuilds their selected images.
+- Scope the DComp system, generated images, credential volume, instance state,
+  and queues to the canonical state-root identity so several installations can
+  share one trusted Docker host without resource-name collision.
+- Bind each installation to one canonical local Docker Unix endpoint on first
+  use and reject later retargeting or remote Docker endpoints.
 
 ### Projects and teams
 
-- Add strict, line-oriented `project.cyclo` files containing a project name,
-  description, optional literal project-context block, one or more team
-  repositories, and named `ro`/`rw` mounts. Relative paths resolve beside the
-  project file and unknown directives fail.
-- Start one container per selected team. Writable mounts appear below
-  `/workspace`, read-only supporting material below `/readonly`, and team
-  repositories remain independently selectable as read-only or writable.
-- Generate one read-only `/agentws/project.cyclo` per running team instance.
-  It keeps the authored description and context while rewriting every mount
-  into the container namespace, so multiple writable projects remain explicit
-  without introducing a second manifest format. Keep that context out of tasks
-  and job prompts.
-- Keep team behavior repository-defined: a roster, role prompts, optional
-  common `AGENTS.md`, and an optional Dockerfile for extra execution
-  dependencies. Cyclo supplies the AgentWS runtime and Pi provider extension as
-  the inherited `CYCLO_TEAM_BASE`.
-- Build an installation-scoped derived image for each team Dockerfile. Image
-  identity records the exact common base; candidate images are validated and
-  promoted transactionally.
-- Preserve AgentWS's durable task, job, comment, result, retry, and planner
-  recovery loop without coupling queue state to provider health.
+- Add strict, line-oriented `project.cyclo` files containing a name,
+  description, optional literal context block, one or more team repositories,
+  and one or more named `ro`/`rw` mounts.
+- Map writable projects to `/workspace/NAME` and read-only supporting inputs to
+  `/readonly/NAME`. Support several writable repositories in one project
+  without inventing a privileged primary repository.
+- Generate a read-only `/agentws/project.cyclo` for each team with container
+  paths and no generated host paths. Require the common agent protocol to read
+  it before choosing a workspace.
+- Keep team behavior Git-defined through a roster, role prompts, optional
+  `AGENTS.md`, and optional Dockerfile.
+- Bake AgentWS, Pi, the Provider adapter, and the team supervisor into the
+  common image. Bind only durable tasks, jobs, agents, Pi state, team source,
+  project context, and declared project directories at runtime.
+- Support team Dockerfiles through `ARG CYCLO_TEAM_BASE` and a final
+  `FROM ${CYCLO_TEAM_BASE}`. Validate the fixed entrypoint, OCI health check,
+  base-image identity, and privilege-drop contract.
+- Preserve AgentWS tasks, jobs, comments, results, retries, planner
+  notifications, and orphan recovery independently of team component
+  replacement.
+- Run task administration through confined one-shot team-image tools over the
+  durable queues, so tasks remain inspectable and editable while a team is
+  stopped without starting its long-running component.
+- Snapshot task specifications with bounded, no-symlink host reads before
+  mounting them into queue-only administration containers.
 
-### Lifecycle and isolation
+### Isolation and correctness
 
-- Build component images under candidate tags and promote the official tag only
-  after validation. Readiness verifies the exact image ID, ownership, launch
-  configuration, mounts, running state, Docker health, and the component health
-  RPC; provider bindings separately determine startup order and route selection.
-- Run intermediate providers without a network, Docker socket, or Linux
-  capabilities, using read-only roots, private namespaces, bounded process and
-  file-descriptor counts, and only the Unix sockets declared by their interface.
-- Keep credentials outside all team and intermediate-provider mounts. A mounted
-  provider socket is the authority to use the configured model catalogue; no
-  internal bearer or administrator token is used.
-- Fail closed if a native upstream response exactly reflects an API key or
-  authentication-header value inserted by the gateway, without imposing Pi
-  event semantics on the opaque Provider transport.
-- Validate real, non-overlapping mount trees and recheck bind-source identity at
-  launch. Multi-team runs preflight the full project and roll back only the
-  containers started by a failed invocation.
-- Add `--offline` to remove ordinary team network egress while retaining access
-  to the provider socket.
-- Harden persisted state with strict parsing, no-follow file access, atomic
-  replacement, serialized queue mutations, bounded scans, and explicit handling
-  of corrupt or incomplete instance records.
-- Treat the validated official tag as the installed component. `start`,
-  `models`, project `run`, gateway provider discovery, and login reuse valid
-  current-release component images, building only missing images or images
-  from a different release. Restart requires an installed current image and
-  never builds.
-- Make explicit build and refresh commands the source-update boundary. Cyclo
-  keeps no source hash or cache database; Docker owns build-context,
-  `.dockerignore`, and layer-cache semantics. Diagnostic commands remain
-  observational.
-- Use each component image's declared OCI command unchanged. Cyclo only
-  overrides `CMD` when explicit arguments follow `--` in `host.conf`; the
-  component runtime has no special `serve` command convention.
-- Isolate optional provider build and startup failures. Failed components and
-  their dependants remain visible in status, while the last working provider
-  remains available to model listing and newly started projects.
-- Fall back across health-ready providers when an outer `ListModels` call is
-  invalid or unavailable, without ever replaying inference.
-- Keep provider catalogue selection format-neutral, then reject roster models
-  incompatible with the pinned Pi ABI at the team-runtime preflight boundary.
-- Enforce one bounded `PROVIDER/MODEL` route grammar across gateway login,
-  catalogues, team rosters, Pi registration, inference audit, and usage reports.
-- Validate gateway login against an in-memory candidate catalogue before
-  atomically replacing the credential store.
-- Make the append-only usage ledger crash-recoverable: startup removes only an
-  incomplete final record, reports read a bounded committed snapshot, and an
-  append failure remains unhealthy until restart.
-- Require system, kind, instance, and current launch identity before team
-  status, task, log, copy, exec, or readiness operations; Docker names alone
-  are never authority.
-- Replace a stopped or dead team launch through an exact, fenced handoff:
-  remove the persisted old launch while its identity is still authoritative,
-  then publish and start the replacement. An interruption at either boundary
-  remains repairable and never authorizes deletion of another launch.
-- Publish a new instance's complete metadata directory atomically before
-  materializing child state, so interruption cannot expose an inventory entry
-  without `run.json`.
-- Retire an instance by atomically removing its complete directory from
-  authoritative inventory before recursively deleting the inert state.
-- Give interactive and one-shot gateway commands owned container identities.
-  Interrupted commands are reconciled under the installation lock without
-  exposing or deleting the credential volume.
-- Keep component log reads observational. Recover the published port of an
-  exact lifecycle-active launch after interrupted startup, and let
-  `cyclo repair` continue independent cleanup attempts before reporting any
-  failures.
-- Add `cyclo forget INSTANCE --confirm INSTANCE` as the explicit way to retire
-  stopped durable state before reusing a logical instance name.
-- Scope gateway, provider, and team Docker resources to the canonical state
-  root, allowing several independent Cyclo installations on one trusted host.
-  Team ownership records the installation, resource kind, and logical instance.
+- Treat the host, DComp, Docker daemon, approved configuration, and image build
+  inputs as the trusted administrative domain; treat arbitrary team code as
+  hostile.
+- Refuse to build or run teams as host root. Map the invoking UID/GID into the
+  common image and drop image-root privileges before AgentWS starts.
+- Canonicalize bind sources and reject missing, overlapping, swapped, or
+  protected mount trees, including Cyclo state, installed code, `host.conf`,
+  DComp, host Pi state, pseudo-filesystems, and Docker sockets.
+- Recheck source device/inode identity at initial launch and mount authority on
+  every later global apply.
+- Keep credentials, Docker control, DComp state, and unrelated project/team
+  paths out of team components.
+- Add `--offline` to remove direct team egress and viewer publication while
+  retaining the private Provider link.
+- Preserve gateway credential-reflection suppression without imposing semantic
+  validation on the opaque Provider transport.
+- Harden instance and queue state with strict parsing, no-follow reads, bounded
+  inputs, serialized mutation, atomic replacement, and directory durability.
 
-### Command line and operations
+### Operator interface
 
-- Organize authoring under `cyclo team` and `cyclo project`, task operations
-  under `cyclo task`, individual host components under `cyclo component`, and
-  gateway/provider conveniences under `cyclo gateway` and `cyclo providers`.
-- Report one factual status per component rather than an aggregate graph-ready
-  state. A failed provider remains visible while route selection falls back to
-  the last working provider.
-- Preserve component health messages and image-contract failures in status
-  output, and distinguish component class from observed container state in the
-  host implementation.
-- Add project-wide `run` and `stop`, detailed `inspect`, read-only fleet and
-  AgentWS dashboards, provider-aware `models`, retained `usage`, and an
-  observational full-system `doctor`.
-- Add `cyclo refresh` to rebuild gateway and configured provider images plus the
-  common and derived team images selected by active projects, then reparse and
-  restart those projects from their recorded definition paths. Serialize the
-  inventory, stop, rebuild, and restart phases as one installation operation.
-- Make gateway login update the private store and automatically restart the
-  gateway so the new catalogue is immediately published.
-- Make gateway health detect a committed catalogue newer than its startup
-  snapshot, closing the host-crash window between login and restart.
-- Keep dashboard usage observation nonblocking without creating an absent
-  installation or binding its provider-configuration scope.
-- Derive provider configuration from the installation: the default state root
-  uses `/etc/cyclo/host.conf`, while an explicit state root uses
-  `STATE_ROOT/host.conf`.
-- Keep wildcard dashboard binds as listening addresses only; generated browser
-  links derive their host from the incoming request.
+- Organize authoring under `cyclo team` and `cyclo project`, work under
+  `cyclo task`, team lifecycle under `run/start/stop/refresh/forget`, and host
+  inspection under `component`, `providers`, `gateway`, and `doctor`.
+- Add `component list|status|logs|restart` over actual DComp components.
+- Add `providers check|status|restart` and
+  `gateway providers|login|status|restart|build|destroy-store`.
+- Add project-wide run/stop, persisted instance start/forget, detailed
+  inspection, live component logs, model discovery, usage reporting, and a
+  read-only fleet dashboard.
+- Make `doctor` observational: report DComp compatibility, expected component
+  health, stopped-instance absence, and model-catalogue reachability without
+  applying an alternative system.
+- Derive browser links from the incoming request host when a viewer listens on
+  `0.0.0.0`; never use the wildcard bind as a destination address.
 
 ### Distribution
 
-- Establish 0.2 as a fresh-install boundary. Cyclo does not adopt or migrate
-  0.1 state or Docker resources.
-- Organize shipped component sources by architectural role under
-  `src/cyclo/components`: shared contracts in `protocol/`, runnable providers
-  beside them, and an explicit `team-runtime` image context. Remove the retired
-  gateway and provider source trees.
-- Ship a self-contained Python package with the AgentWS runtime, dashboard,
-  component protocol, gateway and team build contexts, and built-in team
-  templates. Cyclo no longer depends on external `agentws` or `multiagent`
-  checkouts.
-- Pin image bases and npm dependencies, verify release manifests and supply-chain
-  metadata, scan the Git history for secrets, and build local wheel/source
-  release bundles without publishing them.
-- Regenerate protocol bindings as a checked-source freshness gate and run
-  installation acceptance against the exact normalized wheel placed in the
-  release bundle.
+- Ship the gateway, Provider protocol, Pi adapter, common team runtime, bundled
+  AgentWS runtime, dashboard, and example team templates in the Python
+  distribution.
+- Remove runtime dependencies on external `agentws` or `multiagent` checkouts.
+  DComp remains a separate required executable with machine API version 1.
+- Pin container bases and npm dependencies, validate generated protobuf
+  bindings, scan release history for secrets, and build local wheel/source
+  bundles with provenance, checksums, and an SPDX SBOM without publishing them.
 
 ## [0.1.0] - 2026-07-14
 

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cyclo.component import component_sources_root
+from cyclo.resources import components_root
 from cyclo.errors import CycloError
 from cyclo.pi_runtime import inference_format, model_incompatibility
 from cyclo.project_run import validate_pi_team_models
@@ -11,7 +11,7 @@ from cyclo.project_run import validate_pi_team_models
 
 MODEL_ID_CASES = json.loads(
     (
-        component_sources_root()
+        components_root()
         / "protocol"
         / "provider"
         / "test"

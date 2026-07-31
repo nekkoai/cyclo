@@ -13,13 +13,13 @@ from pathlib import Path
 from typing import Any
 
 
-COMPONENTS = (
-    "protocol/component",
-    "protocol/provider",
-    "gateway",
-    "passthrough",
-    "pi-provider",
-    "team-runtime",
+PACKAGES = (
+    "components/protocol/component",
+    "components/protocol/provider",
+    "components/gateway",
+    "components/passthrough",
+    "adapters/pi",
+    "components/team-runtime",
 )
 PI_PACKAGE = "@earendil-works/pi-coding-agent"
 PI_VERSION = "0.81.1"
@@ -240,11 +240,11 @@ def validate_no_fixed_pi_release(version: str, lock: dict[str, Any]) -> list[str
 
 
 def audit_repository(root: Path) -> None:
-    component_root = root / "src" / "cyclo" / "components"
-    for name in COMPONENTS:
-        package_dir = component_root / name
+    package_root = root / "src" / "cyclo"
+    for name in PACKAGES:
+        package_dir = package_root / name
         report, returncode = run_audit(package_dir)
-        if name == "team-runtime":
+        if name == "components/team-runtime":
             validate_team_runtime(report, returncode, package_dir)
         else:
             findings = high_findings(report)

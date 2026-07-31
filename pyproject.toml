@@ -90,13 +90,11 @@ cyclo = [
   "passthrough/*",
   "passthrough/src/*",
   "passthrough/test/*",
-  "pi-provider/*",
-  "pi-provider/src/*",
-  "pi-provider/test/*",
   "team-runtime/*",
   "team-runtime/Dockerfile.dockerignore",
   "team-runtime/entrypoint.sh",
 ]
+"cyclo.adapters" = ["pi/*", "pi/src/*", "pi/test/*"]
 
 [tool.setuptools.exclude-package-data]
 "cyclo.components" = ["**/node_modules/**"]

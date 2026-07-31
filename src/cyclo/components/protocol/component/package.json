@@ -17,7 +17,7 @@
     },
     "./declaration": "./src/declaration.mjs",
     "./health": "./src/health.mjs",
-    "./paths": "./src/paths.mjs",
+    "./links": "./src/links.mjs",
     "./schema": "./src/schema.mjs",
     "./schema.json": "./gen/schema.json",
     "./server": "./src/server.mjs",

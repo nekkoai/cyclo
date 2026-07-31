@@ -1,18 +1,13 @@
-import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
 import { createServer } from "node:http";
-import { createConnection } from "node:net";
-import { dirname, isAbsolute } from "node:path";
 
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 
 import { registerProvides } from "./bindings.mjs";
 
-const closePromises = new WeakMap();
+export const COMPONENT_HOST = "0.0.0.0";
+export const COMPONENT_PORT = 50051;
 
-// The component must be the only writer of the socket directory. Node unlinks
-// its Unix-socket pathname on close; consumers therefore mount the directory
-// read-only. Mount possession is the capability: the socket is connectable by
-// arbitrary non-root image users, while an unmounted container cannot name it.
+const closePromises = new WeakMap();
 
 export function createComponentServer({ bindings, implementations, shutdownSignal } = {}) {
   if (!bindings?.provides || !bindings?.requires) {
@@ -31,21 +26,18 @@ export function createComponentServer({ bindings, implementations, shutdownSigna
   );
 }
 
-export async function listenComponentServer(server, { socketPath, mode = 0o666 } = {}) {
-  if (typeof socketPath !== "string" || !isAbsolute(socketPath)) {
-    throw new TypeError("socketPath must be an absolute path");
+export async function listenComponentServer(
+  server,
+  { host = COMPONENT_HOST, port = COMPONENT_PORT } = {},
+) {
+  if (typeof host !== "string" || !host) {
+    throw new TypeError("host must be a non-empty string");
   }
-  await mkdir(dirname(socketPath), { recursive: true });
-  await removeStaleSocket(socketPath);
-  await listen(server, socketPath);
-
-  try {
-    await chmod(socketPath, mode);
-  } catch (error) {
-    await closeNodeServer(server);
-    throw error;
+  if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) {
+    throw new TypeError("port must be an integer between 0 and 65535");
   }
-  return socketPath;
+  await listen(server, host, port);
+  return server.address();
 }
 
 export function closeComponentServer(server) {
@@ -59,48 +51,7 @@ export function closeComponentServer(server) {
   return closing;
 }
 
-async function removeStaleSocket(socketPath) {
-  const before = await socketIdentity(socketPath, { missing: true });
-  if (!before) return;
-  if (!before.isSocket) throw new Error(`refusing to replace non-socket path ${socketPath}`);
-
-  let connectError;
-  try {
-    await connectToSocket(socketPath);
-  } catch (error) {
-    connectError = error;
-  }
-  if (!connectError) {
-    const error = new Error(`component socket is already in use: ${socketPath}`);
-    error.code = "EADDRINUSE";
-    throw error;
-  }
-  if (connectError.code === "ENOENT") return;
-  if (connectError.code !== "ECONNREFUSED") throw connectError;
-
-  const after = await socketIdentity(socketPath, { missing: true });
-  if (!after) return;
-  if (!sameSocket(before, after)) {
-    throw new Error(`socket changed while checking whether it was stale: ${socketPath}`);
-  }
-  await unlink(socketPath).catch(ignoreMissing);
-}
-
-function connectToSocket(socketPath) {
-  return new Promise((resolve, reject) => {
-    const socket = createConnection(socketPath);
-    socket.once("connect", () => {
-      socket.destroy();
-      resolve();
-    });
-    socket.once("error", (error) => {
-      socket.destroy();
-      reject(error);
-    });
-  });
-}
-
-function listen(server, socketPath) {
+function listen(server, host, port) {
   return new Promise((resolve, reject) => {
     const onError = (error) => {
       server.off("listening", onListening);
@@ -112,7 +63,7 @@ function listen(server, socketPath) {
     };
     server.once("error", onError);
     server.once("listening", onListening);
-    server.listen(socketPath);
+    server.listen(port, host);
   });
 }
 
@@ -121,27 +72,4 @@ function closeNodeServer(server) {
   return new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
-}
-
-async function socketIdentity(socketPath, { missing = false } = {}) {
-  try {
-    const stat = await lstat(socketPath, { bigint: true });
-    return {
-      path: socketPath,
-      dev: stat.dev,
-      ino: stat.ino,
-      isSocket: stat.isSocket(),
-    };
-  } catch (error) {
-    if (missing && error?.code === "ENOENT") return undefined;
-    throw error;
-  }
-}
-
-function sameSocket(left, right) {
-  return right.isSocket && left.dev === right.dev && left.ino === right.ino;
-}
-
-function ignoreMissing(error) {
-  if (error?.code !== "ENOENT") throw error;
 }

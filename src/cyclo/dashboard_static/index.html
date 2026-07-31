@@ -48,7 +48,7 @@
         <div>
           <p class="eyebrow"><span aria-hidden="true">~/</span> local operations</p>
           <h1 id="page-title">Agentic loops,<br><span>at a glance.</span></h1>
-          <p class="hero-copy">One quiet place to see every team, the work in motion, and what the models consumed.</p>
+          <p class="hero-copy">One quiet place to see every team and the work in motion.</p>
         </div>
         <div class="snapshot-clock" aria-label="Snapshot information">
           <span class="snapshot-clock__label">Last snapshot</span>
@@ -103,16 +103,6 @@
               <span class="stat__label">Active agents</span>
               <strong class="stat__value" id="stat-agents">—</strong>
               <span class="stat__detail" id="stat-agents-detail">Awaiting snapshot</span>
-            </div>
-          </article>
-          <article class="stat">
-            <div class="stat__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M8 12h8M12 8v8" /></svg>
-            </div>
-            <div>
-              <span class="stat__label">Gateway usage</span>
-              <strong class="stat__value" id="stat-tokens">—</strong>
-              <span class="stat__detail" id="stat-tokens-detail">Global physical requests</span>
             </div>
           </article>
           <article class="stat stat--attention" id="attention-stat">
@@ -235,6 +225,9 @@
         <div class="mode-list" aria-label="Instance modes"></div>
 
         <dl class="instance-meta">
+          <div><dt>Desired</dt><dd class="desired-state"></dd></div>
+          <div><dt>Container</dt><dd class="container-state"></dd></div>
+          <div><dt>Readiness</dt><dd class="readiness-state"></dd></div>
           <div><dt>Health</dt><dd class="provider-health"></dd></div>
           <div><dt>Project</dt><dd class="project-path"></dd></div>
           <div><dt>Workspaces</dt><dd class="workspace-paths"></dd></div>

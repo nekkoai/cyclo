@@ -18,7 +18,6 @@ from cyclo.agentws_bundle import (
     packaged_default_roles,
     packaged_default_team,
 )
-from cyclo.state import StateStore
 from cyclo.team import init_team, load_team, verify_agentws_abi
 
 
@@ -72,25 +71,18 @@ def test_packaged_agentws_has_no_provider_runtime_policy() -> None:
     assert "CYCLO_PROJECT_MANIFEST" not in protocol
 
 
-def test_packaged_agentws_materializes_as_an_executable_runtime(tmp_path: Path) -> None:
-    store = StateStore(tmp_path / "state")
-    runtime_script = Path(__file__).parents[1] / "src" / "cyclo" / "container_runtime.py"
+def test_team_image_bakes_the_owned_agentws_runtime() -> None:
+    dockerfile = (
+        Path(__file__).parents[1]
+        / "src"
+        / "cyclo"
+        / "components"
+        / "team-runtime"
+        / "Dockerfile"
+    ).read_text(encoding="utf-8")
 
-    runtime = store.materialize_agentws(
-        "standalone",
-        packaged_agentws_template(),
-        runtime_script,
-        project_config=(
-            "name standalone\n"
-            "description Packaged AgentWS test.\n"
-            "team /team ro\n"
-            "mount source /workspace/source rw\n"
-        ),
-    )
-
-    assert (runtime / "tools" / "run_agentws").stat().st_mode & stat.S_IXUSR
-    assert (runtime / "bin" / "task-create").stat().st_mode & stat.S_IXUSR
-    assert (runtime / "tools" / "agentws-public" / "index.html").is_file()
+    assert "COPY --chown=${CYCLO_HOST_UID}:${CYCLO_HOST_GID} _agentws/template/ /agentws/" in dockerfile
+    assert "COPY container_runtime.py /usr/local/bin/cyclo-team-runtime" in dockerfile
 
 
 @pytest.mark.parametrize("agent_id", ["..", ".hidden", "-hidden", "_hidden"])

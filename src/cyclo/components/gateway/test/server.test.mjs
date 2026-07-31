@@ -1,10 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { EventEmitter, once } from "node:events";
-import { lstat, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
@@ -13,18 +8,16 @@ import {
   closeComponentServer,
   listenComponentServer,
 } from "@cyclo/component/server";
-import { createUnixTransport } from "@cyclo/component/transport";
+import { createDockerTransport } from "@cyclo/component/transport";
 import { Provider } from "@cyclo/provider/contract";
 
 import { checkGatewayHealth } from "../src/healthcheck.mjs";
 import { runGateway } from "../src/main.mjs";
 import { createGatewayServer } from "../src/server.mjs";
 
-const healthcheckPath = fileURLToPath(new URL("../src/healthcheck.mjs", import.meta.url));
-
-test("serves Component and Provider over one HTTP/1.1 Unix socket", async () => {
-  await withGateway(async ({ socketPath, services }) => {
-    const transport = gatewayTransport(socketPath);
+test("serves Component and Provider over one HTTP/1.1 TCP port", async () => {
+  await withGateway(async ({ target, services }) => {
+    const transport = createDockerTransport(target);
     const component = createClient(Component, transport);
     const provider = createClient(Provider, transport);
 
@@ -32,34 +25,39 @@ test("serves Component and Provider over one HTTP/1.1 Unix socket", async () => 
     assert.deepEqual((await provider.listModels({})).models, []);
 
     const payloads = [];
-    for await (const response of provider.infer({ model: "test-model", payload: "request" })) {
+    for await (const response of provider.infer({
+      model: "test-model",
+      payload: "request",
+    })) {
       payloads.push(response.payload);
     }
     assert.deepEqual(payloads, ["start", "done"]);
 
-    assert.equal(await checkGatewayHealth({ socketPath }), true);
-    assert.equal(await healthcheckExit(socketPath), 0);
+    assert.equal(await checkGatewayHealth({ target }), true);
     services.status = HealthStatus.NOT_READY;
-    assert.equal(await checkGatewayHealth({ socketPath }), false);
-    assert.equal(await healthcheckExit(socketPath), 1);
+    assert.equal(await checkGatewayHealth({ target }), false);
   });
 });
 
 for (const signalName of ["SIGTERM", "SIGINT"]) {
-  test(`${signalName} aborts active RPCs and removes the owned socket`, async () => {
-    const directory = await mkdtemp(join(tmpdir(), "cyclo-gateway-signal-"));
-    const socketPath = join(directory, "gateway.sock");
+  test(`${signalName} aborts active RPCs and closes the listener`, async () => {
     const signalSource = new EventEmitter();
-    const run = runGateway({
+    const listening = deferred();
+    const running = runGateway({
       services: fakeServices({ waitForCancellation: true }),
-      env: { CYCLO_COMPONENT_SOCKET: socketPath },
       signalSource,
+      listenOptions: { host: "127.0.0.1", port: 0 },
+      onListening: listening.resolve,
     });
+    const address = await listening.promise;
+    const target = `dns:///127.0.0.1:${address.port}`;
 
     try {
-      await waitForSocket(socketPath);
-      const provider = createClient(Provider, gatewayTransport(socketPath));
-      const iterator = provider.infer({ model: "test-model", payload: "request" })[Symbol.asyncIterator]();
+      const provider = createClient(Provider, createDockerTransport(target));
+      const iterator = provider.infer({
+        model: "test-model",
+        payload: "request",
+      })[Symbol.asyncIterator]();
       assert.equal((await iterator.next()).value.payload, "start");
 
       signalSource.emit(signalName);
@@ -67,27 +65,29 @@ for (const signalName of ["SIGTERM", "SIGINT"]) {
         iterator.next(),
         (error) => error instanceof ConnectError && error.code === Code.Unavailable,
       );
-      await run;
-      await assert.rejects(lstat(socketPath), (error) => error?.code === "ENOENT");
+      await running;
+      await assert.rejects(checkGatewayHealth({ target, timeoutMs: 50 }));
     } finally {
       signalSource.emit(signalName);
-      await run.catch(() => {});
-      await rm(directory, { recursive: true, force: true });
+      await running.catch(() => {});
     }
   });
 }
 
 async function withGateway(run) {
-  const directory = await mkdtemp(join(tmpdir(), "cyclo-gateway-server-"));
-  const socketPath = join(directory, "gateway.sock");
   const services = fakeServices();
   const server = await createGatewayServer({ services });
   try {
-    await listenComponentServer(server, { socketPath });
-    await run({ socketPath, services });
+    const address = await listenComponentServer(server, {
+      host: "127.0.0.1",
+      port: 0,
+    });
+    await run({
+      target: `dns:///127.0.0.1:${address.port}`,
+      services,
+    });
   } finally {
     await closeComponentServer(server);
-    await rm(directory, { recursive: true, force: true });
   }
 }
 
@@ -103,7 +103,7 @@ function fakeServices({ waitForCancellation = false } = {}) {
       listModels() {
         return { models: [] };
       },
-      async *infer(request, context) {
+      async *infer(_request, context) {
         yield { payload: "start" };
         if (waitForCancellation) {
           await aborted(context.signal);
@@ -116,31 +116,17 @@ function fakeServices({ waitForCancellation = false } = {}) {
   return services;
 }
 
-function gatewayTransport(socketPath) {
-  return createUnixTransport(socketPath);
-}
-
 function aborted(signal) {
   if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
-}
-
-async function waitForSocket(socketPath) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    try {
-      if ((await lstat(socketPath)).isSocket()) return;
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error(`timed out waiting for ${socketPath}`);
-}
-
-function healthcheckExit(socketPath) {
-  const child = spawn(process.execPath, [healthcheckPath], {
-    env: { ...process.env, CYCLO_COMPONENT_SOCKET: socketPath },
-    stdio: "ignore",
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", resolve, { once: true });
   });
-  return once(child, "exit").then(([code]) => code);
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }

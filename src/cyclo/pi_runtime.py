@@ -4,9 +4,9 @@ import json
 from functools import lru_cache
 from typing import Mapping
 
-from .component import component_sources_root
 from .errors import CycloError
 from .model_ids import split_public_model_id
+from .resources import components_root
 
 
 _MAX_SAFE_INTEGER = 2**53 - 1
@@ -17,7 +17,7 @@ def inference_format() -> str:
     """Return the Pi payload ABI shared with the packaged Node runtime."""
 
     path = (
-        component_sources_root()
+        components_root()
         / "protocol"
         / "provider"
         / "src"

@@ -25,7 +25,8 @@ export async function login(argv, options = {}) {
     ? await oauthLogin(parsed.provider, { input, output, providerLookup, providers })
     : { type: "api_key", key };
   const authPath = env.CYCLO_GATEWAY_AUTH_JSON ?? "/var/lib/cyclo-gateway/auth.json";
-  const modelsPath = env.CYCLO_GATEWAY_MODELS_JSON ?? "/etc/cyclo-gateway/models.json";
+  const modelsPath = env.CYCLO_GATEWAY_MODELS_JSON
+    ?? "/var/lib/cyclo-gateway/models.json";
   const validateStore = options.validateStore ?? ((candidate) => {
     const catalogue = buildCatalogueForCredentials({
       credentials: candidate,

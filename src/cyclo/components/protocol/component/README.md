@@ -9,16 +9,11 @@ generates the HTTP handler and client contract from that service. Cyclo uses
 the Connect protocol over HTTP/1.1; gRPC and gRPC-Web are not part of this
 component contract.
 
-Components listen on `/run/cyclo/component.sock` by default. A requirement
-named `upstream` binds to `/run/cyclo/requirements/upstream/component.sock`.
-The producer owns and writes its socket directory; consumers receive that
-directory through a read-only mount. The socket is mode `0666` so components
-with unrelated non-root UIDs can connect; possession of the private bind mount,
-not a shared container UID or a sidecar bearer token, is the access boundary.
-Requirement bindings define no credential-file path. This ownership rule is
-required because Node removes its Unix-socket
-pathname when the server closes. Mount directories rather than socket files so
-consumers see the new socket inode after restart.
+Components listen on `0.0.0.0:50051`. DComp gives a linked requirement named
+`upstream` a canonical target such as
+`DCOMP_LINK_UPSTREAM=dns:///provider:50051`. Each direct link is a private
+Docker network containing only its producer and consumer; no bearer token,
+credential file, service registry, or socket mount is involved.
 
 ```text
 .proto service
@@ -44,7 +39,7 @@ require upstream cyclo.component.v1.Component
 ```
 
 `require` has a local name because a component may need the same interface
-more than once. The declaration contains no URL, socket, container, discovery,
+more than once. The declaration contains no URL, target, container, discovery,
 or routing policy. The host configuration binds requirement names to component
 endpoints.
 
@@ -85,7 +80,8 @@ npm run check -- test/fixtures/valid.conf gen/schema.json
 
 Buf lints the contracts, generates native ESM plus declarations in `gen/`, and
 emits `gen/schema.json` for language-neutral declaration validation. The tests
-also make a real generated Connect call over a Unix-domain socket.
+also make a real generated Connect call over TCP and verify DComp target
+parsing.
 
 This package deliberately owns only the common Component interface. Cyclo's
 Provider control plane and opaque Pi transport live in the sibling

@@ -11,9 +11,9 @@ provide cyclo.provider.v1.Provider
 require upstream cyclo.provider.v1.Provider
 ```
 
-It listens at `/run/cyclo/component.sock`. The component runtime mounts the
-upstream producer at `/run/cyclo/requirements/upstream/component.sock`. Both
-connections use ConnectRPC over HTTP/1.1 Unix sockets.
+It listens on `0.0.0.0:50051` and reads the upstream target from
+`DCOMP_LINK_UPSTREAM`, for example `dns:///gateway:50051`. Both connections
+use ConnectRPC over HTTP/1.1 TCP on DComp-owned private networks.
 
 The pass-through never parses or reserializes `Infer.payload`. Whitespace,
 property order, unknown Pi fields, and future events are preserved as strings.
@@ -29,6 +29,6 @@ npm ci
 npm test
 ```
 
-Tests exercise the complete two-socket component and assert exact request and
+Tests exercise the complete two-component path and assert exact request and
 response payload equality, header isolation, cancellation, health recovery,
 and shutdown cleanup.

@@ -11,9 +11,10 @@ provide cyclo.component.v1.Component
 provide cyclo.provider.v1.Provider
 ```
 
-Both services use ConnectRPC on `/run/cyclo/component.sock`. The gateway has no
-TCP listener. Only its container mounts `/var/lib/cyclo-gateway`, containing
-`auth.json` and `usage.jsonl`.
+Both services use ConnectRPC over HTTP/1.1 on `0.0.0.0:50051`. DComp exposes
+that port only to explicitly linked consumers on private Docker networks. Only
+the gateway container mounts `/var/lib/cyclo-gateway`, containing `auth.json`
+and `usage.jsonl`.
 
 ## Inference boundary
 
@@ -71,7 +72,7 @@ restart repair has run.
 | `/var/lib/cyclo-gateway/auth.json` | API keys and OAuth credentials | private, writable |
 | `/var/lib/cyclo-gateway/usage.jsonl` | request/token audit | private, writable |
 | `/etc/cyclo-gateway/models.json` | optional custom Pi catalogue | read-only |
-| `/run/cyclo/component.sock` | Component and Provider ConnectRPC | producer-owned socket |
+| TCP port `50051` | Component and Provider ConnectRPC | DComp private links only |
 
 ## Build and test
 

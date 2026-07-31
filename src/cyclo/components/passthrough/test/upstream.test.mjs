@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 
 import { resolveBindings } from "@cyclo/component/bindings";
@@ -16,11 +13,7 @@ import { Provider } from "@cyclo/provider/contract";
 
 import { createUpstreamBinding } from "../src/upstream.mjs";
 
-test("createUpstreamBinding uses only its UDS and never carries caller credentials", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "cyclo-passthrough-upstream-"));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const socketPath = join(directory, "custom-upstream.sock");
-
+test("createUpstreamBinding uses only its DComp link and never carries caller credentials", async (t) => {
   let requestHeaders;
   const bindings = resolveBindings(
     parseDeclaration(`
@@ -48,11 +41,14 @@ test("createUpstreamBinding uses only its UDS and never carries caller credentia
     ]),
   });
   t.after(() => closeComponentServer(server));
-  await listenComponentServer(server, { socketPath });
+  const address = await listenComponentServer(server, {
+    host: "127.0.0.1",
+    port: 0,
+  });
 
   const binding = await createUpstreamBinding({
     env: {
-      CYCLO_REQUIRE_UPSTREAM_SOCKET: `  ${socketPath}  `,
+      DCOMP_LINK_UPSTREAM: `dns:///127.0.0.1:${address.port}`,
     },
   });
   const controller = new AbortController();
@@ -75,21 +71,17 @@ test("createUpstreamBinding uses only its UDS and never carries caller credentia
   assert.equal([...requestHeaders.values()].some((value) => value.includes("caller-secret")), false);
 });
 
-test("createUpstreamBinding rejects invalid socket overrides before constructing a client", () => {
+test("createUpstreamBinding requires a canonical DComp target", () => {
   assert.throws(
     () => createUpstreamBinding({
       env: {
-        CYCLO_REQUIRE_UPSTREAM_SOCKET: "relative.sock",
+        DCOMP_LINK_UPSTREAM: "upstream:50051",
       },
     }),
-    /must be absolute/u,
+    /dns:\/\/\/host:port/u,
   );
   assert.throws(
-    () => createUpstreamBinding({
-      env: {
-        CYCLO_REQUIRE_UPSTREAM_SOCKET: "   ",
-      },
-    }),
-    /must be non-empty/u,
+    () => createUpstreamBinding({ env: {} }),
+    /DCOMP_LINK_UPSTREAM is required/u,
   );
 });

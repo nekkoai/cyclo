@@ -1,52 +1,113 @@
-# Cyclo Provider protocol v1
+# Provider components and protocol
 
-Cyclo composes model providers as ordinary components connected by named
-interfaces. The Provider interface deliberately separates its control plane
-from its inference data plane.
+## Scope
 
-## Component graph
+Cyclo separates component wiring from application semantics:
 
-Every provider repository contains a Docker build context and a short
-`component.conf`:
+- DComp declares component inputs and outputs, creates direct link networks,
+  injects endpoint addresses, and owns Docker lifecycle.
+- Cyclo defines the `cyclo.provider.v1.Provider` application interface and
+  compiles gateway, provider, and team components into one DComp system.
+- Provider implementations decide what transformation or policy to apply.
 
-```text
-component passthrough
-provide cyclo.component.v1.Component
-provide cyclo.provider.v1.Provider
-require upstream cyclo.provider.v1.Provider
-```
+DComp does not inspect Provider messages. Cyclo does not proxy inference
+traffic on the host.
 
-`provide` declares services implemented by the component. `require` declares a
-named input. The installation's `host.conf` binds each requirement to `gateway`
-or an earlier component:
+## Component source
+
+A provider source is a directory containing `component.dcomp`:
 
 ```text
-provider first ./providers/pass upstream=gateway
-provider second ./providers/pass upstream=first
+docker example/passthrough:1
+input cyclo.provider.v1.Provider upstream
+output cyclo.provider.v1.Provider provider
 ```
 
-The gateway is always the root Provider. An empty `host.conf` selects its
-socket directly. Otherwise Cyclo selects the last working component whose
-declared inputs are also working. A build or startup failure leaves an earlier
-working provider selected—possibly the gateway—while status exposes the failed
-component. For catalogue discovery, Cyclo also falls back when a health-ready
-outer component fails `ListModels` or violates the structural catalogue
-contract (for example, missing/duplicate IDs or a missing format identifier).
-Inference is never replayed through another component.
+The grammar is:
 
-Cyclo starts components in declaration order from their valid current-release
-installed images, building only images that are absent or from a different release.
-An explicit restart requires those images and never builds. Each component gets
-a writable output socket directory at `/run/cyclo` and one read-only producer
-socket directory per requirement at
-`/run/cyclo/requirements/NAME`. Components run with `--network none`; the
-socket mount is the edge capability. They receive no sibling sockets, Docker
-socket, team files, project files, or gateway credential volume.
+```text
+docker IMAGE
+input PROTOBUF_SERVICE LOCAL_NAME
+output PROTOBUF_SERVICE LOCAL_NAME
+```
 
-## Transport
+Blank lines and text following `#` are ignored. `docker` appears exactly once.
+Input and output names are local to the component and use lower-case letters,
+digits, and hyphens. Service names are fully qualified protobuf service names.
 
-Services use ConnectRPC over HTTP/1.1 Unix-domain sockets. The component
-interface provides the common `Health` RPC. The Provider interface provides:
+Cyclo requires every installed provider to expose exactly one
+`cyclo.provider.v1.Provider` output. It may declare additional application
+interfaces. Every input must be bound by `host.conf`.
+
+If the directory contains a `Dockerfile`, Cyclo builds it. Otherwise `IMAGE`
+must already be present in the selected local Docker Engine. The image must
+define an OCI health check and listen for its declared interfaces on TCP port
+50051.
+
+## Host installation
+
+Install component instances in `host.conf`:
+
+```text
+provider trace ./providers/passthrough upstream=gateway.provider -- label=trace
+provider policy ./providers/policy upstream=trace.provider
+```
+
+The grammar is:
+
+```text
+provider NAME SOURCE [context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...]
+```
+
+- `gateway.provider` is the fixed root output.
+- Relative source paths resolve beside `host.conf`; `~` is not expanded.
+- `context=PATH` selects a Docker build context containing `SOURCE`.
+- Each `INPUT` must name an input from the source descriptor.
+- Each target must name a declared output with the same service identity.
+- Every input is bound exactly once.
+- Declarations are resolved as one set, so a target may appear earlier or later
+  in the file and cyclic address wiring is valid.
+- Arguments after `--` replace the image command arguments. They are
+  whitespace-delimited tokens, not a shell command.
+- The last provider line is the outer Provider. With no provider lines, the
+  gateway is outer.
+
+Declaration order selects the outer endpoint; it does not define startup order.
+DComp links are address bindings, not dependency edges.
+
+## Runtime links
+
+Cyclo materializes each Provider source as a DComp component and each binding as
+a DComp link. For:
+
+```text
+provider policy ./policy upstream=trace.provider
+```
+
+DComp attaches `policy` and `trace` to a private internal Docker network and
+injects:
+
+```text
+DCOMP_LINK_UPSTREAM=dns:///trace:50051
+```
+
+The target is consumed by the provider's client library. All built-in Cyclo
+components use ConnectRPC over HTTP/1.1 TCP. No bearer token, service registry,
+sidecar, or host proxy participates in the link.
+
+Each direct link gets a separate network containing only its consumer and
+producer. Output fan-out attaches the producer to one network per consumer.
+Components receive no addresses for undeclared inputs.
+
+The gateway has external egress for native provider calls. The outer Provider
+is published on a dynamic `127.0.0.1` port so the Cyclo host can call
+`ListModels` and read the model catalogue. Usage is read separately through a
+confined gateway administration container. Intermediate providers are not
+published on the host.
+
+## Provider service
+
+The versioned service is:
 
 ```proto
 service Provider {
@@ -55,46 +116,29 @@ service Provider {
 }
 ```
 
-ConnectRPC supplies framing, streaming, backpressure, deadlines, cancellation,
-and transport errors. Cyclo does not add bearer tokens between mounted
-component sockets.
+### Catalogue control plane
 
-## Typed control plane
+`ListModels` returns typed model records. A model includes:
 
-`ListModels` returns the model IDs accepted by that component, display data,
-capabilities, token limits, and an `inference_format` identifier. Cyclo reads
-this information to assemble the format-neutral catalogue. Before launching a
-Pi-based team, the team-runtime boundary verifies that every roster model uses
-the pinned Pi format and has capabilities and limits Pi can register. Every
-model advertising the Pi format must provide positive context-window and
-maximum-output token limits. The gateway excludes an invalid model with a
-bounded diagnostic rather than hiding otherwise valid models from that
-account; the team-side Pi adapter independently repeats the compatibility
-check in case a provider changes after host preflight.
+- a public `PROVIDER/MODEL` identifier;
+- display metadata;
+- input/output modalities and capabilities;
+- optional context/output limits;
+- extension metadata; and
+- an `inference_format` ABI identifier.
 
-Public model IDs are `PROVIDER/MODEL`. `PROVIDER` is a 1–64 character,
-lowercase host route prefix that begins with a letter or number and may then
-contain letters, numbers, underscores, or hyphens. `MODEL` is an opaque
-provider-local value of at most 1,024 UTF-16 code units with no whitespace,
-control characters, or unpaired surrogates; it may contain additional slashes.
-A component that aliases, combines, or selects
-upstreams publishes its own IDs. A pure relay returns the upstream catalogue
-unchanged. Components must not connect an input whose `inference_format` they
-do not implement.
+The provider prefix is a Cyclo route name. The model-local suffix is otherwise
+opaque and may contain `/`. Public IDs must be unique in the outer catalogue.
+Teams select exact IDs from this catalogue.
 
-Version 1 uses:
+Provider components assembling a catalogue must reject or isolate entries whose
+inference format they cannot serve. The Pi adapter accepts only the pinned Pi
+format and requires the Pi-specific positive token limits. This is endpoint ABI
+validation, not inspection of prompts or tool calls.
 
-```text
-pi-ai@0.81.1
-```
+### Opaque inference data plane
 
-The identifier makes the data-plane ABI explicit. Updating the pinned Pi
-version requires updating every endpoint that encodes or decodes its payload;
-relays remain unaffected.
-
-## Opaque inference data plane
-
-The complete wire messages are:
+The data-plane messages are deliberately small:
 
 ```proto
 message InferRequest {
@@ -107,92 +151,76 @@ message InferResponse {
 }
 ```
 
-Cyclo understands `model` because it must select a route. It does not understand
-`payload`.
+For the current team runtime:
 
-The team-side Pi extension serializes one call frame:
+- the request payload is one JSON string containing Pi's native call frame;
+- each response payload is one JSON string containing one native Pi assistant
+  event; and
+- stream order, event meaning, tool schemas, reasoning, and termination remain
+  Pi semantics.
 
-```json
-{
-  "context": { "systemPrompt": "...", "messages": [], "tools": [] },
-  "options": { "reasoning": "high", "maxTokens": 4096 }
-}
+A transparent provider forwards the payload strings exactly. It must not parse,
+validate, normalize, or reserialize them. Only the gateway adapter that invokes
+the native provider and the Pi adapter inside the team decode these strings.
+
+A component may intentionally inspect payloads to implement policy, auditing,
+fusion, or routing. Such inspection is the component's advertised behavior,
+not a requirement of the Provider transport.
+
+Cancellation and deadlines travel through ConnectRPC. Routing and transport
+failures use Connect errors. Provider/model failures represented by Pi remain
+opaque Pi events.
+
+## Health
+
+Every image must define a meaningful OCI `HEALTHCHECK`. DComp observes Docker's
+container and health states; it does not require or query a particular health
+protocol. Cyclo's built-in components implement their own Component health RPC
+and call it from their image health check, but an external provider may use any
+bounded probe that accurately represents readiness.
+
+A provider is operational only when its exact DComp component is running and
+Docker reports it healthy. Cyclo exposes that fact through:
+
+```sh
+cyclo component status NAME
+cyclo providers status
+cyclo doctor
 ```
 
-This is Pi data, not a Cyclo inference schema. Message roles, content blocks,
-tool definitions, JSON Schema, signatures, reasoning state, tool arguments,
-provider-specific options, and future fields pass unchanged. A relay must not
-parse, normalize, validate, redact, reorder, or reserialize the string.
+The selected outer component is the only route; a failed component remains
+visible and makes the system non-operational.
 
-At the root gateway, the Pi endpoint parses the call frame once because it must
-invoke the in-process `pi-ai` API. It passes `context` and the JSON inference
-options to the pinned native `streamSimple` implementation. It supplies the
-native model, credential, abort signal, retry policy, and transport controls
-from gateway-owned state.
+## Security properties
 
-The following local/security controls never come from inference data:
+- Only the gateway receives the credential volume.
+- A provider receives inference payloads and link targets only for its declared
+  inputs.
+- Team and provider components receive no Docker socket or DComp/Cyclo state.
+- Link networks are private to their two endpoints.
+- Host-side Provider calls are restricted to the DComp-reported loopback port.
+- Provider source and Dockerfiles are trusted installation inputs.
 
-- `signal` and the caller deadline travel as ConnectRPC call controls;
-- `apiKey` comes from the gateway credential store;
-- arbitrary HTTP headers and provider environment values are gateway-owned;
-- injected client objects and JavaScript callbacks cannot cross the wire; and
-- native transport, HTTP/WebSocket timeout, and retry controls are
-  gateway-owned.
+This protocol does not provide per-team quotas, semantic filtering, or
+confidentiality from a provider in the selected path. Those policies belong in
+explicit Provider components or separate installations.
 
-All other JSON options are forwarded without a Cyclo allowlist.
+## Implementing a provider
 
-For each native Pi `AssistantMessageEvent`, the gateway serializes one response
-payload. The team-side endpoint parses that string and pushes the event directly
-into Pi. Cyclo does not impose another event state machine or finish-reason
-enumeration. Because the root gateway inserts physical authentication material,
-it also makes an exact, schema-independent containment check across JSON string
-values and property names before emitting an event. If the event reflects an
-inserted API key or authentication-header value, the gateway emits no payload
-and fails with a generic `DATA_LOSS` error. This check belongs only to the
-credential-owning endpoint; relays remain opaque.
+A provider repository should:
 
-## Errors
+1. define its application protobuf services and generated bindings;
+2. add `component.dcomp`;
+3. build an image that listens on `0.0.0.0:50051`;
+4. read each required endpoint from `DCOMP_LINK_<INPUT>`;
+5. implement `ListModels` and streaming `Infer`;
+6. define a bounded OCI health check; and
+7. perform bounded graceful shutdown on Docker's stop signal.
 
-The error boundary is simple:
+Validate its descriptor and host bindings with:
 
-- unknown outer model: Connect `NOT_FOUND`;
-- invalid JSON or missing Pi call framing at the terminating endpoint: Connect
-  `INVALID_ARGUMENT`;
-- unavailable component, credential, or concrete service: Connect
-  `UNAVAILABLE`;
-- upstream response reflecting gateway authentication material: Connect
-  `DATA_LOSS`, with the response suppressed;
-- cancellation or deadline: the corresponding Connect error;
-- a provider/model failure already represented as a Pi event: an opaque response
-  payload.
+```sh
+cyclo providers check
+```
 
-Relays propagate Connect errors unchanged and never retry a partially emitted
-stream. The team-side endpoint converts a transport failure into a terminal Pi
-error event because Pi's local stream API requires a terminal result.
-
-## Semantic provider components
-
-Opaque transport does not prevent useful components. It makes interpretation
-explicit.
-
-- A pass-through or multiplexer can route using the outer model and forward the
-  payload strings untouched.
-- A recorder can store opaque strings without understanding them.
-- A fusion, policy, or transformation component may deliberately terminate the
-  Pi payload ABI, inspect it, perform upstream calls, and emit new Pi events.
-
-Such a component owns and documents those semantics. They are not silently
-imposed on every Cyclo request by the transport layer.
-
-## Required tests
-
-A Provider implementation should test:
-
-- exact request and response payload-string preservation for relays;
-- arbitrary and future Pi fields, including unrestricted tool schemas;
-- streamed delivery without buffering;
-- cancellation propagation and cleanup;
-- isolation from incoming HTTP authorization/cookie headers;
-- suppression of gateway authentication material reflected by an upstream;
-- catalogue inference-format compatibility; and
-- generic health behavior when an upstream disappears and returns.
+Exercise it independently before installing it in a production `host.conf`.

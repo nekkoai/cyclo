@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,17 +22,22 @@ from cyclo.dashboard import (
     scan_agentws_queue,
     validate_dashboard_host,
 )
-from cyclo.component import ComponentStatus
-from cyclo.docker import Docker, DockerContainerState
+from cyclo.dcomp import (
+    DCompComponentStatus,
+    DCompNetworkStatus,
+    DCompPublishedPort,
+    DCompStatus,
+)
 from cyclo.errors import CycloError
-from cyclo.installation import team_container_name, team_network_name
-from cyclo.providers import ProviderConnection
 from cyclo.state import Instance, StateStore
 
 
-PROVIDER_GENERATION = "provider-generation"
-PROVIDER_SOCKET = Path("/var/lib/cyclo/providers/component.sock")
-GATEWAY_SOCKET = Path("/var/lib/cyclo/gateway/component.sock")
+@pytest.fixture(autouse=True)
+def local_docker_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "cyclo.state.local_docker_endpoint",
+        lambda: "unix:///tmp/cyclo-test-docker.sock",
+    )
 
 
 def instance(
@@ -39,26 +45,42 @@ def instance(
     *,
     intent: str = "running",
     offline: bool = False,
-    provider_socket: Path = GATEWAY_SOCKET,
 ) -> Instance:
     return Instance(
         id=identifier,
         team_name=f"team-{identifier}",
         team_path=f"/teams/{identifier}",
-        project_path=f"/projects/{identifier}",
         generation=f"generation-{identifier}",
-        providers=["openai-codex"],
         models=["openai-codex/gpt-test"],
-        container_name=f"cyclo-{identifier}",
-        network_name=f"cyclo-{identifier}-net",
-        image="cyclo-runtime:test",
+        image="sha256:" + "a" * 64,
         team_write=False,
         offline=offline,
-        launch_id="0" * 32,
+        verbose=False,
+        image_override="",
+        agentws_host="127.0.0.1",
         intent=intent,
-        port=4100 if not offline else None,
-        provider_socket_path=str(provider_socket),
-        provider_generation=PROVIDER_GENERATION,
+        requested_port=0,
+        team_roster="team",
+        team_protocol=False,
+        pi_default_provider="openai-codex",
+        pi_default_model="gpt-test",
+        project_name=identifier,
+        project_file=f"/projects/{identifier}/project.cyclo",
+        project_description=f"Dashboard test project {identifier}.",
+        project_generation=f"project-generation-{identifier}",
+        project_config=(
+            f"name {identifier}\n"
+            f"description Dashboard test project {identifier}.\n"
+            f"mount source /projects/{identifier} rw\n"
+        ),
+        project_mounts=[
+            {
+                "name": "source",
+                "path": f"/projects/{identifier}",
+                "mode": "rw",
+            }
+        ],
+        runtime_version="0.2.0",
     )
 
 
@@ -70,8 +92,6 @@ def queue(store: StateStore, identifier: str) -> Path:
 
 
 def persist(store: StateStore, selected: Instance) -> None:
-    selected.container_name = team_container_name(store.system, selected.id)
-    selected.network_name = team_network_name(store.system, selected.id)
     store.save(selected)
 
 
@@ -82,7 +102,9 @@ class InMemoryInstanceStore(StateStore):
         super().__init__(root)
         self._instances = instances
 
-    def list_report(self) -> tuple[list[Instance], list[str]]:
+    def list_report(
+        self,
+    ) -> tuple[list[Instance], list[str]]:
         return list(self._instances), []
 
 
@@ -326,191 +348,129 @@ def test_queue_snapshot_has_a_shared_entry_budget(tmp_path: Path) -> None:
     assert any("truncated" in error for error in result["errors"])
 
 
-class FakeDocker:
+def component_status(
+    name: str,
+    *,
+    status: str = "running",
+    health: str = "healthy",
+    problem: str = "",
+    host_port: int | None = None,
+    host_ip: str = "127.0.0.1",
+) -> DCompComponentStatus:
+    ports = (
+        ()
+        if host_port is None
+        else (
+            DCompPublishedPort(
+                "tcp",
+                host_ip,
+                host_port,
+                4137,
+            ),
+        )
+    )
+    return DCompComponentStatus(
+        name=name,
+        container_id="" if status == "missing" else "a" * 64,
+        status=status,
+        health=health,
+        exit_code=0,
+        problem=problem,
+        published_ports=ports,
+    )
+
+
+def runtime_status(
+    *components: DCompComponentStatus,
+    desired: bool = True,
+    operational: bool | None = None,
+    operation: str = "",
+    phase: str = "",
+    networks: tuple[DCompNetworkStatus, ...] = (),
+) -> DCompStatus:
+    if operational is None:
+        operational = bool(components) and not operation and all(
+            component.status == "running"
+            and component.health == "healthy"
+            and not component.problem
+            for component in components
+        ) and all(not network.problem for network in networks)
+    return DCompStatus(
+        api_version=1,
+        name="cyclo-test",
+        desired=desired,
+        operational=operational,
+        digest="f" * 64 if desired else "",
+        operation=operation,
+        phase=phase,
+        networks=networks,
+        components=components,
+    )
+
+
+class FakeRuntime:
     def __init__(
         self,
-        states: dict[str, bool | DockerContainerState],
+        selected: DCompStatus | Exception,
+        *,
+        outer: str = "gateway",
+        providers: tuple[str, ...] = (),
     ) -> None:
-        self.states = states
-
-    def container_lifecycle_state(
-        self, instance: Instance, *, system: str
-    ) -> DockerContainerState:
-        assert system
-        name = instance.container_name
-        if name not in self.states:
-            logical = name.split("-team-", 1)[-1]
-            name = f"cyclo-{logical}"
-        state = self.states[name]
-        if isinstance(state, bool):
-            return (
-                DockerContainerState.RUNNING
-                if state
-                else DockerContainerState.ABSENT
-            )
-        return state
-
-
-class FakeUsage:
-    def usage(self) -> dict[str, object]:
-        return {
-            "totals": {
-                "requests": 4,
-                "input_tokens": 107,
-                "output_tokens": 27,
-            },
-            "by_provider": {
-                "openai-codex": {
-                    "requests": 4,
-                    "input_tokens": 107,
-                    "output_tokens": 27,
-                }
-            },
-        }
-
-
-def test_snapshot_reports_foreign_same_name_container_as_untrusted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = StateStore(tmp_path / "state")
-    selected = instance("alpha")
-    persist(store, selected)
-    docker = Docker()
-    monkeypatch.setattr(
-        docker,
-        "inspect",
-        lambda _kind, _name, **_kwargs: {
-            "Id": "foreign-container-id",
-            "Name": f"/{selected.container_name}",
-            "Config": {
-                "Labels": {
-                    "io.cyclo.system": "ba9876543210",
-                    "io.cyclo.kind": "team",
-                    "io.cyclo.instance": selected.id,
-                }
-            },
-            "State": {"Running": True},
-        },
-    )
-
-    result = DashboardSnapshot(store, docker=docker).build()
-
-    row = result["instances"][0]
-    assert row["state"] == "unknown"
-    assert row["agentws_port"] is None
-    assert any("non-Cyclo container" in error for error in row["errors"])
-
-
-class FakeProvider:
-    def __init__(self, connection: ProviderConnection) -> None:
-        self.selected_connection = connection
+        self.selected = selected
         self.calls = 0
+        self.port_reads: list[tuple[str, DCompStatus]] = []
+        self.host = SimpleNamespace(
+            outer_component=outer,
+            providers=tuple(
+                SimpleNamespace(name=name) for name in providers
+            ),
+        )
 
-    def statuses(self) -> tuple[ComponentStatus, ...]:
+    def status(self) -> DCompStatus:
         self.calls += 1
-        return self.selected_connection.components
+        if isinstance(self.selected, Exception):
+            raise self.selected
+        return self.selected
 
-    def connection(
+    def component_for_instance(self, identifier: str) -> str:
+        return f"mapped-{identifier}"
+
+    def team_port(
         self,
-        statuses: tuple[ComponentStatus, ...] | None = None,
-    ) -> ProviderConnection:
-        assert statuses is None or statuses == self.selected_connection.components
-        return self.selected_connection
-
-    def catalogue(
-        self,
-        connection: ProviderConnection,
-    ) -> tuple[ProviderConnection, dict[str, object]]:
-        assert connection is self.selected_connection
-        return self.selected_connection, {"models": []}
-
-
-def component_status(
-    *,
-    name: str = "gateway",
-    present: bool = True,
-    running: bool = True,
-    current: bool = True,
-    container_state: str | None = None,
-    engine_health: str = "healthy",
-    ready: bool = True,
-) -> ComponentStatus:
-    return ComponentStatus(
-        name,
-        "gateway" if name == "gateway" else "passthrough",
-        "sha256:" + "1" * 64,
-        "1" * 64 if present else None,
-        running,
-        container_state or ("running" if running else "stopped"),
-        engine_health,
-        current,
-        "ready" if ready else "not-ready",
-    )
+        instance: Instance,
+        status: DCompStatus,
+    ) -> int:
+        self.port_reads.append((instance.id, status))
+        component = status.component(self.component_for_instance(instance.id))
+        assert component is not None
+        ports = [
+            port.host_port
+            for port in component.published_ports
+            if port.container_port == 4137
+        ]
+        if len(ports) != 1:
+            raise CycloError("team has no unique effective dashboard port")
+        return ports[0]
 
 
-def provider_status(
-    *,
-    gateway_docker: ComponentStatus | None = None,
-    gateway_ready: bool = True,
-    component_name: str | None = None,
-    component_docker: ComponentStatus | None = None,
-    component_ready: bool = True,
-) -> ProviderConnection:
-    gateway = gateway_docker or component_status(ready=gateway_ready)
-    if gateway.health == "ready" and not gateway_ready:
-        gateway = ComponentStatus(
-            gateway.name,
-            gateway.kind,
-            gateway.image_id,
-            gateway.container_id,
-            gateway.running,
-            gateway.container_state,
-            gateway.engine_health,
-            gateway.current,
-            "not-ready",
-            gateway.error,
+def healthy_runtime(
+    *identifiers: str,
+    offline: tuple[str, ...] = (),
+) -> FakeRuntime:
+    components = [component_status("gateway")]
+    components.extend(
+        component_status(
+            f"mapped-{identifier}",
+            host_port=None if identifier in offline else 4100,
         )
-    components: tuple[ComponentStatus, ...] = ()
-    if component_name is not None:
-        selected = component_docker or component_status(
-            name=component_name,
-            ready=component_ready,
-        )
-        if selected.name != component_name or (
-            selected.health == "ready" and not component_ready
-        ):
-            selected = ComponentStatus(
-                component_name,
-                "passthrough",
-                selected.image_id,
-                selected.container_id,
-                selected.running,
-                selected.container_state,
-                selected.engine_health,
-                selected.current,
-                "ready" if component_ready else "not-ready",
-                selected.error,
-            )
-        components = (
-            selected,
-        )
-    selected_socket = (
-        PROVIDER_SOCKET
-        if components and components[-1].works
-        else GATEWAY_SOCKET
+        for identifier in identifiers
     )
-    return ProviderConnection(
-        PROVIDER_GENERATION,
-        selected_socket,
-        (gateway, *components),
-    )
+    return FakeRuntime(runtime_status(*components))
 
 
-def ready_provider() -> FakeProvider:
-    return FakeProvider(provider_status())
-
-
-def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
+def test_snapshot_joins_state_runtime_and_queue_from_one_status_read(
+    tmp_path: Path,
+) -> None:
     store = StateStore(tmp_path / "state")
     alpha = instance("alpha")
     old = instance("old", intent="stopped", offline=True)
@@ -527,16 +487,13 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
     (job / "status").write_text("failed\n", encoding="utf-8")
     (alpha_queue / "agents" / "worker").mkdir()
 
-    provider = ready_provider()
-    usage = FakeUsage().usage()
+    runtime = healthy_runtime("alpha")
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True, "cyclo-old": False}),  # type: ignore[arg-type]
-        usage_reader=FakeUsage(),
-        provider_reader=provider,
+        runtime=runtime,  # type: ignore[arg-type]
     ).build()
 
-    assert result["version"] == 3
+    assert result["version"] == 4
     assert result["summary"] == {
         "instances": 2,
         "running": 1,
@@ -545,45 +502,50 @@ def test_snapshot_joins_state_docker_queue_and_usage(tmp_path: Path) -> None:
         "tasks": 1,
         "jobs": 1,
         "agents": 1,
-        "tokens": 134,
-        "requests": 4,
         "errors": 0,
     }
     assert result["source_errors"] == []
-    assert result["usage"] == usage
+    assert "usage" not in result
     running, stopped = result["instances"]
     assert running["id"] == "alpha"
-    assert running["intent"] == "running"
-    assert running["state"] == "running"
+    assert running["desired"] == "running"
+    assert running["container"] == "running"
+    assert running["readiness"] == "healthy"
     assert running["health"] == {"state": "ready", "reason": ""}
     assert running["agentws_port"] == 4100
     assert "agentws_url" not in running
     assert running["project"] == {
         "name": "alpha",
         "path": "/projects/alpha",
-        "definition": None,
-        "description": "",
-        "generation": "",
+        "definition": "/projects/alpha/project.cyclo",
+        "description": "Dashboard test project alpha.",
+        "generation": "project-generation-alpha",
         "workspaces": [
             {
-                "name": "alpha",
+                "name": "source",
                 "path": "/projects/alpha",
-                "container_path": "/workspace",
+                "container_path": "/workspace/source",
             }
         ],
         "read_only_mounts": [],
     }
     assert "project_read_only" not in running["mode"]
     assert "usage" not in running
-    assert stopped["intent"] == "stopped"
-    assert stopped["state"] == "stopped"
+    assert stopped["desired"] == "stopped"
+    assert stopped["container"] == "absent"
+    assert stopped["readiness"] == "absent"
     assert stopped["health"] == {
         "state": "inactive",
-        "reason": "not an active running Cyclo instance",
+        "reason": "instance is not operational",
     }
     assert stopped["agentws_port"] is None
     assert "usage" not in stopped
-    assert provider.calls == 1
+    assert runtime.calls == 1
+    assert [identifier for identifier, _status in runtime.port_reads] == [
+        "alpha"
+    ]
+    assert runtime.port_reads[0][1] is runtime.selected
+    assert result["runtime"]["components"][0]["name"] == "gateway"
 
 
 def test_snapshot_reports_suspended_agents_per_running_instance(
@@ -597,12 +559,10 @@ def test_snapshot_reports_suspended_agents_per_running_instance(
     (runs / "planner-1.suspended").write_text(
         "reason=fatal-agent-safety-error\n", encoding="utf-8"
     )
-    provider = ready_provider()
-
+    runtime = healthy_runtime("alpha", "beta")
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True, "cyclo-beta": True}),  # type: ignore[arg-type]
-        provider_reader=provider,
+        runtime=runtime,  # type: ignore[arg-type]
     ).build()
 
     rows = {row["id"]: row for row in result["instances"]}
@@ -613,14 +573,14 @@ def test_snapshot_reports_suspended_agents_per_running_instance(
     assert rows["beta"]["health"] == {"state": "ready", "reason": ""}
     assert result["summary"]["provider_issues"] == 0
     assert result["summary"]["attention"] == 1
-    assert provider.calls == 1
+    assert runtime.calls == 1
 
 
 def test_snapshot_reports_unresolved_planner_failure_as_attention(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    persist(store, instance("alpha", provider_socket=GATEWAY_SOCKET))
+    persist(store, instance("alpha"))
     root = queue(store, "alpha")
     mark_supervisor_ready(root)
     job = root / "jobs" / "uart-plan"
@@ -630,8 +590,7 @@ def test_snapshot_reports_unresolved_planner_failure_as_attention(
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=healthy_runtime("alpha"),  # type: ignore[arg-type]
     ).build()
 
     assert result["instances"][0]["health"] == {
@@ -655,8 +614,7 @@ def test_snapshot_does_not_report_ready_when_supervisor_state_is_unreadable(
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=healthy_runtime("alpha"),  # type: ignore[arg-type]
     ).build()
 
     health = result["instances"][0]["health"]
@@ -665,7 +623,7 @@ def test_snapshot_does_not_report_ready_when_supervisor_state_is_unreadable(
     assert result["summary"]["attention"] == 1
 
 
-def test_snapshot_preserves_provider_failure_beside_agent_suspension(
+def test_snapshot_preserves_optional_provider_failure_beside_agent_suspension(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
@@ -676,127 +634,126 @@ def test_snapshot_preserves_provider_failure_beside_agent_suspension(
     (runs / "supervisor.ready").write_text("pid=123\n", encoding="utf-8")
     (runs / "planner-1.suspended").write_text("last_status=70\n", encoding="utf-8")
 
+    runtime = FakeRuntime(
+        runtime_status(
+            component_status("gateway"),
+            component_status(
+                "fusion",
+                status="exited",
+                health="unhealthy",
+                problem="upstream refused the connection",
+            ),
+            component_status("mapped-alpha", host_port=4100),
+            operational=False,
+        ),
+        providers=("fusion",),
+    )
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        provider_reader=FakeProvider(
-            provider_status(
-                component_name="fusion",
-                component_docker=component_status(
-                    name="fusion",
-                    running=False,
-                ),
-                component_ready=False,
-            )
-        ),
+        runtime=runtime,  # type: ignore[arg-type]
     ).build()
 
     assert result["instances"][0]["health"] == {
         "state": "agents-suspended",
         "reason": (
-            "ignored unavailable optional components: fusion stopped; "
+            "unavailable optional provider components: component fusion: "
+            "upstream refused the connection; status exited; health unhealthy; "
             "1 agent suspended: planner-1"
         ),
     }
     assert result["summary"]["provider_issues"] == 1
     assert result["summary"]["attention"] == 1
+    assert result["source_errors"] == [
+        "component fusion: upstream refused the connection; "
+        "status exited; health unhealthy"
+    ]
+
+
+def test_snapshot_tolerates_an_absent_optional_provider_component(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    persist(store, instance("alpha"))
+    mark_supervisor_ready(queue(store, "alpha"))
+    runtime = FakeRuntime(
+        runtime_status(
+            component_status("gateway"),
+            component_status("mapped-alpha", host_port=4100),
+        ),
+        providers=("fusion",),
+    )
+
+    result = DashboardSnapshot(
+        store,
+        runtime=runtime,  # type: ignore[arg-type]
+    ).build()
+
+    assert result["instances"][0]["health"] == {
+        "state": "ready",
+        "reason": (
+            "unavailable optional provider components: "
+            "component fusion: absent from runtime status"
+        ),
+    }
+    assert result["summary"]["provider_issues"] == 1
+    assert result["source_errors"] == [
+        "component fusion: absent from runtime status"
+    ]
 
 
 @pytest.mark.parametrize(
-    ("status", "health_state", "reason"),
+    ("provider", "reason"),
     [
         (
-            provider_status(
-                gateway_docker=component_status(
-                    present=False,
-                    running=False,
-                ),
-                gateway_ready=False,
-            ),
-            "provider-down",
-            "gateway absent",
+            None,
+            "outer provider component gateway is absent",
         ),
         (
-            provider_status(
-                component_name="fusion",
-                component_docker=component_status(
-                    name="fusion",
-                    running=False,
-                ),
-                component_ready=False,
+            component_status(
+                "gateway",
+                status="exited",
+                health="unhealthy",
             ),
-            "ready",
-            "ignored unavailable optional components: fusion stopped",
+            "gateway: status exited; health unhealthy",
         ),
         (
-            provider_status(
-                component_name="fusion",
-                component_docker=component_status(
-                    name="fusion",
-                    current=False,
-                ),
+            component_status(
+                "gateway",
+                problem="container identity does not match desired image",
             ),
-            "ready",
-            "ignored unavailable optional components: fusion stale",
-        ),
-        (
-            ProviderConnection(
-                PROVIDER_GENERATION,
-                GATEWAY_SOCKET,
-                (
-                    component_status(),
-                    ComponentStatus(
-                        "fusion",
-                        "passthrough",
-                        None,
-                        None,
-                        False,
-                        "unknown",
-                        "missing",
-                        False,
-                        "unreachable",
-                        "cannot inspect ownership",
-                    ),
-                ),
-            ),
-            "ready",
-            (
-                "ignored unavailable optional components: fusion unknown: "
-                "cannot inspect ownership"
-            ),
+            "gateway: container identity does not match desired image",
         ),
     ],
 )
-def test_snapshot_exposes_exact_provider_health_and_reads_it_once(
+def test_snapshot_exposes_outer_provider_health_from_dcomp(
     tmp_path: Path,
-    status: ProviderConnection,
-    health_state: str,
+    provider: DCompComponentStatus | None,
     reason: str,
 ) -> None:
     store = StateStore(tmp_path / "state")
     for identifier in ("alpha", "beta"):
-        persist(store, instance(identifier, provider_socket=status.socket_path))
+        persist(store, instance(identifier))
         mark_supervisor_ready(queue(store, identifier))
     persist(store, instance("stopped", intent="stopped"))
     queue(store, "stopped")
-    provider = FakeProvider(status)
-
+    components = [
+        component_status("mapped-alpha", host_port=4100),
+        component_status("mapped-beta", host_port=4101),
+    ]
+    if provider is not None:
+        components.insert(0, provider)
+    runtime = FakeRuntime(runtime_status(*components, operational=False))
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker(
-            {
-                "cyclo-alpha": True,
-                "cyclo-beta": True,
-                "cyclo-stopped": False,
-            }
-        ),  # type: ignore[arg-type]
-        provider_reader=provider,
+        runtime=runtime,  # type: ignore[arg-type]
     ).build()
 
     rows = {row["id"]: row for row in result["instances"]}
-    assert rows["alpha"]["state"] == "running"
+    assert rows["alpha"]["desired"] == "running"
+    assert rows["alpha"]["container"] == "running"
+    assert rows["alpha"]["readiness"] == "healthy"
     assert rows["alpha"]["health"] == {
-        "state": health_state,
+        "state": "provider-down",
         "reason": reason,
     }
     assert rows["beta"]["health"] == rows["alpha"]["health"]
@@ -804,139 +761,262 @@ def test_snapshot_exposes_exact_provider_health_and_reads_it_once(
     assert result["summary"]["running"] == 2
     assert result["summary"]["provider_issues"] == 1
     assert result["summary"]["attention"] == 2
-    assert provider.calls == 1
+    assert runtime.calls == 1
 
 
-def test_snapshot_reports_provider_status_errors_as_unknown(tmp_path: Path) -> None:
-    class BrokenProvider:
-        calls = 0
-
-        @classmethod
-        def statuses(cls) -> tuple[ComponentStatus, ...]:
-            cls.calls += 1
-            raise CycloError("Docker socket denied")
-
+def test_snapshot_reports_runtime_status_errors_without_hiding_queues(
+    tmp_path: Path,
+) -> None:
     store = StateStore(tmp_path / "state")
     persist(store, instance("alpha"))
-    mark_supervisor_ready(queue(store, "alpha"))
+    root = queue(store, "alpha")
+    task = root / "tasks" / "saved"
+    task.mkdir()
+    (task / "state").write_text("open\n", encoding="utf-8")
+    runtime = FakeRuntime(CycloError("dcomp state is unreadable"))
+    result = DashboardSnapshot(
+        store,
+        runtime=runtime,  # type: ignore[arg-type]
+    ).build()
+
+    row = result["instances"][0]
+    assert row["container"] == "unknown"
+    assert row["readiness"] == "unknown"
+    assert result["instances"][0]["health"] == {
+        "state": "inactive",
+        "reason": "instance is not operational",
+    }
+    assert row["counts"]["tasks"]["total"] == 1
+    assert result["runtime"] is None
+    assert result["source_errors"] == [
+        "runtime status unavailable: dcomp state is unreadable"
+    ]
+    assert result["summary"]["provider_issues"] == 1
+    assert runtime.calls == 1
+
+
+def test_snapshot_keeps_applied_state_when_host_configuration_is_malformed(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    observed = runtime_status(component_status("gateway"))
+
+    class Runtime:
+        @property
+        def host(self):
+            raise CycloError("host.conf:1: expected provider declaration")
+
+        @staticmethod
+        def component_for_instance(identifier: str) -> str:
+            return f"mapped-{identifier}"
+
+        @staticmethod
+        def status() -> DCompStatus:
+            return observed
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        provider_reader=BrokenProvider(),
+        runtime=Runtime(),  # type: ignore[arg-type]
     ).build()
 
-    assert result["instances"][0]["health"] == {
-        "state": "provider-unknown",
-        "reason": "provider status unavailable: Docker socket denied",
-    }
+    assert result["runtime"]["components"][0]["name"] == "gateway"
+    assert result["source_errors"] == [
+        "host configuration unavailable: "
+        "host.conf:1: expected provider declaration"
+    ]
     assert result["summary"]["provider_issues"] == 1
-    assert BrokenProvider.calls == 1
 
 
-def test_snapshot_fails_closed_when_provider_health_is_not_ready(
+def test_snapshot_exposes_dcomp_component_and_network_problems(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
     persist(store, instance("alpha"))
     mark_supervisor_ready(queue(store, "alpha"))
-
+    runtime = FakeRuntime(
+        runtime_status(
+            component_status("gateway"),
+            component_status(
+                "mapped-alpha",
+                problem="unexpected image sha256:foreign",
+                host_port=4100,
+            ),
+            operational=False,
+            operation="up",
+            phase="start",
+            networks=(
+                DCompNetworkStatus(
+                    key="link:mapped-alpha.provider",
+                    id="network-id",
+                    internal=True,
+                    problem="recorded network is absent",
+                ),
+            ),
+        )
+    )
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        provider_reader=FakeProvider(
-            provider_status(gateway_ready=False)
-        ),
+        runtime=runtime,  # type: ignore[arg-type]
     ).build()
 
-    assert result["instances"][0]["health"] == {
-        "state": "provider-down",
-        "reason": "gateway not ready",
-    }
+    row = result["instances"][0]
+    assert row["container"] == "running"
+    assert row["readiness"] == "healthy"
+    assert row["health"]["state"] == "inactive"
+    assert row["errors"] == [
+        "runtime component mapped-alpha: unexpected image sha256:foreign"
+    ]
+    assert result["source_errors"] == [
+        "runtime operation in progress: up (start)",
+        "runtime network link:mapped-alpha.provider: "
+        "recorded network is absent",
+    ]
+    assert result["runtime"]["components"][1]["problem"] == (
+        "unexpected image sha256:foreign"
+    )
 
 
 @pytest.mark.parametrize(
-    ("docker_state", "expected_state"),
+    "container_state",
     [
-        (DockerContainerState.STOPPED, "stale"),
-        (DockerContainerState.PAUSED, "paused"),
-        (DockerContainerState.RESTARTING, "restarting"),
+        "exited",
+        "paused",
+        "restarting",
     ],
 )
-def test_snapshot_reports_nonoperational_lifecycle_without_persisting_it(
+def test_snapshot_reports_raw_nonoperational_lifecycle_without_persisting_it(
     tmp_path: Path,
-    docker_state: DockerContainerState,
-    expected_state: str,
+    container_state: str,
 ) -> None:
     store = StateStore(tmp_path / "state")
     selected = instance("alpha")
     persist(store, selected)
 
+    runtime = FakeRuntime(
+        runtime_status(
+            component_status("gateway"),
+            component_status(
+                "mapped-alpha",
+                status=container_state,
+                health="none",
+            ),
+            operational=False,
+        )
+    )
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": docker_state}),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=runtime,  # type: ignore[arg-type]
     ).build()
 
     row = result["instances"][0]
-    assert row["intent"] == "running"
-    assert row["state"] == expected_state
+    assert row["desired"] == "running"
+    assert row["container"] == container_state
+    assert row["readiness"] == "none"
     assert row["health"]["state"] == "inactive"
+    assert f"status {container_state}" in row["errors"][0]
     assert result["summary"]["attention"] == 1
     assert store.load("alpha").intent == "running"
 
 
-@pytest.mark.parametrize(
-    "docker_state",
-    [DockerContainerState.STOPPED, DockerContainerState.DEAD],
-)
-def test_snapshot_reports_present_container_with_stopped_intent_as_orphan(
+@pytest.mark.parametrize("readiness", ["starting", "unhealthy", "missing"])
+def test_snapshot_exposes_raw_running_container_readiness(
     tmp_path: Path,
-    docker_state: DockerContainerState,
+    readiness: str,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = instance("alpha")
+    persist(store, selected)
+    runtime = FakeRuntime(
+        runtime_status(
+            component_status("gateway"),
+            component_status(
+                "mapped-alpha",
+                health=readiness,
+                host_port=4100,
+            ),
+            operational=False,
+        )
+    )
+
+    result = DashboardSnapshot(
+        store,
+        runtime=runtime,  # type: ignore[arg-type]
+    ).build()
+
+    row = result["instances"][0]
+    assert row["desired"] == "running"
+    assert row["container"] == "running"
+    assert row["readiness"] == readiness
+    assert row["health"]["state"] == "inactive"
+    assert row["agentws_port"] is None
+    assert result["summary"]["running"] == 1
+    assert result["summary"]["attention"] == 1
+    assert runtime.calls == 1
+    assert runtime.port_reads == []
+
+
+@pytest.mark.parametrize(
+    "container_state",
+    ["exited", "dead"],
+)
+def test_snapshot_reports_raw_present_container_with_stopped_desire(
+    tmp_path: Path,
+    container_state: str,
 ) -> None:
     store = StateStore(tmp_path / "state")
     selected = instance("alpha", intent="stopped")
     persist(store, selected)
 
+    runtime = FakeRuntime(
+        runtime_status(
+            component_status("gateway"),
+            component_status(
+                "mapped-alpha",
+                status=container_state,
+                health="none",
+            ),
+            operational=False,
+        )
+    )
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": docker_state}),  # type: ignore[arg-type]
+        runtime=runtime,  # type: ignore[arg-type]
     ).build()
 
     row = result["instances"][0]
-    assert row["intent"] == "stopped"
-    assert row["state"] == "orphan"
+    assert row["desired"] == "stopped"
+    assert row["container"] == container_state
+    assert row["readiness"] == "none"
     assert row["agentws_port"] is None
     assert result["summary"]["attention"] == 1
 
 
-def test_snapshot_includes_pending_deletion_from_its_retired_queue(
+def test_snapshot_keeps_stopped_instance_queue_visible(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    selected = instance("retiring", intent="deleting")
+    selected = instance("retiring", intent="stopped")
     persist(store, selected)
     root = queue(store, selected.id)
     task = root / "tasks" / "saved-task"
     task.mkdir()
     (task / "spec.md").write_text("durable work\n", encoding="utf-8")
-    store.instance_dir(selected.id).rename(store.deletion_dir(selected.id))
+    (task / "state").write_text("open\n", encoding="utf-8")
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker(
-            {"cyclo-retiring": DockerContainerState.ABSENT}
-        ),  # type: ignore[arg-type]
+        runtime=healthy_runtime(),  # type: ignore[arg-type]
     ).build()
 
     row = result["instances"][0]
     assert row["id"] == selected.id
-    assert row["intent"] == "deleting"
-    assert row["state"] == "deleting"
+    assert row["desired"] == "stopped"
+    assert row["container"] == "absent"
+    assert row["readiness"] == "absent"
     assert row["agentws_port"] is None
     assert row["counts"]["tasks"]["total"] == 1
     assert result["summary"]["instances"] == 1
-    assert result["summary"]["attention"] == 1
+    assert result["summary"]["attention"] == 0
 
 
 def test_snapshot_exposes_project_definition_and_named_mounts(tmp_path: Path) -> None:
@@ -963,13 +1043,12 @@ def test_snapshot_exposes_project_definition_and_named_mounts(tmp_path: Path) ->
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({configured.container_name: True}),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=healthy_runtime("alpha"),  # type: ignore[arg-type]
     ).build()
 
     assert result["instances"][0]["project"] == {
         "name": "silicon",
-        "path": "/projects/alpha",
+        "path": "/configs/silicon",
         "definition": "/configs/silicon/project.cyclo",
         "description": "RTL development",
         "generation": "project-generation",
@@ -1004,10 +1083,7 @@ def test_snapshot_isolates_malformed_project_mount_state(tmp_path: Path) -> None
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker(
-            {good.container_name: True, broken.container_name: True}
-        ),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=healthy_runtime("good", "broken"),  # type: ignore[arg-type]
     ).build()
 
     assert {row["id"] for row in result["instances"]} == {"good", "broken"}
@@ -1051,8 +1127,7 @@ def test_snapshot_preserves_valid_mounts_beside_invalid_entries(
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({configured.container_name: True}),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=healthy_runtime("alpha"),  # type: ignore[arg-type]
     ).build()
 
     row = result["instances"][0]
@@ -1075,6 +1150,7 @@ def test_snapshot_rejects_empty_or_non_string_project_definition_state(
     empty.project_name = "empty-project"
     empty.project_description = "Missing mounts"
     empty.project_generation = "empty-generation"
+    empty.project_mounts = []
     malformed = instance("malformed")
     malformed.project_file = {"unexpected": True}  # type: ignore[assignment]
     store = InMemoryInstanceStore(tmp_path / "state", [empty, malformed])
@@ -1083,15 +1159,18 @@ def test_snapshot_rejects_empty_or_non_string_project_definition_state(
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker(
-            {empty.container_name: True, malformed.container_name: True}
-        ),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=healthy_runtime("empty", "malformed"),  # type: ignore[arg-type]
     ).build()
 
     by_id = {row["id"]: row for row in result["instances"]}
     assert any("must contain at least one mount" in error for error in by_id["empty"]["errors"])
-    assert by_id["malformed"]["project"]["workspaces"] == []
+    assert by_id["malformed"]["project"]["workspaces"] == [
+        {
+            "name": "source",
+            "path": "/projects/malformed",
+            "container_path": "/workspace/source",
+        }
+    ]
     assert any("project_file must be a string" in error for error in by_id["malformed"]["errors"])
 
 
@@ -1101,13 +1180,35 @@ def test_snapshot_counts_queue_errors_as_attention(tmp_path: Path) -> None:
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=healthy_runtime("alpha"),  # type: ignore[arg-type]
     ).build()
 
     assert result["summary"]["attention"] == 1
     assert result["summary"]["errors"] == 1
     assert result["instances"][0]["errors"]
+
+
+def test_snapshot_preserves_fleet_visibility_without_a_runtime_reader(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    selected = instance("alpha")
+    persist(store, selected)
+    mark_supervisor_ready(queue(store, selected.id))
+
+    result = DashboardSnapshot(store).build()
+
+    row = result["instances"][0]
+    assert row["container"] == "unknown"
+    assert row["readiness"] == "unknown"
+    assert row["health"] == {
+        "state": "inactive",
+        "reason": "instance is not operational",
+    }
+    assert result["summary"]["provider_issues"] == 1
+    assert result["source_errors"] == [
+        "runtime status unavailable: runtime is not configured"
+    ]
 
 
 def test_snapshot_reports_bad_instance_records_without_hiding_readable_ones(
@@ -1122,14 +1223,13 @@ def test_snapshot_reports_bad_instance_records_without_hiding_readable_ones(
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=healthy_runtime("alpha"),  # type: ignore[arg-type]
     ).build()
 
     assert [row["id"] for row in result["instances"]] == ["alpha"]
     assert len(result["source_errors"]) == 1
     assert str(broken) in result["source_errors"][0]
-    assert "invalid Cyclo instance metadata" in result["source_errors"][0]
+    assert "invalid Cyclo instance state" in result["source_errors"][0]
     assert result["summary"]["errors"] == 1
 
 
@@ -1143,8 +1243,7 @@ def test_snapshot_counts_unknown_job_status_as_attention(tmp_path: Path) -> None
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=healthy_runtime("alpha"),  # type: ignore[arg-type]
     ).build()
 
     row = result["instances"][0]
@@ -1163,37 +1262,13 @@ def test_snapshot_counts_unknown_task_state_as_attention(tmp_path: Path) -> None
 
     result = DashboardSnapshot(
         store,
-        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        provider_reader=ready_provider(),
+        runtime=healthy_runtime("alpha"),  # type: ignore[arg-type]
     ).build()
 
     row = result["instances"][0]
     assert row["counts"]["tasks"]["unknown"] == 1
     assert any("unknown or unreadable state" in error for error in row["errors"])
     assert result["summary"]["attention"] == 1
-
-
-def test_snapshot_separates_gateway_source_errors_from_instance_errors(
-    tmp_path: Path,
-) -> None:
-    class BrokenUsage:
-        def usage(self) -> dict[str, object]:
-            raise RuntimeError("gateway stopped")
-
-    store = StateStore(tmp_path / "state")
-    persist(store, instance("alpha"))
-    mark_supervisor_ready(queue(store, "alpha"))
-
-    result = DashboardSnapshot(
-        store,
-        docker=FakeDocker({"cyclo-alpha": True}),  # type: ignore[arg-type]
-        usage_reader=BrokenUsage(),
-        provider_reader=ready_provider(),
-    ).build()
-
-    assert result["source_errors"] == ["gateway usage unavailable: gateway stopped"]
-    assert result["summary"]["errors"] == 1
-    assert result["instances"][0]["errors"] == []
 
 
 def test_dashboard_http_server_is_read_only_and_serves_injected_assets() -> None:

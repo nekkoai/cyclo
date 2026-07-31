@@ -69,15 +69,15 @@ jobs:
           node-version: "22"
       - name: Install shipped component dependencies
         run: |
-          for package in protocol/component protocol/provider gateway passthrough pi-provider; do
-            npm ci --ignore-scripts --prefix "src/cyclo/components/$package"
+          for package in components/protocol/component components/protocol/provider components/gateway components/passthrough adapters/pi; do
+            npm ci --ignore-scripts --prefix "src/cyclo/$package"
           done
           npm ci --force --ignore-scripts --prefix src/cyclo/components/team-runtime
       - name: Run Node tests
         run: |
           node --test tests/*.mjs
-          for package in protocol/component protocol/provider gateway passthrough pi-provider; do
-            npm test --prefix "src/cyclo/components/$package"
+          for package in components/protocol/component components/protocol/provider components/gateway components/passthrough adapters/pi; do
+            npm test --prefix "src/cyclo/$package"
           done
       - name: Confirm generated protocol sources are current
         run: |
@@ -125,6 +125,10 @@ jobs:
           python tools/normalize-distributions dist
           python -m twine check dist/*
       - name: Exercise the built wheel installation
+        env:
+          # DComp is released separately and is not downloaded by Cyclo CI.
+          # The local release builder runs the required API-1 integration.
+          CYCLO_RELEASE_REQUIRE_DCOMP: "0"
         run: tools/release-acceptance "$PWD"/dist/cyclo_agent-*.whl
       - name: Confirm acceptance did not modify tracked files
         run: git diff --exit-code
@@ -146,16 +150,18 @@ jobs:
       - name: Build team image
         run: |
           docker build --pull \
+            --build-arg "CYCLO_HOST_UID=$(id -u)" \
+            --build-arg "CYCLO_HOST_GID=$(id -g)" \
             --tag cyclo-team:ci \
             --file src/cyclo/components/team-runtime/Dockerfile \
-            src/cyclo/components
+            src/cyclo
       - name: Build a derived team image through Cyclo
         run: |
-          PYTHONPATH=src python -c 'from pathlib import Path; from cyclo.team_runtime_image import docker_runner, ensure_derived, image_id; base = docker_runner.inspect("image", "cyclo-team:ci", missing=False); assert base is not None; ensure_derived("cyclo-derived-team:ci", Path("tests/fixtures/derived-team").resolve(), image_id(base))'
+          PYTHONPATH=src python -c 'from pathlib import Path; from cyclo.images import Images; images = Images(); base = images.inspect("cyclo-team:ci"); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); images.build("cyclo-derived-team:ci", dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))'
           docker run --rm --network none --entrypoint /bin/sh \
             cyclo-derived-team:ci -ceu \
             'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
-      - name: Exercise the real multi-project team runtime
+      - name: Exercise the baked AgentWS team runtime
         run: PYTHONPATH=src tools/runtime-write-acceptance cyclo-team:ci
       - name: Build gateway image
         run: |
@@ -172,8 +178,6 @@ jobs:
       - name: Smoke-test images without credentials
         run: |
           docker run --rm --network none \
-            --env CYCLO_HOST_UID=1000 \
-            --env CYCLO_HOST_GID=1000 \
             cyclo-team:ci sh -ceu '
               python3 --version
               node --version

@@ -18,6 +18,46 @@ command -v npm >/dev/null 2>&1 || fail "npm is required"
 command -v docker >/dev/null 2>&1 || fail "Docker is required"
 docker info >/dev/null 2>&1 || fail "the Docker daemon is unavailable"
 
+if [ "${CYCLO_DCOMP+x}" = x ]; then
+    [ -n "$CYCLO_DCOMP" ] || fail "CYCLO_DCOMP is empty"
+    dcomp_request=$CYCLO_DCOMP
+else
+    dcomp_request=dcomp
+fi
+command -v "$dcomp_request" >/dev/null 2>&1 \
+    || fail "DComp is required; install machine API 1 or set CYCLO_DCOMP"
+dcomp=$(command -v "$dcomp_request")
+dcomp=$(CDPATH= cd -- "$(dirname -- "$dcomp")" && pwd)/$(basename -- "$dcomp")
+"$python" - "$dcomp" <<'PY'
+import json
+import subprocess
+import sys
+
+completed = subprocess.run(
+    [sys.argv[1], "version", "--json"],
+    check=False,
+    capture_output=True,
+    text=True,
+)
+if completed.returncode:
+    detail = " ".join((completed.stderr or completed.stdout).split())
+    raise SystemExit(
+        f"DComp version check failed ({completed.returncode})"
+        + (f": {detail}" if detail else "")
+    )
+try:
+    document = json.loads(completed.stdout)
+except json.JSONDecodeError as exc:
+    raise SystemExit("DComp version did not return JSON") from exc
+if (
+    not isinstance(document, dict)
+    or document.get("api_version") != 1
+    or not isinstance(document.get("version"), str)
+    or not document["version"]
+):
+    raise SystemExit(f"DComp machine API 1 is required, found: {document!r}")
+PY
+
 cd "$repo_root"
 [ -z "$(git status --porcelain --untracked-files=normal)" ] \
     || fail "the release must be built from a clean committed tree"
@@ -67,8 +107,8 @@ git archive --format=tar HEAD | tar -xf - -C "$source_tree"
 printf '%s\n' '==> source tests'
 (
     cd "$source_tree"
-    for package in protocol/component protocol/provider gateway passthrough pi-provider; do
-        npm ci --ignore-scripts --prefix "src/cyclo/components/$package"
+    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough adapters/pi; do
+        npm ci --ignore-scripts --prefix "src/cyclo/$package"
     done
     # This is the same intentional, lockfile-bounded peer override used by the
     # team Dockerfile for pi-simplify 0.2.2 against Pi 0.81.
@@ -80,8 +120,8 @@ printf '%s\n' '==> source tests'
         "$venv/bin/python" -m pytest -q \
         tests/test_release_manifest.py tests/test_secret_scan.py
     node --test tests/*.mjs
-    for package in protocol/component protocol/provider gateway passthrough pi-provider; do
-        npm test --prefix "src/cyclo/components/$package"
+    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough adapters/pi; do
+        npm test --prefix "src/cyclo/$package"
     done
     # Tests regenerate the checked-in protocol bindings. Refuse to package a
     # source tree that is no longer byte-for-byte equivalent to the release
@@ -130,6 +170,8 @@ wheel=$dist/cyclo_agent-$version-py3-none-any.whl
 [ -f "$wheel" ] || fail "expected wheel was not built: $wheel"
 
 printf '%s\n' '==> exact-wheel acceptance'
+CYCLO_DCOMP="$dcomp" \
+CYCLO_RELEASE_REQUIRE_DCOMP=1 \
 PYTHON="$venv/bin/python" \
     "$source_tree/tools/release-acceptance" "$wheel"
 
@@ -149,11 +191,13 @@ done
 
 printf '%s\n' '==> credential-free Docker images'
 docker build --pull \
+    --build-arg "CYCLO_HOST_UID=$(id -u)" \
+    --build-arg "CYCLO_HOST_GID=$(id -g)" \
     --tag "cyclo-team:release-$short_commit" \
     --file "$source_tree/src/cyclo/components/team-runtime/Dockerfile" \
-    "$source_tree/src/cyclo/components"
+    "$source_tree/src/cyclo"
 "$venv/bin/python" -c \
-    'import pathlib, sys; from cyclo.team_runtime_image import docker_runner, ensure_derived, image_id; base = docker_runner.inspect("image", sys.argv[1], missing=False); assert base is not None; root = pathlib.Path(sys.argv[2]); ensure_derived(sys.argv[3], root, image_id(base))' \
+    'import pathlib, sys; from cyclo.images import Images; images = Images(); base = images.inspect(sys.argv[1]); assert base is not None; root = pathlib.Path(sys.argv[2]).resolve(); images.build(sys.argv[3], dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))' \
     "cyclo-team:release-$short_commit" \
     "$source_tree/tests/fixtures/derived-team" \
     "cyclo-derived-team:release-$short_commit"
@@ -172,8 +216,6 @@ docker build --pull \
     --file "$source_tree/src/cyclo/components/passthrough/Dockerfile" \
     "$source_tree/src/cyclo/components"
 docker run --rm --network none \
-    --env CYCLO_HOST_UID=1000 \
-    --env CYCLO_HOST_GID=1000 \
     "cyclo-team:release-$short_commit" sh -ceu '
         python3 --version
         node --version

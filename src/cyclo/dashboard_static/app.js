@@ -2,15 +2,12 @@
   "use strict";
 
   const API_URL = "/api/snapshot";
+  const API_VERSION = 4;
   const REFRESH_INTERVAL_MS = 10_000;
   const ACTIVITY_LIMIT = 10;
   const CARD_ACTIVITY_LIMIT = 3;
 
   const numberFormatter = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
-  const compactFormatter = new Intl.NumberFormat(undefined, {
-    notation: "compact",
-    maximumFractionDigits: 1,
-  });
   const dateFormatter = new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium",
     timeStyle: "medium",
@@ -46,8 +43,6 @@
     statTasksDetail: document.querySelector("#stat-tasks-detail"),
     statAgents: document.querySelector("#stat-agents"),
     statAgentsDetail: document.querySelector("#stat-agents-detail"),
-    statTokens: document.querySelector("#stat-tokens"),
-    statTokensDetail: document.querySelector("#stat-tokens-detail"),
     statAttention: document.querySelector("#stat-attention"),
     statAttentionDetail: document.querySelector("#stat-attention-detail"),
     attentionStat: document.querySelector("#attention-stat"),
@@ -101,13 +96,38 @@
     return Number.isNaN(date.getTime()) ? null : date;
   }
 
-  function normalizeState(value) {
+  function displayContainerState(value) {
+    if (value === "running") return "running";
+    if (value === "restarting") return "starting";
+    if (["absent", "stopped", "dead"].includes(value)) return "stopped";
+    return "attention";
+  }
+
+  function normalizeContainerState(value) {
     const raw = stringValue(value, "unknown").toLowerCase();
-    if (["running", "up", "online", "active", "healthy"].includes(raw)) return "running";
-    if (["starting", "created", "restarting", "pending"].includes(raw)) return "starting";
-    if (["failed", "error", "unhealthy", "orphan", "orphaned", "paused", "stale", "unknown", "missing"].includes(raw)) return "attention";
-    if (["stopped", "exited", "dead", "removed", "offline"].includes(raw)) return "stopped";
-    return raw;
+    return [
+      "absent",
+      "running",
+      "paused",
+      "restarting",
+      "stopped",
+      "dead",
+      "unknown",
+    ].includes(raw) ? raw : "unknown";
+  }
+
+  function normalizeDesiredState(value) {
+    const raw = stringValue(value).toLowerCase();
+    if (["running", "stopped", "absent"].includes(raw)) return raw;
+    return "unknown";
+  }
+
+  function normalizeReadiness(value) {
+    const raw = stringValue(value).toLowerCase();
+    if (["absent", "starting", "healthy", "unhealthy", "missing", "unknown"].includes(raw)) {
+      return raw;
+    }
+    return "unknown";
   }
 
   function normalizeCounterGroup(value, keys) {
@@ -177,20 +197,12 @@
 
   function normalizeInstance(rawValue, generatedAt) {
     const raw = asObject(rawValue);
-    const id = firstString([raw.id, raw.instance_id], "unknown-instance");
-    const rawTeam = typeof raw.team === "object" ? asObject(raw.team) : {};
-    const teamReference = firstString([
-      rawTeam.name,
-      rawTeam.id,
-      typeof raw.team === "string" ? raw.team : "",
-      raw.team_name,
-      id,
-    ]);
+    const id = stringValue(raw.id, "unknown-instance");
+    const teamReference = stringValue(raw.team, id);
     const team = basename(teamReference) || id;
     const rawProject = asObject(raw.project);
     const project = firstString([
       rawProject.name,
-      typeof raw.project === "string" ? raw.project : "",
       rawProject.path,
     ], "—");
     const projectReference = firstString([
@@ -222,9 +234,16 @@
     ]);
     const agents = normalizeCounterGroup(counts.agents, ["total", "active"]);
     const errors = asArray(raw.errors).map(errorMessage).filter(Boolean);
-    const runtimeState = normalizeState(raw.state);
+    const container = normalizeContainerState(raw.container);
+    const desired = normalizeDesiredState(raw.desired);
+    const readiness = normalizeReadiness(raw.readiness);
+    const operational = desired === "running"
+      && container === "running"
+      && readiness === "healthy";
+    const settledStopped = desired === "stopped" && container === "absent";
+    const runtimeState = displayContainerState(container);
     const rawHealth = asObject(raw.health);
-    const healthState = firstString([rawHealth.state], runtimeState === "running" ? "provider-unknown" : "inactive").toLowerCase();
+    const healthState = firstString([rawHealth.state], operational ? "provider-unknown" : "inactive").toLowerCase();
     const knownHealthStates = [
       "ready",
       "provider-down",
@@ -239,9 +258,11 @@
       state: knownHealthStates.includes(healthState) ? healthState : "provider-unknown",
       reason: firstString([rawHealth.reason], raw.health ? "" : "provider status unavailable"),
     };
-    const needsAttention = runtimeState === "attention"
+    const needsAttention = !(operational || settledStopped)
+      || runtimeState === "attention"
       || health.state.startsWith("provider-")
       || health.state.startsWith("agents-")
+      || (health.state === "ready" && Boolean(health.reason))
       || errors.length > 0
       || tasks.unknown > 0
       || jobs.failed > 0
@@ -260,15 +281,19 @@
       projectDescription,
       workspaces,
       readOnlyMounts,
+      desired,
+      container,
+      readiness,
+      operational,
       state: runtimeState,
       displayState,
-      rawState: stringValue(raw.state, "unknown"),
+      rawState: container,
       health,
       mode: {
         offline: Boolean(mode.offline),
         teamWrite: Boolean(mode.team_write),
       },
-      generation: firstString([raw.generation, raw.team_generation], "—"),
+      generation: stringValue(raw.generation, "—"),
       agentwsUrl: agentwsUrlForCurrentHost(raw.agentws_port),
       tasks,
       jobs,
@@ -296,37 +321,32 @@
 
   function normalizeSnapshot(payloadValue) {
     const payload = asObject(payloadValue);
+    if (payload.version !== API_VERSION) {
+      throw new Error(`Snapshot response requires API version ${API_VERSION}.`);
+    }
     if (!Array.isArray(payload.instances)) {
       throw new Error("Snapshot response is missing its instances list.");
     }
-    const generatedAtText = firstString([payload.generated_at, payload.timestamp]);
+    const generatedAtText = stringValue(payload.generated_at);
     const generatedAt = safeDate(generatedAtText) || new Date();
     const instances = payload.instances.map((item) => normalizeInstance(item, generatedAt));
     const computed = computeSummary(instances);
     const provided = asObject(payload.summary);
-    const legacySourceErrors = Array.isArray(provided.errors)
-      ? provided.errors.map(errorMessage).filter(Boolean)
-      : [];
-    const sourceErrors = [
-      ...asArray(payload.source_errors).map(errorMessage),
-      ...legacySourceErrors,
-    ].filter(Boolean).filter((item, index, all) => all.indexOf(item) === index);
-    const providedErrorCount = Array.isArray(provided.errors)
-      ? 0
-      : asNumber(provided.errors);
+    const sourceErrors = asArray(payload.source_errors)
+      .map(errorMessage)
+      .filter(Boolean)
+      .filter((item, index, all) => all.indexOf(item) === index);
 
     const summary = {
       ...computed,
       running: asNumber(provided.running, computed.running),
       providerIssues: asNumber(provided.provider_issues, computed.providerIssues),
       attention: asNumber(provided.attention, computed.attention),
-      tokens: asNumber(provided.tokens, 0),
-      requests: asNumber(provided.requests, 0),
       sourceErrors: sourceErrors.length,
     };
     summary.errors = Math.max(
       computed.errors + summary.sourceErrors,
-      providedErrorCount,
+      asNumber(provided.errors),
     );
     const activityShell = { id: "fleet", team: "Fleet" };
     const globalActivity = asArray(payload.recent_activity)
@@ -348,12 +368,10 @@
       tasks: { total: 0, open: 0, closed: 0, unknown: 0 },
       jobs: { total: 0, active: 0, done: 0, failed: 0, unknown: 0 },
       agents: { total: 0, active: 0 },
-      tokens: 0,
-      requests: 0,
       errors: 0,
     };
     for (const instance of instances) {
-      if (instance.state === "running") summary.running += 1;
+      if (instance.container === "running") summary.running += 1;
       if (instance.health.state.startsWith("provider-")) summary.providerIssues = 1;
       if (instance.displayState === "attention") summary.attention += 1;
       summary.tasks.total += instance.tasks.total;
@@ -410,11 +428,6 @@
     return numberFormatter.format(asNumber(value));
   }
 
-  function formatTokens(value) {
-    const amount = asNumber(value);
-    return amount < 1_000 ? numberFormatter.format(amount) : compactFormatter.format(amount);
-  }
-
   function plural(value, singular, pluralForm = `${singular}s`) {
     return `${formatCount(value)} ${value === 1 ? singular : pluralForm}`;
   }
@@ -450,11 +463,7 @@
   }
 
   function stateLabel(instance) {
-    if (instance.state === "attention") return instance.rawState;
-    if (instance.state === "running") return "running";
-    if (instance.state === "starting") return instance.rawState;
-    if (instance.state === "stopped") return "stopped";
-    return instance.rawState || "unknown";
+    return instance.container || "unknown";
   }
 
   function avatarColor(value) {
@@ -491,9 +500,6 @@
     elements.statTasksDetail.textContent = taskSummary.join(" · ");
     elements.statAgents.textContent = formatCount(summary.agents.active);
     elements.statAgentsDetail.textContent = `${plural(summary.agents.total, "agent")} configured`;
-    elements.statTokens.textContent = formatTokens(summary.tokens);
-    elements.statTokens.title = `${formatCount(summary.tokens)} tokens`;
-    elements.statTokensDetail.textContent = `${plural(summary.requests, "request")} · global gateway total`;
     elements.statAttention.textContent = formatCount(summary.attention);
     elements.statAttentionDetail.textContent = `${plural(summary.jobs.failed, "failed job")} · ${plural(summary.providerIssues, "provider issue")} · ${plural(summary.errors, "data error")}`;
     elements.attentionStat.classList.toggle("has-attention", summary.attention > 0);
@@ -579,7 +585,7 @@
     pill.dataset.state = instance.state;
     pill.querySelector("b").textContent = stateLabel(instance);
 
-    const workspaceIsAvailable = Boolean(instance.agentwsUrl) && instance.state === "running" && !instance.mode.offline;
+    const workspaceIsAvailable = Boolean(instance.agentwsUrl) && instance.operational && !instance.mode.offline;
     workspaceLink.hidden = !workspaceIsAvailable;
     if (workspaceIsAvailable) {
       workspaceLink.href = instance.agentwsUrl;
@@ -588,6 +594,9 @@
 
     appendModeBadges(fragment.querySelector(".mode-list"), instance);
 
+    fragment.querySelector(".desired-state").textContent = instance.desired;
+    fragment.querySelector(".container-state").textContent = instance.container;
+    fragment.querySelector(".readiness-state").textContent = instance.readiness;
     const providerHealth = fragment.querySelector(".provider-health");
     providerHealth.dataset.state = instance.health.state;
     providerHealth.textContent = instance.health.state === "inactive"
@@ -667,6 +676,9 @@
         ...instance.readOnlyMounts.flatMap((mount) => [mount.name, mount.path, mount.containerPath]),
         instance.id,
         instance.generation,
+        instance.desired,
+        instance.container,
+        instance.readiness,
         instance.rawState,
         instance.health.state,
         instance.health.reason,

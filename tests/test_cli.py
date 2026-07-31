@@ -1,3379 +1,594 @@
 from __future__ import annotations
 
-import argparse
-import json
-import shutil
-from contextlib import contextmanager
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from cyclo.agentws_bundle import packaged_agentws_root
-from cyclo.agentws_queue import AgentSupervisorStatus
 from cyclo.cli import (
-    DEFAULT_HOST_CONFIG,
-    _GatewayUsageReader,
-    _prepare_team_images,
-    _refresh_projects,
+    _gateway_login_arguments,
+    _normalize_global_options,
+    _running_instance_condition,
     build_parser,
-    host_config,
+    cmd_component,
+    cmd_doctor,
+    cmd_models,
+    cmd_ps,
+    cmd_refresh,
+    cmd_run,
+    cmd_stop,
+    cmd_task_run,
     main,
     state_store,
 )
-from cyclo.component import COMPONENT_INTERFACE, PROVIDER_INTERFACE
-from cyclo.docker import Docker, DockerContainerState
+from cyclo.dcomp import DCompComponentStatus, DCompStatus
 from cyclo.errors import CycloError
-from cyclo.health import ProviderHealth
-from cyclo.installation import (
-    derived_team_image_name,
-    installation_id,
-    team_container_name,
-    team_image_name,
-    team_network_name,
-)
-from cyclo.project import MAX_PROJECT_FILE_BYTES, load_project
-from cyclo.project_run import (
-    configure_team_network,
-    load_project_teams,
-    project_run_bindings,
-    start_binding_locked,
-    validate_run_options,
-)
-from cyclo.state import Instance, StateStore
-from cyclo.team import load_team
 
 
-MODELS = ("openai-codex/gpt-test", "anthropic/claude-test")
+def namespace(**values):
+    defaults = {"state_root": None}
+    defaults.update(values)
+    return SimpleNamespace(**defaults)
 
 
-def catalogue_model(identifier: str) -> dict[str, object]:
-    return {
-        "id": identifier,
-        "displayName": identifier,
-        "capabilities": {
-            "inputModalities": ["MODALITY_TEXT"],
-            "outputModalities": ["MODALITY_TEXT"],
-        },
-        "contextWindowTokens": "128000",
-        "maxOutputTokens": "4096",
-        "inferenceFormat": "pi-ai@0.81.1",
-    }
+class MemoryStore:
+    def __init__(self, instances=()):
+        self.instances = {item.id: item for item in instances}
+        self.saved: list[str] = []
+        self.system = "test"
+
+    def locked(self, **_options):
+        return nullcontext()
+
+    def list(self):
+        return list(self.instances.values())
+
+    def list_report(self):
+        return self.list(), []
+
+    def load(self, identifier):
+        try:
+            return self.instances[identifier]
+        except KeyError as exc:
+            raise CycloError(f"Cyclo instance not found: {identifier}") from exc
+
+    def save(self, instance):
+        self.instances[instance.id] = instance
+        self.saved.append(instance.id)
+
+    def save_many(self, instances):
+        for instance in instances:
+            self.save(instance)
 
 
-def write_project(
-    path: Path,
-    team: Path,
-    project: Path,
-    *,
-    second_team: Path | None = None,
-) -> Path:
-    documentation = path.parent / "documentation"
-    documentation.mkdir(exist_ok=True)
-    lines = [
-        "name integration-project",
-        "description Exercise configured teams and named mounts.",
-        f"team {team} ro",
-    ]
-    if second_team is not None:
-        lines.append(f"team {second_team} rw")
-    lines.extend(
-        (
-            f"mount source {project} rw",
-            f"mount documentation {documentation} ro",
-        )
+def dcomp_status(*components: DCompComponentStatus) -> DCompStatus:
+    return DCompStatus(
+        api_version=1,
+        name="cyclo-test",
+        desired=True,
+        operational=all(
+            item.status == "running" and item.health == "healthy"
+            for item in components
+        ),
+        digest="a" * 64,
+        operation="",
+        phase="",
+        networks=(),
+        components=components,
     )
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return path
 
 
-def instance(
-    identifier: str,
-    root: Path,
-    *,
-    intent: str = "stopped",
-    project_file: Path | None = None,
-) -> Instance:
-    configured = project_file is not None
-    return Instance(
-        id=identifier,
-        team_name=f"team-{identifier}",
-        team_path=str((root / f"team-{identifier}").resolve()),
-        project_path=str(root.resolve()),
-        generation="team-generation",
-        providers=["gateway"],
-        models=[MODELS[0]],
-        container_name=f"cyclo-{identifier}",
-        network_name=f"cyclo-{identifier}-net",
-        image="cyclo-team:test",
-        team_write=False,
-        offline=False,
-        launch_id="0" * 32,
-        intent=intent,
-        project_name="integration-project" if configured else "",
-        project_file=str(project_file.resolve()) if configured else "",
-        project_description="Configured project" if configured else "",
-        project_generation="project-generation" if configured else "",
-        project_mounts=(
-            [{"name": "source", "path": str(root.resolve()), "mode": "rw"}]
-            if configured
-            else []
+def component(name: str) -> DCompComponentStatus:
+    return DCompComponentStatus(
+        name=name,
+        container_id="a" * 64,
+        status="running",
+        health="healthy",
+        exit_code=0,
+        problem="",
+        published_ports=(),
+    )
+
+
+def test_cli_surface_has_declarative_provider_and_component_commands() -> None:
+    parser = build_parser()
+
+    assert parser.parse_args(["providers", "check"]).providers_action == "check"
+    assert parser.parse_args(["providers", "status"]).providers_action == "status"
+    assert parser.parse_args(["providers", "restart"]).providers_action == "restart"
+    assert parser.parse_args(["component", "list"]).component_action == "list"
+    assert parser.parse_args(
+        ["component", "logs", "-f", "gateway"]
+    ).follow
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["providers", "start"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["component", "stop", "gateway"])
+
+
+def test_global_state_root_is_accepted_after_subcommands(tmp_path: Path) -> None:
+    arguments = _normalize_global_options(
+        ["task", "list", "demo", "--state-root", str(tmp_path)]
+    )
+
+    assert arguments[:2] == ["--state-root", str(tmp_path)]
+    assert arguments[2:] == ["task", "list", "demo"]
+
+
+def test_explicit_state_root_selects_local_host_configuration(
+    tmp_path: Path,
+) -> None:
+    store = state_store(namespace(state_root=str(tmp_path)))
+
+    assert store.root == tmp_path
+    assert store.host_config_scope == "local"
+
+
+def test_run_persists_intent_before_final_dcomp_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    instance = SimpleNamespace(id="demo-team")
+    binding = SimpleNamespace(instance=instance, team=SimpleNamespace())
+    store = MemoryStore()
+    status = dcomp_status(component("gateway"), component("team-demo"))
+
+    class Runtime:
+        def validate_project_mounts(self, definition, teams):
+            events.append("validate-mounts")
+
+        def apply(self, instances):
+            events.append("apply:" + ",".join(item.id for item in instances))
+            return SimpleNamespace(status=status)
+
+        def validate_instances(self, instances):
+            events.append(
+                "validate-instances:"
+                + ",".join(item.id for item in instances)
+            )
+
+        def require_instances_ready(self, instances, _status):
+            events.append(
+                "require-ready:" + ",".join(item.id for item in instances)
+            )
+
+    runtime = Runtime()
+    monkeypatch.setattr("cyclo.cli.load_project", lambda _path: SimpleNamespace())
+    monkeypatch.setattr(
+        "cyclo.cli.load_project_teams",
+        lambda _definition: ((SimpleNamespace(), SimpleNamespace()),),
+    )
+    monkeypatch.setattr("cyclo.cli.validate_run_options", lambda *_a, **_kw: None)
+    monkeypatch.setattr("cyclo.cli.agentws_root", lambda: Path("/agentws"))
+    monkeypatch.setattr(
+        "cyclo.cli.project_instance_id",
+        lambda _definition, _selected: "demo-team",
+    )
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.cyclo_runtime", lambda _args, _store: runtime)
+    monkeypatch.setattr("cyclo.cli._catalogue", lambda *_args: {"models": []})
+    monkeypatch.setattr(
+        "cyclo.cli.validate_pi_team_models",
+        lambda *_args: events.append("validate-models"),
+    )
+    monkeypatch.setattr(
+        "cyclo.cli._prepare_run_bindings",
+        lambda *_args: (binding,),
+    )
+    monkeypatch.setattr(
+        "cyclo.cli.verify_source_identities",
+        lambda _binding: events.append("verify-mounts"),
+    )
+    monkeypatch.setattr(
+        "cyclo.cli._announce_instance",
+        lambda *_args: events.append("announce"),
+    )
+    original_save_many = store.save_many
+
+    def save_many(selected):
+        cohort = tuple(selected)
+        events.append("save-many:" + ",".join(item.id for item in cohort))
+        original_save_many(cohort)
+
+    store.save_many = save_many
+
+    assert cmd_run(
+        namespace(
+            project="project.cyclo",
+            image=None,
+            offline=False,
+            verbose=False,
+            host="127.0.0.1",
+            port=0,
+            foreground=False,
+        )
+    ) == 0
+    assert events == [
+        "validate-mounts",
+        "apply:",
+        "validate-models",
+        "verify-mounts",
+        "validate-instances:demo-team",
+        "save-many:demo-team",
+        "apply:demo-team",
+        "require-ready:demo-team",
+        "announce",
+    ]
+
+
+def test_stop_persists_stopped_intent_before_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    instance = SimpleNamespace(id="demo", intent="running")
+    store = MemoryStore((instance,))
+
+    class Runtime:
+        def apply(self, instances):
+            events.append(
+                "apply:" + ",".join(f"{item.id}={item.intent}" for item in instances)
+            )
+
+    runtime = Runtime()
+    original_save = store.save
+
+    def save(selected):
+        events.append(f"save:{selected.id}={selected.intent}")
+        original_save(selected)
+
+    store.save = save
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.cyclo_runtime", lambda _args, _store: runtime)
+
+    assert cmd_stop(namespace(target="demo")) == 0
+    assert events == ["save:demo=stopped", "apply:demo=stopped"]
+
+
+def test_refresh_reconciles_provider_system_before_replacement_teams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    stale = SimpleNamespace(id="demo", intent="running")
+    replacement = SimpleNamespace(id="demo", intent="running")
+    team = SimpleNamespace()
+    store = MemoryStore((stale,))
+    status = dcomp_status(component("gateway"))
+
+    class Runtime:
+        def validate_instances(self, instances):
+            events.append(
+                "validate:" + ",".join(item.id for item in instances)
+            )
+
+        def apply(self, instances, *, rebuild_host=False):
+            selected = tuple(instances)
+            events.append(
+                "apply:"
+                + ",".join(item.id for item in selected)
+                + f":rebuild={str(rebuild_host).lower()}"
+            )
+            return SimpleNamespace(status=status)
+
+        def require_instances_ready(self, instances, _status):
+            events.append(
+                "require-ready:" + ",".join(item.id for item in instances)
+            )
+
+    monkeypatch.setattr("cyclo.cli.agentws_root", lambda: Path("/agentws"))
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr(
+        "cyclo.cli.cyclo_runtime",
+        lambda _args, _store: Runtime(),
+    )
+    monkeypatch.setattr(
+        "cyclo.cli._refresh_instance",
+        lambda _runtime, _instance: (replacement, team),
+    )
+    monkeypatch.setattr("cyclo.cli._catalogue", lambda *_args: {"models": []})
+    monkeypatch.setattr(
+        "cyclo.cli.validate_pi_team_models",
+        lambda *_args: events.append("validate-model"),
+    )
+
+    assert cmd_refresh(namespace()) == 0
+    assert events == [
+        "validate:demo",
+        "apply::rebuild=true",
+        "validate-model",
+        "apply:demo:rebuild=false",
+        "require-ready:demo",
+    ]
+    assert store.instances == {"demo": replacement}
+
+
+def test_models_automatically_applies_system_before_catalogue(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[str] = []
+    store = MemoryStore()
+    status = dcomp_status(component("gateway"))
+
+    class Runtime:
+        def apply(self, _instances):
+            events.append("apply")
+            return SimpleNamespace(status=status)
+
+    runtime = Runtime()
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.cyclo_runtime", lambda _args, _store: runtime)
+    monkeypatch.setattr(
+        "cyclo.cli._catalogue",
+        lambda selected, observed: (
+            events.append("catalogue") or {"models": [{"id": "b"}, {"id": "a"}]}
         ),
     )
 
-
-def persist(store: StateStore, selected: Instance) -> None:
-    selected.container_name = team_container_name(store.system, selected.id)
-    selected.network_name = team_network_name(store.system, selected.id)
-    store.save(selected)
+    assert cmd_models(namespace()) == 0
+    assert events == ["apply", "catalogue"]
+    assert capsys.readouterr().out == "a\nb\n"
 
 
-def component_status(
-    *,
-    name: str = "gateway",
-    present: bool = True,
-    running: bool = True,
-    current: bool = True,
-    container_state: str = "running",
-    ready: bool = True,
-    error: str = "",
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        name=name,
-        kind="gateway" if name == "gateway" else "passthrough",
-        image_id="sha256:" + "a" * 64,
-        container_id="b" * 64 if present else None,
-        running=running,
-        current=current,
-        container_state=container_state,
-        engine_health="healthy" if running else "none",
-        health="ready" if ready else "not-ready",
-        error=error,
-        works=bool(present and running and current and ready and not error),
-    )
-
-
-def gateway_status(*, ready: bool = True, current: bool = True) -> SimpleNamespace:
-    return component_status(
-        name="gateway",
-        ready=ready,
-        current=current,
-    )
-
-
-def provider_connection(
-    socket_path: Path,
-    *,
-    ready: bool = True,
-) -> SimpleNamespace:
-    component = component_status(
-        name="pass",
-        ready=ready,
-    )
-    return SimpleNamespace(
-        generation="provider-generation",
-        socket_path=socket_path,
-        components=(gateway_status(), component),
-    )
-
-
-class RecordingStore:
-    def __init__(self, root: Path, instances: list[object] | None = None) -> None:
-        self.root = root
-        self.components_root = root / "components"
-        self.host_config_scope = "local"
-        self.instances = instances or []
-        self.lock_entries = 0
-
-    @property
-    def system(self) -> str:
-        return StateStore(self.root).system
-
-    @contextmanager
-    def locked(
-        self,
-        *,
-        blocking: bool = True,
-        bind_host_config: bool = True,
-    ):
-        assert isinstance(blocking, bool)
-        assert isinstance(bind_host_config, bool)
-        self.lock_entries += 1
-        yield
-
-    def list(self):
-        return list(self.instances)
-
-    def load(self, identifier: str):
-        selected = next(
-            (item for item in self.instances if item.id == identifier),
-            None,
-        )
-        if selected is None:
-            raise CycloError(f"Cyclo instance not found: {identifier}")
-        return selected
-
-    def load_for_removal(self, identifier: str):
-        return self.load(identifier)
-
-    def list_deletions(self):
-        return []
-
-    def save(self, selected: object) -> None:
-        for index, current in enumerate(self.instances):
-            if current.id == selected.id:
-                self.instances[index] = selected
-                return
-        self.instances.append(selected)
-
-    def queue_root(self, identifier: str) -> Path:
-        return self.root / "instances" / identifier / "agentws-state"
-
-
-class RunSystem:
-    def __init__(self, socket_path: Path) -> None:
-        self.connection_value = provider_connection(socket_path)
-        self.configured_socket_path = socket_path
-        self.configuration = SimpleNamespace(generation="provider-generation")
-        self.gateway = SimpleNamespace(
-            socket_path=Path("/run/cyclo/gateway/component.sock")
-        )
-        self.calls: list[str] = []
-
-    def start(self):
-        self.calls.append("start")
-        return self.connection_value
-
-    def catalogue(self, connection):
-        self.calls.append("catalogue")
-        assert connection is self.connection_value
-        return (
-            connection,
-            {"models": [catalogue_model(model) for model in MODELS]},
-        )
-
-
-def install_run_fakes(
-    monkeypatch: pytest.MonkeyPatch,
+def test_task_run_uses_confined_admin_tool_without_dcomp(
     tmp_path: Path,
-) -> RunSystem:
-    source = tmp_path / "agentws"
-    source.mkdir()
-    socket_dir = tmp_path / "provider-socket"
-    socket_dir.mkdir()
-    stack = RunSystem(socket_dir / "component.sock")
-    monkeypatch.setattr("cyclo.cli.agentws_root", lambda: source)
-    monkeypatch.setattr("cyclo.cli.provider_system", lambda *_args, **_kwargs: stack)
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    tasks = root / "tasks"
+    jobs = root / "jobs"
+    tasks.mkdir(parents=True)
+    jobs.mkdir()
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Build it\n", encoding="utf-8")
+    instance = SimpleNamespace(id="demo", image="sha256:" + "a" * 64)
+    observed: list[tuple[str, tuple[str, ...], bytes | None]] = []
+
+    class Store(MemoryStore):
+        def queue_root(self, _identifier):
+            return root
+
+        def tasks_dir(self, _identifier):
+            return tasks
+
+        def jobs_dir(self, _identifier):
+            return jobs
+
+    store = Store((instance,))
+
+    class Admin:
+        def __init__(self, selected_store, selected_instance):
+            assert selected_store is store
+            assert selected_instance is instance
+
+        def run(self, tool, arguments=(), *, specification=None):
+            observed.append((tool, tuple(arguments), specification))
+            return 0
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.TaskAdmin", Admin)
     monkeypatch.setattr(
-        "cyclo.cli._prepare_team_images",
-        lambda _bindings, **_kwargs: None,
+        "cyclo.cli.cyclo_runtime",
+        lambda *_args: pytest.fail("task operations must not require DComp"),
     )
-    return stack
-
-
-def subcommands(parser: argparse.ArgumentParser) -> set[str]:
-    action = next(
-        item
-        for item in parser._actions
-        if isinstance(item, argparse._SubParsersAction)
-    )
-    return set(action.choices)
-
-
-def test_parser_exposes_only_the_cutover_command_surface() -> None:
-    parser = build_parser()
-
-    assert subcommands(parser) == {
-        "team",
-        "project",
-        "validate",
-        "refresh",
-        "run",
-        "stop",
-        "forget",
-        "ps",
-        "inspect",
-        "dashboard",
-        "task",
-        "logs",
-        "path",
-        "usage",
-        "models",
-        "repair",
-        "component",
-        "providers",
-        "gateway",
-        "doctor",
-    }
-    assert "runtime" not in subcommands(parser)
-    assert "provider" not in subcommands(parser)
-
-
-@pytest.mark.parametrize(
-    "argv",
-    (
-        ["init", "TEAM", "--model", "provider/model"],
-        ["templates"],
-        ["run", "TEAM", "PROJECT"],
-        ["run", "--team-write", "project.cyclo"],
-        ["run", "--project-read-only", "project.cyclo"],
-        ["run", "--name", "legacy", "project.cyclo"],
-        ["runtime", "status"],
-        ["provider", "status"],
-    ),
-)
-def test_parser_rejects_removed_entry_points(argv: list[str]) -> None:
-    with pytest.raises(SystemExit) as stopped:
-        build_parser().parse_args(argv)
-
-    assert stopped.value.code == 2
-
-
-def test_run_parser_has_one_project_argument_and_loopback_default() -> None:
-    args = build_parser().parse_args(["run", "project.cyclo"])
-
-    assert args.project == "project.cyclo"
-    assert not hasattr(args, "team")
-    assert args.host == "127.0.0.1"
-
-
-@pytest.mark.parametrize(
-    ("host", "accepted"),
-    (
-        ("127.0.0.1", True),
-        ("0.0.0.0", True),
-        ("localhost", False),
-        ("::1", False),
-    ),
-)
-def test_run_host_requires_a_literal_ipv4_address(
-    host: str,
-    accepted: bool,
-) -> None:
-    args = SimpleNamespace(
-        port=0,
-        offline=False,
-        foreground=False,
-        host=host,
+    monkeypatch.setattr(
+        "cyclo.cli._task_project_summary",
+        lambda _instance: (),
     )
 
-    if accepted:
-        validate_run_options(args, team_count=1)
-    else:
-        with pytest.raises(CycloError, match="literal IPv4 address"):
-            validate_run_options(args, team_count=1)
-
-
-def test_run_and_dashboard_help_explain_observation_modes_and_exposure() -> None:
-    parser = build_parser()
-    root_action = next(
-        action
-        for action in parser._actions
-        if isinstance(action, argparse._SubParsersAction)
-    )
-
-    run_help = " ".join(root_action.choices["run"].format_help().split())
-    assert "rendered transcript" in run_help
-    assert "Ctrl-C stops that instance" in run_help
-    assert "literal IPv4 bind address" in run_help
-
-    dashboard_help = " ".join(
-        root_action.choices["dashboard"].format_help().split()
-    )
-    assert "read-only but unauthenticated" in dashboard_help
-    assert (
-        "non-loopback addresses expose unauthenticated fleet data"
-        in dashboard_help
-    )
-    assert "0 chooses a free port" in dashboard_help
-
-
-def test_state_root_selects_the_host_configuration(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first_xdg = tmp_path / "first-xdg"
-    monkeypatch.setenv("XDG_STATE_HOME", str(first_xdg))
-    monkeypatch.delenv("CYCLO_STATE_ROOT", raising=False)
-
-    default_args = build_parser().parse_args(["doctor"])
-    default_store = state_store(default_args)
-    assert default_store.root == first_xdg / "cyclo"
-    assert host_config(default_store) == DEFAULT_HOST_CONFIG
-    with default_store.locked():
-        pass
-    assert default_store.host_config_scope_path.read_text(
-        encoding="ascii"
-    ) == "system\n"
-    assert (
-        default_store.host_config_scope_path.stat().st_mode & 0o777
-    ) == 0o600
-
-    # The persisted installation identity wins over a later explicit spelling
-    # or a different process environment.
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "second-xdg"))
-    explicit_default_args = build_parser().parse_args(
-        ["--state-root", str(default_store.root), "doctor"]
-    )
-    explicit_default_store = state_store(explicit_default_args)
-    assert explicit_default_store.root == default_store.root
-    assert explicit_default_store.system == default_store.system
-    assert host_config(explicit_default_store) == DEFAULT_HOST_CONFIG
-
-    monkeypatch.setenv("CYCLO_STATE_ROOT", str(default_store.root))
-    environment_default_args = build_parser().parse_args(["doctor"])
-    environment_default_store = state_store(environment_default_args)
-    assert environment_default_store.root == default_store.root
-    assert environment_default_store.system == default_store.system
-    assert host_config(environment_default_store) == DEFAULT_HOST_CONFIG
-
-    # The reverse alias is stable too: a root first selected explicitly keeps
-    # its local host.conf when it later becomes the implicit XDG default.
-    local_xdg = tmp_path / "local-xdg"
-    local_root = local_xdg / "cyclo"
-    explicit_local_args = build_parser().parse_args(
-        ["--state-root", str(local_root), "doctor"]
-    )
-    explicit_local_store = state_store(explicit_local_args)
-    assert host_config(explicit_local_store) == local_root / "host.conf"
-    with explicit_local_store.locked():
-        pass
-    assert explicit_local_store.host_config_scope_path.read_text(
-        encoding="ascii"
-    ) == "local\n"
-
-    monkeypatch.delenv("CYCLO_STATE_ROOT")
-    monkeypatch.setenv("XDG_STATE_HOME", str(local_xdg))
-    implicit_local_args = build_parser().parse_args(["doctor"])
-    implicit_local_store = state_store(implicit_local_args)
-    assert implicit_local_store.root == local_root
-    assert implicit_local_store.system == explicit_local_store.system
-    assert host_config(implicit_local_store) == local_root / "host.conf"
-
-
-def test_team_commands_own_initialization_and_template_discovery() -> None:
-    parser = build_parser()
-
-    init_args = parser.parse_args(
-        ["team", "init", "./team", "--model", "provider/model"]
-    )
-    templates_args = parser.parse_args(["team", "templates"])
-
-    assert init_args.team == "./team"
-    assert init_args.model == "provider/model"
-    assert init_args.func.__name__ == "cmd_team_init"
-    assert templates_args.func.__name__ == "cmd_team_templates"
-
-
-def test_project_init_writes_a_valid_definition_without_overwriting(
-    tmp_path: Path,
-    team_repo: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    definition = tmp_path / "demo" / "project.cyclo"
-    context = tmp_path / "project-context.md"
-    context.write_text(
-        "`source` contains the RTL implementation.\n"
-        "CYCLO_CONTEXT\n",
-        encoding="utf-8",
-    )
-    arguments = [
-        "project",
-        "init",
-        str(definition),
-        "--description",
-        "RTL integration project",
-        "--context",
-        str(context),
-        "--team",
-        str(team_repo),
-        "ro",
-        "--mount",
-        "source",
-        str(source),
-        "rw",
+    assert cmd_task_run(
+        namespace(instance="demo", task_id="uart", spec=str(spec))
+    ) == 0
+    assert observed == [
+        ("task-create", ("uart",), b"# Build it\n"),
     ]
 
-    assert main(arguments) == 0
-    project = load_project(definition)
-    assert project.name == "demo"
-    assert project.description == "RTL integration project"
-    assert project.context == (
-        "`source` contains the RTL implementation.\nCYCLO_CONTEXT"
-    )
-    assert project.teams[0].path == team_repo.resolve()
-    assert project.mounts[0].path == source.resolve()
-    assert "next: cyclo validate" in capsys.readouterr().out
-    assert "context <<CYCLO_CONTEXT_2" in definition.read_text(encoding="utf-8")
 
-    assert main(arguments) == 1
-    assert "refusing to overwrite" in capsys.readouterr().err
-
-
-def test_project_init_rejects_bad_input_without_leaving_a_definition(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    team = tmp_path / "team"
-    source = tmp_path / "source"
-    team.mkdir()
-    source.mkdir()
-    definition = tmp_path / "project.cyclo"
-
-    assert main(
-        [
-            "project",
-            "init",
-            str(definition),
-            "--team",
-            str(team),
-            "execute",
-            "--mount",
-            "source",
-            str(source),
-            "rw",
-        ]
-    ) == 1
-    assert "invalid team access mode" in capsys.readouterr().err
-    assert not definition.exists()
-
-
-@pytest.mark.parametrize(
-    ("content", "message"),
-    [
-        (b"", "must not be empty"),
-        (b"\xff", "not valid UTF-8"),
-        (b"x" * (MAX_PROJECT_FILE_BYTES + 1), "exceeds"),
-    ],
-    ids=("empty", "invalid-utf8", "oversized"),
-)
-def test_project_init_rejects_invalid_context_without_creating_definition(
-    tmp_path: Path,
-    team_repo: Path,
-    capsys: pytest.CaptureFixture[str],
-    content: bytes,
-    message: str,
-) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    context = tmp_path / "context.md"
-    context.write_bytes(content)
-    definition = tmp_path / "project.cyclo"
-
-    assert main(
-        [
-            "project",
-            "init",
-            str(definition),
-            "--context",
-            str(context),
-            "--team",
-            str(team_repo),
-            "ro",
-            "--mount",
-            "source",
-            str(source),
-            "rw",
-        ]
-    ) == 1
-
-    assert message in capsys.readouterr().err
-    assert not definition.exists()
-
-
-def test_refresh_refreshes_providers_before_replacing_running_projects(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
+def test_component_status_reports_configured_component_as_absent(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    (team_repo / "Dockerfile").write_text(
-        "ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n",
-        encoding="utf-8",
+    store = MemoryStore()
+    status = dcomp_status()
+    runtime = SimpleNamespace(
+        status=lambda: status,
+        host=SimpleNamespace(providers=()),
+        component_for_instance=lambda identifier: f"team-{identifier}",
     )
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        team_repo,
-        project_repo,
-    )
-    selected = instance(
-        "integration-project-review-team",
-        tmp_path,
-        intent="running",
-        project_file=definition,
-    )
-    selected.agentws_host = "0.0.0.0"
-    selected.offline = True
-    selected.verbose = True
-    selected.port = None
-
-    class RefreshStore(RecordingStore):
-        def __init__(self, root: Path, instances: list[object]) -> None:
-            super().__init__(root, instances)
-            self.lock_depth = 0
-
-        @contextmanager
-        def locked(self, *, blocking: bool = True):
-            assert blocking
-            assert self.lock_depth == 0
-            self.lock_entries += 1
-            self.lock_depth = 1
-            try:
-                yield
-            finally:
-                self.lock_depth = 0
-
-    store = RefreshStore(tmp_path / "state", [selected])
-    events: list[str] = []
-
-    class RefreshStack:
-        def __init__(self) -> None:
-            self.connection = provider_connection(
-                tmp_path / "provider" / "component.sock"
-            )
-            self.gateway = SimpleNamespace(
-                socket_path=tmp_path / "gateway" / "component.sock"
-            )
-
-        def refresh(self):
-            assert store.lock_depth == 1
-            events.append("provider-system-refresh")
-            return self.connection
-
-        def catalogue(self, connection):
-            assert connection is self.connection
-            events.append("provider-catalogue")
-            return (
-                connection,
-                {"models": [catalogue_model(model) for model in MODELS]},
-            )
-
-    class RefreshDocker:
-        @staticmethod
-        def stop_remove(
-            _container,
-            expected_instance,
-            *,
-            expected_system,
-            expected_launch,
-        ):
-            assert expected_system == store.system
-            assert expected_launch == selected.launch_id
-            events.append(f"stop:{expected_instance}")
-            return True
-
-        @staticmethod
-        def remove_network(_name, expected_instance, *, system):
-            assert system == store.system
-            events.append(f"network:{expected_instance}")
-
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", RefreshDocker)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda _args, _store: RefreshStack(),
-    )
-    monkeypatch.setattr(
-        "cyclo.cli._prepare_team_images",
-        lambda _bindings, **_kwargs: None,
-    )
+    monkeypatch.setattr("cyclo.cli.cyclo_runtime", lambda _args, _store: runtime)
 
-    def start(
-        project_args,
-        _source,
-        selected_store,
-        _docker,
-        _base_image,
-        bindings,
-        *,
-        images_prepared=False,
-    ):
-        assert images_prepared
-        assert selected_store is store
-        assert selected_store.lock_depth == 1
-        assert project_args.project == str(definition)
-        assert project_args.image is None
-        assert project_args.offline is True
-        assert project_args.host == "0.0.0.0"
-        assert project_args.port == 0
-        assert project_args.verbose is True
-        assert [binding.instance.id for binding in bindings] == [
-            "integration-project-review-team"
-        ]
-        events.append(f"run:{project_args.project}")
-
-    monkeypatch.setattr("cyclo.cli._start_project_locked", start)
-
-    assert main(["refresh"]) == 0
-    assert store.lock_entries == 1
-    assert store.lock_depth == 0
-    stopped = "stop:integration-project-review-team"
-    assert events.index("provider-system-refresh") < events.index(stopped)
-    assert events.index("provider-catalogue") < events.index(stopped)
-    assert events.index(stopped) < events.index(f"run:{definition}")
-    assert selected.intent == "running"
-    assert "Cyclo refresh complete" in capsys.readouterr().out
-
-
-def test_refresh_provider_failure_leaves_running_teams_untouched(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        team_repo,
-        project_repo,
-    )
-    selected = instance(
-        "integration-project-review-team",
-        tmp_path,
-        intent="running",
-        project_file=definition,
-    )
-    store = RecordingStore(tmp_path / "state", [selected])
-
-    class NoTeamDockerWrites:
-        def __getattr__(self, name):
-            raise AssertionError(f"unexpected team Docker operation: {name}")
-
-    class FailingProviders:
-        @staticmethod
-        def refresh():
-            raise CycloError("provider build failed")
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", NoTeamDockerWrites)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda _args, _store: FailingProviders(),
-    )
-    monkeypatch.setattr(
-        "cyclo.cli._prepare_team_images",
-        lambda _bindings, **_kwargs: None,
-    )
-
-    assert main(["refresh"]) == 1
-    assert selected.intent == "running"
-    assert "provider build failed" in capsys.readouterr().err
-
-
-def test_refresh_catalogue_mismatch_leaves_running_teams_untouched(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        team_repo,
-        project_repo,
-    )
-    selected = instance(
-        "integration-project-review-team",
-        tmp_path,
-        intent="running",
-        project_file=definition,
-    )
-    store = RecordingStore(tmp_path / "state", [selected])
-
-    class NoTeamDockerWrites:
-        def __getattr__(self, name):
-            raise AssertionError(f"unexpected team Docker operation: {name}")
-
-    class IncompatibleProviders:
-        def __init__(self) -> None:
-            self.connection = provider_connection(
-                tmp_path / "provider" / "component.sock"
-            )
-            self.gateway = SimpleNamespace(
-                socket_path=tmp_path / "gateway" / "component.sock"
-            )
-
-        def refresh(self):
-            return self.connection
-
-        def catalogue(self, connection):
-            assert connection is self.connection
-            return (
-                connection,
-                {"models": [catalogue_model(MODELS[1])]},
-            )
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", NoTeamDockerWrites)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda _args, _store: IncompatibleProviders(),
-    )
-    monkeypatch.setattr(
-        "cyclo.cli._prepare_team_images",
-        lambda _bindings, **_kwargs: None,
-    )
-
-    assert main(["refresh"]) == 1
-    assert selected.intent == "running"
-    assert "requests unavailable provider model" in capsys.readouterr().err
-
-
-def test_refresh_retry_recovers_a_partially_stopped_multi_team_project(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    first_team = tmp_path / "first"
-    second_team = tmp_path / "second"
-    shutil.copytree(team_repo, first_team)
-    shutil.copytree(team_repo, second_team)
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        first_team,
-        project_repo,
-        second_team=second_team,
-    )
-    first = instance(
-        "integration-project-first",
-        tmp_path,
-        intent="running",
-        project_file=definition,
-    )
-    second = instance(
-        "integration-project-second",
-        tmp_path,
-        intent="running",
-        project_file=definition,
-    )
-    first.verbose = True
-    second.verbose = True
-    state_root = tmp_path / "state"
-    initial_store = StateStore(state_root)
-    persist(initial_store, first)
-    persist(initial_store, second)
-    inventory_calls = 0
-    refresh_attempt = 1
-    stopped: list[tuple[int, str]] = []
-    restarted: list[str] = []
-
-    def inspect(selected_store):
-        nonlocal inventory_calls
-        inventory_calls += 1
-        return [
-            selected
-            for selected in selected_store.list()
-            if selected.intent == "running"
-        ]
-
-    class RefreshDocker:
-        @staticmethod
-        def stop_remove(
-            _container,
-            expected_instance,
-            *,
-            expected_system,
-            expected_launch,
-        ):
-            assert expected_system == StateStore(state_root).system
-            assert expected_launch == "0" * 32
-            stopped.append((refresh_attempt, expected_instance))
-            if refresh_attempt == 1 and expected_instance == second.id:
-                raise CycloError("injected stop failure")
-            return True
-
-        @staticmethod
-        def remove_network(_name, _expected_instance, *, system):
-            assert system == StateStore(state_root).system
-
-    class RefreshStack:
-        def __init__(self) -> None:
-            self.connection = provider_connection(
-                tmp_path / "provider" / "component.sock"
-            )
-            self.gateway = SimpleNamespace(
-                socket_path=tmp_path / "gateway" / "component.sock"
-            )
-
-        def refresh(self):
-            restarted.append("providers")
-            return self.connection
-
-        def catalogue(self, connection):
-            assert connection is self.connection
-            return (
-                connection,
-                {"models": [catalogue_model(model) for model in MODELS]},
-            )
-
-    def start(
-        project_args,
-        _source,
-        selected_store,
-        _docker,
-        _base_image,
-        bindings,
-        *,
-        images_prepared=False,
-    ):
-        assert images_prepared
-        assert project_args.verbose is True
-        assert [binding.instance.id for binding in bindings] == [
-            first.id,
-            second.id,
-        ]
-        for binding in bindings:
-            selected_store.save(binding.instance)
-            restarted.append(binding.instance.id)
-
-    monkeypatch.setattr(
-        "cyclo.cli.state_store",
-        lambda _args: StateStore(state_root),
-    )
-    monkeypatch.setattr("cyclo.cli.Docker", RefreshDocker)
-    monkeypatch.setattr("cyclo.cli.intended_running_instances", inspect)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda _args, _store: RefreshStack(),
-    )
-    monkeypatch.setattr(
-        "cyclo.cli._prepare_team_images",
-        lambda _bindings, **_kwargs: None,
-    )
-    monkeypatch.setattr("cyclo.cli._start_project_locked", start)
-
-    assert main(["refresh"]) == 1
-    interrupted = StateStore(state_root)
-    assert interrupted.load(first.id).intent == "running"
-    assert interrupted.load(second.id).intent == "running"
-    assert "injected stop failure" in capsys.readouterr().err
-
-    refresh_attempt = 2
-    assert main(["refresh"]) == 0
-    assert inventory_calls == 2
-    assert stopped == [
-        (1, first.id),
-        (1, second.id),
-        (2, first.id),
-        (2, second.id),
-    ]
-    assert restarted == ["providers", "providers", first.id, second.id]
-    completed = StateStore(state_root)
-    assert completed.load(first.id).intent == "running"
-    assert completed.load(first.id).verbose
-    assert completed.load(second.id).intent == "running"
-    assert completed.load(second.id).verbose
-    assert "Cyclo refresh complete" in capsys.readouterr().out
-
-
-def test_refresh_refuses_running_legacy_instance_before_building(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    selected = instance("legacy", tmp_path, intent="running")
-    store = RecordingStore(tmp_path / "state", [selected])
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", lambda: object())
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args: pytest.fail("legacy validation must happen before builds"),
-    )
-
-    assert main(["refresh"]) == 1
-    assert "cannot refresh legacy instances without project.cyclo: legacy" in capsys.readouterr().err
-
-
-def test_refresh_recreates_only_running_intent_from_partially_stopped_project(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    first_team = tmp_path / "first"
-    second_team = tmp_path / "second"
-    shutil.copytree(team_repo, first_team)
-    shutil.copytree(team_repo, second_team)
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        first_team,
-        project_repo,
-        second_team=second_team,
-    )
-    selected = instance(
-        "integration-project-first",
-        tmp_path,
-        intent="running",
-        project_file=definition,
-    )
-    # The published port is observed runtime state, not launch intent.  It must
-    # neither become an explicit port nor make the selected subset look like a
-    # multi-team launch.
-    selected.port = 49152
-    # The stopped team's repository may be temporarily unusable; recreating
-    # the selected running team must not load or validate it.
-    (second_team / "team").unlink()
-    store = RecordingStore(tmp_path / "state", [selected])
-    stopped: list[str] = []
-    restarted: list[str] = []
-
-    class RefreshDocker:
-        @staticmethod
-        def stop_remove(
-            _container,
-            expected_instance,
-            *,
-            expected_system,
-            expected_launch,
-        ):
-            assert expected_system == store.system
-            assert expected_launch == selected.launch_id
-            stopped.append(expected_instance)
-            return True
-
-        @staticmethod
-        def remove_network(_name, expected_instance, *, system):
-            assert system == store.system
-            assert expected_instance == selected.id
-
-    class RefreshStack:
-        def __init__(self) -> None:
-            self.connection = provider_connection(
-                tmp_path / "provider" / "component.sock"
-            )
-            self.gateway = SimpleNamespace(
-                socket_path=tmp_path / "gateway" / "component.sock"
-            )
-
-        def refresh(self):
-            return self.connection
-
-        def catalogue(self, connection):
-            assert connection is self.connection
-            return (
-                connection,
-                {"models": [catalogue_model(model) for model in MODELS]},
-            )
-
-    def start(
-        project_args,
-        _source,
-        _store,
-        _docker,
-        _base_image,
-        bindings,
-        *,
-        images_prepared=False,
-    ):
-        assert images_prepared
-        assert project_args.port == 0
-        restarted.extend(binding.instance.id for binding in bindings)
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", RefreshDocker)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda _args, _store: RefreshStack(),
-    )
-    monkeypatch.setattr(
-        "cyclo.cli._prepare_team_images",
-        lambda _bindings, **_kwargs: None,
-    )
-    monkeypatch.setattr("cyclo.cli._start_project_locked", start)
-
-    assert main(["refresh"]) == 0
-    assert stopped == [selected.id]
-    assert restarted == [selected.id]
-    assert "Cyclo refresh complete" in capsys.readouterr().out
-
-
-def test_refresh_reuses_requested_port_not_observed_port(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-) -> None:
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        team_repo,
-        project_repo,
-    )
-    selected = instance(
-        "integration-project-review-team",
-        tmp_path,
-        intent="running",
-        project_file=definition,
-    )
-    selected.requested_port = 8123
-    selected.port = 49152
-
-    (project_args,) = _refresh_projects(
-        argparse.Namespace(state_root=None),
-        [selected],
-    )
-
-    assert project_args.port == 8123
-
-
-def test_project_dry_run_expands_team_and_mount_authority_without_state(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    second_team = tmp_path / "review-audit"
-    shutil.copytree(team_repo, second_team)
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        team_repo,
-        project_repo,
-        second_team=second_team,
-    )
-    state_root = tmp_path / "state"
-    stack = install_run_fakes(monkeypatch, tmp_path)
-
-    result = main(
-        ["--state-root", str(state_root), "run", "--dry-run", str(definition)]
-    )
-
+    assert cmd_component(
+        namespace(component_action="status", name="gateway")
+    ) == 0
     output = capsys.readouterr().out
-    assert result == 0
-    assert stack.calls == []
-    assert output.count("docker create --name") == 2
-    assert output.count(f"src={project_repo.resolve()},dst=/workspace/source") == 2
-    assert output.count("dst=/readonly/documentation,readonly") == 2
-    assert f"src={team_repo.resolve()},dst=/team,readonly" in output
-    assert f"src={second_team.resolve()},dst=/team" in output
-    assert f"src={second_team.resolve()},dst=/team,readonly" not in output
-    assert "CYCLO_PROJECT_MANIFEST=" not in output
-    assert "gateway-token" not in output
-    assert "Authorization" not in output
-    system = installation_id(state_root / "components")
-    assert (
-        f"--name {team_container_name(system, 'integration-project-review-team')}"
-        in output
-    )
-    assert team_image_name(system, "0.2.0") in output
-    assert not state_root.exists()
+    assert "gateway" in output
+    assert "absent" in output
 
 
-def test_project_dry_run_selects_a_derived_image_per_team_dockerfile(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
+def test_raw_component_diagnostics_do_not_require_host_configuration(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    derived_team = tmp_path / "rtl-team"
-    shutil.copytree(team_repo, derived_team)
-    (derived_team / "Dockerfile").write_text(
-        "ARG CYCLO_TEAM_BASE\n"
-        "FROM ${CYCLO_TEAM_BASE}\n"
-        "RUN apt-get update && apt-get install -y verilator\n",
-        encoding="utf-8",
-    )
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        team_repo,
-        project_repo,
-        second_team=derived_team,
-    )
-    state_root = tmp_path / "state"
-    install_run_fakes(monkeypatch, tmp_path)
+    store = MemoryStore()
+    observed = dcomp_status(component("gateway"), component("fusion"))
+    log_calls: list[tuple[str, str, bool]] = []
+    restart_calls: list[tuple[str, str]] = []
 
+    class Runtime:
+        name = "cyclo-test"
+        dcomp = SimpleNamespace(
+            logs=lambda system, name, *, follow, output: log_calls.append(
+                (system, name, follow)
+            ),
+            restart=lambda system, name: restart_calls.append((system, name)),
+        )
+
+        @property
+        def host(self):
+            raise CycloError("host.conf:1: unknown directive 'invalid'")
+
+        def status(self):
+            return observed
+
+        @staticmethod
+        def component_for_instance(identifier):
+            return f"team-{identifier}"
+
+    runtime = Runtime()
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.cyclo_runtime", lambda _args, _store: runtime)
+
+    assert cmd_component(namespace(component_action="list", name=None)) == 0
     assert (
-        main(
-            [
-                "--state-root",
-                str(state_root),
-                "run",
-                "--dry-run",
-                str(definition),
-            ]
+        cmd_component(namespace(component_action="status", name="fusion"))
+        == 0
+    )
+    assert (
+        cmd_component(
+            namespace(component_action="logs", name="fusion", follow=True)
         )
         == 0
     )
-
+    assert (
+        cmd_component(namespace(component_action="restart", name="fusion"))
+        == 0
+    )
     output = capsys.readouterr().out
-    system = installation_id(state_root / "components")
-    assert team_image_name(system, "0.2.0") in output
-    assert (
-        derived_team_image_name(system, "0.2.0", derived_team, "rtl-team")
-        in output
-    )
+    assert "gateway" in output
+    assert "fusion" in output
+    assert log_calls == [("cyclo-test", "fusion", True)]
+    assert restart_calls == [("cyclo-test", "fusion")]
 
 
-def test_run_has_no_manual_build_mode(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
+def test_ps_reports_applied_team_state_when_host_configuration_is_malformed(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        team_repo,
-        project_repo,
-    )
-    install_run_fakes(monkeypatch, tmp_path)
-
-    with pytest.raises(SystemExit, match="2"):
-        main(
-            [
-                "run",
-                "--dry-run",
-                "--build",
-                str(definition),
-            ]
-        )
-    assert "unrecognized arguments: --build" in capsys.readouterr().err
-
-
-def test_prepare_team_images_resolves_base_and_derived_tags_to_exact_ids(
-    tmp_path: Path,
-    team_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    plain = load_team(team_repo)
-    derived_root = tmp_path / "derived"
-    shutil.copytree(team_repo, derived_root)
-    (derived_root / "Dockerfile").write_text(
-        "ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n",
-        encoding="utf-8",
-    )
-    derived = load_team(derived_root)
-    base_id = "sha256:" + "a" * 64
-    derived_id = "sha256:" + "b" * 64
-    plain_instance = SimpleNamespace(image="base:tag", image_override="")
-    derived_instance = SimpleNamespace(image="derived:tag", image_override="")
-    bindings = (
-        SimpleNamespace(team=plain, instance=plain_instance),
-        SimpleNamespace(team=derived, instance=derived_instance),
-    )
-    calls: list[tuple[object, ...]] = []
-    monkeypatch.setattr(
-        "cyclo.cli.ensure_team_runtime_image",
-        lambda image: calls.append(("base", image)) or base_id,
-    )
-    monkeypatch.setattr(
-        "cyclo.cli.ensure_derived_team_image",
-        lambda image, root, base: calls.append(
-            ("derived", image, root, base)
-        )
-        or derived_id,
-    )
-
-    assert (
-        _prepare_team_images(
-            bindings,
-            base_image="base:tag",
-        )
-        == base_id
-    )
-    assert plain_instance.image == base_id
-    assert derived_instance.image == derived_id
-    assert calls == [
-        ("base", "base:tag"),
-        (
-            "derived",
-            "derived:tag",
-            derived.root,
-            base_id,
-        ),
-    ]
-
-    another_plain = SimpleNamespace(image="base:tag", image_override="")
-    assert (
-        _prepare_team_images(
-            (SimpleNamespace(team=plain, instance=another_plain),),
-            base_image="base:tag",
-            base_image_id=base_id,
-        )
-        == base_id
-    )
-    assert another_plain.image == base_id
-    assert calls == [
-        ("base", "base:tag"),
-        (
-            "derived",
-            "derived:tag",
-            derived.root,
-            base_id,
-        ),
-    ]
-
-
-def test_prepare_team_images_never_rebuilds_an_operator_override(
-    tmp_path: Path,
-    team_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    selected = SimpleNamespace(image="custom:approved", image_override="custom:approved")
-    binding = SimpleNamespace(team=load_team(team_repo), instance=selected)
-    exact = "sha256:" + "c" * 64
-    monkeypatch.setattr(
-        "cyclo.cli.require_team_runtime_image",
-        lambda image: exact if image == "custom:approved" else None,
-    )
-    monkeypatch.setattr(
-        "cyclo.cli.ensure_team_runtime_image",
-        lambda *_args, **_kwargs: pytest.fail("override was rebuilt"),
-    )
-
-    assert (
-        _prepare_team_images(
-            (binding,),
-            base_image="base:tag",
-        )
-        is None
-    )
-    assert selected.image == exact
-
-
-def test_run_preflights_every_team_then_starts_project_bindings(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    second_team = tmp_path / "review-audit"
-    shutil.copytree(team_repo, second_team)
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        team_repo,
-        project_repo,
-        second_team=second_team,
-    )
-    install_run_fakes(monkeypatch, tmp_path)
-    events: list[tuple[object, ...]] = []
-    lock_depth = 0
-    original_locked = StateStore.locked
-
-    @contextmanager
-    def tracked_lock(store):
-        nonlocal lock_depth
-        with original_locked(store):
-            lock_depth += 1
-            try:
-                yield
-            finally:
-                lock_depth -= 1
-
-    monkeypatch.setattr(StateStore, "locked", tracked_lock)
-    monkeypatch.setattr("cyclo.cli.Docker", lambda: SimpleNamespace())
-    monkeypatch.setattr(
-        "cyclo.cli.preflight_binding",
-        lambda binding, _store, _docker: events.append(
-            ("preflight", binding.instance.id, lock_depth)
-        ),
-    )
-
-    def start(_args, binding, _source, _store, _docker):
-        events.append(("start", binding.instance.id, lock_depth))
-        binding.instance.port = 4100 + len(events)
-
-    monkeypatch.setattr("cyclo.cli.start_binding_locked", start)
-
-    result = main(["--state-root", str(tmp_path / "state"), "run", str(definition)])
-
-    assert result == 0
-    assert [event[0] for event in events] == [
-        "preflight",
-        "preflight",
-        "start",
-        "start",
-    ]
-    assert all(event[2] == 1 for event in events)
-    starts = [event for event in events if event[0] == "start"]
-    assert [event[1] for event in starts] == [
-        "integration-project-review-team",
-        "integration-project-review-audit",
-    ]
-    output = capsys.readouterr().out
-    assert output.count("started Cyclo instance:") == 2
-    assert "mount (rw): source" in output
-    assert "mount (ro): documentation" in output
-
-
-def test_run_materializes_each_teams_container_project(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    second_team = tmp_path / "review-audit"
-    shutil.copytree(team_repo, second_team)
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        team_repo,
-        project_repo,
-        second_team=second_team,
-    )
-    state_root = tmp_path / "state"
-    store = StateStore(state_root)
-    install_run_fakes(monkeypatch, tmp_path)
-    monkeypatch.setattr("cyclo.cli.agentws_root", packaged_agentws_root)
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    materialized: dict[str, str] = {}
-
-    class FakeDocker:
-        @staticmethod
-        def previous_launch_lifecycle_state(_instance, *, system):
-            assert system == store.system
-            return DockerContainerState.ABSENT
-
-        @staticmethod
-        def container_lifecycle_active(_instance, *, system):
-            assert system == store.system
-            return True
-
-        @staticmethod
-        def ensure_network(_name, _identifier, *, system):
-            assert system == store.system
-
-        @staticmethod
-        def start(spec):
-            config = spec.runtime_root / "project.cyclo"
-            materialized[spec.instance.id] = config.read_text(encoding="utf-8")
-            return 4100 + len(materialized)
-
-        @staticmethod
-        def wait_ready(_instance, _port, *, system, host):
-            assert system == store.system
-            assert host == "127.0.0.1"
-
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-
-    assert main(["--state-root", str(state_root), "run", str(definition)]) == 0
-
-    assert set(materialized) == {
-        "integration-project-review-team",
-        "integration-project-review-audit",
-    }
-    first = materialized["integration-project-review-team"]
-    second = materialized["integration-project-review-audit"]
-    assert "team /team ro\n" in first
-    assert "team /team rw\n" in second
-    for config in (first, second):
-        assert "mount source /workspace/source rw\n" in config
-        assert (
-            "mount documentation /readonly/documentation ro\n"
-            in config
-        )
-        assert str(team_repo.resolve()) not in config
-        assert str(second_team.resolve()) not in config
-        assert str(project_repo.resolve()) not in config
-    for identifier in materialized:
-        runtime = store.runtime_root(identifier)
-        assert (runtime / "project.cyclo").stat().st_mode & 0o777 == 0o444
-        assert not (runtime / "PROJECT.md").exists()
-
-
-def test_first_start_is_recoverable_when_materialization_fails(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    definition = load_project(
-        write_project(tmp_path / "project.cyclo", team_repo, project_repo)
-    )
-    store = StateStore(tmp_path / "state")
-    args = SimpleNamespace(
-        image=None,
-        offline=False,
-        host="127.0.0.1",
-        port=0,
-        verbose=False,
-    )
-    binding = project_run_bindings(
-        args,
-        definition,
-        load_project_teams(definition),
-        system=store.system,
-        base_image="cyclo-team:test",
-        version="0.2.0",
-    )[0]
-    provider = tmp_path / "provider"
-    provider.mkdir()
-    binding.instance.provider_socket_path = str(provider / "component.sock")
-    binding.instance.provider_generation = "provider-generation"
-    observed: list[Instance] = []
-
-    def fail_after_publication(*_args, **_kwargs):
-        observed.append(store.load(binding.instance.id))
-        raise RuntimeError("injected materialization failure")
-
-    monkeypatch.setattr(store, "materialize_agentws", fail_after_publication)
-
-    class DockerDouble:
-        @staticmethod
-        def previous_launch_lifecycle_state(_instance, *, system):
-            assert system == store.system
-            return DockerContainerState.ABSENT
-
-        @staticmethod
-        def container_lifecycle_active(_instance, *, system):
-            assert system == store.system
-            return False
-
-        @staticmethod
-        def stop_remove(
-            _name,
-            _identifier,
-            *,
-            expected_system,
-            expected_launch,
-        ):
-            assert expected_system == store.system
-            assert expected_launch == binding.instance.launch_id
-            return False
-
-        @staticmethod
-        def remove_network(_name, _identifier, *, system):
-            assert system == store.system
-            return False
-
-    with pytest.raises(RuntimeError, match="injected materialization failure"):
-        start_binding_locked(
-            args,
-            binding,
-            packaged_agentws_root(),
-            store,
-            DockerDouble(),  # type: ignore[arg-type]
-        )
-
-    assert len(observed) == 1
-    assert observed[0].intent == "running"
-    persisted = store.load(binding.instance.id)
-    assert persisted.intent == "running"
-    assert persisted.launch_id == binding.instance.launch_id
-    assert store.list() == [persisted]
-
-
-@pytest.mark.parametrize(
-    ("offline", "operation"),
-    ((True, "remove"), (False, "ensure")),
-)
-def test_team_network_selection(
-    tmp_path: Path,
-    offline: bool,
-    operation: str,
-) -> None:
-    selected = instance("network-selection", tmp_path)
-    selected.offline = offline
-    calls: list[tuple[str, str, str, str]] = []
-
-    class DockerDouble:
-        @staticmethod
-        def ensure_network(name, identifier, *, system):
-            calls.append(("ensure", name, identifier, system))
-
-        @staticmethod
-        def remove_network(name, identifier, *, system):
-            calls.append(("remove", name, identifier, system))
-
-    configure_team_network(
-        DockerDouble(),  # type: ignore[arg-type]
-        selected,
-        system="selected-system",
-    )
-
-    assert calls == [
-        (
-            operation,
-            selected.network_name,
-            selected.id,
-            "selected-system",
-        )
-    ]
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [None, "remove", "publish", "start"],
-    ids=("success", "remove-fails", "publish-fails", "start-fails"),
-)
-def test_restart_launch_transition_is_exact_and_repairable(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str | None,
-) -> None:
-    definition = load_project(
-        write_project(tmp_path / "project.cyclo", team_repo, project_repo)
-    )
-    store = StateStore(tmp_path / "state")
-    args = SimpleNamespace(
-        image=None,
-        offline=False,
-        host="127.0.0.1",
-        port=0,
-        verbose=False,
-    )
-    binding = project_run_bindings(
-        args,
-        definition,
-        load_project_teams(definition),
-        system=store.system,
-        base_image="cyclo-team:test",
-        version="0.2.0",
-    )[0]
-    provider = tmp_path / "provider"
-    provider.mkdir()
-    binding.instance.provider_socket_path = str(provider / "component.sock")
-    binding.instance.provider_generation = "provider-generation"
-    previous = Instance.from_json(binding.instance.as_json())
-    previous.launch_id = "1" * 32
-    previous.intent = "stopped"
-    store.save(previous)
-    events: list[tuple[str, str]] = []
-    save = store.save
-
-    def save_with_failure(instance: Instance) -> None:
-        if failure == "publish" and instance.launch_id == binding.instance.launch_id:
-            events.append(("publish", instance.launch_id))
-            raise OSError("injected publish failure")
-        save(instance)
-
-    monkeypatch.setattr(store, "save", save_with_failure)
-
-    class DockerDouble:
-        old_launch_present = True
-
-        @classmethod
-        def previous_launch_lifecycle_state(cls, instance, *, system):
-            assert system == store.system
-            events.append(("preflight", instance.launch_id))
-            return (
-                DockerContainerState.STOPPED
-                if cls.old_launch_present
-                else DockerContainerState.ABSENT
-            )
-
-        @classmethod
-        def container_lifecycle_active(cls, instance, *, system):
-            assert system == store.system
-            events.append(("boundary", instance.launch_id))
-            if cls.old_launch_present and instance.launch_id != previous.launch_id:
-                raise CycloError("launch identity changed")
-            return False
-
-        @classmethod
-        def remove_inactive_launch(
-            cls,
-            container,
-            identifier,
-            *,
-            expected_system,
-            expected_launch,
-        ):
-            assert container == previous.container_name
-            assert identifier == previous.id
-            assert expected_system == store.system
-            assert expected_launch == previous.launch_id
-            assert cls.old_launch_present
-            events.append(("remove", expected_launch))
-            if failure == "remove":
-                raise RuntimeError("injected remove failure")
-            cls.old_launch_present = False
-            return True
-
-        @staticmethod
-        def ensure_network(_name, _identifier, *, system):
-            assert system == store.system
-            events.append(("network", binding.instance.launch_id))
-
-        @staticmethod
-        def start(spec):
-            assert store.load(spec.instance.id).launch_id == spec.instance.launch_id
-            events.append(("start", spec.instance.launch_id))
-            if failure == "start":
-                raise RuntimeError("injected start failure")
-            return 4317
-
-        @staticmethod
-        def wait_ready(instance, port, *, system, host):
-            assert system == store.system
-            assert port == 4317
-            assert host == "127.0.0.1"
-            events.append(("ready", instance.launch_id))
-
-        @staticmethod
-        def stop_remove(
-            _container,
-            _identifier,
-            *,
-            expected_system,
-            expected_launch,
-        ):
-            assert expected_system == store.system
-            assert expected_launch == binding.instance.launch_id
-            events.append(("rollback", expected_launch))
-            return False
-
-        @staticmethod
-        def remove_network(_name, _identifier, *, system):
-            assert system == store.system
-            events.append(("remove-network", binding.instance.launch_id))
-            return True
-
-    if failure is not None:
-        with pytest.raises(
-            (OSError, RuntimeError),
-            match=rf"injected {failure} failure",
-        ):
-            start_binding_locked(
-                args,
-                binding,
-                packaged_agentws_root(),
-                store,
-                DockerDouble(),  # type: ignore[arg-type]
-            )
-    else:
-        start_binding_locked(
-            args,
-            binding,
-            packaged_agentws_root(),
-            store,
-            DockerDouble(),  # type: ignore[arg-type]
-        )
-
-    old_boundary = events.index(("boundary", previous.launch_id))
-    removal = events.index(("remove", previous.launch_id))
-    assert old_boundary < removal
-    persisted = store.load(binding.instance.id)
-    if failure in {"remove", "publish"}:
-        assert persisted.launch_id == previous.launch_id
-        assert not any(event == "rollback" for event, _launch in events)
-        assert ("network", binding.instance.launch_id) not in events
-        assert ("start", binding.instance.launch_id) not in events
-        assert DockerDouble.old_launch_present is (failure == "remove")
-        return
-
-    new_boundary = events.index(("boundary", binding.instance.launch_id))
-    start = events.index(("start", binding.instance.launch_id))
-    assert removal < new_boundary < start
-    assert persisted.launch_id == binding.instance.launch_id
-    if failure == "start":
-        assert persisted.intent == "running"
-        assert ("rollback", binding.instance.launch_id) in events
-    else:
-        assert persisted.intent == "running"
-        assert persisted.port == 4317
-
-
-def test_project_startup_interrupt_preserves_durable_running_intent(
-    tmp_path: Path,
-    team_repo: Path,
-    project_repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    second_team = tmp_path / "review-audit"
-    shutil.copytree(team_repo, second_team)
-    definition = write_project(
-        tmp_path / "project.cyclo",
-        team_repo,
-        project_repo,
-        second_team=second_team,
-    )
-    store = StateStore(tmp_path / "state")
-    install_run_fakes(monkeypatch, tmp_path)
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", lambda: SimpleNamespace())
-    monkeypatch.setattr("cyclo.cli.preflight_binding", lambda *_args: None)
-    started: list[tuple[str, str]] = []
-
-    def start(_args, binding, _source, selected_store, _docker):
-        selected_store.save(binding.instance)
-        started.append((binding.instance.id, binding.instance.launch_id))
-        if len(started) == 2:
-            raise KeyboardInterrupt
-
-    monkeypatch.setattr("cyclo.cli.start_binding_locked", start)
-
-    result = main(["run", str(definition)])
-
-    assert result == 130
-    assert len(started) == 2
-    assert {
-        selected.id: selected.intent for selected in store.list()
-    } == {
-        identifier: "running" for identifier, _launch in started
-    }
-    assert "interrupted" in capsys.readouterr().err
-
-
-class GatewayDouble:
-    def __init__(self) -> None:
-        self.calls: list[tuple[object, ...]] = []
-        self.status_value = gateway_status()
-        self.store_volume = "cyclo-gateway-state"
-
-    def providers(self) -> str:
-        self.calls.append(("providers",))
-        return "PROVIDER\tDESCRIPTION\nopenai\tOpenAI API"
-
-    def status(self):
-        self.calls.append(("status",))
-        return self.status_value
-
-    def login(self, arguments):
-        self.calls.append(("login", tuple(arguments)))
-        return self.status_value
-
-    def build(self) -> str:
-        self.calls.append(("build",))
-        return "sha256:" + "c" * 64
-
-    def start(self):
-        self.calls.append(("start",))
-        return self.status_value
-
-    def restart(self):
-        self.calls.append(("restart",))
-        return self.status_value
-
-    def refresh(self):
-        self.calls.append(("refresh",))
-        return self.status_value
-
-    def stop(self) -> bool:
-        self.calls.append(("stop",))
-        return True
-
-    def destroy_store(self) -> bool:
-        self.calls.append(("destroy_store",))
-        return True
-
-    def usage(self):
-        self.calls.append(("usage",))
-        return {"requests": 3, "by_provider": {"openai": {"requests": 3}}}
-
-    def store_ready(self) -> bool:
-        self.calls.append(("store_ready",))
-        return True
-
-
-@pytest.mark.parametrize(
-    ("arguments", "call", "locks", "output"),
-    (
-        (("providers",), ("providers",), 1, "OpenAI API"),
-        (("status",), ("status",), 0, "gateway\tready"),
-        (("build",), ("refresh",), 1, "sha256:"),
-        (("start",), ("start",), 1, "gateway\tready"),
-        (("restart",), ("restart",), 1, "gateway\tready"),
-        (("stop",), ("stop",), 1, "stopped gateway"),
-        (
-            ("destroy-store", "--confirm", "cyclo-gateway-state"),
-            ("destroy_store",),
-            1,
-            "destroyed gateway store",
-        ),
-    ),
-)
-def test_gateway_actions_use_only_the_gateway_component(
-    arguments: tuple[str, ...],
-    call: tuple[object, ...],
-    locks: int,
-    output: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = RecordingStore(tmp_path / "state")
-    proxy = GatewayDouble()
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: proxy)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: pytest.fail(
-            "gateway command used provider composition"
-        ),
-    )
-
-    result = main(["gateway", *arguments])
-
-    assert result == 0
-    assert proxy.calls == [call]
-    assert store.lock_entries == locks
-    rendered = capsys.readouterr().out
-    assert output in rendered
-    if arguments[0] in {"build", "start", "restart", "status"}:
-        assert "store\tcyclo-gateway-state" in rendered
-
-
-def test_destroy_store_requires_the_exact_volume_name(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = RecordingStore(tmp_path / "state")
-    proxy = GatewayDouble()
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: proxy)
-
-    result = main(["gateway", "destroy-store", "--confirm", "wrong-volume"])
-
-    assert result == 1
-    assert proxy.calls == []
-    assert store.lock_entries == 1
-    assert "--confirm must equal cyclo-gateway-state" in capsys.readouterr().err
-
-
-def test_gateway_help_describes_store_and_credential_free_discovery() -> None:
-    parser = build_parser()
-    root_action = next(
-        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
-    )
-    gateway = root_action.choices["gateway"]
-    gateway_action = next(
-        action for action in gateway._actions if isinstance(action, argparse._SubParsersAction)
-    )
-
-    assert "credentials, subscriptions, and retained usage history" in gateway.format_help()
-    providers_help = " ".join(gateway_action.choices["providers"].format_help().split())
-    assert "Providers are upstream AI services" in providers_help
-    assert "does not read or mount the gateway credential store" in providers_help
-    login_help = " ".join(gateway_action.choices["login"].format_help().split())
-    assert "catalogue provider/account name" in login_help
-    assert "default: PROVIDER" in login_help
-    assert "read the API key from host environment variable NAME" in login_help
-    assert "pass it to the gateway over standard input" in login_help
-    assert (
-        "read an API key from standard input instead of using OAuth login"
-        in login_help
-    )
-    destroy_help = " ".join(gateway_action.choices["destroy-store"].format_help().split())
-    assert "--confirm VOLUME" in destroy_help
-    assert "credentials, subscriptions, and retained usage history" in destroy_help
-    assert "irreversibly" in destroy_help
-
-
-def test_gateway_login_forwards_only_explicit_login_arguments(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = RecordingStore(tmp_path / "state")
-    proxy = GatewayDouble()
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: proxy)
-
-    result = main(
-        [
-            "gateway",
-            "login",
-            "openai",
-            "--as",
-            "work",
-            "--api-key-env",
-            "WORK_OPENAI_KEY",
-        ]
-    )
-
-    assert result == 0
-    assert proxy.calls == [
-        ("login", ("openai", "--as", "work", "--api-key-env", "WORK_OPENAI_KEY"))
-    ]
-    assert store.lock_entries == 1
-    assert "gateway\tready" in capsys.readouterr().out
-
-
-def test_gateway_status_reports_stale_not_ready_component(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    proxy = GatewayDouble()
-    proxy.status_value = gateway_status(ready=False, current=False)
-    monkeypatch.setattr(
-        "cyclo.cli.state_store", lambda _args: RecordingStore(tmp_path / "state")
-    )
-    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: proxy)
-
-    assert main(["gateway", "status"]) == 1
-    rendered = capsys.readouterr().out
-    assert "gateway\tstale" in rendered
-    assert "stale\tstale" not in rendered
-
-
-class ProviderSystemDouble:
-    def __init__(self, socket_path: Path) -> None:
-        self.calls: list[tuple[object, ...]] = []
-        self.connection_value = provider_connection(socket_path)
-        self.gateway = SimpleNamespace(
-            socket_path=Path("/run/cyclo/gateway/component.sock")
-        )
-        self.configuration = SimpleNamespace(
-            path=Path("/etc/cyclo/host.conf"),
-            providers=(object(),),
-        )
-
-    def check(self) -> int:
-        self.calls.append(("check",))
-        return 1
-
-    def build(self):
-        self.calls.append(("build",))
-        return (("pass", "sha256:" + "d" * 64),)
-
-    def statuses(self):
-        self.calls.append(("statuses",))
-        return self.connection_value.components
-
-    def status_component(self, name):
-        self.calls.append(("status_component", name))
-        return next(
-            status
-            for status in self.connection_value.components
-            if status.name == name
-        )
-
-    def connection(self, statuses=None):
-        self.calls.append(("connection",))
-        if statuses is not None:
-            assert statuses is self.connection_value.components
-        return self.connection_value
-
-    def catalogue(self, connection):
-        self.calls.append(("catalogue",))
-        assert connection is self.connection_value
-        return (
-            connection,
-            {"models": [catalogue_model(model) for model in MODELS]},
-        )
-
-    def start(self):
-        self.calls.append(("start",))
-        return self.connection_value
-
-    def restart(self):
-        self.calls.append(("restart",))
-        return self.connection_value
-
-    def stop(self):
-        self.calls.append(("stop",))
-        return ("pass", "old-component")
-
-    def component_logs(self, name, lines):
-        self.calls.append(("component_logs", name, lines))
-        return "component output"
-
-
-def test_component_list_reports_each_component_without_failing_for_health(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    providers = ProviderSystemDouble(tmp_path / "component.sock")
-    providers.connection_value = SimpleNamespace(
-        generation="provider-generation",
-        socket_path=tmp_path / "component.sock",
-        components=(
-            gateway_status(),
-            component_status(
-                name="broken",
-                present=False,
-                running=False,
-                ready=False,
-                error="build failed",
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: providers,
-    )
-
-    assert main(["component", "list"]) == 0
-    rendered = capsys.readouterr().out
-    assert "gateway" in rendered
-    assert "broken" in rendered
-    assert "build failed" in rendered
-
-
-def test_component_status_labels_an_inspection_failure_unknown(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    providers = ProviderSystemDouble(tmp_path / "component.sock")
-    providers.connection_value = SimpleNamespace(
-        generation="provider-generation",
-        socket_path=tmp_path / "component.sock",
-        components=(
-            gateway_status(),
-            component_status(
-                name="broken",
-                present=False,
-                running=False,
-                ready=False,
-                container_state="unknown",
-                error="cannot inspect ownership",
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: providers,
-    )
-
-    assert main(["component", "status"]) == 1
-    row = next(
-        line
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith("broken")
-    )
-    assert "unknown" in row
-    assert "absent" not in row
-
-
-def test_component_gateway_status_does_not_parse_host_configuration(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    providers = ProviderSystemDouble(tmp_path / "component.sock")
-    loads: list[bool] = []
-
-    def make_system(_args, _store, *, load_config=True):
-        loads.append(load_config)
-        return providers
-
-    monkeypatch.setattr("cyclo.cli.provider_system", make_system)
-
-    assert main(["component", "status", "gateway"]) == 0
-    assert loads == [False]
-
-
-def test_component_logs_are_observational(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    root = tmp_path / "state"
-    store = StateStore(root, requested_host_config_scope="local")
-    providers = ProviderSystemDouble(tmp_path / "component.sock")
-
-    def make_system(_args, selected_store, *, load_config=True):
-        assert selected_store is store
-        assert load_config is True
-        assert host_config(selected_store) == root / "host.conf"
-        return providers
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.provider_system", make_system)
-
-    assert main(["component", "logs", "pass", "--lines", "4"]) == 0
-    assert providers.calls == [("component_logs", "pass", 4)]
-    assert capsys.readouterr().out == "component output\n"
-    assert not store.host_config_scope_path.exists()
-    assert not store.lock_path.exists()
-
-
-def test_invalid_component_log_count_does_not_initialize_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    root = tmp_path / "state"
-    store = StateStore(root, requested_host_config_scope="local")
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: pytest.fail(
-            "invalid log arguments must be rejected before provider inspection"
-        ),
-    )
-
-    assert main(["component", "logs", "pass", "--lines", "0"]) == 1
-    assert "--lines must be a positive integer" in capsys.readouterr().err
-    assert not root.exists()
-
-
-@pytest.mark.parametrize(
-    ("arguments", "call", "locks", "output"),
-    (
-        (("check",), ("check",), 0, "ok: 1 provider component(s)"),
-        (("build",), ("build",), 1, "pass\tsha256:"),
-        (("status",), ("statuses",), 0, "passthrough"),
-        (("start",), ("start",), 1, "gateway"),
-        (("restart",), ("restart",), 1, "passthrough"),
-    ),
-)
-def test_provider_actions_use_the_configured_stack(
-    arguments: tuple[str, ...],
-    call: tuple[object, ...],
-    locks: int,
-    output: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    socket_dir = tmp_path / "provider"
-    socket_dir.mkdir()
-    store = RecordingStore(tmp_path / "state")
-    stack = ProviderSystemDouble(socket_dir / "component.sock")
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: stack,
-    )
-
-    assert main(["providers", *arguments]) == 0
-    assert stack.calls == [call]
-    assert store.lock_entries == locks
-    assert output in capsys.readouterr().out
-
-
-def test_provider_stop_does_not_parse_an_invalid_host_configuration(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    root = tmp_path / "state"
-    root.mkdir()
-    invalid = root / "host.conf"
-    invalid.write_text("this is deliberately invalid\n", encoding="utf-8")
-    store = RecordingStore(root)
-    stack = ProviderSystemDouble(tmp_path / "component.sock")
-    loads: list[bool] = []
-
-    def make_stack(args, selected_store, *, load_config=True):
-        assert selected_store is store
-        assert host_config(selected_store) == invalid
-        loads.append(load_config)
-        return stack
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.provider_system", make_stack)
-
-    result = main(["providers", "stop", "--state-root", str(root)])
-
-    assert result == 0
-    assert loads == [False]
-    assert stack.calls == [("stop",)]
-    assert store.lock_entries == 1
-    assert "stopped: pass, old-component" in capsys.readouterr().out
-
-
-def test_models_lists_only_the_outer_provider_catalogue(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    stack = ProviderSystemDouble(tmp_path / "component.sock")
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: stack,
-    )
-    monkeypatch.setattr(
-        "cyclo.cli.gateway",
-        lambda *_args: pytest.fail("models queried gateway directly"),
-    )
-
-    assert main(["models", "--state-root", str(tmp_path / "state")]) == 0
-    assert capsys.readouterr().out.splitlines() == list(MODELS)
-    assert stack.calls == [("start",), ("catalogue",)]
-
-
-def test_models_explains_an_empty_catalogue(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    stack = ProviderSystemDouble(tmp_path / "component.sock")
-    stack.catalogue = lambda connection: (
-        connection,
-        {"models": []},
-    )
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: stack,
-    )
-
-    assert main(["models"]) == 1
-    assert "cyclo gateway providers" in capsys.readouterr().err
-
-
-def test_usage_is_the_gateway_global_report(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = RecordingStore(tmp_path / "state")
-    proxy = GatewayDouble()
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.gateway", lambda _args, _store: proxy)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: pytest.fail(
-            "usage queried provider composition"
-        ),
-    )
-
-    assert main(["--state-root", str(tmp_path / "state"), "usage"]) == 0
-    assert json.loads(capsys.readouterr().out) == {
-        "requests": 3,
-        "by_provider": {"openai": {"requests": 3}},
-    }
-    assert proxy.calls == [("usage",)]
-    assert store.lock_entries == 1
-
-
-def test_dashboard_usage_never_waits_for_the_installation_lock(
-    tmp_path: Path,
-) -> None:
-    events: list[str] = []
-
-    class Store(RecordingStore):
-        @contextmanager
-        def locked(
-            self,
-            *,
-            blocking: bool = True,
-            bind_host_config: bool = True,
-        ):
-            assert not blocking
-            assert not bind_host_config
-            self.lock_entries += 1
-            events.append("lock-enter")
-            try:
-                yield
-            finally:
-                events.append("lock-exit")
-
-    store = Store(tmp_path / "state")
-    store.components_root.mkdir(parents=True)
-    proxy = GatewayDouble()
-    real_store_ready = proxy.store_ready
-    real_usage = proxy.usage
-
-    def store_ready() -> bool:
-        assert events == ["lock-enter"]
-        return real_store_ready()
-
-    def usage():
-        assert events == ["lock-enter"]
-        return real_usage()
-
-    proxy.store_ready = store_ready  # type: ignore[method-assign]
-    proxy.usage = usage  # type: ignore[method-assign]
-    reader = _GatewayUsageReader(proxy, store)  # type: ignore[arg-type]
-
-    assert reader.usage()["requests"] == 3
-    assert store.lock_entries == 1
-    assert events == ["lock-enter", "lock-exit"]
-    assert proxy.calls == [("store_ready",), ("usage",)]
-
-
-def test_dashboard_usage_does_not_initialize_or_bind_observed_state(
-    tmp_path: Path,
-) -> None:
-    absent = StateStore(tmp_path / "absent")
-
-    class Proxy:
-        def store_ready(self) -> bool:
-            pytest.fail("an absent installation queried its gateway volume")
-
-        def usage(self):
-            pytest.fail("an absent installation ran a gateway tool")
-
-    assert _GatewayUsageReader(Proxy(), absent).usage() == {}  # type: ignore[arg-type]
-    assert not absent.root.exists()
-
-    selected = StateStore(tmp_path / "selected")
-    selected.components_root.mkdir(parents=True)
-    assert selected.host_config_scope == "local"
-
-    class ReadyProxy:
-        @staticmethod
-        def store_ready() -> bool:
-            return True
-
-        @staticmethod
-        def usage() -> dict[str, object]:
-            return {"totals": {}}
-
-    reader = _GatewayUsageReader(ReadyProxy(), selected)  # type: ignore[arg-type]
-    assert reader.usage() == {"totals": {}}
-    assert not selected.host_config_scope_path.exists()
-
-
-@pytest.mark.parametrize("task_status", (0, 7))
-def test_task_uses_agentws_and_always_removes_the_copied_spec(
-    task_status: int,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = StateStore(tmp_path / "state")
-    project_file = tmp_path / "project.cyclo"
-    project_file.write_text("not reread by task\n", encoding="utf-8")
-    selected = instance(
-        "silicon-rtl",
-        tmp_path,
+    selected = SimpleNamespace(
+        id="demo",
+        team_name="jon-rtl",
+        project_name="core-et",
         intent="running",
-        project_file=project_file,
+        offline=True,
     )
-    selected.project_mounts.append(
-        {"name": "specifications", "path": "/host/specifications", "mode": "ro"}
-    )
-    persist(store, selected)
-    specification = tmp_path / "task.md"
-    specification.write_text("Create a UART.\n", encoding="utf-8")
-    calls: list[tuple[object, ...]] = []
+    store = MemoryStore((selected,))
+    observed = dcomp_status(component("gateway"), component("team-demo"))
 
-    class FakeDocker:
-        def container_running(self, instance, *, system):
-            assert system == store.system
-            calls.append(("running", instance.container_name))
-            return True
+    class Runtime:
+        @property
+        def host(self):
+            raise CycloError("host.conf:1: unknown directive 'invalid'")
 
-        def copy_to(self, instance, source, destination, *, system):
-            assert system == store.system
-            calls.append(("copy", instance.container_name, source, destination))
+        def status(self):
+            return observed
 
-        def exec(self, instance, command, *, system, check=True, user=None):
-            assert system == store.system
-            calls.append(
-                ("exec", instance.container_name, tuple(command), check, user)
-            )
-            return task_status if command[0] == "/agentws/bin/task-create" else 0
+        @staticmethod
+        def component_for_instance(identifier):
+            return f"team-{identifier}"
 
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-
-    result = main(
-        [
-            "--state-root",
-            str(store.root),
-            "task",
-            "run",
-            selected.id,
-            "uart",
-            str(specification),
-        ]
-    )
-
-    assert result == (0 if task_status == 0 else 1)
-    create = next(call for call in calls if call[:2] == ("exec", selected.container_name))
-    assert create[2][0] == "/agentws/bin/task-create"
-    cleanup = [call for call in calls if call[0] == "exec" and call[2][:2] == ("rm", "-f")]
-    assert len(cleanup) == 1
-    assert cleanup[0][4] == "0:0"
-    captured = capsys.readouterr()
-    if task_status == 0:
-        assert "source: /workspace/source" in captured.out
-        assert "specifications: /readonly/specifications" in captured.out
-    else:
-        assert "AgentWS task creation failed with status 7" in captured.err
-
-
-def test_task_cleanup_failure_does_not_mask_creation_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = StateStore(tmp_path / "state")
-    selected = instance("silicon-rtl", tmp_path, intent="running")
-    persist(store, selected)
-    specification = tmp_path / "task.md"
-    specification.write_text("Create a UART.\n", encoding="utf-8")
-
-    class FakeDocker:
-        def container_running(self, instance, *, system):
-            return True
-
-        def copy_to(self, instance, source, destination, *, system):
+        @staticmethod
+        def team_port(_instance, _status):
             return None
 
-        def exec(self, instance, command, *, system, check=True, user=None):
-            if command[0] == "/agentws/bin/task-create":
-                return 7
-            return 9
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr(
+        "cyclo.cli.cyclo_runtime",
+        lambda _args, _store: Runtime(),
+    )
 
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-
-    assert main(
-        [
-            "--state-root",
-            str(store.root),
-            "task",
-            "run",
-            selected.id,
-            "uart",
-            str(specification),
-        ]
-    ) == 1
-    error = capsys.readouterr().err
-    assert "AgentWS task creation failed with status 7" in error
-    assert "copied task specification cleanup failed" in error
-    assert "status 9" in error
-
-
-def test_task_copy_failure_removes_any_partial_copy(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = StateStore(tmp_path / "state")
-    selected = instance("silicon-rtl", tmp_path, intent="running")
-    persist(store, selected)
-    specification = tmp_path / "task.md"
-    specification.write_text("Create a UART.\n", encoding="utf-8")
-    commands: list[tuple[str, ...]] = []
-
-    class FakeDocker:
-        def container_running(self, instance, *, system):
-            return True
-
-        def copy_to(self, instance, source, destination, *, system):
-            raise CycloError("injected copy failure")
-
-        def exec(self, instance, command, *, system, check=True, user=None):
-            commands.append(tuple(command))
-            return 0
-
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-
-    assert main(
-        [
-            "--state-root",
-            str(store.root),
-            "task",
-            "run",
-            selected.id,
-            "uart",
-            str(specification),
-        ]
-    ) == 1
-    assert len(commands) == 1
-    assert commands[0][:2] == ("rm", "-f")
-    assert commands[0][2].startswith("/tmp/cyclo-task-uart-")
-    assert "injected copy failure" in capsys.readouterr().err
-
-
-def test_task_cleanup_failure_does_not_overturn_committed_task(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = StateStore(tmp_path / "state")
-    selected = instance("silicon-rtl", tmp_path, intent="running")
-    persist(store, selected)
-    specification = tmp_path / "task.md"
-    specification.write_text("Create a UART.\n", encoding="utf-8")
-
-    class FakeDocker:
-        def container_running(self, instance, *, system):
-            return True
-
-        def copy_to(self, instance, source, destination, *, system):
-            return None
-
-        def exec(self, instance, command, *, system, check=True, user=None):
-            if command[0] == "/agentws/bin/task-create":
-                return 0
-            return 9
-
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-
-    assert main(
-        [
-            "--state-root",
-            str(store.root),
-            "task",
-            "run",
-            selected.id,
-            "uart",
-            str(specification),
-        ]
-    ) == 0
+    assert cmd_ps(namespace()) == 1
     captured = capsys.readouterr()
-    assert f"project: {tmp_path.name}" in captured.out
-    assert "copied task specification cleanup failed" in captured.err
-    assert "status 9" in captured.err
+    assert "demo" in captured.out
+    assert "ready" in captured.out
+    assert "host configuration unavailable" in captured.err
 
 
-@pytest.mark.parametrize(
-    ("arguments", "agentws_command"),
-    (
-        (["list", "silicon-rtl"], ("/agentws/bin/task-list",)),
-        (
-            ["show", "silicon-rtl", "uart"],
-            ("/agentws/bin/task-show", "uart"),
-        ),
-        (
-            ["comment", "silicon-rtl", "uart", "check", "timing"],
-            ("/agentws/bin/task-comment", "uart", "check timing"),
-        ),
-        (
-            ["complete", "silicon-rtl", "uart", "-m", "accepted"],
-            ("/agentws/bin/task-state", "uart", "done", "-m", "accepted"),
-        ),
-        (
-            ["reopen", "silicon-rtl", "uart"],
-            ("/agentws/bin/task-state", "uart", "open"),
-        ),
-    ),
-)
-def test_task_commands_are_a_scoped_agentws_interface(
-    arguments: list[str],
-    agentws_command: tuple[str, ...],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = StateStore(tmp_path / "state")
-    selected = instance("silicon-rtl", tmp_path, intent="running")
-    persist(store, selected)
-    calls: list[tuple[object, ...]] = []
-
-    class FakeDocker:
-        def container_running(self, instance, *, system):
-            assert system == store.system
-            calls.append(("running", instance.container_name))
-            return True
-
-        def exec(self, instance, command, *, system, check=True, user=None):
-            assert system == store.system
-            calls.append(
-                ("exec", instance.container_name, tuple(command), check, user)
-            )
-            return 0
-
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-
-    assert main(["--state-root", str(store.root), "task", *arguments]) == 0
-    assert calls == [
-        ("running", selected.container_name),
-        ("exec", selected.container_name, agentws_command, False, None),
-    ]
-
-
-def test_task_rejects_a_foreign_same_name_container_before_exec(
-    tmp_path: Path,
+def test_doctor_checks_applied_components_when_host_configuration_is_malformed(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    store = StateStore(tmp_path / "state")
-    selected = instance("silicon-rtl", tmp_path, intent="running")
-    persist(store, selected)
-    docker = Docker()
-    monkeypatch.setattr(
-        docker,
-        "inspect",
-        lambda _kind, _name: {
-            "Id": "foreign-container-id",
-            "Name": f"/{selected.container_name}",
-            "Config": {
-                "Labels": {
-                    "io.cyclo.system": "ba9876543210",
-                    "io.cyclo.kind": "team",
-                    "io.cyclo.instance": selected.id,
-                }
-            },
-            "State": {"Running": True},
-        },
-    )
-    monkeypatch.setattr(
-        docker,
-        "call",
-        lambda *_args, **_kwargs: pytest.fail(
-            "foreign container must never receive an AgentWS command"
-        ),
-    )
-    monkeypatch.setattr("cyclo.cli.Docker", lambda: docker)
+    store = MemoryStore()
+    observed = dcomp_status(component("gateway"), component("fusion"))
 
-    assert main(
-        ["--state-root", str(store.root), "task", "list", selected.id]
-    ) == 1
-    assert "refusing to use non-Cyclo container" in capsys.readouterr().err
-
-
-def test_task_rejects_an_agentws_invalid_id_before_docker(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = StateStore(tmp_path / "state")
-    persist(store, instance("silicon-rtl", tmp_path, intent="running"))
-    monkeypatch.setattr(
-        "cyclo.cli.Docker",
-        lambda: pytest.fail("Docker consulted for an invalid task ID"),
-    )
-
-    assert main(
-        ["--state-root", str(store.root), "task", "show", "silicon-rtl", ".hidden"]
-    ) == 1
-    assert "task ID must start with a letter or number" in capsys.readouterr().err
-
-
-def test_stop_by_instance_id_does_not_consult_project_files(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = StateStore(tmp_path / "state")
-    selected = instance("alpha", tmp_path, intent="running")
-    persist(store, selected)
-    stopped: list[str] = []
-    observer = StateStore(store.root)
-
-    def stop(selected_store, _docker, instance):
-        assert selected_store.root == store.root
-        with pytest.raises(CycloError, match="state is busy"):
-            with observer.locked(blocking=False):
-                pytest.fail("instance stop escaped the installation lock")
-        stopped.append(instance.id)
-
-    monkeypatch.setattr("cyclo.cli.Docker", lambda: object())
-    monkeypatch.setattr(
-        "cyclo.cli.stop_managed_instance_locked",
-        stop,
-    )
-
-    assert main(["--state-root", str(store.root), "stop", selected.id]) == 0
-    assert stopped == [selected.id]
-    assert "stopped Cyclo instance: alpha" in capsys.readouterr().out
-
-
-def test_stop_project_uses_persisted_bindings_and_continues_after_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = StateStore(tmp_path / "state")
-    definition = tmp_path / "deleted-project.cyclo"
-    first = instance(
-        "alpha",
-        tmp_path,
-        intent="running",
-        project_file=definition,
-    )
-    second = instance(
-        "beta",
-        tmp_path,
-        intent="running",
-        project_file=definition,
-    )
-    persist(store, first)
-    persist(store, second)
-    attempted: list[str] = []
-    observer = StateStore(store.root)
-
-    def stop(selected_store, _docker, instance):
-        assert selected_store.root == store.root
-        with pytest.raises(CycloError, match="state is busy"):
-            with observer.locked(blocking=False):
-                pytest.fail("project stop escaped the installation lock")
-        attempted.append(instance.id)
-        if instance.id == first.id:
-            raise CycloError("injected cleanup failure")
-
-    monkeypatch.setattr("cyclo.cli.Docker", lambda: object())
-    monkeypatch.setattr("cyclo.cli.stop_managed_instance_locked", stop)
-
-    result = main(["--state-root", str(store.root), "stop", str(definition)])
-
-    assert result == 1
-    assert attempted == [first.id, second.id]
-    captured = capsys.readouterr()
-    assert "stopped Cyclo instance: beta" in captured.out
-    assert "project stop incomplete" in captured.err
-    assert "injected cleanup failure" in captured.err
-
-
-def test_forget_removes_only_a_confirmed_stopped_instance(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = StateStore(tmp_path / "state")
-    selected = instance("retired", tmp_path, intent="stopped")
-    persist(store, selected)
-    task = store.tasks_dir(selected.id) / "saved-task"
-    task.mkdir(parents=True)
-    (task / "spec.md").write_text("durable work\n", encoding="utf-8")
-    calls: list[tuple[object, ...]] = []
-
-    class FakeDocker:
-        def container_lifecycle_state(self, instance, *, system):
-            assert instance.id == selected.id
-            assert system == store.system
-            return DockerContainerState.STOPPED
-
-        def stop_remove(
-            self,
-            container,
-            expected_instance,
-            *,
-            expected_system,
-            expected_launch,
-        ):
-            assert store.load(selected.id).intent == "deleting"
-            calls.append(
-                (
-                    "container",
-                    container,
-                    expected_instance,
-                    expected_system,
-                    expected_launch,
-                )
-            )
-            return True
-
-        def remove_network(self, name, expected_instance, *, system):
-            calls.append(("network", name, expected_instance, system))
-
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-
-    arguments = [
-        "--state-root",
-        str(store.root),
-        "forget",
-        selected.id,
-        "--confirm",
-        selected.id,
-    ]
-    assert main(arguments) == 0
-    assert not store.instance_dir(selected.id).exists()
-    assert calls == [
-        (
-            "container",
-            selected.container_name,
-            selected.id,
-            store.system,
-            selected.launch_id,
-        ),
-        ("network", selected.network_name, selected.id, store.system),
-    ]
-    assert "forgot Cyclo instance: retired" in capsys.readouterr().out
-
-    # The durable absence is the commit. A controller killed after that point
-    # can safely retry the same explicitly confirmed command.
-    assert main(arguments) == 0
-    assert calls == [
-        (
-            "container",
-            selected.container_name,
-            selected.id,
-            store.system,
-            selected.launch_id,
-        ),
-        ("network", selected.network_name, selected.id, store.system),
-    ]
-    assert "already absent" in capsys.readouterr().out
-
-
-def test_forget_requires_exact_confirmation_and_stopped_intent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = StateStore(tmp_path / "state")
-    selected = instance("active", tmp_path, intent="running")
-    persist(store, selected)
-    monkeypatch.setattr(
-        "cyclo.cli.Docker",
-        lambda: pytest.fail("unconfirmed state must not touch Docker"),
-    )
-
-    prefix = ["--state-root", str(store.root), "forget", selected.id]
-    assert main([*prefix, "--confirm", "another"]) == 1
-    assert "--confirm must exactly match" in capsys.readouterr().err
-
-    class NoDockerCalls:
-        def __getattr__(self, name):
-            raise AssertionError(f"unexpected Docker call: {name}")
-
-    monkeypatch.setattr("cyclo.cli.Docker", NoDockerCalls)
-    assert main([*prefix, "--confirm", selected.id]) == 1
-    assert "still has running intent" in capsys.readouterr().err
-    assert store.metadata_path(selected.id).is_file()
-
-
-@pytest.mark.parametrize(
-    "active_state",
-    [DockerContainerState.PAUSED, DockerContainerState.RESTARTING],
-)
-def test_repair_restarts_non_running_intent_and_cleans_stopped_resources(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    active_state: DockerContainerState,
-) -> None:
-    stale = instance("stale", tmp_path, intent="running")
-    stopped = instance("stopped", tmp_path, intent="stopped")
-    store = RecordingStore(tmp_path / "state", [stale, stopped])
-    calls: list[tuple[str, str]] = []
-    restarted: list[str] = []
-    base_inputs: list[str | None] = []
-
-    class FakeDocker:
-        @staticmethod
-        def container_lifecycle_state(instance, *, system):
-            assert system == store.system
-            return (
-                active_state
-                if instance.id == stale.id
-                else DockerContainerState.STOPPED
-            )
-
-        @staticmethod
-        def stop_remove(
-            name, identifier, *, expected_system, expected_launch
-        ):
-            assert expected_system == store.system
-            assert expected_launch == "0" * 32
-            calls.append(("container", f"{name}:{identifier}"))
-            return True
-
-        @staticmethod
-        def remove_network(name, identifier, *, system):
-            assert system == store.system
-            calls.append(("network", name))
-
-    def prepare(_args, selected_store, _source, instances):
-        assert selected_store is store
-        assert [selected.id for selected in instances] == [stale.id]
-        return [
-            (
-                SimpleNamespace(project="persisted-project.cyclo"),
-                "cyclo-team:test",
-                (SimpleNamespace(instance=stale),),
-            )
-        ]
-
-    def start(
-        _project_args,
-        _source,
-        selected_store,
-        _docker,
-        _base_image,
-        bindings,
-        *,
-        images_prepared=False,
-    ):
-        assert selected_store is store
-        assert images_prepared
-        restarted.extend(binding.instance.id for binding in bindings)
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-    monkeypatch.setattr("cyclo.cli.agentws_root", lambda: tmp_path / "agentws")
-    monkeypatch.setattr("cyclo.cli._prepare_recorded_projects", prepare)
-    stack = RunSystem(tmp_path / "provider" / "component.sock")
-    monkeypatch.setattr("cyclo.cli.provider_system", lambda *_args: stack)
-    monkeypatch.setattr(
-        "cyclo.cli._configure_provider_bindings",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        "cyclo.cli._prepare_team_images",
-        lambda _bindings, *, base_image, base_image_id=None: (
-            base_inputs.append(base_image_id)
-            or "sha256:" + "a" * 64
-        ),
-    )
-    monkeypatch.setattr("cyclo.cli._start_project_locked", start)
-
-    assert main(["repair"]) == 0
-    assert store.lock_entries == 1
-    assert restarted == [stale.id]
-    assert base_inputs == [None]
-    assert calls == [
-        ("container", f"{stale.container_name}:{stale.id}"),
-        ("network", stale.network_name),
-        ("container", f"{stopped.container_name}:{stopped.id}"),
-        ("network", stopped.network_name),
-    ]
-    assert (
-        "restarted 1 missing instance(s); recovered 0 published port(s); "
-        "removed 2 unwanted container(s); finished 0 deletion(s)"
-        in capsys.readouterr().out
-    )
-
-
-def test_repair_continues_after_independent_cleanup_failures(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    first = instance("first", tmp_path, intent="stopped")
-    second = instance("second", tmp_path, intent="stopped")
-    third = instance("third", tmp_path, intent="stopped")
-    store = RecordingStore(tmp_path / "state", [first, second, third])
-    calls: list[tuple[str, str]] = []
-
-    class FakeDocker:
-        @staticmethod
-        def container_lifecycle_state(_instance, *, system):
-            assert system == store.system
-            return DockerContainerState.STOPPED
-
-        @staticmethod
-        def stop_remove(
-            name, identifier, *, expected_system, expected_launch
-        ):
-            assert expected_system == store.system
-            assert expected_launch == "0" * 32
-            calls.append(("container", identifier))
-            if identifier == "first":
-                raise CycloError("container failure")
-            return True
-
-        @staticmethod
-        def remove_network(name, identifier, *, system):
-            assert system == store.system
-            calls.append(("network", identifier))
-            if identifier == "second":
-                raise CycloError("network failure")
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-
-    assert main(["repair"]) == 1
-    assert store.lock_entries == 1
-    assert calls == [
-        ("container", "first"),
-        ("container", "second"),
-        ("network", "second"),
-        ("container", "third"),
-        ("network", "third"),
-    ]
-    streams = capsys.readouterr()
-    assert (
-        "restarted 0 missing instance(s); recovered 0 published port(s); "
-        "removed 2 unwanted container(s); finished 0 deletion(s)"
-        in streams.out
-    )
-    assert "first cleanup: container failure" in streams.err
-    assert "second cleanup: network failure" in streams.err
-
-
-def test_ps_distinguishes_container_and_metadata_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    running = instance("running", tmp_path, intent="running")
-    running.project_name = "live-project"
-    orphan = instance("orphan", tmp_path, intent="stopped")
-    paused = instance("paused", tmp_path, intent="running")
-    restarting = instance("restarting", tmp_path, intent="running")
-    stale = instance("stale", tmp_path, intent="running")
-    stopped = instance("stopped", tmp_path, intent="stopped")
-    for selected in (running, orphan, paused, restarting, stale, stopped):
-        selected.port = 4100
-    store = RecordingStore(
-        tmp_path / "state",
-        [running, orphan, paused, restarting, stale, stopped],
-    )
-    container_states = {
-        running.container_name: DockerContainerState.RUNNING,
-        orphan.container_name: DockerContainerState.RUNNING,
-        paused.container_name: DockerContainerState.PAUSED,
-        restarting.container_name: DockerContainerState.RESTARTING,
-        stale.container_name: DockerContainerState.STOPPED,
-        stopped.container_name: DockerContainerState.ABSENT,
-    }
-    shared_reads: list[bool] = []
-
-    class FakeDocker:
-        @staticmethod
-        def container_lifecycle_state(instance, *, system):
-            assert system == store.system
-            return container_states[instance.container_name]
-
-    def shared(_args, selected_store):
-        assert selected_store is store
-        shared_reads.append(True)
-        return ProviderHealth("ready"), SimpleNamespace()
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-    monkeypatch.setattr("cyclo.cli._shared_provider_health", shared)
-    monkeypatch.setattr(
-        "cyclo.cli.instance_provider_health",
-        lambda *_args: ProviderHealth("ready"),
-    )
-    monkeypatch.setattr(
-        "cyclo.cli.read_agent_supervisor_status",
-        lambda _root: AgentSupervisorStatus(),
-    )
-
-    assert main(["ps"]) == 0
-    rows = {
-        fields[0]: fields
-        for line in capsys.readouterr().out.splitlines()[1:]
-        if (fields := line.split())
-    }
-    assert rows["running"][1:4] == ["running", "running", "ready"]
-    assert rows["running"][5] == "live-project"
-    assert rows["orphan"][1:4] == ["stopped", "orphan", "inactive"]
-    assert rows["paused"][1:4] == ["running", "paused", "inactive"]
-    assert rows["restarting"][1:4] == [
-        "running",
-        "restarting",
-        "inactive",
-    ]
-    assert rows["stale"][1:4] == ["running", "stale", "inactive"]
-    assert rows["stopped"][1:4] == ["stopped", "stopped", "inactive"]
-    assert len(rows["running"]) == 7
-    assert rows["running"][-1] == "4100"
-    assert all(
-        "4100" not in rows[identifier]
-        for identifier in (
-            "orphan",
-            "paused",
-            "restarting",
-            "stale",
-            "stopped",
+    class Runtime:
+        dcomp = SimpleNamespace(
+            version=lambda: SimpleNamespace(version="0.1.0", api_version=1)
         )
-    )
-    assert shared_reads == [True]
 
+        @property
+        def host(self):
+            raise CycloError("host.conf:1: unknown directive 'invalid'")
 
-def test_ps_reports_one_uninspectable_container_and_continues(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    broken = instance("broken", tmp_path, intent="running")
-    stopped = instance("stopped", tmp_path, intent="stopped")
-    store = RecordingStore(tmp_path / "state", [broken, stopped])
+        def status(self):
+            return observed
 
-    class FakeDocker:
         @staticmethod
-        def container_lifecycle_state(selected, *, system):
-            assert system == store.system
-            if selected.id == "broken":
-                raise CycloError("container ownership labels do not match")
-            return DockerContainerState.ABSENT
+        def component_for_instance(identifier):
+            return f"team-{identifier}"
 
     monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
     monkeypatch.setattr(
-        "cyclo.cli._shared_provider_health",
-        lambda *_args: pytest.fail("no running instance should inspect providers"),
+        "cyclo.cli.cyclo_runtime",
+        lambda _args, _store: Runtime(),
     )
 
-    assert main(["ps"]) == 0
+    assert cmd_doctor(namespace()) == 1
     output = capsys.readouterr().out
-    assert "broken" in output
-    assert "unknown (container ownership labels do not match)" in output
-    assert "stopped" in output
+    assert "ok  dcomp 0.1.0 (API 1)" in output
+    assert "ok  component gateway" in output
+    assert "ok  component fusion" in output
+    assert "no  host configuration unavailable" in output
 
 
-def test_inspect_explains_one_persisted_instance_without_requiring_it_to_run(
-    tmp_path: Path,
+def test_running_instance_requires_its_outer_provider() -> None:
+    team = component("team-demo")
+    gateway = DCompComponentStatus(
+        name="gateway",
+        container_id="b" * 64,
+        status="exited",
+        health="unhealthy",
+        exit_code=1,
+        problem="provider failed",
+        published_ports=(),
+    )
+    status = dcomp_status(gateway, team)
+    runtime = SimpleNamespace(
+        host=SimpleNamespace(outer_component="gateway"),
+    )
+
+    condition, detail = _running_instance_condition(runtime, status, team)
+
+    assert condition == "not-ready"
+    assert "provider failed" in detail
+
+
+def test_gateway_login_arguments_do_not_expand_secret_environment() -> None:
+    args = namespace(
+        provider="openai",
+        account="work",
+        api_key_env="OPENAI_SECRET",
+        api_key_stdin=False,
+    )
+
+    assert _gateway_login_arguments(args) == [
+        "openai",
+        "--as",
+        "work",
+        "--api-key-env",
+        "OPENAI_SECRET",
+    ]
+
+
+def test_main_prints_one_user_facing_error(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    store = StateStore(tmp_path / "state")
-    project_file = tmp_path / "project.cyclo"
-    project_file.write_text("persisted definition path only\n", encoding="utf-8")
-    selected = instance("silicon-rtl", tmp_path, project_file=project_file)
-    selected.project_mounts.append(
-        {"name": "specifications", "path": "/host/specifications", "mode": "ro"}
-    )
-    persist(store, selected)
+    def fail(_args):
+        raise CycloError("broken")
 
-    class FakeDocker:
-        def container_lifecycle_state(self, instance, *, system):
-            assert system == store.system
-            assert instance.container_name == selected.container_name
-            return DockerContainerState.ABSENT
+    monkeypatch.setattr("cyclo.cli.cmd_ps", fail)
 
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: pytest.fail("stopped instance queried providers"),
-    )
-
-    assert main(["inspect", selected.id, "--state-root", str(store.root)]) == 0
-    rendered = capsys.readouterr().out
-    assert "instance: silicon-rtl" in rendered
-    assert "state: stopped" in rendered
-    assert "AgentWS: unavailable (stopped)" in rendered
-    assert "source (rw):" in rendered
-    assert "-> /workspace/source" in rendered
-    assert "specifications (ro): /host/specifications -> /readonly/specifications" in rendered
-
-
-def test_ps_and_inspect_include_a_pending_deletion_without_stale_endpoint(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = StateStore(tmp_path / "state")
-    selected = instance("retiring", tmp_path, intent="deleting")
-    selected.port = 4100
-    persist(store, selected)
-    task = store.tasks_dir(selected.id) / "saved-task"
-    task.mkdir(parents=True)
-    (task / "spec.md").write_text("durable work\n", encoding="utf-8")
-    store.instance_dir(selected.id).rename(store.deletion_dir(selected.id))
-
-    class FakeDocker:
-        @staticmethod
-        def container_lifecycle_state(instance, *, system):
-            assert instance.id == selected.id
-            assert system == store.system
-            return DockerContainerState.ABSENT
-
-    monkeypatch.setattr("cyclo.cli.Docker", FakeDocker)
-
-    state_root = ["--state-root", str(store.root)]
-    assert main([*state_root, "ps"]) == 0
-    row = capsys.readouterr().out.splitlines()[1].split()
-    assert row[0:4] == ["retiring", "deleting", "deleting", "inactive"]
-    assert "4100" not in row
-
-    assert main([*state_root, "inspect", selected.id]) == 0
-    rendered = capsys.readouterr().out
-    assert "intent: deleting" in rendered
-    assert "state: deleting" in rendered
-    assert "AgentWS: unavailable (deleting)" in rendered
-    assert (
-        f"queue: {store.deletion_dir(selected.id) / 'agentws-state'}"
-        in rendered
-    )
-
-
-def test_doctor_reports_a_ready_installation_without_mutating_it(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = RecordingStore(tmp_path / "state")
-    components = tmp_path / "components"
-    stack = ProviderSystemDouble(tmp_path / "provider" / "component.sock")
-    stack.configuration = SimpleNamespace(
-        path=tmp_path / "host.conf",
-        providers=(object(),),
-    )
-    class FakeDocker:
-        @staticmethod
-        def available():
-            return True, "test-engine"
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.agentws_root", lambda: tmp_path / "agentws")
-    monkeypatch.setattr("cyclo.cli.component_sources_root", lambda: components)
-    monkeypatch.setattr(
-        "cyclo.cli.parse_declaration",
-        lambda _path: SimpleNamespace(provides=(COMPONENT_INTERFACE, PROVIDER_INTERFACE)),
-    )
-    monkeypatch.setattr("cyclo.cli.ComponentController", FakeDocker)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: stack,
-    )
-
-    assert main(["doctor"]) == 0
-    output = capsys.readouterr().out
-    assert "ok  bundled AgentWS ABI:" in output
-    assert "ok  component ABI:" in output
-    assert "ok  persisted instance state: 0 instance(s)" in output
-    assert "ok  Docker daemon: test-engine" in output
-    assert "ok  host provider configuration:" in output
-    assert "ok  credential gateway: ready" in output
-    assert "ok  provider component pass: ready" in output
-    assert "ok  selected provider catalogue: 2 model(s)" in output
-    assert store.lock_entries == 0
-
-
-def test_doctor_reports_a_catalogue_fallback_as_component_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = RecordingStore(tmp_path / "state")
-    stack = ProviderSystemDouble(tmp_path / "provider" / "component.sock")
-    stack.configuration = SimpleNamespace(
-        path=tmp_path / "host.conf",
-        providers=(object(),),
-    )
-    fallback = provider_connection(stack.gateway.socket_path)
-    fallback.components = (
-        fallback.components[0],
-        component_status(
-            name="pass",
-            error="model catalogue unavailable: invalid response",
-        ),
-    )
-    stack.catalogue = lambda _connection: (
-        fallback,
-        {"models": [catalogue_model(MODELS[0])]},
-    )
-
-    class FakeDocker:
-        @staticmethod
-        def available():
-            return True, "test-engine"
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.agentws_root", lambda: tmp_path / "agentws")
-    monkeypatch.setattr(
-        "cyclo.cli.component_sources_root",
-        lambda: tmp_path / "components",
-    )
-    monkeypatch.setattr(
-        "cyclo.cli.parse_declaration",
-        lambda _path: SimpleNamespace(
-            provides=(COMPONENT_INTERFACE, PROVIDER_INTERFACE)
-        ),
-    )
-    monkeypatch.setattr("cyclo.cli.ComponentController", FakeDocker)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: stack,
-    )
-
-    assert main(["doctor"]) == 1
-    output = capsys.readouterr().out
-    assert "no  provider component pass:" in output
-    assert "model catalogue unavailable: invalid response" in output
-    assert "ok  selected provider catalogue: 1 model(s)" in output
-
-
-def test_doctor_stops_cleanly_when_docker_is_unavailable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = RecordingStore(tmp_path / "state")
-
-    class MissingDocker:
-        @staticmethod
-        def available():
-            return False, "daemon unavailable"
-
-    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
-    monkeypatch.setattr("cyclo.cli.agentws_root", lambda: tmp_path / "agentws")
-    monkeypatch.setattr(
-        "cyclo.cli.component_sources_root", lambda: tmp_path / "components"
-    )
-    monkeypatch.setattr(
-        "cyclo.cli.parse_declaration",
-        lambda _path: SimpleNamespace(provides=(COMPONENT_INTERFACE, PROVIDER_INTERFACE)),
-    )
-    monkeypatch.setattr("cyclo.cli.ComponentController", MissingDocker)
-    monkeypatch.setattr(
-        "cyclo.cli.provider_system",
-        lambda *_args, **_kwargs: pytest.fail("doctor parsed providers without Docker"),
-    )
-
-    assert main(["doctor"]) == 1
-    assert "no  Docker daemon: daemon unavailable" in capsys.readouterr().out
-    assert store.lock_entries == 0
+    assert main(["ps"]) == 1
+    assert capsys.readouterr().err == "error: broken\n"

@@ -22,15 +22,16 @@ include tests/fixtures/derived-team/Dockerfile
 
 include src/cyclo/components/__init__.py
 include src/cyclo/components/README.md
+include src/cyclo/adapters/__init__.py
+graft src/cyclo/adapters/pi
 graft src/cyclo/components/protocol/component
 graft src/cyclo/components/protocol/provider
 graft src/cyclo/components/gateway
 graft src/cyclo/components/passthrough
-graft src/cyclo/components/pi-provider
 graft src/cyclo/components/team-runtime
+prune src/cyclo/adapters/pi/node_modules
 prune src/cyclo/components/protocol/component/node_modules
 prune src/cyclo/components/protocol/provider/node_modules
 prune src/cyclo/components/gateway/node_modules
 prune src/cyclo/components/passthrough/node_modules
-prune src/cyclo/components/pi-provider/node_modules
 prune src/cyclo/components/team-runtime/node_modules

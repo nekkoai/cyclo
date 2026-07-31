@@ -2,7 +2,7 @@
 
 `@cyclo/provider` defines the interface between Cyclo model components. It has
 a typed control plane and an opaque inference data plane. ConnectRPC carries
-both over HTTP/1.1 Unix-domain sockets.
+both over HTTP/1.1 TCP on DComp's private link networks.
 
 ```proto
 service Provider {
@@ -58,14 +58,14 @@ provide cyclo.provider.v1.Provider
 require upstream cyclo.provider.v1.Provider
 ```
 
-The component runtime mounts the selected upstream socket at the named
-requirement path. The interface package knows nothing about Docker, paths,
-credentials, routing policy, or lifecycle.
+DComp exposes the selected upstream as
+`DCOMP_LINK_UPSTREAM=dns:///provider:50051`. The interface package knows
+nothing about Docker credentials, routing policy, or lifecycle.
 
 ```sh
 npm ci
 npm test
 ```
 
-The tests regenerate the descriptor, exercise real ConnectRPC calls over Unix
-sockets, prove exact payload-string preservation, and verify cancellation.
+The tests regenerate the descriptor, exercise real ConnectRPC calls over TCP,
+prove exact payload-string preservation, and verify cancellation.
