@@ -228,6 +228,15 @@ The common team image contains:
 - the read-only AgentWS viewer; and
 - the standard command-line tools.
 
+The source tree follows that runtime boundary. `cyclo.components.team` owns
+everything copied into or executed by the team image: its Dockerfile,
+entrypoint, supervisor, AgentWS tree, Pi adapter, and JavaScript dependencies.
+`cyclo.team` is the separate host-side library for team definitions, packaged
+templates, image construction, DComp component compilation, queue inspection,
+compatibility checks, and confined task administration. Shared Component and
+Provider interface packages remain under `cyclo.components.protocol`; the Pi
+adapter is not an independent runtime component.
+
 AgentWS code is image content, not a host bind mount. A running team receives:
 
 ```text

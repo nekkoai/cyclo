@@ -7,13 +7,13 @@ import { connectNodeAdapter } from "@connectrpc/connect-node";
 import { Modality, Provider } from "@cyclo/provider/contract";
 import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
 
-import { createPiAdapter } from "../../../components/gateway/src/pi-adapter.mjs";
-import { createGatewayServices } from "../../../components/gateway/src/services.mjs";
+import { createPiAdapter } from "../../../gateway/src/pi-adapter.mjs";
+import { createGatewayServices } from "../../../gateway/src/services.mjs";
 import { groupModels, streamProvider } from "../src/adapter.mjs";
 import { registerCycloProviders } from "../src/extension.mjs";
 
 const MODEL_ID_CASES = JSON.parse(await readFile(
-  new URL("../../../components/protocol/provider/test/model-id-cases.json", import.meta.url),
+  new URL("../../../protocol/provider/test/model-id-cases.json", import.meta.url),
   "utf8",
 ));
 

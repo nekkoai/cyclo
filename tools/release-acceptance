@@ -216,8 +216,13 @@ forbidden_names = {
     "cyclo/providers.py",
     "cyclo/runtime.lock.json",
     "cyclo/team_runtime_image.py",
-    "cyclo/_agentws/LICENSE",
-    "cyclo/_agentws/UPSTREAM.json",
+    "cyclo/agentws_bundle.py",
+    "cyclo/agentws_queue.py",
+    "cyclo/container_runtime.py",
+    "cyclo/pi_runtime.py",
+    "cyclo/task_admin.py",
+    "cyclo/team.py",
+    "cyclo/team_templates.py",
 }
 
 required_names = {
@@ -229,7 +234,12 @@ required_names = {
     and path.suffix not in {".pyc", ".pyo"}
 }
 
-legacy_package_prefix = "cyclo/" + "vendor" + "_gateway/"
+legacy_package_prefixes = (
+    "cyclo/" + "vendor" + "_gateway/",
+    "cyclo/_agentws/",
+    "cyclo/adapters/",
+    "cyclo/team_templates/",
+)
 upstream_https = b"github" + b".com/glguida/"
 upstream_ssh = b"git@" + b"github.com:glguida/"
 private_home = b"/home/" + b"glguida"
@@ -257,12 +267,18 @@ with zipfile.ZipFile(wheel) as archive:
     problems.extend(
         f"legacy package path remains: {name}"
         for name in sorted(names)
-        if name.startswith(legacy_package_prefix)
+        if name.startswith(legacy_package_prefixes)
     )
     problems.extend(
         f"installed dependency tree leaked into wheel: {name}"
         for name in sorted(names)
         if "node_modules" in Path(name).parts
+    )
+    problems.extend(
+        f"Python bytecode cache leaked into wheel: {name}"
+        for name in sorted(names)
+        if "__pycache__" in Path(name).parts
+        or Path(name).suffix in {".pyc", ".pyo"}
     )
     for name in sorted(names):
         data = archive.read(name)

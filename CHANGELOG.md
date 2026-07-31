@@ -94,6 +94,10 @@ adopt Cyclo 0.1 state or Docker resources.
 - Bake AgentWS, Pi, the Provider adapter, and the team supervisor into the
   common image. Bind only durable tasks, jobs, agents, Pi state, team source,
   project context, and declared project directories at runtime.
+- Keep all code installed or executed in a team container together under the
+  team component, with a separate host-side `cyclo.team` library for parsing,
+  image and DComp-definition construction, queue inspection, templates,
+  compatibility checks, and administration.
 - Support team Dockerfiles through `ARG CYCLO_TEAM_BASE` and a final
   `FROM ${CYCLO_TEAM_BASE}`. Validate the fixed entrypoint, OCI health check,
   base-image identity, and privilege-drop contract.

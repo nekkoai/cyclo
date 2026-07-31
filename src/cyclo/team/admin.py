@@ -9,9 +9,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from .errors import CycloError
-from .images import Images
-from .state import Instance, StateStore
+from ..errors import CycloError
+from ..images import Images
+from ..state import Instance, StateStore
 
 
 _TOOL_LABEL = "io.cyclo.task-tool"
@@ -49,6 +49,7 @@ class TaskAdmin:
             raise CycloError(f"invalid AgentWS task tool: {tool!r}")
         if (specification is not None) != (tool == "task-create"):
             raise CycloError("a task specification is valid only for task-create")
+        self._ensure_queue()
         with self._staged_specification(specification) as staged:
             self._remove_abandoned()
             name = (
@@ -101,6 +102,28 @@ class TaskAdmin:
             )
             result = self.images.command(command, check=False, capture=False)
             return result.returncode
+
+    def _ensure_queue(self) -> None:
+        paths = (
+            self.store.queue_root(self.instance.id),
+            self.store.tasks_dir(self.instance.id),
+            self.store.jobs_dir(self.instance.id),
+        )
+        try:
+            for path in paths:
+                if path.is_symlink():
+                    raise CycloError(
+                        f"refusing symlinked AgentWS state directory: {path}"
+                    )
+                path.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chmod(path, 0o700)
+        except CycloError:
+            raise
+        except OSError as exc:
+            raise CycloError(
+                f"cannot prepare AgentWS task queue for "
+                f"{self.instance.id}: {exc}"
+            ) from exc
 
     @contextmanager
     def _staged_specification(

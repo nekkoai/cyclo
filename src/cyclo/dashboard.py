@@ -10,7 +10,7 @@ from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .agentws_queue import (
+from .team.queue import (
     JOB_STATUSES,
     QueueLimits,
     empty_counts as _empty_counts,

@@ -13,10 +13,10 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME = ROOT / "src" / "cyclo" / "components" / "team-runtime"
+RUNTIME = ROOT / "src" / "cyclo" / "components" / "team"
 GATEWAY = ROOT / "src" / "cyclo" / "components" / "gateway"
 COMPONENTS = ROOT / "src" / "cyclo" / "components"
-PI_ADAPTER = ROOT / "src" / "cyclo" / "adapters" / "pi"
+PI_ADAPTER = RUNTIME / "pi"
 
 
 def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() -> None:
@@ -109,13 +109,13 @@ def test_every_shipped_component_has_a_pinned_lock_and_declaration() -> None:
         "protocol/provider",
         "gateway",
         "passthrough",
-        "team-runtime",
+        "team",
     ):
         package = COMPONENTS / name
         lock = json.loads((package / "package-lock.json").read_text(encoding="utf-8"))
         assert lock["lockfileVersion"] == 3
         assert (package / "package.json").is_file()
-        if name in {"gateway", "passthrough", "team-runtime"}:
+        if name in {"gateway", "passthrough", "team"}:
             assert (package / "Dockerfile").is_file()
         if name in {"gateway", "passthrough"}:
             assert (package / "component.conf").is_file()
@@ -143,11 +143,11 @@ def test_local_protocol_dependencies_match_source_and_image_layouts() -> None:
         dependency: adapter["dependencies"][dependency]
         for dependency in expected_dependencies
     } == {
-        "@cyclo/component": "file:../../components/protocol/component",
-        "@cyclo/provider": "file:../../components/protocol/provider",
+        "@cyclo/component": "file:../../protocol/component",
+        "@cyclo/provider": "file:../../protocol/provider",
     }
 
-    for name in ("gateway", "passthrough", "team-runtime"):
+    for name in ("gateway", "passthrough", "team"):
         dockerfile = (COMPONENTS / name / "Dockerfile").read_text(encoding="utf-8")
         assert "protocol/component/package.json" in dockerfile
         assert "./protocol/component/" in dockerfile
@@ -181,17 +181,17 @@ def test_ci_uses_and_tests_the_current_component_layout() -> None:
     assert "src/cyclo/_bundle" not in ci
     assert (
         "for package in components/protocol/component components/protocol/provider "
-        "components/gateway components/passthrough adapters/pi; do"
+        "components/gateway components/passthrough components/team/pi; do"
     ) in ci
     assert 'npm test --prefix "src/cyclo/$package"' in ci
     assert "python3 tools/dependency-audit" in ci
     assert '"$source_tree/tools/dependency-audit"' in release
     assert "npm audit" not in ci
     assert "npm audit" not in release
-    for component in ("team-runtime", "gateway", "passthrough"):
+    for component in ("team", "gateway", "passthrough"):
         assert f"src/cyclo/components/{component}/Dockerfile" in ci
     assert re.search(
-        r"--file src/cyclo/components/team-runtime/Dockerfile \\\n\s+src/cyclo\n",
+        r"--file src/cyclo/components/team/Dockerfile \\\n\s+src/cyclo/components\n",
         ci,
     )
     assert ci.count("src/cyclo/components\n") >= 2
@@ -285,15 +285,18 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert 'sh -n "$script" || exit 1' in release
     assert "tools/release-acceptance" in release
     assert "tools/runtime-write-acceptance" in release
+    assert 'import("/opt/cyclo/team/pi/src/extension.mjs")' in (
+        ROOT / "tools" / "runtime-write-acceptance"
+    ).read_text(encoding="utf-8")
     assert "CYCLO_RELEASE_REQUIRE_DCOMP=1" in release
     assert "DComp machine API 1 is required" in release
     assert 'CYCLO_RELEASE_REQUIRE_DCOMP: "0"' in (
         ROOT / ".github" / "workflows" / "ci.yml"
     ).read_text(encoding="utf-8")
     assert "node --test tests/*.mjs" in release
-    assert "npm ci --force --ignore-scripts --prefix src/cyclo/components/team-runtime" in release
+    assert "npm ci --force --ignore-scripts --prefix src/cyclo/components/team" in release
     assert "docker build --pull" in release
-    assert "src/cyclo/components/team-runtime" in release
+    assert "src/cyclo/components/team" in release
     assert (
         'docker run --rm --network none --entrypoint /bin/sh \\\n'
         '    "cyclo-team:release-$short_commit" -ceu'
@@ -326,9 +329,17 @@ def test_wheel_audit_requires_dcomp_architecture_and_forbids_legacy_runtime() ->
         "cyclo/instance_lifecycle.py",
         "cyclo/providers.py",
         "cyclo/team_runtime_image.py",
+        "cyclo/agentws_bundle.py",
+        "cyclo/agentws_queue.py",
+        "cyclo/container_runtime.py",
+        "cyclo/pi_runtime.py",
+        "cyclo/task_admin.py",
+        "cyclo/team.py",
+        "cyclo/team_templates.py",
     ):
         assert f'"{obsolete}"' in acceptance
     assert "obsolete wheel resource remains" in acceptance
+    assert "Python bytecode cache leaked into wheel" in acceptance
     assert "--dry-run" in acceptance
     assert "exposes obsolete --dry-run" in acceptance
 

@@ -69,14 +69,14 @@ jobs:
           node-version: "22"
       - name: Install shipped component dependencies
         run: |
-          for package in components/protocol/component components/protocol/provider components/gateway components/passthrough adapters/pi; do
+          for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
             npm ci --ignore-scripts --prefix "src/cyclo/$package"
           done
-          npm ci --force --ignore-scripts --prefix src/cyclo/components/team-runtime
+          npm ci --force --ignore-scripts --prefix src/cyclo/components/team
       - name: Run Node tests
         run: |
           node --test tests/*.mjs
-          for package in components/protocol/component components/protocol/provider components/gateway components/passthrough adapters/pi; do
+          for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
             npm test --prefix "src/cyclo/$package"
           done
       - name: Confirm generated protocol sources are current
@@ -153,8 +153,8 @@ jobs:
             --build-arg "CYCLO_HOST_UID=$(id -u)" \
             --build-arg "CYCLO_HOST_GID=$(id -g)" \
             --tag cyclo-team:ci \
-            --file src/cyclo/components/team-runtime/Dockerfile \
-            src/cyclo
+            --file src/cyclo/components/team/Dockerfile \
+            src/cyclo/components
       - name: Build a derived team image through Cyclo
         run: |
           PYTHONPATH=src python -c 'from pathlib import Path; from cyclo.images import Images; images = Images(); base = images.inspect("cyclo-team:ci"); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); images.build("cyclo-derived-team:ci", dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))'

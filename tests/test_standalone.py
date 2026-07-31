@@ -55,6 +55,6 @@ def test_controller_has_no_external_agent_runtime_discovery() -> None:
 
 
 def test_team_runtime_uses_the_fixed_private_pi_home() -> None:
-    from cyclo.runtime import PI_ROOT
+    from cyclo.team.component import PI_ROOT
 
     assert PI_ROOT == "/home/cyclo/.pi"

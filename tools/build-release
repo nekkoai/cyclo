@@ -107,12 +107,12 @@ git archive --format=tar HEAD | tar -xf - -C "$source_tree"
 printf '%s\n' '==> source tests'
 (
     cd "$source_tree"
-    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough adapters/pi; do
+    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
         npm ci --ignore-scripts --prefix "src/cyclo/$package"
     done
     # This is the same intentional, lockfile-bounded peer override used by the
     # team Dockerfile for pi-simplify 0.2.2 against Pi 0.81.
-    npm ci --force --ignore-scripts --prefix src/cyclo/components/team-runtime
+    npm ci --force --ignore-scripts --prefix src/cyclo/components/team
     "$venv/bin/python" -m pytest -q \
         --ignore=tests/test_release_manifest.py \
         --ignore=tests/test_secret_scan.py
@@ -120,7 +120,7 @@ printf '%s\n' '==> source tests'
         "$venv/bin/python" -m pytest -q \
         tests/test_release_manifest.py tests/test_secret_scan.py
     node --test tests/*.mjs
-    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough adapters/pi; do
+    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
         npm test --prefix "src/cyclo/$package"
     done
     # Tests regenerate the checked-in protocol bindings. Refuse to package a
@@ -194,8 +194,8 @@ docker build --pull \
     --build-arg "CYCLO_HOST_UID=$(id -u)" \
     --build-arg "CYCLO_HOST_GID=$(id -g)" \
     --tag "cyclo-team:release-$short_commit" \
-    --file "$source_tree/src/cyclo/components/team-runtime/Dockerfile" \
-    "$source_tree/src/cyclo"
+    --file "$source_tree/src/cyclo/components/team/Dockerfile" \
+    "$source_tree/src/cyclo/components"
 "$venv/bin/python" -c \
     'import pathlib, sys; from cyclo.images import Images; images = Images(); base = images.inspect(sys.argv[1]); assert base is not None; root = pathlib.Path(sys.argv[2]).resolve(); images.build(sys.argv[3], dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))' \
     "cyclo-team:release-$short_commit" \

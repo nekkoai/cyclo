@@ -9,15 +9,18 @@ protocol/
   provider/       model catalogue and opaque inference transport contract
 gateway/          credential-owning root provider component
 passthrough/      example intermediate provider component
-team-runtime/     common AgentWS and Pi container image
+team/             per-team component implementation
+  agentws/        job loop, tools, roles, and read-only viewer
+  pi/             in-process Provider adapter for Pi
+  runtime.py      component supervisor
 ```
 
 `gateway` and `passthrough` are independently runnable components. Each has a
 `component.conf`, implementation, tests, and—where runnable as a container—a
 Dockerfile. The packages below `protocol/` are shared interface definitions,
-not running services. `team-runtime` is the agent workload image. The
-team-side Pi bridge is an in-process package under `../adapters/pi`, not a
-DComp component.
+not running services. Cyclo creates one DComp component from `team/` for every
+configured team instance. Its Pi bridge runs in that component's process and
+is not an independent DComp component.
 
 All Dockerfiles use this directory as their build context. They copy only the
 protocol and implementation sources they require; their adjacent

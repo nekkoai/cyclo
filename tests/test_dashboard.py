@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from cyclo.agentws_queue import read_agent_supervisor_status
 from cyclo.dashboard import (
     DashboardSnapshot,
     QueueLimits,
@@ -22,6 +21,7 @@ from cyclo.dashboard import (
     scan_agentws_queue,
     validate_dashboard_host,
 )
+from cyclo.team.queue import read_agent_supervisor_status
 from cyclo.dcomp import (
     DCompComponentStatus,
     DCompNetworkStatus,

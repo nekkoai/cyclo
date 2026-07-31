@@ -57,17 +57,10 @@ include = ["cyclo", "cyclo.*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-cyclo = [
-  "team_templates/*",
-  "team_templates/*/*",
-  "team_templates/*/roles/*",
-]
-"cyclo._agentws" = [
-  "template/*",
-  "template/bin/*",
-  "template/roles/*",
-  "template/tools/*",
-  "template/tools/agentws-public/*",
+"cyclo.team.templates" = [
+  "README.md",
+  "*/*",
+  "*/roles/*",
 ]
 "cyclo.dashboard_static" = ["*.html", "*.css", "*.js"]
 "cyclo.components" = [
@@ -90,14 +83,28 @@ cyclo = [
   "passthrough/*",
   "passthrough/src/*",
   "passthrough/test/*",
-  "team-runtime/*",
-  "team-runtime/Dockerfile.dockerignore",
-  "team-runtime/entrypoint.sh",
 ]
-"cyclo.adapters" = ["pi/*", "pi/src/*", "pi/test/*"]
+"cyclo.components.team" = [
+  "README.md",
+  "Dockerfile",
+  "Dockerfile.dockerignore",
+  "entrypoint.sh",
+  "package.json",
+  "package-lock.json",
+  "agentws/*",
+  "agentws/bin/*",
+  "agentws/roles/*",
+  "agentws/tools/*",
+  "agentws/tools/agentws-public/*",
+  "pi/*",
+  "pi/src/*",
+  "pi/test/*",
+]
 
 [tool.setuptools.exclude-package-data]
+"*" = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo"]
 "cyclo.components" = ["**/node_modules/**"]
+"cyclo.components.team" = ["**/node_modules/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

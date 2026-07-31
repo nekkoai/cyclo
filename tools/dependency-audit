@@ -18,8 +18,8 @@ PACKAGES = (
     "components/protocol/provider",
     "components/gateway",
     "components/passthrough",
-    "adapters/pi",
-    "components/team-runtime",
+    "components/team/pi",
+    "components/team",
 )
 PI_PACKAGE = "@earendil-works/pi-coding-agent"
 PI_VERSION = "0.81.1"
@@ -125,7 +125,7 @@ def validate_waiver_lock(package_dir: Path) -> None:
     package = read_json(package_dir / "package.json")
     packages = read_json(package_dir / "package-lock.json").get("packages")
     if not isinstance(packages, dict):
-        raise AuditPolicyError("team-runtime lock has no package map")
+        raise AuditPolicyError("team component lock has no package map")
     root = packages.get("")
     pi = packages.get(PI_LOCK_PATH)
     nested = packages.get(WAIVED_NODE)
@@ -154,13 +154,13 @@ def validate_waiver_lock(package_dir: Path) -> None:
         raise AuditPolicyError(f"independent {WAIVED_PACKAGE} copy remains vulnerable")
 
 
-def validate_team_runtime(
+def validate_team_component(
     report: dict[str, Any], returncode: int, package_dir: Path
 ) -> None:
     findings = high_findings(report)
     if len(findings) != 1:
         raise AuditPolicyError(
-            "team-runtime does not have exactly the documented temporary finding"
+            "team component does not have exactly the documented temporary finding"
         )
     name, finding = findings[0]
     via = finding.get("via")
@@ -183,7 +183,7 @@ def validate_team_runtime(
     )
     if not exact:
         raise AuditPolicyError(
-            "team-runtime finding does not exactly match the documented Pi exception"
+            "team component finding does not exactly match the documented Pi exception"
         )
     validate_waiver_lock(package_dir)
 
@@ -244,8 +244,8 @@ def audit_repository(root: Path) -> None:
     for name in PACKAGES:
         package_dir = package_root / name
         report, returncode = run_audit(package_dir)
-        if name == "components/team-runtime":
-            validate_team_runtime(report, returncode, package_dir)
+        if name == "components/team":
+            validate_team_component(report, returncode, package_dir)
         else:
             findings = high_findings(report)
             if findings or returncode != 0:
@@ -257,7 +257,7 @@ def audit_repository(root: Path) -> None:
     affected = validate_no_fixed_pi_release(latest_version, latest_lock)
     versions = ", ".join(sorted({str(value) for value in affected}))
     print(
-        "team-runtime: TEMPORARY WAIVER "
+        "team component: TEMPORARY WAIVER "
         f"{WAIVED_ADVISORY} at {WAIVED_NODE}@{WAIVED_VERSION}; "
         f"latest {PI_PACKAGE}@{latest_version} remains affected ({versions})"
     )

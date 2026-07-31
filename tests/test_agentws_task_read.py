@@ -8,13 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from cyclo.agentws_bundle import packaged_agentws_template
+from cyclo.team.resources import packaged_agentws_runtime
 
 
 def runtime_copy(tmp_path: Path) -> Path:
     runtime = Path(
         shutil.copytree(
-            packaged_agentws_template(),
+            packaged_agentws_runtime(),
             tmp_path / "runtime",
             copy_function=shutil.copy2,
         )

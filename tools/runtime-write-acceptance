@@ -24,6 +24,9 @@ esac
     || fail "CYCLO_RUNTIME_ACCEPTANCE_TIMEOUT must be from 1 to 120 seconds"
 docker image inspect "$image" >/dev/null 2>&1 \
     || fail "team image not found: $image"
+docker run --rm --network none --entrypoint node "$image" \
+    -e 'import("/opt/cyclo/team/pi/src/extension.mjs")' \
+    || fail "team image cannot load its Pi Provider adapter"
 
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/cyclo-runtime-write.XXXXXX")
 container="cyclo-runtime-write-$$"
@@ -83,7 +86,7 @@ cat > "$settings_template" <<'EOF'
     "npm:pi-web-access",
     "npm:pi-lens",
     "npm:pi-simplify",
-    "/opt/cyclo/pi-adapter"
+    "/opt/cyclo/team/pi"
   ]
 }
 EOF
@@ -102,7 +105,7 @@ printf '%s\n' 'writer-1 planner pi local/acceptance' > "$team/team"
 
 agentws=$(
     "$python" -c \
-        'from cyclo.agentws_bundle import packaged_agentws_template; print(packaged_agentws_template())'
+        'from cyclo.team.resources import packaged_agentws_runtime; print(packaged_agentws_runtime())'
 )
 [ -x "$agentws/bin/task-create" ] \
     || fail "installed Cyclo package does not contain AgentWS"
@@ -274,7 +277,7 @@ from types import SimpleNamespace
 import sys
 
 from cyclo.state import StateStore
-from cyclo.task_admin import TaskAdmin
+from cyclo.team.admin import TaskAdmin
 
 store = StateStore(Path(sys.argv[1]))
 store.tasks_dir("acceptance").mkdir(parents=True)

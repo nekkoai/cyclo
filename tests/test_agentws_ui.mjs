@@ -3,8 +3,8 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
-const asset = (name) => new URL(`../src/cyclo/_agentws/template/tools/agentws-public/${name}`, import.meta.url);
-const viewer = new URL("../src/cyclo/_agentws/template/tools/agentws", import.meta.url);
+const asset = (name) => new URL(`../src/cyclo/components/team/agentws/tools/agentws-public/${name}`, import.meta.url);
+const viewer = new URL("../src/cyclo/components/team/agentws/tools/agentws", import.meta.url);
 
 test("AgentWS exposes an accessible Cyclo operations dashboard without chat", async () => {
   const html = await readFile(asset("index.html"), "utf8");

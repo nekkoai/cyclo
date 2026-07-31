@@ -7,7 +7,7 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Collection, Mapping
+from typing import Collection
 
 from . import __version__
 from .errors import CycloError
@@ -16,7 +16,6 @@ from .project import (
     ProjectTeam,
     render_container_project,
 )
-from .pi_runtime import model_incompatibility
 from .project_state import decode_instance_project, encode_project_mounts
 from .state import Instance, StateStore, validate_instance_id
 from .team import (
@@ -254,31 +253,3 @@ def project_run_bindings(
             )
         )
     return tuple(result)
-
-
-def validate_pi_team_models(
-    team: Team,
-    catalogue: Mapping[str, object],
-) -> None:
-    raw_models = catalogue.get("models")
-    if not isinstance(raw_models, list):
-        raise CycloError("provider system returned an invalid model catalogue")
-    models = {
-        model.get("id"): model
-        for model in raw_models
-        if isinstance(model, dict) and isinstance(model.get("id"), str)
-    }
-    for agent in team.agents:
-        model = models.get(agent.model)
-        if model is None:
-            raise CycloError(
-                f"agent {agent.name} requests unavailable provider model "
-                f"{agent.model!r}"
-            )
-        incompatibility = model_incompatibility(model)
-        if incompatibility:
-            raise CycloError(
-                f"agent {agent.name} requests provider model {agent.model!r} "
-                f"that is incompatible with the {agent.engine} runtime: "
-                f"{incompatibility}"
-            )

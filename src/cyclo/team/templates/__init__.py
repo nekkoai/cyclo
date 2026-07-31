@@ -3,13 +3,13 @@ from __future__ import annotations
 from importlib import resources
 from pathlib import Path
 
-from .errors import CycloError
+from ...errors import CycloError
 
 
 def packaged_team_templates_root() -> Path:
     """Return the example-team directory shipped inside Cyclo itself."""
 
-    return Path(str(resources.files("cyclo").joinpath("team_templates"))).resolve()
+    return Path(str(resources.files("cyclo.team.templates"))).resolve()
 
 
 def packaged_team_template(name: str) -> Path:

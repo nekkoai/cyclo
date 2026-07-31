@@ -21,8 +21,8 @@
   },
   "dependencies": {
     "@connectrpc/connect": "2.1.2",
-    "@cyclo/component": "file:../../components/protocol/component",
-    "@cyclo/provider": "file:../../components/protocol/provider"
+    "@cyclo/component": "file:../../protocol/component",
+    "@cyclo/provider": "file:../../protocol/provider"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "0.81.1"

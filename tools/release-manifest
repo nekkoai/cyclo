@@ -24,9 +24,9 @@ NODE_LOCK_PATHS = (
     Path("src/cyclo/components/protocol/component/package-lock.json"),
     Path("src/cyclo/components/gateway/package-lock.json"),
     Path("src/cyclo/components/passthrough/package-lock.json"),
-    Path("src/cyclo/adapters/pi/package-lock.json"),
+    Path("src/cyclo/components/team/pi/package-lock.json"),
     Path("src/cyclo/components/protocol/provider/package-lock.json"),
-    Path("src/cyclo/components/team-runtime/package-lock.json"),
+    Path("src/cyclo/components/team/package-lock.json"),
 )
 
 
