@@ -9,7 +9,7 @@ import { createPiAdapter } from "./pi-adapter.mjs";
 
 const DEFAULTS = Object.freeze({
   authPath: "/var/lib/cyclo-gateway/auth.json",
-  modelsPath: "/etc/cyclo-gateway/models.json",
+  modelsPath: "/var/lib/cyclo-gateway/models.json",
   usagePath: "/var/lib/cyclo-gateway/usage.jsonl",
 });
 
@@ -102,6 +102,7 @@ export function createGatewayServices(options = {}) {
 
         let usage;
         let failure;
+        let pendingResponse;
         let auditAttempted = false;
         const writeOutcome = async (outcome) => {
           auditAttempted = true;
@@ -125,7 +126,10 @@ export function createGatewayServices(options = {}) {
             );
             for await (const response of responses) {
               if (response.usage !== undefined) usage = response.usage;
-              yield { payload: response.payload };
+              if (pendingResponse !== undefined) {
+                yield { payload: pendingResponse.payload };
+              }
+              pendingResponse = response;
             }
           } catch (error) {
             failure = error;
@@ -138,6 +142,9 @@ export function createGatewayServices(options = {}) {
               : "ok");
           if (failure instanceof ConnectError) throw failure;
           if (failure) throw new ConnectError("gateway inference failed", Code.Internal);
+          if (pendingResponse !== undefined) {
+            yield { payload: pendingResponse.payload };
+          }
         } finally {
           if (!auditAttempted) {
             await writeOutcome(context.signal?.aborted ? `rpc_${Code.Canceled}` : "client_abandoned");

@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "src" / "cyclo" / "components" / "team-runtime"
 GATEWAY = ROOT / "src" / "cyclo" / "components" / "gateway"
 COMPONENTS = ROOT / "src" / "cyclo" / "components"
+PI_ADAPTER = ROOT / "src" / "cyclo" / "adapters" / "pi"
 
 
 def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() -> None:
@@ -59,7 +60,7 @@ def test_pi_extension_shares_the_cli_pi_ai_without_replacing_legacy_peers() -> N
         (RUNTIME / "package-lock.json").read_text(encoding="utf-8")
     )
     extension = json.loads(
-        (COMPONENTS / "pi-provider" / "package.json").read_text(encoding="utf-8")
+        (PI_ADAPTER / "package.json").read_text(encoding="utf-8")
     )
     packages = runtime_lock["packages"]
     cli_path = "node_modules/@earendil-works/pi-coding-agent"
@@ -108,7 +109,6 @@ def test_every_shipped_component_has_a_pinned_lock_and_declaration() -> None:
         "protocol/provider",
         "gateway",
         "passthrough",
-        "pi-provider",
         "team-runtime",
     ):
         package = COMPONENTS / name
@@ -119,6 +119,10 @@ def test_every_shipped_component_has_a_pinned_lock_and_declaration() -> None:
             assert (package / "Dockerfile").is_file()
         if name in {"gateway", "passthrough"}:
             assert (package / "component.conf").is_file()
+    assert (PI_ADAPTER / "package.json").is_file()
+    assert json.loads(
+        (PI_ADAPTER / "package-lock.json").read_text(encoding="utf-8")
+    )["lockfileVersion"] == 3
 
 
 def test_local_protocol_dependencies_match_source_and_image_layouts() -> None:
@@ -126,7 +130,7 @@ def test_local_protocol_dependencies_match_source_and_image_layouts() -> None:
         "@cyclo/component": "file:../protocol/component",
         "@cyclo/provider": "file:../protocol/provider",
     }
-    for name in ("gateway", "passthrough", "pi-provider"):
+    for name in ("gateway", "passthrough"):
         package = json.loads(
             (COMPONENTS / name / "package.json").read_text(encoding="utf-8")
         )
@@ -134,6 +138,14 @@ def test_local_protocol_dependencies_match_source_and_image_layouts() -> None:
             dependency: package["dependencies"][dependency]
             for dependency in expected_dependencies
         } == expected_dependencies
+    adapter = json.loads((PI_ADAPTER / "package.json").read_text(encoding="utf-8"))
+    assert {
+        dependency: adapter["dependencies"][dependency]
+        for dependency in expected_dependencies
+    } == {
+        "@cyclo/component": "file:../../components/protocol/component",
+        "@cyclo/provider": "file:../../components/protocol/provider",
+    }
 
     for name in ("gateway", "passthrough", "team-runtime"):
         dockerfile = (COMPONENTS / name / "Dockerfile").read_text(encoding="utf-8")
@@ -168,19 +180,32 @@ def test_ci_uses_and_tests_the_current_component_layout() -> None:
 
     assert "src/cyclo/_bundle" not in ci
     assert (
-        "for package in protocol/component protocol/provider gateway passthrough "
-        "pi-provider; do"
+        "for package in components/protocol/component components/protocol/provider "
+        "components/gateway components/passthrough adapters/pi; do"
     ) in ci
-    assert 'npm test --prefix "src/cyclo/components/$package"' in ci
+    assert 'npm test --prefix "src/cyclo/$package"' in ci
     assert "python3 tools/dependency-audit" in ci
     assert '"$source_tree/tools/dependency-audit"' in release
     assert "npm audit" not in ci
     assert "npm audit" not in release
     for component in ("team-runtime", "gateway", "passthrough"):
         assert f"src/cyclo/components/{component}/Dockerfile" in ci
-    assert ci.count("src/cyclo/components\n") >= 3
-    assert "ensure_derived(" in ci
-    assert "ensure_derived(" in release
+    assert re.search(
+        r"--file src/cyclo/components/team-runtime/Dockerfile \\\n\s+src/cyclo\n",
+        ci,
+    )
+    assert ci.count("src/cyclo/components\n") >= 2
+    assert "from cyclo.images import Images" in ci
+    assert "from cyclo.images import Images" in release
+    assert "ensure_derived(" not in ci
+    assert "ensure_derived(" not in release
+    for obsolete in (
+        "cyclo.component_runtime",
+        "cyclo.team_runtime_image",
+        "cyclo.docker_engine",
+    ):
+        assert obsolete not in ci
+        assert obsolete not in release
     assert "build=True" not in ci
     assert "build=True" not in release
 
@@ -260,12 +285,18 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert 'sh -n "$script" || exit 1' in release
     assert "tools/release-acceptance" in release
     assert "tools/runtime-write-acceptance" in release
+    assert "CYCLO_RELEASE_REQUIRE_DCOMP=1" in release
+    assert "DComp machine API 1 is required" in release
+    assert 'CYCLO_RELEASE_REQUIRE_DCOMP: "0"' in (
+        ROOT / ".github" / "workflows" / "ci.yml"
+    ).read_text(encoding="utf-8")
     assert "node --test tests/*.mjs" in release
     assert "npm ci --force --ignore-scripts --prefix src/cyclo/components/team-runtime" in release
     assert "docker build --pull" in release
     assert "src/cyclo/components/team-runtime" in release
     assert "gateway" in release
-    assert "cyclo gateway providers" in acceptance
+    assert '"$cyclo" gateway --help' in acceptance
+    assert "provider discovery" in acceptance
     assert "CYCLO_PROVIDER_RUNTIME_IMAGE" not in acceptance
     assert not re.search(r"\bgh\s", release)
     assert "git push" not in release
@@ -273,6 +304,29 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert "GITHUB_REF_NAME" not in (ROOT / "tools" / "release-manifest").read_text(
         encoding="utf-8"
     )
+
+
+def test_wheel_audit_requires_dcomp_architecture_and_forbids_legacy_runtime() -> None:
+    acceptance = (ROOT / "tools" / "release-acceptance").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'for path in package_root.rglob("*")' in acceptance
+    assert "missing required wheel resource" in acceptance
+    for obsolete in (
+        "cyclo/component_runtime.py",
+        "cyclo/docker.py",
+        "cyclo/docker_engine.py",
+        "cyclo/gateway.py",
+        "cyclo/health.py",
+        "cyclo/instance_lifecycle.py",
+        "cyclo/providers.py",
+        "cyclo/team_runtime_image.py",
+    ):
+        assert f'"{obsolete}"' in acceptance
+    assert "obsolete wheel resource remains" in acceptance
+    assert "--dry-run" in acceptance
+    assert "exposes obsolete --dry-run" in acceptance
 
 
 def test_release_bundle_is_published_by_same_filesystem_rename() -> None:

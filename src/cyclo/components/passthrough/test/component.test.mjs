@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { lstat, mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { createClient } from "@connectrpc/connect";
@@ -14,7 +12,7 @@ import {
   createComponentServer,
   listenComponentServer,
 } from "@cyclo/component/server";
-import { createUnixTransport } from "@cyclo/component/transport";
+import { createDockerTransport } from "@cyclo/component/transport";
 import { Modality, Provider } from "@cyclo/provider/contract";
 import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
 
@@ -117,26 +115,26 @@ test("propagates cancellation to the upstream without encoding it in JSON", asyn
   });
 });
 
-test("SIGTERM aborts active inference and removes the output socket", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "cyclo-passthrough-signal-"));
-  const upstreamSocket = join(directory, "upstream.sock");
-  const outputSocket = join(directory, "output.sock");
+test("SIGTERM aborts active inference and closes the output listener", async () => {
   const canceled = deferred();
   const observed = state();
   const upstream = upstreamServer(observed, { wait: true, canceled });
   const signalSource = new EventEmitter();
-  await listenComponentServer(upstream, { socketPath: upstreamSocket });
+  const upstreamTarget = await listenTarget(upstream);
+  const listening = deferred();
   const running = runPassthrough({
     env: {
-      CYCLO_COMPONENT_SOCKET: outputSocket,
-      CYCLO_REQUIRE_UPSTREAM_SOCKET: upstreamSocket,
+      DCOMP_LINK_UPSTREAM: upstreamTarget,
     },
     signalSource,
+    listenOptions: { host: "127.0.0.1", port: 0 },
+    onListening: listening.resolve,
   });
 
   try {
-    await waitForSocket(outputSocket);
-    const provider = createClient(Provider, createUnixTransport(outputSocket));
+    const address = await listening.promise;
+    const outputTarget = `dns:///127.0.0.1:${address.port}`;
+    const provider = createClient(Provider, createDockerTransport(outputTarget));
     const iterator = provider.infer({ model: "account/model", payload: "opaque" })[
       Symbol.asyncIterator
     ]();
@@ -145,32 +143,27 @@ test("SIGTERM aborts active inference and removes the output socket", async () =
     await assert.rejects(iterator.next());
     await running;
     await withTimeout(canceled.promise);
-    await assert.rejects(lstat(outputSocket), (error) => error?.code === "ENOENT");
   } finally {
     signalSource.emit("SIGTERM");
     await running.catch(() => {});
     await closeComponentServer(upstream);
-    await rm(directory, { recursive: true, force: true });
   }
 });
 
 async function withPassthrough(options, run) {
-  const directory = await mkdtemp(join(tmpdir(), "cyclo-passthrough-"));
-  const upstreamSocket = join(directory, "upstream.sock");
-  const outputSocket = join(directory, "output.sock");
   const observed = state();
   const upstream = upstreamServer(observed, options);
   let passthrough;
   try {
-    await listenComponentServer(upstream, { socketPath: upstreamSocket });
+    const upstreamTarget = await listenTarget(upstream);
     const binding = createUpstreamBinding({
-      env: { CYCLO_REQUIRE_UPSTREAM_SOCKET: upstreamSocket },
+      env: { DCOMP_LINK_UPSTREAM: upstreamTarget },
     });
     passthrough = await createPassthroughServer({
       services: createPassthroughServices({ upstream: binding, healthTimeoutMs: 100 }),
     });
-    await listenComponentServer(passthrough, { socketPath: outputSocket });
-    const transport = createUnixTransport(outputSocket);
+    const outputTarget = await listenTarget(passthrough);
+    const transport = createDockerTransport(outputTarget);
     await run({
       component: createClient(Component, transport),
       provider: createClient(Provider, transport),
@@ -179,7 +172,6 @@ async function withPassthrough(options, run) {
   } finally {
     if (passthrough) await closeComponentServer(passthrough).catch(() => {});
     await closeComponentServer(upstream).catch(() => {});
-    await rm(directory, { recursive: true, force: true });
   }
 }
 
@@ -251,14 +243,10 @@ function withTimeout(promise, timeoutMs = 1_000) {
   ]).finally(() => clearTimeout(timer));
 }
 
-async function waitForSocket(socketPath) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    try {
-      if ((await lstat(socketPath)).isSocket()) return;
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error(`timed out waiting for ${socketPath}`);
+async function listenTarget(server) {
+  const address = await listenComponentServer(server, {
+    host: "127.0.0.1",
+    port: 0,
+  });
+  return `dns:///127.0.0.1:${address.port}`;
 }

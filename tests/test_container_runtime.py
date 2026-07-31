@@ -33,9 +33,18 @@ def test_runtime_lock_excludes_a_second_queue_owner(tmp_path: Path) -> None:
 def runtime_environment(
     monkeypatch: pytest.MonkeyPatch, runtime: Path, roster: Path
 ) -> None:
-    monkeypatch.setenv("CYCLO_AGENTWS_RUNTIME", str(runtime))
-    monkeypatch.setenv("AGENTWS_TEAM_ROSTER", str(roster))
-    monkeypatch.delenv("CYCLO_VERBOSE", raising=False)
+    monkeypatch.setattr(container_runtime, "AGENTWS_ROOT", runtime)
+    monkeypatch.setattr(container_runtime, "TEAM_ROOT", roster.parent)
+    monkeypatch.setattr(
+        container_runtime,
+        "WORKSPACE_ROOT",
+        runtime.parent / "workspace",
+    )
+    monkeypatch.setattr(
+        container_runtime,
+        "PI_AGENT_ROOT",
+        runtime.parent / "pi" / "agent",
+    )
     (runtime / "agents").mkdir(parents=True)
     (runtime / "project.cyclo").write_text(
         CONTAINER_PROJECT_CONFIG,
@@ -63,7 +72,8 @@ def test_invalid_project_config_stops_before_runtime_processes(
     kind: str,
 ) -> None:
     runtime = tmp_path / "agentws"
-    roster = tmp_path / "team"
+    roster = tmp_path / "team-root" / "team"
+    roster.parent.mkdir()
     runtime_environment(monkeypatch, runtime, roster)
     project_config = runtime / "project.cyclo"
     project_config.unlink()
@@ -92,7 +102,7 @@ def test_invalid_project_config_stops_before_runtime_processes(
         lambda *_args, **_kwargs: pytest.fail("runtime process was started"),
     )
 
-    assert container_runtime.main() == 70
+    assert container_runtime.main(["--roster", str(roster)]) == 70
     assert "invalid project config" in capsys.readouterr().err
 
 
@@ -100,7 +110,8 @@ def test_queue_recovery_precedes_every_runtime_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = tmp_path / "agentws"
-    roster = tmp_path / "team"
+    roster = tmp_path / "team-root" / "team"
+    roster.parent.mkdir()
     runtime_environment(monkeypatch, runtime, roster)
     events: list[tuple[str, object]] = []
 
@@ -136,7 +147,7 @@ def test_queue_recovery_precedes_every_runtime_process(
         lambda processes: events.append(("terminate", len(processes))),
     )
 
-    assert container_runtime.main() == 42
+    assert container_runtime.main(["--roster", str(roster)]) == 42
     assert events == [
         (
             "recover",
@@ -155,7 +166,8 @@ def test_failed_queue_recovery_starts_no_runtime_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = tmp_path / "agentws"
-    roster = tmp_path / "team"
+    roster = tmp_path / "team-root" / "team"
+    roster.parent.mkdir()
     runtime_environment(monkeypatch, runtime, roster)
     events: list[str] = []
 
@@ -178,7 +190,7 @@ def test_failed_queue_recovery_starts_no_runtime_process(
         lambda processes: events.append(f"terminate:{len(processes)}"),
     )
 
-    assert container_runtime.main() == 70
+    assert container_runtime.main(["--roster", str(roster)]) == 70
     assert events == ["recover", "terminate:0"]
 
 
@@ -186,7 +198,8 @@ def test_stop_during_recovery_starts_no_runtime_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = tmp_path / "agentws"
-    roster = tmp_path / "team"
+    roster = tmp_path / "team-root" / "team"
+    roster.parent.mkdir()
     runtime_environment(monkeypatch, runtime, roster)
     events: list[str] = []
 
@@ -212,5 +225,5 @@ def test_stop_during_recovery_starts_no_runtime_process(
         lambda processes: events.append(f"terminate:{len(processes)}"),
     )
 
-    assert container_runtime.main() == 0
+    assert container_runtime.main(["--roster", str(roster)]) == 0
     assert events == ["recover", "terminate:1"]

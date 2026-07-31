@@ -9,19 +9,19 @@ import test from "node:test";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { HealthStatus } from "@cyclo/component/contract";
 import { closeComponentServer, listenComponentServer } from "@cyclo/component/server";
-import { createUnixTransport } from "@cyclo/component/transport";
+import { createDockerTransport } from "@cyclo/component/transport";
 import { Modality, Provider } from "@cyclo/provider/contract";
 import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
 
 import { aggregateUsageFile } from "../src/audit.mjs";
 import { buildCatalogue } from "../src/catalogue.mjs";
 import { login } from "../src/login.mjs";
+import { createPiAdapter } from "../src/pi-adapter.mjs";
 import { createGatewayServer } from "../src/server.mjs";
 import { createGatewayServices } from "../src/services.mjs";
 
 test("routes only on model and passes the opaque payload to the endpoint", async () => {
   const directory = await mkdtemp(join(tmpdir(), "cyclo-gateway-services-"));
-  const socketPath = join(directory, "gateway.sock");
   const model = publicModel("work/gpt-test");
   const route = {
     account: "work",
@@ -55,8 +55,8 @@ test("routes only on model and passes the opaque payload to the endpoint", async
   const server = await createGatewayServer({ services });
 
   try {
-    await listenComponentServer(server, { socketPath });
-    const client = createClient(Provider, createUnixTransport(socketPath));
+    const target = await listenTarget(server);
+    const client = createClient(Provider, createDockerTransport(target));
     const payloads = [];
     for await (const response of client.infer(
       { model: model.id, payload: requestPayload },
@@ -80,9 +80,65 @@ test("routes only on model and passes the opaque payload to the endpoint", async
   }
 });
 
+test("commits usage before releasing the final opaque response", async () => {
+  const model = publicModel("work/gpt-test");
+  const auditStarted = deferred();
+  const releaseAudit = deferred();
+  const services = createGatewayServices({
+    catalogue: {
+      models: [model],
+      routes: Object.assign(Object.create(null), {
+        [model.id]: { publicModel: model, rawModel: {} },
+      }),
+    },
+    credentials: { async resolve() { return { apiKey: "key" }; } },
+    backend: {
+      async *infer() {
+        yield { payload: "streaming" };
+        yield {
+          payload: "terminal",
+          usage: { inputTokens: 7, outputTokens: 3 },
+        };
+      },
+    },
+    audit: {
+      async record(value) {
+        auditStarted.resolve(value);
+        await releaseAudit.promise;
+      },
+    },
+  });
+  const iterator = services.provider.infer(
+    { model: model.id, payload: "opaque" },
+    { signal: new AbortController().signal },
+  )[Symbol.asyncIterator]();
+
+  assert.deepEqual(await iterator.next(), {
+    value: { payload: "streaming" },
+    done: false,
+  });
+  const terminal = iterator.next();
+  let terminalSettled = false;
+  void terminal.then(
+    () => { terminalSettled = true; },
+    () => { terminalSettled = true; },
+  );
+  const record = await auditStarted.promise;
+  assert.equal(record.outcome, "ok");
+  assert.equal(record.input_tokens, 7);
+  await Promise.resolve();
+  assert.equal(terminalSettled, false);
+
+  releaseAudit.resolve();
+  assert.deepEqual(await terminal, {
+    value: { payload: "terminal" },
+    done: false,
+  });
+  assert.deepEqual(await iterator.next(), { value: undefined, done: true });
+});
+
 test("never returns a gateway credential reflected by a native upstream", async () => {
   const directory = await mkdtemp(join(tmpdir(), "cyclo-gateway-secret-boundary-"));
-  const socketPath = join(directory, "gateway.sock");
   const authPath = join(directory, "auth.json");
   const modelsPath = join(directory, "models.json");
   const usagePath = join(directory, "usage.jsonl");
@@ -130,8 +186,8 @@ test("never returns a gateway credential reflected by a native upstream", async 
   const server = await createGatewayServer({ services });
 
   try {
-    await listenComponentServer(server, { socketPath });
-    const client = createClient(Provider, createUnixTransport(socketPath));
+    const target = await listenTarget(server);
+    const client = createClient(Provider, createDockerTransport(target));
     const payloads = [];
     let failure;
     try {
@@ -166,6 +222,65 @@ test("never returns a gateway credential reflected by a native upstream", async 
     )));
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("never reconstructs a gateway credential split across native events", async () => {
+  const secret = "test-private-secret-9e0a";
+  const model = publicModel("work/gpt-test");
+  const events = [
+    { type: "text_delta", delta: "test-private-" },
+    { type: "text_delta", delta: "secret-" },
+    { type: "text_delta", delta: "9e0a" },
+    { type: "done", message: {} },
+  ];
+  const services = createGatewayServices({
+    catalogue: {
+      models: [model],
+      routes: Object.assign(Object.create(null), {
+        [model.id]: {
+          publicModel: model,
+          rawModel: {
+            id: "gpt-test",
+            provider: "openai",
+            api: "openai-responses",
+          },
+        },
+      }),
+    },
+    credentials: {
+      async resolve() {
+        return { apiKey: secret, secretValues: [secret] };
+      },
+    },
+    backend: createPiAdapter({
+      streamers: {
+        "openai-responses": () => backendEvents(events),
+      },
+    }),
+    audit: { async record() {} },
+  });
+
+  const payloads = [];
+  let failure;
+  try {
+    for await (const response of services.provider.infer(
+      {
+        model: model.id,
+        payload: JSON.stringify({ context: {}, options: {} }),
+      },
+      { signal: new AbortController().signal },
+    )) payloads.push(response.payload);
+  } catch (error) {
+    failure = error;
+  }
+
+  const visibleText = payloads
+    .map((payload) => JSON.parse(payload).delta ?? "")
+    .join("");
+  assert.equal(visibleText.includes(secret), false);
+  assert.ok(failure instanceof ConnectError);
+  assert.equal(failure.code, Code.DataLoss);
+  assert.equal(failure.rawMessage.includes(secret), false);
 });
 
 test("one public ID survives login, catalogue, inference, audit, and usage", async (t) => {
@@ -389,5 +504,24 @@ async function* backendStream(payloads) {
 
 async function* endlessBackend() {
   yield { payload: "first" };
+  yield { payload: "held" };
   await new Promise(() => {});
+}
+
+async function* backendEvents(events) {
+  for (const event of events) yield event;
+}
+
+async function listenTarget(server) {
+  const address = await listenComponentServer(server, {
+    host: "127.0.0.1",
+    port: 0,
+  });
+  return `dns:///127.0.0.1:${address.port}`;
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
 }

@@ -8,7 +8,6 @@ import mimetypes
 import os
 import re
 import signal
-import stat
 import subprocess
 import sys
 import threading
@@ -19,9 +18,15 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from queue_reader import ConfinedQueueReader
+
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1]
-PUBLIC_DIR = Path(__file__).resolve().parent / "agentws-public"
+PUBLIC_DIR = TOOLS_DIR / "agentws-public"
 DEFAULT_PORT = 4137
 PROCESS_CHECK_INTERVAL = 1.0
 PROCESS_RESTART_DELAY = 1.0
@@ -300,198 +305,6 @@ def server_url(server, config: Config):
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-class ConfinedQueueReader:
-    """Read an AgentWS queue without following links below its root."""
-
-    def __init__(self, root: Path):
-        if not hasattr(os, "O_NOFOLLOW"):
-            raise OSError(errno.ENOTSUP, "safe AgentWS queue reads require O_NOFOLLOW")
-        self.root = Path(root).expanduser().resolve()
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        self.root_fd = os.open(self.root, flags)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, _exc_type, _exc, _traceback):
-        self.close()
-
-    def close(self):
-        if self.root_fd is not None:
-            os.close(self.root_fd)
-            self.root_fd = None
-
-    @staticmethod
-    def _parts(relative):
-        if isinstance(relative, (str, os.PathLike)):
-            path = Path(relative)
-        else:
-            path = Path(*relative)
-        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-            raise ValueError("AgentWS queue path must stay below its root")
-        return path.parts
-
-    def _open_directory(self, relative):
-        parts = self._parts(relative)
-        fd = os.dup(self.root_fd)
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        try:
-            for part in parts:
-                child = os.open(part, flags, dir_fd=fd)
-                os.close(fd)
-                fd = child
-            return fd
-        except Exception:
-            os.close(fd)
-            raise
-
-    def _open_parent(self, relative):
-        parts = self._parts(relative)
-        if not parts:
-            raise ValueError("AgentWS queue file path is empty")
-        return self._open_directory(parts[:-1]), parts[-1]
-
-    def _open_regular(self, relative):
-        parent_fd, name = self._open_parent(relative)
-        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        try:
-            fd = os.open(name, flags, dir_fd=parent_fd)
-        finally:
-            os.close(parent_fd)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise OSError(errno.EINVAL, "AgentWS queue entry is not a regular file")
-            return fd
-        except Exception:
-            os.close(fd)
-            raise
-
-    def has_directory(self, relative):
-        try:
-            fd = self._open_directory(relative)
-        except (OSError, ValueError):
-            return False
-        os.close(fd)
-        return True
-
-    def has_regular_file(self, relative):
-        try:
-            fd = self._open_regular(relative)
-        except (OSError, ValueError):
-            return False
-        os.close(fd)
-        return True
-
-    def list_directories(self, relative, include_hidden=False):
-        try:
-            fd = self._open_directory(relative)
-        except (OSError, ValueError):
-            return []
-        try:
-            result = []
-            for name in os.listdir(fd):
-                if not include_hidden and name.startswith("."):
-                    continue
-                try:
-                    entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                except OSError:
-                    continue
-                if stat.S_ISDIR(entry.st_mode):
-                    result.append(name)
-            return sorted(result)
-        finally:
-            os.close(fd)
-
-    def list_regular_files(self, relative, suffix=""):
-        try:
-            fd = self._open_directory(relative)
-        except (OSError, ValueError):
-            return []
-        try:
-            result = []
-            for name in os.listdir(fd):
-                if suffix and not name.endswith(suffix):
-                    continue
-                try:
-                    entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                except OSError:
-                    continue
-                if stat.S_ISREG(entry.st_mode):
-                    result.append(name)
-            return sorted(result)
-        finally:
-            os.close(fd)
-
-    def directory_timestamp(self, relative):
-        try:
-            fd = self._open_directory(relative)
-        except (OSError, ValueError):
-            return None
-        try:
-            modified = os.fstat(fd).st_mtime
-        finally:
-            os.close(fd)
-        return datetime.fromtimestamp(modified, timezone.utc).isoformat().replace("+00:00", "Z")
-
-    def file_size(self, relative):
-        try:
-            fd = self._open_regular(relative)
-        except (OSError, ValueError):
-            return 0
-        try:
-            return os.fstat(fd).st_size
-        finally:
-            os.close(fd)
-
-    def read_file(self, relative, max_bytes=256 * 1024, tail=False):
-        if max_bytes < 0:
-            raise ValueError("maxBytes must be non-negative")
-        fd = self._open_regular(relative)
-        with os.fdopen(fd, "rb", closefd=True) as stream:
-            size = os.fstat(stream.fileno()).st_size
-            if tail and size > max_bytes:
-                stream.seek(max(0, size - max_bytes))
-                data = stream.read(max_bytes)
-                truncated = True
-                prefix = True
-            else:
-                data = stream.read(max_bytes + 1)
-                truncated = size > max_bytes or len(data) > max_bytes
-                data = data[:max_bytes]
-                prefix = False
-        text = data.decode("utf-8", "replace")
-        if truncated:
-            marker = "\n[... earlier content truncated ...]\n" if prefix else "\n[... content truncated ...]\n"
-            text = marker + text if prefix else text + marker
-        return text, size, truncated
-
-    def read_text(self, relative, fallback="", max_bytes=256 * 1024, tail=False):
-        try:
-            return self.read_file(relative, max_bytes=max_bytes, tail=tail)[0]
-        except (OSError, ValueError):
-            return fallback
-
-    def fifo_writable(self, relative):
-        try:
-            parent_fd, name = self._open_parent(relative)
-        except (OSError, ValueError):
-            return False
-        flags = os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        try:
-            entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if not stat.S_ISFIFO(entry.st_mode):
-                return False
-            fd = os.open(name, flags, dir_fd=parent_fd)
-            try:
-                return stat.S_ISFIFO(os.fstat(fd).st_mode)
-            finally:
-                os.close(fd)
-        except OSError:
-            return False
-        finally:
-            os.close(parent_fd)
 
 
 def first_markdown_title(markdown, fallback):

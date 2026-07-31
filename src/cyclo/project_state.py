@@ -20,7 +20,6 @@ class InstanceProject:
     description: str
     generation: str
     mounts: tuple[ProjectMount, ...]
-    configured: bool
     errors: tuple[str, ...]
 
     def require_valid(self) -> "InstanceProject":
@@ -41,13 +40,6 @@ class InstanceProject:
 
         workspaces = [location(mount) for mount in self.mounts if mount.writable]
         read_only = [location(mount) for mount in self.mounts if mount.read_only]
-        if not self.configured and self.path is not None:
-            direct = {
-                "name": self.path.name or "project",
-                "path": str(self.path),
-                "container_path": "/workspace",
-            }
-            workspaces.append(direct)
         return {
             "name": self.name,
             "path": str(self.path) if self.path is not None else "",
@@ -80,44 +72,31 @@ def decode_instance_project(instance: Instance) -> InstanceProject:
         errors.append(f"{field} must be a string")
         return ""
 
-    project_path = text(instance.project_path, "project_path")
-    path = Path(project_path) if project_path else None
-    if path is None:
-        errors.append("project_path is required")
-    elif not path.is_absolute():
-        errors.append("project_path must be absolute")
-        path = None
-
-    raw_definition = instance.project_file
-    configured = bool(raw_definition)
-    definition_text = text(raw_definition, "project_file")
-    if not isinstance(raw_definition, str):
-        configured = True
+    definition_text = text(instance.project_file, "project_file")
     definition = Path(definition_text) if definition_text else None
-    if definition is not None and not definition.is_absolute():
+    if definition is None:
+        errors.append("project_file is required")
+    elif not definition.is_absolute():
         errors.append("project_file must be absolute")
         definition = None
+    path = definition.parent if definition is not None else None
 
     name = text(instance.project_name, "project_name")
     description = text(instance.project_description, "project_description")
     generation = text(instance.project_generation, "project_generation")
-    if configured:
-        if not name:
-            errors.append("project_name is required for project.cyclo")
-        if not description:
-            errors.append("project_description is required for project.cyclo")
-        if not generation:
-            errors.append("project_generation is required for project.cyclo")
+    if not name:
+        errors.append("project_name is required")
+    if not description:
+        errors.append("project_description is required")
+    if not generation:
+        errors.append("project_generation is required")
 
     raw_mounts = instance.project_mounts
     if not isinstance(raw_mounts, list):
         errors.append("project_mounts must be a list")
         raw_mounts = []
-    elif configured and not raw_mounts:
+    elif not raw_mounts:
         errors.append("project_mounts must contain at least one mount")
-    elif not configured and raw_mounts:
-        errors.append("project_mounts require a project_file")
-        raw_mounts = []
 
     mounts: list[ProjectMount] = []
     for index, raw_mount in enumerate(raw_mounts):
@@ -157,6 +136,5 @@ def decode_instance_project(instance: Instance) -> InstanceProject:
         description=description,
         generation=generation,
         mounts=tuple(mounts),
-        configured=configured,
         errors=tuple(errors),
     )

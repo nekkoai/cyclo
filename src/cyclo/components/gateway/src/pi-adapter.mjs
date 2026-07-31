@@ -41,6 +41,7 @@ async function* dispatch(route, payload, credential, signal, streamers) {
     dispatchSignal,
     route.rawModel.api,
   );
+  const reflectionGuard = credentialReflectionGuard(credential);
 
   let native;
   try {
@@ -60,7 +61,7 @@ async function* dispatch(route, payload, credential, signal, streamers) {
           "upstream emitted a non-JSON Pi event",
         );
       }
-      assertNoCredentialReflection(encoded, credential);
+      reflectionGuard.check(encoded);
       yield {
         payload: encoded,
         usage: eventUsage(event),
@@ -140,36 +141,64 @@ function safeTokens(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
-function assertNoCredentialReflection(payload, credential) {
+function credentialReflectionGuard(credential) {
   const secrets = [...new Set([
     credential.apiKey,
     ...(Array.isArray(credential.secretValues) ? credential.secretValues : []),
   ].filter((value) => typeof value === "string" && value))];
-  const candidates = secrets.filter((secret) => (
-    payload.includes(JSON.stringify(secret).slice(1, -1))
-  ));
-  if (candidates.length === 0) return;
+  const partials = secrets.map(() => new Set());
 
-  if (containsCredential(JSON.parse(payload), candidates)) {
-    throw new GatewayResponseError(
-      "upstream response contained gateway authentication material",
-    );
-  }
+  return Object.freeze({
+    check(payload) {
+      const fragments = stringFragments(JSON.parse(payload));
+      for (const fragment of fragments) {
+        for (let index = 0; index < secrets.length; index += 1) {
+          if (advancesToCredential(secrets[index], partials[index], fragment)) {
+            throw new GatewayResponseError(
+              "upstream response contained gateway authentication material",
+            );
+          }
+        }
+      }
+    },
+  });
 }
 
-function containsCredential(document, secrets) {
+function stringFragments(document) {
+  const fragments = [];
   const pending = [document];
   while (pending.length > 0) {
     const value = pending.pop();
     if (typeof value === "string") {
-      if (secrets.some((secret) => value.includes(secret))) return true;
+      fragments.push(value);
       continue;
     }
     if (value === null || typeof value !== "object") continue;
-    for (const [key, child] of Object.entries(value)) {
-      if (secrets.some((secret) => key.includes(secret))) return true;
+    const entries = Object.entries(value);
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const [key, child] = entries[index];
       pending.push(child);
+      pending.push(key);
     }
+  }
+  return fragments;
+}
+
+function advancesToCredential(secret, partials, fragment) {
+  if (fragment.includes(secret)) return true;
+
+  const existing = [...partials];
+  for (const matched of existing) {
+    const remainder = secret.slice(matched);
+    if (fragment.startsWith(remainder)) return true;
+    if (remainder.startsWith(fragment)) {
+      partials.add(matched + fragment.length);
+    }
+  }
+
+  const limit = Math.min(secret.length - 1, fragment.length);
+  for (let length = 1; length <= limit; length += 1) {
+    if (fragment.endsWith(secret.slice(0, length))) partials.add(length);
   }
   return false;
 }

@@ -25,12 +25,10 @@ RUN npm ci --omit=dev
 COPY --chown=node:node passthrough/component.conf ./component.conf
 COPY --chown=node:node passthrough/src ./src
 
-RUN install -d -o node -g node -m 0770 /run/cyclo \
- && install -d -o node -g node -m 0550 /run/cyclo/requirements/upstream
-
 ENV NODE_ENV=production
 
 USER 1000:1000
+EXPOSE 50051
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["node", "src/main.mjs"]
 

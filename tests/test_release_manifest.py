@@ -22,9 +22,9 @@ COMPONENT_SOURCES = (
     "protocol/provider",
     "gateway",
     "passthrough",
-    "pi-provider",
     "team-runtime",
 )
+ADAPTER_SOURCES = ("pi",)
 
 
 def test_release_manifest_scans_every_owned_node_lockfile(tmp_path: Path) -> None:
@@ -34,7 +34,7 @@ def test_release_manifest_scans_every_owned_node_lockfile(tmp_path: Path) -> Non
         "src/cyclo/components/protocol/component/package-lock.json",
         "src/cyclo/components/gateway/package-lock.json",
         "src/cyclo/components/passthrough/package-lock.json",
-        "src/cyclo/components/pi-provider/package-lock.json",
+        "src/cyclo/adapters/pi/package-lock.json",
         "src/cyclo/components/protocol/provider/package-lock.json",
         "src/cyclo/components/team-runtime/package-lock.json",
     }
@@ -116,7 +116,11 @@ def test_built_distributions_contain_component_sources_without_installs(
     source_files = [component_root / "__init__.py"]
     for component in COMPONENT_SOURCES:
         source_files.extend((component_root / component).rglob("*"))
-    expected = {
+    adapter_root = ROOT / "src" / "cyclo" / "adapters"
+    adapter_files = [adapter_root / "__init__.py"]
+    for adapter in ADAPTER_SOURCES:
+        adapter_files.extend((adapter_root / adapter).rglob("*"))
+    expected_components = {
         (Path("cyclo/components") / path.relative_to(component_root)).as_posix()
         for path in source_files
         if path.is_file()
@@ -124,6 +128,15 @@ def test_built_distributions_contain_component_sources_without_installs(
         and "__pycache__" not in path.parts
         and path.suffix not in {".pyc", ".pyo"}
     }
+    expected_adapters = {
+        (Path("cyclo/adapters") / path.relative_to(adapter_root)).as_posix()
+        for path in adapter_files
+        if path.is_file()
+        and "node_modules" not in path.parts
+        and "__pycache__" not in path.parts
+        and path.suffix not in {".pyc", ".pyo"}
+    }
+    expected = expected_components | expected_adapters
 
     wheel = next(built_distributions.glob("cyclo_agent-*.whl"))
     with zipfile.ZipFile(wheel) as archive:

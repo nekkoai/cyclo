@@ -1,9 +1,12 @@
 # Team repository contract
 
-A Cyclo team is a Git repository that defines agents, not a service. It does
-not implement the Component or Provider interfaces, start a daemon, contain
-credentials, or own runtime state. Cyclo consumes the repository as data and
-runs it with the system-owned team runtime.
+A Cyclo team is a Git repository containing agent behavior and optional
+execution-image additions. It is not a standalone daemon and does not implement
+the DComp or Provider protocols.
+
+At runtime Cyclo wraps the repository in its common team image and emits one
+DComp team component per project selection. The component consumes one
+`cyclo.provider.v1.Provider` input and runs the bundled AgentWS supervisor.
 
 ## Repository contents
 
@@ -18,184 +21,210 @@ my-team/
     verifier.md
 ```
 
-It may also contain:
+Optional files are:
 
 ```text
-  AGENTS.md              # optional team-wide policy
-  Dockerfile             # optional execution-image delta
-  .dockerignore          # recommended with Dockerfile
-  README.md              # human documentation; ignored by Cyclo
-  LICENSE                # repository metadata; ignored by Cyclo
+  AGENTS.md
+  Dockerfile
+  .dockerignore
+  README.md
+  LICENSE
 ```
 
-Cyclo reads `team`, every Markdown file directly below `roles/`, and optional
-`AGENTS.md`. Other files are not part of team-definition validation, although
-agents can read them because the selected repository is mounted at `/team`.
-The canonical roster name for an independent repository is `team`;
-`default.team` remains accepted for compatibility.
+Cyclo validates the `team` roster, every Markdown file directly under `roles/`,
+optional `AGENTS.md`, and optional Dockerfile contract. Other files are not part
+of the team definition, although agents can see them through `/team`.
 
-The roster format is:
+The selected directory must be the root of a Git repository. `team` is the
+canonical roster name; `default.team` remains accepted for compatibility.
+
+## Roster
+
+Each non-comment roster line has four fields:
 
 ```text
-# <agent-name> <role> <engine> <provider/model>
-planner-1      planner   pi       codex-work/MODEL_ID
-builder-1      builder   pi       codex-work/MODEL_ID
-verifier-1     verifier  pi       claude-work/MODEL_ID
+AGENT_NAME ROLE ENGINE PROVIDER/MODEL
 ```
 
-Every role must have a corresponding `roles/<role>.md`, agent names must be
-unique, and at least one agent must have the `planner` role. The model is an
-exact identifier from the outer Provider catalogue. The roster selects a
-model; it is not by itself an authorization boundary.
-
-Each agent receives four instruction inputs:
-
-1. the system-owned generic AgentWS protocol;
-2. the fixed, generated `/agentws/project.cyclo` file;
-3. optional team-wide policy from `AGENTS.md`; and
-4. the selected `roles/<role>.md`.
-
-The system protocol, optional team policy, and selected role are composed into
-the launch prompt. The project snapshot remains a separate instance-wide file
-that the system protocol requires agents to read. A team therefore never needs
-to copy Cyclo's generic filesystem and job-loop rules merely to add local
-behavior.
-For a writable team, changes to `/team/AGENTS.md` affect subsequently launched
-agents without modifying the system protocol.
-
-## Ownership and interaction
-
-Four separate inputs have separate owners:
-
-| Input | Owns |
-|---|---|
-| Installation `host.conf` | Installation-wide provider composition and available models |
-| Team repository | Agent roster, role behavior, optional team policy, and optionally the execution-image delta |
-| Host `project.cyclo` | Which teams run, which projects and inputs they receive, each mount mode, and authored instance-wide description/context |
-| Cyclo state root | Tasks, jobs, comments, results, transcripts, Pi state, generated runtime files, and instance metadata |
-
-At runtime, one generic team container receives:
+Example:
 
 ```text
-/team                   selected team repository, read-only or read-write
-/workspace/<name>       one declared writable project per rw mount
-/readonly/<name>        declared read-only supporting inputs
-/agentws                Cyclo-supplied AgentWS tools and per-instance queue
-/agentws/project.cyclo  generated, read-only container-facing project snapshot
-$CYCLO_PROVIDER_SOCKET  outer Provider Unix socket
+planner-1   planner   pi   codex-work/MODEL_ID
+builder-1   builder   pi   codex-work/MODEL_ID
+verifier-1  verifier  pi   claude-work/MODEL_ID
 ```
 
-The generated snapshot uses the host `project.cyclo` grammar but its structured
-paths contain only the selected `team /team MODE` and container-visible
-mounts. Cyclo maps `mount NAME ... rw` to `/workspace/NAME` and
-`mount NAME ... ro` to `/readonly/NAME`; it copies the authored name,
-description, and optional context literally. Several `rw` declarations
-therefore expose several writable projects. Cyclo assigns none of them hidden
-priority: the description and context tell agents what each project is and how
-they relate. Do not put host paths or secrets in those authored text fields.
+Rules:
 
-Cyclo validates the repository, records its generation, selects its execution
-image, and launches the agents in the roster. Agents coordinate through the
-AgentWS filesystem tools and reach models through the Provider interface. The
-repository itself calls no Cyclo API and executes no service.
+- agent names are unique;
+- each role has a matching `roles/ROLE.md`;
+- at least one agent has the `planner` role;
+- engines are `pi` or `pi-interactive`; and
+- the model is an exact public ID advertised by `cyclo models`.
 
-A `team PATH ro` line is the normal reproducible mode. `team PATH rw`
-deliberately exposes the same Git working tree read-write at `/team`, allowing
-agents to edit their own roster, roles, policy, or Dockerfile. Such a Dockerfile
-edit affects the image selected by the next operator-initiated
-`cyclo run` or `cyclo refresh`; it never changes the image of an already
-running container.
+The roster selects model routes. It is not a separate authorization token or
+credential boundary.
 
-## Optional derived team image
+## Instruction layers
 
-Docker's standard composition mechanism is image inheritance through `FROM`;
-there is no general Dockerfile include or multiple-inheritance operation. Cyclo
-therefore supplies a compatible team-runtime base image, and an optional team
-Dockerfile describes only the additional packages or artifacts that team
-needs.
+Every agent receives these instruction sources:
 
-The required shape is:
+1. Cyclo's generic AgentWS `AGENTS.md`, baked into the team image;
+2. `/agentws/project.cyclo`, generated from the selected project;
+3. optional team-wide `/team/AGENTS.md`;
+4. the selected `/team/roles/ROLE.md`; and
+5. the assigned AgentWS task and job.
+
+The generic protocol defines queue behavior, planner notifications, project
+discovery, and failure settlement. A team `AGENTS.md` may specialize behavior
+but does not replace those invariants. A role file describes only that role.
+
+Agents must read `/agentws/project.cyclo` before choosing a source directory.
+It tells them which paths below `/workspace` are writable projects and which
+paths below `/readonly` are supporting inputs.
+
+## Runtime filesystem
+
+A team component sees:
+
+```text
+/agentws/
+  AGENTS.md              baked generic protocol
+  bin/ tools/ roles/     baked AgentWS runtime
+  tasks/                 durable writable bind
+  jobs/                  durable writable bind
+  agents/                durable writable bind
+  project.cyclo          generated read-only bind
+/opt/cyclo/pi-settings.json generated read-only Pi settings template
+/home/cyclo/.pi          private writable Pi state
+/team                    selected team repository
+/workspace/NAME          each project `rw` mount
+/readonly/NAME           each project `ro` mount
+```
+
+The team repository is mounted read-only by default. A project may select it
+with `team PATH rw` to authorize self-modification. That is a deliberate
+authority grant: changes are live in the mounted repository, while Cyclo's
+recorded team generation is updated only by a later `cyclo refresh`.
+
+The Provider adapter obtains its endpoint from the DComp input:
+
+```text
+DCOMP_LINK_PROVIDER=dns:///OUTER_COMPONENT:50051
+```
+
+Agents and role files should use Pi normally; they do not need to handle this
+environment variable or know the provider topology.
+
+Team containers receive no gateway credential volume, Docker socket, DComp
+state, host Pi configuration, or undeclared filesystem mount.
+
+## Durable AgentWS state
+
+AgentWS tasks, jobs, comments, results, retry state, and agent transcripts live
+under the Cyclo state root, not in the team repository or container writable
+layer. Replacing or stopping a DComp team component therefore does not discard
+work.
+
+Task operations are available from the host:
+
+```sh
+cyclo task run INSTANCE TASK_ID SPEC_FILE
+cyclo task list INSTANCE
+cyclo task show INSTANCE TASK_ID
+cyclo task comment INSTANCE TASK_ID MESSAGE
+cyclo task complete INSTANCE TASK_ID
+cyclo task reopen INSTANCE TASK_ID
+```
+
+At component startup the supervisor resets orphaned active jobs, starts the
+read-only AgentWS viewer and queue runner, and holds a queue lifetime lock.
+Shutdown terminates both children with a bounded grace period.
+
+## Team generation
+
+Cyclo records the repository's current Git commit plus a digest of the roster,
+role files, and optional `AGENTS.md`. Uncommitted definition changes are
+therefore part of the generation even though they are not a Git commit.
+
+Cyclo reads definition files without following symlinks and bounds their size.
+It does not run `git status` because repository-local Git hooks and filesystem
+monitor configuration are host execution surfaces.
+
+Changing a team does not silently replace a running component. Use:
+
+```sh
+cyclo refresh
+```
+
+Refresh reparses the project and team, validates current models and mounts,
+rebuilds the team image when required, updates the persisted generation, and
+applies the global DComp system.
+
+## Extra packages with a Dockerfile
+
+Cyclo's common team image already contains AgentWS, Pi, the Provider adapter,
+Git, Python, Node.js, and common shell tools. A team that needs more packages
+adds a Dockerfile:
 
 ```dockerfile
-# syntax=docker/dockerfile:1
-
-ARG CYCLO_TEAM_BASE=cyclo-team-base-required
+ARG CYCLO_TEAM_BASE
 FROM ${CYCLO_TEAM_BASE}
 
+USER root
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        iverilog \
-        verilator \
-        yosys \
+    && apt-get install -y --no-install-recommends verilator yosys \
     && rm -rf /var/lib/apt/lists/*
-
-RUN python -m pip install --no-cache-dir cocotb==2.0.0
 ```
 
-Docker permits a global `ARG` before `FROM`, so Cyclo can provide the exact
-compatible base reference at build time. In a multi-stage Dockerfile, the final
-stage must use `FROM ${CYCLO_TEAM_BASE}`; earlier builder stages may use other
-images. The team should not hard-code a floating Cyclo base tag, replace the
-inherited runtime entrypoint, remove AgentWS or Pi, or install a separate
-provider transport. The completed image must still satisfy the Cyclo
-team-runtime ABI.
+The contract is strict:
 
-No API key, provider credential, subscription file, gateway store, project
-directory, Docker socket, or other host secret is supplied to this build.
-Docker receives the team repository as an ordinary build context and honors
-its `.dockerignore`; Docker build arguments are not a secret mechanism.
+- `ARG CYCLO_TEAM_BASE` appears before the relevant `FROM`;
+- the final stage uses `FROM ${CYCLO_TEAM_BASE}` or
+  `FROM $CYCLO_TEAM_BASE`;
+- the final image preserves
+  `/usr/local/bin/cyclo-container-entrypoint`;
+- the final image preserves the inherited OCI health check; and
+- the final image's configured user is root, `0`, or empty.
 
-See Docker's official documentation for
-[`ARG` and `FROM`](https://docs.docker.com/reference/dockerfile/) and
-[multi-stage builds](https://docs.docker.com/build/building/multi-stage/).
+The root image user is required only so Cyclo's entrypoint can select the
+host-mapped `cyclo` UID/GID. It immediately drops privileges before executing
+the AgentWS runtime. Cyclo refuses team operations when the invoking host UID is
+zero.
 
-## Image identity and lifecycle
+Cyclo gives the derived image a stable tag scoped by the installation, Cyclo
+version, team name, and canonical team-repository identity. It invokes
+`docker build` with the repository as the real context and passes the common
+team tag as `CYCLO_TEAM_BASE`. Docker applies `.dockerignore` and decides
+layer-cache reuse. Cyclo validates the completed tag and base-image identity,
+then persists only the immutable image ID in the instance. It keeps no
+source-digest cache or build history.
 
-The team definition and execution image have related but distinct identities:
+Use a `.dockerignore` to keep `.git`, generated output, caches, and local
+artifacts out of the build context.
 
-- the **team generation** is the Git commit plus the live roster, roles, and
-  optional team policy digest;
-- the **image generation** is the exact ID of the last successfully built team
-  image, labelled with the exact Cyclo-compatible base image ID.
+## Build trust
 
-An instance records both. Docker alone interprets `.dockerignore` and decides
-whether a changed file affects the build cache.
+Running a team Dockerfile authorizes Docker to execute that repository's build
+steps in the trusted host domain. Review it as installed software. Runtime
+mount/network restrictions do not make a hostile Docker build safe.
 
-The accepted build lifecycle is:
+An operator may bypass team Dockerfiles with:
 
-1. Resolve the installed Cyclo team base to an immutable image reference.
-2. Give Docker the team repository as its normal build context.
-3. Record and inspect the completed build by its immutable image ID.
-4. Validate the completed image against the team-runtime ABI.
-5. Promote the expected tag only after validation succeeds.
-6. Record and run the exact resulting image ID.
+```sh
+cyclo run project.cyclo --image OPERATOR_IMAGE
+```
 
-An ordinary `cyclo run` asks Docker to build the common runtime and each
-selected derived image. Docker applies the applicable `.dockerignore` or
-`Dockerfile.dockerignore` and reuses cached work. Cyclo passes the exact common
-base image ID, validates the completed image, and transactionally promotes
-it before starting any team. `cyclo refresh` stops and restarts the selected
-system through the same build path. Only the latest successfully promoted image
-is operational state; Cyclo keeps no registry of historical local builds.
+Cyclo requires that image to exist and satisfy the same entrypoint, user, and
+health-check contract. It does not build or modify it.
 
-The final image must also leave the effective container user as root (the base
-image default, `USER root`, or `USER 0`). Cyclo's fixed entrypoint starts as
-root only long enough to prepare the host-mapped user and group, then drops
-privileges before starting AgentWS. A derived Dockerfile may switch users in
-builder stages, but must switch back to root in its final stage.
+## Reusable toolchain bases
 
-Running or refreshing a team with a Dockerfile authorizes Cyclo to execute that
-repository's build through the Docker daemon and is therefore a
-host-administration action. Review the repository exactly as an installed
-provider component. Runtime container isolation cannot make an unsafe build
-recipe safe to execute on the host.
-
-## Reusable toolchain layers
-
-Organizations may maintain ordinary compatible intermediate images:
+An organization can extend the common runtime once, then use that approved
+image as `CYCLO_TEAM_BASE` for specialized teams:
 
 ```text
-Cyclo team runtime
+Cyclo common team image
         |
         v
 organization RTL toolchain
@@ -204,13 +233,7 @@ organization RTL toolchain
 specific RTL team
 ```
 
-Cyclo may pass the approved RTL toolchain image as `CYCLO_TEAM_BASE`, provided
-that image still satisfies the same team-runtime ABI. This is a normal,
-single-parent Docker inheritance chain. Multi-stage builds are appropriate for
-compiling and copying artifacts into the final image, but they do not merge the
-installed package state of several parent images.
-
-Cyclo should not invent a parallel `packages.conf` language. `apt`, `pip`,
-`npm`, compiler stages, version pinning, and distribution-specific setup remain
-ordinary Dockerfile concerns. Keep generated files and `.git` out of the
-context with `.dockerignore`.
+This is ordinary single-parent Docker inheritance. Multi-stage builds may
+compile artifacts, but they do not merge package state from multiple final
+parents. Cyclo intentionally does not add a second package-description
+language.

@@ -1,24 +1,13 @@
-#!/bin/sh
+#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-set -eu
+import sys
+from pathlib import Path
 
-AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-. "$AGENTWS_ROOT/bin/lib-agentws"
+AGENTWS_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(AGENTWS_ROOT / "tools"))
 
-usage() {
-    echo "Usage: task-list"
-    exit 1
-}
+from task_read import list_main  # noqa: E402
 
-[ "$#" -eq 0 ] || usage
-require_tasks_dir
 
-found=0
-for task_dir in "$TASKS_DIR"/*; do
-    [ -d "$task_dir" ] || continue
-    found=1
-    task_id="$(basename "$task_dir")"
-    state="$(cat "$task_dir/state" 2>/dev/null || printf 'open')"
-    printf '%s\t%s\n' "$task_id" "$state"
-done
-[ "$found" -eq 1 ] || true
+if __name__ == "__main__":
+    raise SystemExit(list_main(sys.argv[1:]))

@@ -93,12 +93,12 @@ test("dashboard normalizes workspace and read-only mount lists independently", a
   assert.equal(configured.workspaces[0].containerPath, "/workspace/source");
   assert.equal(configured.readOnlyMounts[0].containerPath, "/readonly/docs");
 
-  const legacy = normalizeInstance({
-    id: "legacy",
+  const unsupportedProjectString = normalizeInstance({
+    id: "unsupported-project-string",
     project: "/host/legacy-project",
   });
-  assert.equal(legacy.project, "/host/legacy-project");
-  assert.equal(legacy.projectReference, "/host/legacy-project");
+  assert.equal(unsupportedProjectString.project, "—");
+  assert.equal(unsupportedProjectString.projectReference, "—");
 
   const unsupportedAliases = normalizeInstance({
     id: "unsupported-aliases",
@@ -120,7 +120,9 @@ test("dashboard keeps lifecycle state separate from provider health", async () =
   ]);
   const instance = normalizeInstance({
     id: "provider-down",
-    state: "running",
+    desired: "running",
+    container: "running",
+    readiness: "healthy",
     health: { state: "provider-down", reason: "fusion stopped" },
   });
 
@@ -132,6 +134,33 @@ test("dashboard keeps lifecycle state separate from provider health", async () =
   assert.equal(computeSummary([instance]).running, 1);
   assert.equal(computeSummary([instance]).providerIssues, 1);
   assert.equal(computeSummary([instance]).attention, 1);
+
+  const degraded = normalizeInstance({
+    id: "optional-provider-down",
+    desired: "running",
+    container: "running",
+    readiness: "healthy",
+    health: {
+      state: "ready",
+      reason: "ignored unavailable optional components: fusion stopped",
+    },
+  });
+  assert.equal(degraded.displayState, "attention");
+  assert.equal(computeSummary([degraded]).attention, 1);
+});
+
+test("dashboard never infers readiness from container state", async () => {
+  const { normalizeInstance } = await dashboardHelpers(["normalizeInstance"]);
+  const instance = normalizeInstance({
+    id: "missing-readiness",
+    desired: "running",
+    container: "running",
+    health: { state: "ready", reason: "" },
+  });
+
+  assert.equal(instance.readiness, "unknown");
+  assert.equal(instance.operational, false);
+  assert.equal(instance.displayState, "attention");
 });
 
 test("dashboard treats suspended AgentWS supervisors as instance attention", async () => {
@@ -142,7 +171,9 @@ test("dashboard treats suspended AgentWS supervisors as instance attention", asy
   ]);
   const instance = normalizeInstance({
     id: "suspended-team",
-    state: "running",
+    desired: "running",
+    container: "running",
+    readiness: "healthy",
     health: {
       state: "agents-suspended",
       reason: "1 agent suspended: planner-1",
@@ -159,7 +190,9 @@ test("dashboard treats suspended AgentWS supervisors as instance attention", asy
 
   const plannerFailure = normalizeInstance({
     id: "planner-failure",
-    state: "running",
+    desired: "running",
+    container: "running",
+    readiness: "healthy",
     health: {
       state: "agents-attention",
       reason: "1 unresolved planner failure: uart-plan",
@@ -176,12 +209,16 @@ test("dashboard preserves paused and restarting lifecycle labels", async () => {
   ]);
   const paused = normalizeInstance({
     id: "paused-team",
-    state: "paused",
+    desired: "running",
+    container: "paused",
+    readiness: "missing",
     health: { state: "inactive", reason: "" },
   });
   const restarting = normalizeInstance({
     id: "restarting-team",
-    state: "restarting",
+    desired: "running",
+    container: "restarting",
+    readiness: "missing",
     health: { state: "inactive", reason: "" },
   });
 
@@ -198,7 +235,9 @@ test("dashboard preserves unknown task counts as attention", async () => {
   ]);
   const instance = normalizeInstance({
     id: "corrupt-task",
-    state: "running",
+    desired: "running",
+    container: "running",
+    readiness: "healthy",
     health: { state: "ready", reason: "" },
     counts: {
       tasks: { total: 1, open: 0, closed: 0, unknown: 1 },
@@ -215,7 +254,9 @@ test("failure sorting does not count reported unknown queue states twice", async
   const { normalizeInstance } = await dashboardHelpers(["normalizeInstance"]);
   const instance = normalizeInstance({
     id: "corrupt-queue",
-    state: "running",
+    desired: "running",
+    container: "running",
+    readiness: "healthy",
     health: { state: "ready", reason: "" },
     counts: {
       tasks: { total: 4, open: 0, closed: 0, unknown: 4 },
@@ -230,10 +271,10 @@ test("failure sorting does not count reported unknown queue states twice", async
   assert.equal(instance.failureCount, 4);
 });
 
-test("API v3 keeps gateway usage global and ignores per-instance attribution", async () => {
+test("API v4 ignores usage fields outside the fleet observation contract", async () => {
   const { normalizeSnapshot } = await dashboardHelpers(["normalizeSnapshot"]);
   const snapshot = normalizeSnapshot({
-    version: 3,
+    version: 4,
     generated_at: "2026-07-21T12:00:00Z",
     summary: {
       running: 1,
@@ -252,7 +293,9 @@ test("API v3 keeps gateway usage global and ignores per-instance attribution", a
     },
     instances: [{
       id: "alpha",
-      state: "running",
+      desired: "running",
+      container: "running",
+      readiness: "healthy",
       health: { state: "ready", reason: "" },
       usage: {
         input_tokens: 999_999,
@@ -262,10 +305,23 @@ test("API v3 keeps gateway usage global and ignores per-instance attribution", a
     }],
   });
 
-  assert.equal(snapshot.summary.tokens, 134);
-  assert.equal(snapshot.summary.requests, 4);
+  assert.equal("tokens" in snapshot.summary, false);
+  assert.equal("requests" in snapshot.summary, false);
   assert.equal(snapshot.summary.providerIssues, 0);
   assert.equal("usage" in snapshot.instances[0], false);
+});
+
+test("dashboard rejects snapshots from another API contract", async () => {
+  const { normalizeSnapshot } = await dashboardHelpers(["normalizeSnapshot"]);
+
+  assert.throws(
+    () => normalizeSnapshot({ version: 3, instances: [] }),
+    /requires API version 4/,
+  );
+  assert.throws(
+    () => normalizeSnapshot({ instances: [] }),
+    /requires API version 4/,
+  );
 });
 
 test("dashboard styles include keyboard, motion, and responsive affordances", async () => {

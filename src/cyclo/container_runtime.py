@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import os
 import signal
@@ -15,14 +16,22 @@ from pathlib import Path
 
 RUNTIME_LOCK_FD_ENV = "CYCLO_RUNTIME_LOCK_FD"
 MAX_PROJECT_CONFIG_BYTES = 1024 * 1024
+AGENTWS_ROOT = Path("/agentws")
+TEAM_ROOT = Path("/team")
+WORKSPACE_ROOT = Path("/workspace")
+PI_AGENT_ROOT = Path("/home/cyclo/.pi/agent")
 
 
-def required(name: str) -> str:
-    value = os.environ.get(name, "")
-    if not value:
-        print(f"cyclo runtime: missing ${name}", file=sys.stderr, flush=True)
-        raise SystemExit(2)
-    return value
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="cyclo-team-runtime")
+    result.add_argument("--roster", required=True)
+    result.add_argument("--team-protocol")
+    result.add_argument("--verbose", action="store_true")
+    # These values make immutable team/project revisions part of DComp's
+    # component digest. The supervisor does not interpret their contents.
+    result.add_argument("--generation", default="")
+    result.add_argument("--project-generation", default="")
+    return result
 
 
 def terminate(processes: list[subprocess.Popen[bytes]]) -> None:
@@ -101,9 +110,24 @@ def require_project_config(runtime: Path) -> Path:
     return config
 
 
-def main() -> int:
-    runtime = Path(required("CYCLO_AGENTWS_RUNTIME"))
-    roster = required("AGENTWS_TEAM_ROSTER")
+def main(arguments: list[str] | None = None) -> int:
+    options = parser().parse_args(arguments)
+    runtime = AGENTWS_ROOT
+    roster = Path(options.roster)
+    if (
+        not roster.is_absolute()
+        or roster.parent != TEAM_ROOT
+        or roster.name in {"", ".", ".."}
+    ):
+        print("cyclo runtime: roster must be a direct file in /team", file=sys.stderr)
+        return 2
+    team_protocol = Path(options.team_protocol) if options.team_protocol else None
+    if team_protocol is not None and team_protocol != TEAM_ROOT / "AGENTS.md":
+        print(
+            "cyclo runtime: team protocol must be /team/AGENTS.md",
+            file=sys.stderr,
+        )
+        return 2
     try:
         require_project_config(runtime)
     except OSError as exc:
@@ -114,7 +138,6 @@ def main() -> int:
             flush=True,
         )
         return 70
-    verbose = os.environ.get("CYCLO_VERBOSE") == "1"
     stopping = False
     processes: list[subprocess.Popen[bytes]] = []
     runtime_lock = -1
@@ -144,9 +167,23 @@ def main() -> int:
         "--read-only",
     ]
     runner = [str(runtime / "tools" / "run_agentws")]
-    if verbose:
+    if options.verbose:
         runner.append("--verbose")
-    runner.append(roster)
+    runner.append(str(roster))
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PI_CODING_AGENT_DIR": str(PI_AGENT_ROOT),
+            "AGENTWS_TEAM_ROOT": str(TEAM_ROOT),
+            "AGENTWS_TEAM_ROSTER": str(roster),
+            "AGENTWS_SYSTEM_PROTOCOL": str(runtime / "AGENTS.md"),
+            "AGENTWS_TEAM_ROLES_DIR": str(TEAM_ROOT / "roles"),
+            "AGENTWS_WORKSPACE": str(WORKSPACE_ROOT),
+        }
+    )
+    if team_protocol is not None:
+        environment["AGENTWS_TEAM_PROTOCOL"] = str(team_protocol)
 
     try:
         runtime_lock = acquire_runtime_lock(runtime)
@@ -161,7 +198,7 @@ def main() -> int:
         return 70
 
     try:
-        recovery_environment = os.environ.copy()
+        recovery_environment = environment.copy()
         recovery_environment[RUNTIME_LOCK_FD_ENV] = str(runtime_lock)
         recovery = subprocess.Popen(
             [str(runtime / "bin" / "job-reset-orphans"), "--all-active"],
@@ -188,7 +225,13 @@ def main() -> int:
         for command in (viewer, runner):
             if stopping:
                 return 0
-            processes.append(subprocess.Popen(command, start_new_session=True))
+            processes.append(
+                subprocess.Popen(
+                    command,
+                    env=environment,
+                    start_new_session=True,
+                )
+            )
         while not stopping:
             for process, label in zip(processes, ("viewer", "team")):
                 status = process.poll()

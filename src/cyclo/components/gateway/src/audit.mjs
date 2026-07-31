@@ -3,6 +3,7 @@ import {
   constants as fsConstants,
   fchmodSync,
   fstatSync,
+  fsyncSync,
   ftruncateSync,
   mkdirSync,
   openSync,
@@ -40,7 +41,11 @@ export function createUsageAudit(path) {
       // it before accepting another inference request.
       if (failure) throw failure;
       await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-      await appendFile(path, JSON.stringify(value) + "\n", { encoding: "utf8", mode: 0o600 });
+      await appendFile(path, JSON.stringify(value) + "\n", {
+        encoding: "utf8",
+        mode: 0o600,
+        flush: true,
+      });
     });
     tail = write.catch((error) => {
       if (!failure) failure = error;
@@ -57,20 +62,52 @@ export function createUsageAudit(path) {
 }
 
 function prepareAuditPath(path) {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const descriptor = openSync(
-    path,
-    fsConstants.O_RDWR
-      | fsConstants.O_APPEND
-      | fsConstants.O_CREAT
-      | fsConstants.O_NOFOLLOW,
-    0o600,
-  );
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const { descriptor, created } = openAudit(path);
   try {
     const information = fstatSync(descriptor);
     if (!information.isFile()) throw new Error("usage audit is not a regular file");
     repairIncompleteTail(descriptor, information.size);
     fchmodSync(descriptor, 0o600);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  if (created) syncDirectory(directory);
+}
+
+function openAudit(path) {
+  const flags = fsConstants.O_RDWR
+    | fsConstants.O_APPEND
+    | fsConstants.O_NOFOLLOW;
+  try {
+    return { descriptor: openSync(path, flags), created: false };
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  try {
+    return {
+      descriptor: openSync(
+        path,
+        flags | fsConstants.O_CREAT | fsConstants.O_EXCL,
+        0o600,
+      ),
+      created: true,
+    };
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    return { descriptor: openSync(path, flags), created: false };
+  }
+}
+
+function syncDirectory(path) {
+  const descriptor = openSync(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY,
+  );
+  try {
+    fsyncSync(descriptor);
   } finally {
     closeSync(descriptor);
   }

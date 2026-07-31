@@ -1,591 +1,511 @@
 # Cyclo user guide
 
-Cyclo runs Git-defined agent teams against directories selected by a
-`project.cyclo` file. Each team gets an isolated Docker container, durable
-AgentWS queue, writable Pi state, declared project mounts, and read-only access
-to the outer model-provider Unix socket. Credentials remain in the independent
-gateway volume.
+## 1. Install
 
-For design details, see [Architecture](architecture.md). For the exact project
-grammar, see [Project format](project-format.md).
+Cyclo requires Linux, Python 3.10 or newer, Git, a local Docker Engine, and a
+DComp executable whose machine API is version 1.
 
-## Requirements
-
-- Linux
-- Python 3.10 or newer
-- Git
-- Docker, with a running daemon accessible to the current user
-
-Node.js and npm are maintainer requirements, not host runtime requirements.
-The installed Python package contains the component, gateway, Pi, team, and
-AgentWS sources used to build its images.
-
-Cyclo 0.2 is a fresh-install boundary: it does not adopt or migrate 0.1 state
-or Docker resources. Before the first 0.2 command, select a new state root and
-keep it set for every command:
+Install DComp on `PATH`, or point Cyclo at an executable:
 
 ```sh
-export CYCLO_STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cyclo-0.2"
+export CYCLO_DCOMP=/opt/dcomp/bin/dcomp
+"$CYCLO_DCOMP" version --json
 ```
 
-Do not point 0.2 at a state root used by 0.1. Then install from a source
-checkout or release artifact using the Python environment policy appropriate
-for the machine:
+The response must contain `"api_version":1`. Cyclo checks this interface before
+every new operational client session; it does not parse DComp's terminal
+output.
+
+Install Cyclo itself on the host:
 
 ```sh
 python3 -m pip install .
 cyclo --version
-cyclo doctor
 ```
 
-The distribution is named `cyclo-agent`; the command and Python package are
-named `cyclo`.
+Run Cyclo as a non-root user who can access the selected Docker daemon. Cyclo
+refuses to build or run teams as host root because that would make agent code
+root inside its container.
 
-## First gateway
+Cyclo supports only a local Docker Unix socket. The first operation that needs
+the Docker endpoint records the selected canonical value in the state root.
+Later commands reject a different context or endpoint for that installation.
 
-List login choices before storing any credential:
+## 2. Select an installation
+
+Without an explicit root, Cyclo stores state under
+`${XDG_STATE_HOME:-$HOME/.local/state}/cyclo` and reads
+`/etc/cyclo/host.conf`.
+
+For a user-owned installation, set an explicit root:
+
+```sh
+export CYCLO_STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cyclo-work"
+mkdir -p "$CYCLO_STATE_ROOT"
+```
+
+That installation reads `$CYCLO_STATE_ROOT/host.conf`. The selected
+system/local configuration scope is recorded on first mutation. Do not alternate
+between an explicit and implicit spelling for the same state directory.
+
+The canonical state-root path determines the installation ID, DComp system
+name, Docker resource names, gateway credential volume, generated image names,
+and queue locations. Several installations may share one trusted Docker host
+when each uses a different state root.
+
+Cyclo 0.2 does not migrate Cyclo 0.1 state. Start with a fresh state root.
+
+## 3. Configure the gateway
+
+List supported login providers before authenticating:
 
 ```sh
 cyclo gateway providers
 ```
 
-The validated official tag is the installed gateway image. Provider discovery,
-login, and start reuse a valid current-release image, building only when it is
-absent or from a different release. Restart requires an already-installed
-current image and never builds. `cyclo gateway build` explicitly rebuilds and
-restarts the gateway. The private credential volume is created if absent and
-survives ordinary build, stop, and restart operations.
-
-Login using OAuth/subscription or an API key:
+OAuth or subscription login is interactive:
 
 ```sh
 cyclo gateway login openai-codex --as codex-work
-cyclo gateway login anthropic --as claude-work
+```
+
+Read an API key without putting it in shell history:
+
+```sh
 cyclo gateway login openai --as openai-work --api-key-stdin
+```
+
+Or read a named environment variable:
+
+```sh
 cyclo gateway login openai --as openai-work --api-key-env OPENAI_API_KEY
 ```
 
-The account name selected by `--as` becomes the public prefix in
-`ACCOUNT/MODEL`. Account names are 1–64 lowercase letters, numbers,
-underscores, or hyphens, begin with a letter or number, and may not use a
-reserved Cyclo route name. Login writes the store, restarts the gateway, and
-returns only after the resulting model catalogue is ready:
+`--as` chooses the public account/provider prefix used in model IDs. A
+successful login writes the gateway's private Docker volume and restarts the
+gateway. On a fresh installation Cyclo first creates only that fixed
+gateway/store boundary; unrelated Provider or team failures do not block login.
+A separate build or restart command is not required.
+
+Inspect the result:
 
 ```sh
+cyclo gateway status
 cyclo models
+cyclo usage
 ```
 
-The gateway commands are:
+Useful gateway operations are:
 
-```text
-cyclo gateway providers
-cyclo gateway login PROVIDER [--as ACCOUNT] [--api-key-stdin|--api-key-env NAME]
-cyclo gateway build
-cyclo gateway start
+```sh
 cyclo gateway restart
-cyclo gateway stop
-cyclo gateway status
+cyclo gateway build
 cyclo gateway destroy-store --confirm VOLUME
 ```
 
-`gateway build` is the source-update boundary. The other gateway commands do not
-compare the installed image with its source. Cyclo keeps no source hash or cache
-database; Docker applies `.dockerignore` and layer-cache rules during an
-explicit build. After changing gateway source, use `cyclo gateway build` or
-`cyclo refresh`.
+`build` explicitly runs the gateway Docker build, applies the complete system,
+and restarts the gateway. Other operations that need the gateway image also
+invoke Docker build; Docker decides layer-cache reuse. `destroy-store` is
+destructive: first copy the exact volume name reported by
+`cyclo gateway status`.
 
-`destroy-store` is the explicit destructive operation for credentials and
-usage. `cyclo gateway status` prints `VOLUME`; no other gateway command deletes
-it.
+## 4. Configure Provider components
 
-## Provider components
+The gateway is always present and exposes `gateway.provider`. If `host.conf` is
+absent or empty, it is also the outer Provider.
 
-The gateway is the fixed root Provider. Optional intermediate providers are an
-ordered component graph declared by the installation's `host.conf`. The
-implicit state root initially uses `/etc/cyclo/host.conf`; a state root selected
-explicitly uses `STATE_ROOT/host.conf`. Cyclo keeps that association with the
-installation after the provider graph is first applied:
+Install an intermediate component by adding one line:
 
 ```text
-# provider INSTANCE SOURCE [context=PATH] REQUIREMENT=TARGET ... [-- ARGUMENT ...]
-provider first ./providers/passthrough upstream=gateway
-provider second ./providers/passthrough upstream=first
+provider trace ./providers/passthrough upstream=gateway.provider -- label=trace
 ```
 
-`first` and `second` are ordinary host-local instance names; they have no
-special meaning. Each `SOURCE` directory contains:
+The complete syntax is:
 
 ```text
-Dockerfile
-component.conf
+provider NAME SOURCE [context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...]
 ```
 
-For example:
+Rules:
+
+- `NAME` is a lower-case DComp component name.
+- Relative `SOURCE` paths resolve beside `host.conf`; `~` is not expanded.
+- `SOURCE` must contain `component.dcomp`.
+- `context=PATH` optionally selects a containing Docker build context.
+- Every input declared by `component.dcomp` must be bound exactly once.
+- A binding names a concrete `COMPONENT.OUTPUT`; the service identities must
+  match.
+- All declarations are resolved together, so forward references and cycles are
+  valid address wiring.
+- Words after `--` replace the image's command arguments. There is no quoting
+  or shell evaluation.
+- The last provider line selects the outer Provider used by teams and host
+  catalogue calls.
+
+Example descriptor:
 
 ```text
-component passthrough
-provide cyclo.component.v1.Component
-provide cyclo.provider.v1.Provider
-require upstream cyclo.provider.v1.Provider
+docker cyclo-passthrough:dev
+input cyclo.provider.v1.Provider upstream
+output cyclo.provider.v1.Provider provider
 ```
 
-Requirement names in `component.conf` are bound with `NAME=TARGET` in
-`host.conf`. A target is `gateway` or an earlier component instance. The file
-order is therefore the dependency order; forward references fail. Arguments
-after `--` explicitly replace the image's OCI `CMD`; when they are absent,
-Docker uses the image's own command unchanged. Cyclo does not require a
-component command named `serve`. A `context=PATH` setting selects a Docker
-build context containing the component source.
+If `SOURCE/Dockerfile` exists, Cyclo builds it. Otherwise the descriptor's
+Docker image must already exist locally. Every component image must define an
+OCI health check.
 
-An absent or empty `host.conf` is valid and exposes the gateway directly.
-Relative source paths resolve from the configuration file's directory.
-
-Inspect or operate one component directly:
-
-```sh
-cyclo component list
-cyclo component status [NAME]
-cyclo component build NAME
-cyclo component start NAME
-cyclo component restart NAME
-cyclo component stop NAME
-cyclo component logs NAME
-```
-
-`list` and `status` report each component independently. They show whether its
-container is present, current, and running, together with Docker health,
-Component health, and a concrete error. They do not compute a graph-wide
-readiness flag. A named `status` inspects only that component, so an unrelated
-broken container cannot prevent diagnosis. `cyclo component status gateway`
-remains usable even when `host.conf` is invalid.
-
-Operate every configured provider with:
+Inspect provider configuration and runtime status:
 
 ```sh
 cyclo providers check
-cyclo providers build
-cyclo providers start
-cyclo providers restart
 cyclo providers status
-cyclo providers stop
+cyclo providers restart
+cyclo component list
+cyclo component status trace
+cyclo component logs -f trace
+cyclo component restart trace
 ```
 
-The validated official tag is the installed component. `component build` and
-`providers build` submit the selected contexts to Docker, validate each
-completed immutable image, and only then promote that tag; they do not restart
-containers. `start`,
-`models`, and project `run` reuse valid current-release installed images,
-building only missing images or images from a different release. `restart`
-requires installed current images and recreates containers without building.
-Use `cyclo refresh` after changing installed component source.
-Global refresh selects instances whose durable intent is `running`; it never
-turns a stopped instance back on. It builds team images and refreshes the
-independent provider system, obtains its model catalogue, and validates every
-selected team before stopping any team. If a later stop, start, or host process
-fails, the running intent remains recorded. Correct the underlying problem and
-run `cyclo refresh` again, or use `cyclo repair` to recreate missing running
-instances from their current `project.cyclo` definitions. There is no separate
-refresh plan to resume or abort.
+Provider status is literal. A broken component is not bypassed. Fix or remove
+it, then apply the system again.
 
-`stop` removes all provider-lifecycle containers owned by this Cyclo state root
-even if the current configuration is temporarily invalid. The gateway remains
-independent. Team images have a separate lifecycle: an ordinary project run
-still submits the selected common and derived team contexts as described below.
+## 5. Create a team
 
-Every provider component gets only its own output socket directory and the
-read-only socket directories named by its requirements. Intermediate
-components run with no network. Cyclo selects the last working provider whose
-inputs are working and mounts that socket read-only into newly started teams.
-If a component cannot build or start, Cyclo reports it, skips its dependants,
-and keeps an earlier working provider available; this may be the gateway.
-Catalogue selection also tries usable components from outermost to innermost:
-if a health-ready component cannot return a structurally valid `ListModels`
-response, model listing and a new project fall back without retrying inference
-requests. The catalogue itself is format-neutral. A project run separately
-checks that every model requested by its current Pi team is Pi-compatible.
-
-The Provider data plane carries `model` and an opaque Pi JSON string. Relays do
-not understand prompts, history, tools, JSON Schema, or events. See
-[Provider protocol v1](provider-protocol.md).
-
-## Create a team
-
-List installed templates:
+List the bundled starting points:
 
 ```sh
 cyclo team templates
 ```
 
-Create a team repository using a Pi-compatible model from `cyclo models`:
+Create a Git repository:
 
 ```sh
-cyclo team init ./teams/my-team --template plan-execute-verify --model codex-work/MODEL_ID
+cyclo team init ./teams/jon-rtl --template plan-execute-verify --model codex-work/MODEL
 ```
-
-`cyclo models` prints the selected Provider catalogue, including models for
-future inference formats. `cyclo run` fails before starting containers if a
-Pi-based roster selects a model with an incompatible format or metadata.
 
 The repository contains:
 
 ```text
-team
-roles/
-  planner.md
-  ...
-AGENTS.md          # optional team-wide additions
-Dockerfile         # optional packages/tools, derived from CYCLO_TEAM_BASE
+jon-rtl/
+  team
+  roles/
+    planner.md
+    implementer.md
+    verifier.md
 ```
 
-The roster format is:
+It may add `AGENTS.md` for team-wide instructions and a `Dockerfile` for extra
+packages. The roster format is:
 
 ```text
-AGENT ROLE ENGINE PROVIDER/MODEL
+NAME ROLE ENGINE PROVIDER/MODEL
 ```
 
-Supported engines are `pi` and `pi-interactive`. Each role needs a matching
-`roles/ROLE.md`. At least one agent must have role `planner` because new tasks
-begin with a planner job.
+Cyclo currently supports `pi` and `pi-interactive`. Every role needs a matching
+`roles/ROLE.md`, names must be unique, and at least one agent must have the
+`planner` role.
 
-Cyclo supplies AgentWS, Pi, and the provider extension. The team repository
-defines the roster, prompts, optional instructions, and—when needed—an
-execution-image delta:
+Validate a team:
+
+```sh
+cyclo validate ./teams/jon-rtl
+```
+
+Teams requiring extra tools inherit the common runtime:
 
 ```dockerfile
-ARG CYCLO_TEAM_BASE=cyclo-team-base-required
+ARG CYCLO_TEAM_BASE
 FROM ${CYCLO_TEAM_BASE}
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends verilator yosys \
-    && rm -rf /var/lib/apt/lists/*
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends verilator
 ```
 
-Cyclo uses the common runtime directly when this file is absent. When it is
-present, every project run submits the team build context to Docker; Docker
-reuses cached work when the effective context is unchanged. Validate the
-repository with:
+The final stage must use `CYCLO_TEAM_BASE` and preserve Cyclo's entrypoint and
+health check. Team and provider Dockerfiles are trusted host build inputs;
+review them before running Cyclo.
+
+## 6. Define a project
+
+Create a context file that explains the source layout, then generate a project:
 
 ```sh
-cyclo validate ./teams/my-team
+cyclo project init ./project.cyclo --context ./project-context.md --team ./teams/jon-rtl ro --mount core-et /home/user/openhw/core-et rw --mount specifications ./specifications ro
 ```
 
-After upgrading Cyclo or changing installed component or team source, use one
-command to stop running project instances, rebuild and restart the gateway and
-configured providers, then rebuild the selected common and derived team images
-while recreating every instance whose recorded intent is `running`:
-
-```sh
-cyclo refresh
-```
-
-Queue state and lifecycle intent are preserved. Every running instance must
-retain its `project.cyclo` path so Cyclo can reproduce the same mount and team
-authority. If an operation is interrupted, `cyclo repair` recreates missing
-running containers, removes containers for stopped instances, and finishes
-pending deletion.
-
-## Define a project
-
-Create a validated one-team definition spanning two writable projects and one
-read-only input:
-
-```sh
-cyclo project init ./project.cyclo --context ./project-context.md --team ./teams/jon-rtl ro --mount core-et /home/user/openhw/core-et rw --mount uart-ip /home/user/openhw/uart-ip rw --mount specifications ./references/specifications ro
-```
-
-Add further `--team PATH MODE` or `--mount NAME PATH MODE` options as needed.
-Alternatively, write the same format by hand:
-
-Create `project.cyclo`:
+The generated format is intentionally small:
 
 ```text
 name core-et-uart
-description Integrate and verify a reusable UART IP in CORE-ET.
-
+description Implement and verify an ET-Link UART.
 context <<PROJECT_CONTEXT
-`core-et` is the processor implementation repository.
-`uart-ip` is the separately versioned UART repository being integrated into it.
-`specifications` contains normative interface documents for both projects.
+`core-et` is the writable implementation repository.
+`specifications` contains read-only protocol documentation.
 PROJECT_CONTEXT
-
 team ./teams/jon-rtl ro
-team ./teams/rtl-auditor ro
-
 mount core-et /home/user/openhw/core-et rw
-mount uart-ip /home/user/openhw/uart-ip rw
-mount specifications ./references/specifications ro
+mount specifications ./specifications ro
 ```
 
-The syntax is whitespace-delimited and has no quoting or `~` expansion.
-Relative paths resolve beside the file.
+Every team line becomes an independent persisted instance. Every selected team
+sees all project mounts:
 
-The optional literal `context <<MARKER` block explains what the mounted
-projects are, where work belongs, and how the repositories and supporting
-inputs relate. On launch or refresh, Cyclo creates the fixed, read-only
-`/agentws/project.cyclo` snapshot. It uses the same grammar, keeps the authored
-name, description, and context, selects the current team as `/team`, and
-rewrites structured paths automatically: `rw` mounts become `/workspace/NAME`
-and `ro` mounts become `/readonly/NAME`. Authored description/context text is
-copied literally. Every team agent reads that
-instance-wide contract; tasks contain only task-specific work.
+```text
+/workspace/core-et
+/readonly/specifications
+```
 
-- `team PATH ro` mounts the team definition read-only at `/team`.
-- `team PATH rw` deliberately permits team self-modification.
-- `mount NAME PATH rw` creates one writable project at `/workspace/NAME`.
-- `mount NAME PATH ro` creates `/readonly/NAME`.
+`rw` mounts are projects. `ro` mounts are supporting inputs. A definition may
+contain several of each. The team repository itself is mounted at `/team` with
+the mode on its `team` line.
 
-Several `rw` lines intentionally expose several writable projects. Cyclo does
-not infer which is primary; the description and context explain their
-relationship. Read-only mounts are supporting inputs, not projects.
+Cyclo also creates a read-only `/agentws/project.cyclo` for each team. It keeps
+the name, description, and context but replaces host paths with the actual
+container paths. Agents are required to read it before choosing a workspace.
 
-Validate before running:
+Validate without starting anything:
 
 ```sh
 cyclo validate ./project.cyclo
 ```
 
-## Run and operate teams
+## 7. Run work
 
-Start one container per team line:
+Start every team in a project:
 
 ```sh
 cyclo run ./project.cyclo
 ```
 
-Useful options:
+Common options are:
 
 ```text
---offline           remove direct network access; provider UDS remains usable
---host ADDRESS      AgentWS viewer bind address (default 127.0.0.1)
---port PORT         fixed viewer port for a one-team project; 0 chooses one
---verbose           verbose team runtime logs
---foreground        attach for a one-team project
---dry-run           print the container launch without starting it
+--image IMAGE       use one prebuilt compatible team image
+--offline           remove direct team egress and dashboard publication
+--host IPV4         AgentWS viewer bind address; default 127.0.0.1
+--port PORT         fixed viewer port for a single-team project; default dynamic
+--verbose           mirror rendered agent transcripts to component logs
+--foreground        follow logs after a single-team start
 ```
 
-Inspect instances:
+`--port` and `--foreground` are rejected for multi-team projects.
+`--port` is incompatible with `--offline`.
+
+`run` performs one global apply:
+
+1. validate project, team, model, mount, and Docker authority;
+2. build the gateway and configured source-built providers through Docker;
+3. build team images, allowing Docker to reuse cached layers;
+4. persist each new instance with `running` intent; and
+5. compile and apply gateway, providers, and every running team through DComp.
+
+If apply fails after intent is persisted, the instances remain visible and
+repairable. Fix the reported component or configuration, then run:
+
+```sh
+cyclo repair
+```
+
+## 8. Tasks
+
+Create a task from a specification file:
+
+```sh
+cyclo task run INSTANCE uart-ip ./uart-task.md
+```
+
+Inspect and update it:
+
+```sh
+cyclo task list INSTANCE
+cyclo task show INSTANCE uart-ip
+cyclo task comment INSTANCE uart-ip "Review requested"
+cyclo task complete INSTANCE uart-ip -m "Accepted"
+cyclo task reopen INSTANCE uart-ip -m "More work required"
+```
+
+Task operations run the bundled AgentWS tools in a confined one-shot container
+over the host-owned durable queues. They remain available when a team component
+is stopped; a stopped team simply does not process pending work until it is
+started again.
+
+Print the durable queue path when direct local inspection is needed:
+
+```sh
+cyclo path INSTANCE
+```
+
+Use AgentWS tools rather than editing queue control files by hand.
+
+## 9. Observe the system
+
+Inspect teams:
 
 ```sh
 cyclo ps
 cyclo inspect INSTANCE
 cyclo logs INSTANCE
 cyclo logs -f INSTANCE
-cyclo path INSTANCE
 ```
 
-Submit a Markdown task specification:
+Inspect the global DComp composition:
 
 ```sh
-cyclo task run INSTANCE uart-ip ./uart-task.md
-cyclo task list INSTANCE
-cyclo task show INSTANCE uart-ip
+cyclo component list
+cyclo component status
+cyclo component logs -f COMPONENT
+cyclo doctor
 ```
 
-`task` is an instance-scoped command group:
+`doctor` is observational. It checks DComp compatibility, expected components,
+Docker health, stopped-instance absence, and the model catalogue when the
+system is operational. It does not build or apply the system.
 
-```text
-cyclo task list INSTANCE
-cyclo task show INSTANCE TASK
-cyclo task run INSTANCE TASK SPEC.md
-cyclo task comment INSTANCE TASK MESSAGE...
-cyclo task complete INSTANCE TASK [-m MESSAGE]
-cyclo task reopen INSTANCE TASK [-m MESSAGE]
+Serve the fleet dashboard:
+
+```sh
+cyclo dashboard --host 127.0.0.1 --port 8080
 ```
 
-`task run` atomically creates the AgentWS task and its initial planner job, then
-prints the project definition and logical writable/read-only mounts seen by the
-team. The other commands expose the task lifecycle without requiring operators
-to know the container name or invoke AgentWS directly.
+The fleet dashboard and each AgentWS viewer are read-only and unauthenticated.
+Keep them on loopback unless a trusted network boundary or authenticated
+reverse proxy protects them. When a viewer is bound to `0.0.0.0`, browser links
+use the host of the incoming request, not the wildcard bind address.
 
-Stop one instance or every persisted instance belonging to a project:
+## 10. Lifecycle
+
+Stop one instance or all current teams listed by a project:
 
 ```sh
 cyclo stop INSTANCE
 cyclo stop ./project.cyclo
 ```
 
-Queue state and transcripts survive the team-container removal.
-
-When a stopped instance binding is no longer wanted, retire it explicitly:
+Start a stopped instance from its persisted definition:
 
 ```sh
-cyclo forget INSTANCE --confirm INSTANCE
+cyclo start INSTANCE
 ```
 
-This permanently removes that instance's tasks, jobs, transcripts, generated
-runtime, and metadata. It requires the instance's recorded intent to be
-`stopped`; use `cyclo stop` first. The explicit operation allows a later project
-at a moved path to reuse the logical instance name without silently mixing old
-queue state into the new project. Cyclo records `deleting`, cleans the exact
-container and network, and moves the state out of ordinary inventory before
-purging it. If interrupted, `cyclo repair` finishes that deletion. Repeating
-the same exactly confirmed command after deletion has completed succeeds as an
-already-absent operation.
-
-## Dashboards
-
-Start the read-only fleet dashboard:
+Adopt current project/team sources and rebuild every running instance:
 
 ```sh
-cyclo dashboard
-cyclo dashboard --host 0.0.0.0 --port 8080
+cyclo refresh
 ```
 
-The default is loopback. Version 0.2.0 has no dashboard authentication; protect
-any non-loopback binding with host networking or a trusted reverse proxy. The
-dashboard derives AgentWS links from the browser's current host and the
-instance port; `0.0.0.0` is a bind address, never a link target.
+`refresh` reparses each running instance's recorded project file, validates its
+current team, runs host and team Docker builds, updates the persisted instance,
+and applies the installation-wide DComp system. Stopped instances remain
+stopped and retain their previous persisted configuration.
 
-Each team also runs its read-only AgentWS viewer. The interactive chat surface
-is not part of Cyclo's job model.
-
-## Usage and health
-
-Show gateway accounting:
-
-```sh
-cyclo usage
-```
-
-Usage is global by account/provider and exact model. The shared socket has no
-trustworthy team identity, so Cyclo does not invent per-team attribution.
-Observation never creates a missing gateway credential store.
-
-Run the non-mutating installation check:
-
-```sh
-cyclo doctor
-```
-
-It verifies the bundled AgentWS and component ABI, persisted state, Docker,
-`host.conf`, exact image/container state, each component's own health, provider
-bindings, and the selected model catalogue.
-
-`cyclo ps` distinguishes team-container state from provider readiness. A team
-can be running while its model path is unavailable; the health reason makes
-that explicit.
-
-After an interrupted team start or stop, reconcile launch-pinned metadata and
-clean only stale owned resources with:
+Reapply current `host.conf` and persisted instance intent:
 
 ```sh
 cyclo repair
 ```
 
-Repair makes the recorded lifecycle intent true. It recreates missing
-`running` instances from their current `project.cyclo`, replaces paused or
-restarting instances, verifies AgentWS readiness for every running container
-before saving a recovered published port, removes Docker resources for
-`stopped` instances, and completes `deleting` instances. It reports every
-remaining failure and exits nonzero if any operation was incomplete.
+`repair` runs the required host Docker builds and resumes an interrupted DComp
+operation before applying. It does not re-read team/project definitions for
+persisted instances; use `refresh` for that.
 
-## Persistent state
-
-The state root is `$XDG_STATE_HOME/cyclo` or `~/.local/state/cyclo` by default.
-Select it explicitly with `--state-root` or `CYCLO_STATE_ROOT`. When the
-provider graph is first applied, the implicit root uses `/etc/cyclo/host.conf`;
-an explicitly selected root uses `host.conf` inside that root. Cyclo persists
-this association in the state root, so later environment changes cannot switch
-the provider configuration for an existing installation. Read-only checks do
-not create the binding, and gateway-only commands do not depend on it.
-
-### Multiple installations on one host
-
-An installation is identified by its canonical state root. Cyclo derives a
-stable 12-hex-character installation ID from the root's fixed `components/`
-path and uses it in every Docker resource it creates: the gateway and provider
-containers/images, gateway credential volume, team containers and networks,
-common and derived team images, and ownership labels. Two installations may
-therefore use the same project name, team name, and instance ID without Docker
-name or mutable-tag collisions.
-
-Give each installation its own state root and put its provider configuration
-there:
+Delete a stopped instance and its durable AgentWS/Pi state:
 
 ```sh
-mkdir -p ~/.local/state/cyclo-work ~/.local/state/cyclo-lab
-printf '%s\n' 'provider passthrough /opt/providers/passthrough upstream=gateway' > ~/.local/state/cyclo-work/host.conf
-CYCLO_STATE_ROOT=~/.local/state/cyclo-work cyclo gateway providers
-CYCLO_STATE_ROOT=~/.local/state/cyclo-lab cyclo gateway providers
+cyclo forget INSTANCE --confirm INSTANCE
 ```
 
-Use the same state-root setting on every command for that installation. Shell
-wrappers or environment files are convenient, but Cyclo needs no second binary
-installation. The equivalent explicit form is:
+Cyclo first applies the system without that stopped team, then removes the
+instance directory. Gateway credentials and declared DComp volumes are not
+removed by ordinary stop, refresh, repair, or forget operations.
 
-```sh
-cyclo --state-root ~/.local/state/cyclo-work ps
-```
+## 11. State and ownership
 
-The state root owns the gateway credential store, usage data, queues, sockets,
-Docker namespace, and optional provider configuration. `cyclo gateway status`,
-`cyclo providers status`, `cyclo ps`, and `cyclo doctor` inspect only the
-selected installation.
-
-`--image IMAGE` and `CYCLO_TEAM_IMAGE` deliberately bypass the namespaced
-common/derived image selection. Cyclo validates but does not build that
-operator-supplied image. Use the override only when one externally managed
-image is intended for every team in the project.
-
-As established at the start of this guide, 0.2 does not adopt or migrate 0.1
-state, containers, networks, images, or provider configuration. Recreate
-projects from their `project.cyclo` files. The separately selected state root
-keeps an old installation isolated if it must remain available during the
-transition.
+A typical explicit installation contains:
 
 ```text
-instances/INSTANCE/
-  runtime/          materialized read-only AgentWS runtime
-  agentws-state/
-    tasks/ jobs/ agents/
-  pi/               writable Pi settings and runtime metadata
-  workspace/        inert named writable layout
-  readonly/         inert named read-only layout
-components/gateway/socket/       root gateway socket
-components/sockets/COMPONENT/    intermediate component sockets
+STATE_ROOT/
+  host.conf
+  host-config.scope
+  docker-endpoint
+  control.lock
+  pending-instance-batch.json  # present only during recoverable cohort publish
+  instances/
+    INSTANCE/
+      run.json
+      agentws-state/
+        tasks/
+        jobs/
+        agents/
+      pi/
+      project-config/
+      runtime-config/
+  system/
+    system.dcomp
+    descriptors/
+  dcomp/
 ```
 
-The gateway credential and usage store is a separately labelled Docker volume.
-Cyclo verifies installation, resource-kind, instance, and persisted launch
-identity before operating on a current team container. Startup replacement
-uses the first three labels so it can remove a stopped previous launch; it
-never adopts that previous launch as the current instance.
+Cyclo owns instance intent, queue state, Pi state, image construction, and the
+generated system definition. DComp owns the contents of `dcomp/` and all
+container/network/volume lifecycle state. Cyclo never reads DComp's private
+files; it uses machine API version 1. The gateway owns credentials and usage in
+its named Docker volume.
 
-## Security model
+When one command changes several instances, Cyclo journals the complete cohort
+in `pending-instance-batch.json` before replacing any `run.json`. Readers hold
+the same installation lock and finish an interrupted publication before
+returning an inventory snapshot.
 
-Cyclo's trusted-host threat model, resource-capability semantics, and extension
-points are defined in [Security architecture](architecture.md#security-architecture).
-In particular, the host is the administrative security domain while agent code
-inside a team container is treated as potentially hostile.
+Do not copy one state root over another running installation. Back up state only
+with the corresponding system stopped and include the gateway volume separately
+when credential recovery is required.
 
-- Only the gateway mounts physical credentials.
-- Teams and intermediate components receive no Docker socket.
-- Provider edges are explicit read-only Unix-socket directory mounts.
-- Intermediate providers use `--network none`.
-- Teams see only declared team/project paths and the outer provider socket.
-- Incoming RPC authentication headers are not forwarded through components.
-- Gateway-owned API keys, native model routes, headers, environment, callbacks,
-  abort signals, transports, timeouts, and retry controls cannot be selected in
-  inference JSON.
-- Prompt and tool data are intentionally visible to an allowed model. Cyclo is
-  not a confidentiality boundary against a provider the operator chose.
+## 12. Mount and network safety
 
-## Maintainer checks
+Cyclo rejects:
 
-From the source tree:
+- missing, non-directory, or non-canonical bind sources after path resolution;
+- overlapping team and project trees;
+- mounts overlapping Cyclo state, installed Cyclo code, `host.conf`, DComp,
+  the host Pi directory, `/proc`, `/sys`, `/dev`, `/run`, or a Docker socket;
+- a selected Docker endpoint that is remote or changes after installation
+  binding; and
+- team image execution as host root.
+
+Team containers never receive the Docker socket or gateway credential volume.
+Provider links are private DComp networks. This isolation does not make
+readable project data confidential from a normal network-enabled team or from
+the external model service. Use `--offline`, separate projects/installations,
+or explicit policy components according to the deployment threat model.
+
+## 13. Troubleshooting
+
+Check the boundary first:
 
 ```sh
-pytest -q
-npm --prefix src/cyclo/components/protocol/component test
-npm --prefix src/cyclo/components/protocol/provider test
-npm --prefix src/cyclo/components/gateway test
-npm --prefix src/cyclo/components/passthrough test
-npm --prefix src/cyclo/components/pi-provider test
-tools/build-release
-tools/release-acceptance
+"${CYCLO_DCOMP:-dcomp}" version --json
+cyclo doctor
+cyclo component status
 ```
 
-`tools/release-acceptance` builds and exercises an isolated wheel.
-`tools/build-release` additionally builds the real gateway, pass-through, and
-team images. The source tests exercise real ConnectRPC Unix sockets across the
-gateway endpoint, relay, and team-side Pi adapter without external credentials.
+If DComp reports an interrupted operation, ordinary mutating Cyclo commands and
+`cyclo repair` attempt `dcomp resume` before applying the desired system.
+
+If one provider is unhealthy:
+
+```sh
+cyclo component logs PROVIDER
+cyclo component status PROVIDER
+```
+
+Correct its source, image, arguments, or `host.conf` binding. The configured
+outer Provider remains the only route.
+
+If a team is unhealthy:
+
+```sh
+cyclo inspect INSTANCE
+cyclo logs -f INSTANCE
+```
+
+The team health check covers the AgentWS viewer. Agent startup and task failures
+remain in the component logs and durable AgentWS state.

@@ -4,7 +4,6 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { Code, ConnectError } from "@connectrpc/connect";
-import { componentSocketPath } from "@cyclo/component/paths";
 import {
   closeComponentServer,
   listenComponentServer,
@@ -21,6 +20,8 @@ export async function runGateway({
   createServices = loadDefaultServices,
   env = process.env,
   signalSource = process,
+  listenOptions,
+  onListening,
 } = {}) {
   const shutdown = new AbortController();
   let notifySignal;
@@ -48,9 +49,8 @@ export async function runGateway({
       services: resolvedServices,
       shutdownSignal: shutdown.signal,
     });
-    await listenComponentServer(server, {
-      socketPath: componentSocketPath(env),
-    });
+    const address = await listenComponentServer(server, listenOptions);
+    onListening?.(address);
 
     await Promise.race([signaled, serverFailure(server)]);
   } finally {

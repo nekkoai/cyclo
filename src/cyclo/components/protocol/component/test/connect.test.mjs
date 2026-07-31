@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 
 import { createClient } from "@connectrpc/connect";
@@ -15,11 +12,9 @@ import {
   createComponentServer,
   listenComponentServer,
 } from "../src/server.mjs";
-import { createUnixTransport } from "../src/transport.mjs";
+import { createDockerTransport } from "../src/transport.mjs";
 
-test("generated handler and client communicate over a Unix socket", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "cyclo-component-"));
-  const socketPath = join(directory, "component.sock");
+test("generated handler and client communicate over ConnectRPC TCP", async () => {
   const declaration = parseDeclaration(`
     component health-proxy
     provide cyclo.component.v1.Component
@@ -45,23 +40,21 @@ test("generated handler and client communicate over a Unix socket", async () => 
   });
 
   try {
-    await listenComponentServer(server, { socketPath });
-    const client = createClient(required, createUnixTransport(socketPath));
+    const address = await listenComponentServer(server, { host: "127.0.0.1", port: 0 });
+    const target = `dns:///127.0.0.1:${address.port}`;
+    const client = createClient(required, createDockerTransport(target));
 
     const response = await client.health({});
     assert.equal(response.status, HealthStatus.READY);
     assert.equal(response.message, "test");
-    assert.equal(await checkComponentHealth({ socketPath }), true);
+    assert.equal(await checkComponentHealth({ target }), true);
     status = HealthStatus.UNSPECIFIED;
-    assert.equal(await checkComponentHealth({ socketPath }), false);
+    assert.equal(await checkComponentHealth({ target }), false);
     status = HealthStatus.NOT_READY;
-    assert.equal(await checkComponentHealth({ socketPath }), false);
+    assert.equal(await checkComponentHealth({ target }), false);
+    await closeComponentServer(server);
+    await assert.rejects(checkComponentHealth({ target, timeoutMs: 50 }));
   } finally {
     await closeComponentServer(server);
-  }
-  try {
-    await assert.rejects(checkComponentHealth({ socketPath, timeoutMs: 50 }));
-  } finally {
-    await rm(directory, { recursive: true, force: true });
   }
 });

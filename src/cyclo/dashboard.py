@@ -8,7 +8,6 @@ from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path
-from typing import Protocol
 from urllib.parse import urlsplit
 
 from .agentws_queue import (
@@ -18,48 +17,16 @@ from .agentws_queue import (
     read_agent_supervisor_status,
     scan_agentws_queue,
 )
-from .docker import Docker, DockerContainerState
+from .dcomp import DCompComponentStatus, DCompStatus
 from .errors import CycloError
-from .health import (
-    INACTIVE_TEAM_HEALTH,
-    ProviderHealth,
-    ProviderStatusReader,
-    instance_provider_health,
-    read_provider_status,
-    team_health,
-)
-from .instance_lifecycle import instance_lifecycle_label
 from .project_state import decode_instance_project
-from .state import DEFAULT_AGENTWS_HOST, Instance, StateStore, utc_now
+from .runtime import CycloRuntime
+from .state import Instance, StateStore, utc_now
 
 
-API_VERSION = 3
-DEFAULT_DASHBOARD_HOST = DEFAULT_AGENTWS_HOST
+API_VERSION = 4
+DEFAULT_DASHBOARD_HOST = "127.0.0.1"
 DEFAULT_DASHBOARD_PORT = 0
-
-
-class UsageReader(Protocol):
-    def usage(self) -> dict[str, object]: ...
-
-
-def _safe_number(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return 0
-    if value < 0 or value != value or value in {float("inf"), float("-inf")}:
-        return 0
-    return int(value)
-
-
-def _usage_counters(value: object) -> dict[str, int]:
-    data = value if isinstance(value, dict) else {}
-    input_tokens = _safe_number(data.get("input_tokens"))
-    output_tokens = _safe_number(data.get("output_tokens"))
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
-        "requests": _safe_number(data.get("requests")),
-    }
 
 
 def _project_metadata(
@@ -73,6 +40,184 @@ def _project_metadata(
     ]
 
 
+def _error_summary(exc: Exception) -> str:
+    detail = " ".join(str(exc).split()) or type(exc).__name__
+    return detail if len(detail) <= 240 else detail[:237] + "..."
+
+
+def _component_issue(component: DCompComponentStatus) -> str:
+    details: list[str] = []
+    if component.problem:
+        details.append(component.problem)
+    if component.status != "running":
+        state = component.status or "unknown"
+        if component.exit_code:
+            state += f" (exit {component.exit_code})"
+        details.append(f"status {state}")
+    if component.health != "healthy":
+        details.append(f"health {component.health or 'unknown'}")
+    return "; ".join(dict.fromkeys(details))
+
+
+def _health(state: str, reason: str = "") -> dict[str, str]:
+    return {"state": state, "reason": reason}
+
+
+def _with_agent_health(
+    provider: dict[str, str],
+    suspended_agents: tuple[str, ...],
+    supervisor_error: str,
+    planner_attention_jobs: tuple[str, ...],
+) -> dict[str, str]:
+    agents = tuple(sorted(set(suspended_agents)))
+    attention = tuple(sorted(set(planner_attention_jobs)))
+    details: list[str] = []
+    if agents:
+        shown = ", ".join(agents[:5])
+        if len(agents) > 5:
+            shown += f", +{len(agents) - 5} more"
+        noun = "agent" if len(agents) == 1 else "agents"
+        details.append(f"{len(agents)} {noun} suspended: {shown}")
+    if attention:
+        shown = ", ".join(attention[:5])
+        if len(attention) > 5:
+            shown += f", +{len(attention) - 5} more"
+        noun = "failure" if len(attention) == 1 else "failures"
+        details.append(f"{len(attention)} unresolved planner {noun}: {shown}")
+
+    if supervisor_error:
+        details.insert(
+            0,
+            f"AgentWS supervisor status unavailable: {supervisor_error}",
+        )
+        agent_state = "agents-unknown"
+    elif agents:
+        agent_state = "agents-suspended"
+    elif attention:
+        agent_state = "agents-attention"
+    else:
+        return provider
+
+    reasons = [
+        value
+        for value in (provider["reason"], "; ".join(details))
+        if value
+    ]
+    return _health(
+        agent_state if provider["state"] == "ready" else provider["state"],
+        "; ".join(reasons),
+    )
+
+
+def _provider_component_names(runtime: CycloRuntime) -> set[str]:
+    return {
+        "gateway",
+        *(provider.name for provider in runtime.host.providers),
+    }
+
+
+def _provider_health(
+    runtime: CycloRuntime | None,
+    status: DCompStatus | None,
+) -> tuple[dict[str, str], list[str]]:
+    if runtime is None or status is None:
+        return _health("provider-unknown", "runtime status unavailable"), []
+
+    try:
+        names = _provider_component_names(runtime)
+        outer_name = runtime.host.outer_component
+    except CycloError as exc:
+        issue = f"host configuration unavailable: {_error_summary(exc)}"
+        gateway = status.component("gateway")
+        if gateway is not None:
+            gateway_issue = _component_issue(gateway)
+            if gateway_issue:
+                issue += f"; gateway: {gateway_issue}"
+        return _health("provider-unknown", issue), [issue]
+    issues: list[str] = []
+    by_name = {
+        component.name: component
+        for component in status.components
+        if component.name in names
+    }
+    for name in sorted(names):
+        component = by_name.get(name)
+        if component is None:
+            issues.append(f"component {name}: absent from runtime status")
+            continue
+        problem = _component_issue(component)
+        if problem:
+            issues.append(f"component {name}: {problem}")
+
+    outer = by_name.get(outer_name)
+    if outer is None:
+        return (
+            _health(
+                "provider-down",
+                f"outer provider component {outer_name} is absent",
+            ),
+            issues,
+        )
+    outer_issue = _component_issue(outer)
+    if outer_issue:
+        return (
+            _health("provider-down", f"{outer_name}: {outer_issue}"),
+            issues,
+        )
+
+    optional = [
+        issue
+        for issue in issues
+        if not issue.startswith(f"component {outer_name}:")
+    ]
+    reason = (
+        "unavailable optional provider components: " + ", ".join(optional)
+        if optional
+        else ""
+    )
+    return _health("ready", reason), issues
+
+
+def _runtime_value(status: DCompStatus | None) -> dict[str, object] | None:
+    if status is None:
+        return None
+    return {
+        "name": status.name,
+        "desired": status.desired,
+        "operational": status.operational,
+        "digest": status.digest,
+        "operation": status.operation,
+        "phase": status.phase,
+        "networks": [
+            {
+                "key": network.key,
+                "internal": network.internal,
+                "problem": network.problem,
+            }
+            for network in status.networks
+        ],
+        "components": [
+            {
+                "name": component.name,
+                "status": component.status,
+                "health": component.health,
+                "exit_code": component.exit_code,
+                "problem": component.problem,
+                "published_ports": [
+                    {
+                        "protocol": port.protocol,
+                        "host_ip": port.host_ip,
+                        "host_port": port.host_port,
+                        "container_port": port.container_port,
+                    }
+                    for port in component.published_ports
+                ],
+            }
+            for component in status.components
+        ],
+    }
+
+
 class DashboardSnapshot:
     """Build a best-effort, read-only host view of all Cyclo instances."""
 
@@ -80,83 +225,85 @@ class DashboardSnapshot:
         self,
         store: StateStore,
         *,
-        docker: Docker | None = None,
-        usage_reader: UsageReader | None = None,
-        provider_reader: ProviderStatusReader | None = None,
+        runtime: CycloRuntime | None = None,
         queue_limits: QueueLimits | None = None,
     ) -> None:
         self.store = store
-        self.docker = docker or Docker()
-        self.usage_reader = usage_reader
-        self.provider_reader = provider_reader
+        self.runtime = runtime
         self.queue_limits = queue_limits or QueueLimits()
 
-    def _gateway_usage(self) -> tuple[dict[str, object], str | None]:
-        if self.usage_reader is None:
-            return {}, None
-        try:
-            usage = self.usage_reader.usage()
-        except Exception as exc:
-            return {}, f"gateway usage unavailable: {exc}"
-        if not isinstance(usage, dict):
-            return {}, "gateway usage unavailable: response is not an object"
-        return usage, None
-
     def build(self) -> dict[str, object]:
-        gateway_usage, usage_error = self._gateway_usage()
-        global_usage = _usage_counters(gateway_usage.get("totals"))
         rows: list[dict[str, object]] = []
-        shared_provider: tuple[ProviderHealth, object | None] | None = None
         instances, instance_state_errors = self.store.list_report()
-        entries = [
-            (instance, self.store.queue_root(instance.id))
-            for instance in instances
-        ]
-        identifiers = {instance.id for instance in instances}
-        try:
-            deletions = self.store.list_deletions()
-        except Exception as exc:
-            instance_state_errors.append(
-                f"cannot enumerate Cyclo deletion state: {exc}"
-            )
-            deletions = []
-        for instance in deletions:
-            if instance.id in identifiers:
-                instance_state_errors.append(
-                    f"Cyclo instance {instance.id!r} exists in both active "
-                    "and deletion state"
+        source_errors = [*instance_state_errors]
+        runtime_status: DCompStatus | None = None
+        if self.runtime is None:
+            source_errors.append("runtime status unavailable: runtime is not configured")
+        else:
+            try:
+                runtime_status = self.runtime.status()
+            except Exception as exc:
+                source_errors.append(
+                    f"runtime status unavailable: {_error_summary(exc)}"
                 )
-                continue
-            identifiers.add(instance.id)
-            entries.append(
-                (
-                    instance,
-                    self.store.deletion_dir(instance.id) / "agentws-state",
+
+        provider_health, provider_issues = _provider_health(
+            self.runtime,
+            runtime_status,
+        )
+        source_errors.extend(provider_issues)
+        if runtime_status is not None:
+            if runtime_status.operation:
+                phase = runtime_status.phase or "unknown"
+                source_errors.append(
+                    "runtime operation in progress: "
+                    f"{runtime_status.operation} ({phase})"
                 )
+            source_errors.extend(
+                f"runtime network {network.key}: {network.problem}"
+                for network in runtime_status.networks
+                if network.problem
             )
 
-        for instance, queue_root in entries:
+        for instance in instances:
+            queue_root = self.store.queue_root(instance.id)
             errors: list[str] = []
-            try:
-                docker_state: DockerContainerState | None = (
-                    self.docker.container_lifecycle_state(
-                        instance, system=self.store.system
-                    )
-                )
-            except Exception as exc:
-                docker_state = None
-                errors.append(f"Docker status unavailable: {exc}")
-            state = instance_lifecycle_label(instance, docker_state)
-            if state == "running":
-                if shared_provider is None:
-                    shared_provider = read_provider_status(self.provider_reader)
-                provider = instance_provider_health(
-                    shared_provider[0], shared_provider[1], instance  # type: ignore[arg-type]
-                )
+            desired = instance.intent
+            component_name = ""
+            component: DCompComponentStatus | None = None
+            if self.runtime is not None:
                 try:
-                    supervisor = read_agent_supervisor_status(
-                        queue_root
+                    component_name = self.runtime.component_for_instance(
+                        instance.id
                     )
+                except Exception as exc:
+                    errors.append(
+                        "runtime component mapping unavailable: "
+                        f"{_error_summary(exc)}"
+                    )
+            if runtime_status is not None and component_name:
+                component = runtime_status.component(component_name)
+            if component is None:
+                container_state = "absent" if runtime_status is not None else "unknown"
+                readiness = "absent" if runtime_status is not None else "unknown"
+                ready = False
+                if desired == "running" and runtime_status is not None:
+                    errors.append(
+                        f"runtime component {component_name or instance.id} is absent"
+                    )
+            else:
+                container_state = component.status or "unknown"
+                readiness = component.health or "unknown"
+                component_problem = _component_issue(component)
+                if component_problem:
+                    errors.append(
+                        f"runtime component {component.name}: {component_problem}"
+                    )
+                ready = not component_problem
+            operational = desired == "running" and ready
+            if operational:
+                try:
+                    supervisor = read_agent_supervisor_status(queue_root)
                     suspended_agents = supervisor.suspended_agents
                     planner_attention_jobs = supervisor.planner_attention_jobs
                     supervisor_error = supervisor.error
@@ -164,14 +311,14 @@ class DashboardSnapshot:
                     suspended_agents = ()
                     planner_attention_jobs = ()
                     supervisor_error = str(exc)
-                health = team_health(
-                    provider,
+                health = _with_agent_health(
+                    provider_health,
                     suspended_agents,
                     supervisor_error,
                     planner_attention_jobs,
                 )
             else:
-                health = INACTIVE_TEAM_HEALTH
+                health = _health("inactive", "instance is not operational")
             try:
                 queue = scan_agentws_queue(
                     queue_root, limits=self.queue_limits
@@ -187,16 +334,17 @@ class DashboardSnapshot:
             if isinstance(queue_errors, list):
                 errors.extend(str(item) for item in queue_errors)
             agentws_port = None
-            if state == "running" and not instance.offline:
-                agentws_port = instance.port
-                if agentws_port is None:
-                    try:
-                        agentws_port = self.docker.current_published_port(
-                            instance,
-                            system=self.store.system,
-                        )
-                    except Exception as exc:
-                        errors.append(f"AgentWS port unavailable: {exc}")
+            if operational and not instance.offline:
+                try:
+                    if self.runtime is None or runtime_status is None:
+                        raise CycloError("runtime status unavailable")
+                    agentws_port = self.runtime.team_port(
+                        instance, runtime_status
+                    )
+                except Exception as exc:
+                    errors.append(
+                        f"AgentWS port unavailable: {_error_summary(exc)}"
+                    )
             try:
                 project, project_errors = _project_metadata(instance)
             except Exception as exc:
@@ -216,9 +364,10 @@ class DashboardSnapshot:
                     "id": instance.id,
                     "team": instance.team_name,
                     "project": project,
-                    "intent": instance.intent,
-                    "state": state,
-                    "health": health.api_value(),
+                    "desired": desired,
+                    "container": container_state,
+                    "readiness": readiness,
+                    "health": health,
                     "mode": {
                         "offline": instance.offline,
                         "team_write": instance.team_write,
@@ -232,42 +381,49 @@ class DashboardSnapshot:
                 }
             )
 
-        state_priority = {
-            "running": 0,
-            "restarting": 1,
-            "paused": 2,
-            "stale": 3,
-            "orphan": 4,
-            "deleting": 5,
-            "unknown": 6,
-            "stopped": 7,
-        }
-        rows.sort(key=lambda item: (state_priority.get(str(item["state"]), 9), str(item["id"])))
-        source_errors = [*instance_state_errors]
-        if usage_error:
-            source_errors.append(usage_error)
+        def lifecycle_operational(item: dict[str, object]) -> bool:
+            return (
+                item["desired"] == "running"
+                and item["container"] == "running"
+                and item["readiness"] == "healthy"
+            )
+
+        def lifecycle_settled(item: dict[str, object]) -> bool:
+            return lifecycle_operational(item) or (
+                item["desired"] == "stopped"
+                and item["container"] == "absent"
+            )
+
+        def lifecycle_rank(item: dict[str, object]) -> int:
+            if lifecycle_operational(item):
+                return 0
+            return {
+                "running": 1,
+                "absent": 2,
+                "stopped": 3,
+            }.get(str(item["desired"]), 4)
+
+        rows.sort(
+            key=lambda item: (
+                lifecycle_rank(item),
+                str(item["id"]),
+            )
+        )
+        source_errors = list(dict.fromkeys(source_errors))
         instance_error_count = sum(len(item["errors"]) for item in rows)  # type: ignore[arg-type]
         summary = {
             "instances": len(rows),
-            "running": sum(1 for item in rows if item["state"] == "running"),
-            "provider_issues": int(
-                shared_provider is not None
-                and (
-                    shared_provider[0].state.startswith("provider-")
-                    or bool(shared_provider[0].reason)
-                )
+            "running": sum(
+                1
+                for item in rows
+                if item["container"] == "running"
             ),
+            "provider_issues": len(provider_issues)
+            + int(self.runtime is None or runtime_status is None),
             "attention": sum(
                 1
                 for item in rows
-                if item["state"] in {
-                    "restarting",
-                    "paused",
-                    "stale",
-                    "orphan",
-                    "deleting",
-                    "unknown",
-                }
+                if not lifecycle_settled(item)
                 or str(item["health"]["state"]).startswith("provider-")  # type: ignore[index]
                 or str(item["health"]["state"]).startswith("agents-")  # type: ignore[index]
                 or (
@@ -280,8 +436,6 @@ class DashboardSnapshot:
             "tasks": sum(item["counts"]["tasks"]["total"] for item in rows),  # type: ignore[index]
             "jobs": sum(item["counts"]["jobs"]["total"] for item in rows),  # type: ignore[index]
             "agents": sum(item["counts"]["agents"]["total"] for item in rows),  # type: ignore[index]
-            "tokens": global_usage["total_tokens"],
-            "requests": global_usage["requests"],
             "errors": len(source_errors) + instance_error_count,
         }
         return {
@@ -289,7 +443,7 @@ class DashboardSnapshot:
             "generated_at": utc_now(),
             "summary": summary,
             "source_errors": source_errors,
-            "usage": gateway_usage,
+            "runtime": _runtime_value(runtime_status),
             "instances": rows,
         }
 
