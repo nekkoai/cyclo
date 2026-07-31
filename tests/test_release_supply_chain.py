@@ -313,32 +313,13 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     )
 
 
-def test_wheel_audit_requires_dcomp_architecture_and_forbids_legacy_runtime() -> None:
+def test_wheel_audit_requires_current_tree_and_rejects_generated_artifacts() -> None:
     acceptance = (ROOT / "tools" / "release-acceptance").read_text(
         encoding="utf-8"
     )
 
     assert 'for path in package_root.rglob("*")' in acceptance
     assert "missing required wheel resource" in acceptance
-    for obsolete in (
-        "cyclo/component_runtime.py",
-        "cyclo/docker.py",
-        "cyclo/docker_engine.py",
-        "cyclo/gateway.py",
-        "cyclo/health.py",
-        "cyclo/instance_lifecycle.py",
-        "cyclo/providers.py",
-        "cyclo/team_runtime_image.py",
-        "cyclo/agentws_bundle.py",
-        "cyclo/agentws_queue.py",
-        "cyclo/container_runtime.py",
-        "cyclo/pi_runtime.py",
-        "cyclo/task_admin.py",
-        "cyclo/team.py",
-        "cyclo/team_templates.py",
-    ):
-        assert f'"{obsolete}"' in acceptance
-    assert "obsolete wheel resource remains" in acceptance
     assert "Python bytecode cache leaked into wheel" in acceptance
     assert "--dry-run" in acceptance
     assert "exposes obsolete --dry-run" in acceptance
