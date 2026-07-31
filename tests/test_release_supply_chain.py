@@ -294,6 +294,10 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert "npm ci --force --ignore-scripts --prefix src/cyclo/components/team-runtime" in release
     assert "docker build --pull" in release
     assert "src/cyclo/components/team-runtime" in release
+    assert (
+        'docker run --rm --network none --entrypoint /bin/sh \\\n'
+        '    "cyclo-team:release-$short_commit" -ceu'
+    ) in release
     assert "gateway" in release
     assert '"$cyclo" gateway --help' in acceptance
     assert "provider discovery" in acceptance

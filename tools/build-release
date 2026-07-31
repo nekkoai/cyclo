@@ -215,8 +215,8 @@ docker build --pull \
     --tag "cyclo-passthrough:release-$short_commit" \
     --file "$source_tree/src/cyclo/components/passthrough/Dockerfile" \
     "$source_tree/src/cyclo/components"
-docker run --rm --network none \
-    "cyclo-team:release-$short_commit" sh -ceu '
+docker run --rm --network none --entrypoint /bin/sh \
+    "cyclo-team:release-$short_commit" -ceu '
         python3 --version
         node --version
         npm --version
