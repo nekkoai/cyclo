@@ -6,7 +6,7 @@ import pytest
 
 from cyclo.errors import CycloError
 from cyclo.team import load_team
-from cyclo.team_templates import (
+from cyclo.team.templates import (
     bundled_team_template_names,
     packaged_team_template,
     packaged_team_templates_root,

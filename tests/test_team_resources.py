@@ -12,27 +12,26 @@ from pathlib import Path
 
 import pytest
 
-from cyclo.agentws_bundle import (
-    packaged_agentws_root,
-    packaged_agentws_template,
+from cyclo.resources import components_root
+from cyclo.team.resources import (
+    packaged_agentws_runtime,
     packaged_default_roles,
     packaged_default_team,
 )
-from cyclo.team import init_team, load_team, verify_agentws_abi
+from cyclo.team import init_team, load_team, verify_agentws_runtime
 
 
 def test_packaged_agentws_is_the_complete_owned_template() -> None:
-    root = packaged_agentws_root()
-    template = packaged_agentws_template()
+    runtime = packaged_agentws_runtime()
 
-    assert template == root / "template"
-    assert packaged_default_team() == template / "default.team"
-    assert packaged_default_roles() == template / "roles"
-    verify_agentws_abi(root)
+    assert runtime == components_root() / "team" / "agentws"
+    assert packaged_default_team() == runtime / "default.team"
+    assert packaged_default_roles() == runtime / "roles"
+    verify_agentws_runtime(runtime)
 
 
 def test_packaged_agentws_preserves_executable_modes() -> None:
-    template = packaged_agentws_template()
+    template = packaged_agentws_runtime()
     executables = [
         *sorted((template / "bin").iterdir()),
         template / "tools" / "agent",
@@ -55,8 +54,8 @@ def test_packaged_agentws_preserves_executable_modes() -> None:
 
 
 def test_packaged_agentws_has_no_provider_runtime_policy() -> None:
-    tools = packaged_agentws_template() / "tools"
-    protocol = (packaged_agentws_template() / "AGENTS.md").read_text(
+    tools = packaged_agentws_runtime() / "tools"
+    protocol = (packaged_agentws_runtime() / "AGENTS.md").read_text(
         encoding="utf-8"
     )
 
@@ -77,12 +76,12 @@ def test_team_image_bakes_the_owned_agentws_runtime() -> None:
         / "src"
         / "cyclo"
         / "components"
-        / "team-runtime"
+        / "team"
         / "Dockerfile"
     ).read_text(encoding="utf-8")
 
-    assert "COPY --chown=${CYCLO_HOST_UID}:${CYCLO_HOST_GID} _agentws/template/ /agentws/" in dockerfile
-    assert "COPY container_runtime.py /usr/local/bin/cyclo-team-runtime" in dockerfile
+    assert "COPY --chown=${CYCLO_HOST_UID}:${CYCLO_HOST_GID} team/agentws/ /agentws/" in dockerfile
+    assert "COPY team/runtime.py /usr/local/bin/cyclo-team-runtime" in dockerfile
 
 
 @pytest.mark.parametrize("agent_id", ["..", ".hidden", "-hidden", "_hidden"])
@@ -90,7 +89,7 @@ def test_queue_names_must_start_alphanumeric(
     tmp_path: Path, agent_id: str
 ) -> None:
     runtime = Path(
-        shutil.copytree(packaged_agentws_template(), tmp_path / "runtime")
+        shutil.copytree(packaged_agentws_runtime(), tmp_path / "runtime")
     )
 
     result = subprocess.run(
@@ -108,7 +107,7 @@ def test_queue_names_must_start_alphanumeric(
 
 def test_viewer_team_validation_rejects_hidden_agent_names() -> None:
     namespace = runpy.run_path(
-        str(packaged_agentws_template() / "tools" / "agentws")
+        str(packaged_agentws_runtime() / "tools" / "agentws")
     )
 
     with pytest.raises(ValueError, match="must start with an alphanumeric"):
@@ -134,7 +133,7 @@ def test_packaged_agentws_initializes_a_team_without_a_checkout(tmp_path: Path) 
 
 
 def test_packaged_agentws_viewer_is_observation_only(tmp_path: Path) -> None:
-    runtime = packaged_agentws_template()
+    runtime = packaged_agentws_runtime()
     namespace = runpy.run_path(str(runtime / "tools" / "agentws"))
     queue = tmp_path / "queue"
     for directory in ("tasks", "jobs", "agents"):

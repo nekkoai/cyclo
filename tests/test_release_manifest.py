@@ -22,9 +22,8 @@ COMPONENT_SOURCES = (
     "protocol/provider",
     "gateway",
     "passthrough",
-    "team-runtime",
+    "team",
 )
-ADAPTER_SOURCES = ("pi",)
 
 
 def test_release_manifest_scans_every_owned_node_lockfile(tmp_path: Path) -> None:
@@ -34,9 +33,9 @@ def test_release_manifest_scans_every_owned_node_lockfile(tmp_path: Path) -> Non
         "src/cyclo/components/protocol/component/package-lock.json",
         "src/cyclo/components/gateway/package-lock.json",
         "src/cyclo/components/passthrough/package-lock.json",
-        "src/cyclo/adapters/pi/package-lock.json",
+        "src/cyclo/components/team/pi/package-lock.json",
         "src/cyclo/components/protocol/provider/package-lock.json",
-        "src/cyclo/components/team-runtime/package-lock.json",
+        "src/cyclo/components/team/package-lock.json",
     }
     assert {
         path.as_posix() for path in namespace["NODE_LOCK_PATHS"]
@@ -116,10 +115,6 @@ def test_built_distributions_contain_component_sources_without_installs(
     source_files = [component_root / "__init__.py"]
     for component in COMPONENT_SOURCES:
         source_files.extend((component_root / component).rglob("*"))
-    adapter_root = ROOT / "src" / "cyclo" / "adapters"
-    adapter_files = [adapter_root / "__init__.py"]
-    for adapter in ADAPTER_SOURCES:
-        adapter_files.extend((adapter_root / adapter).rglob("*"))
     expected_components = {
         (Path("cyclo/components") / path.relative_to(component_root)).as_posix()
         for path in source_files
@@ -128,21 +123,15 @@ def test_built_distributions_contain_component_sources_without_installs(
         and "__pycache__" not in path.parts
         and path.suffix not in {".pyc", ".pyo"}
     }
-    expected_adapters = {
-        (Path("cyclo/adapters") / path.relative_to(adapter_root)).as_posix()
-        for path in adapter_files
-        if path.is_file()
-        and "node_modules" not in path.parts
-        and "__pycache__" not in path.parts
-        and path.suffix not in {".pyc", ".pyo"}
-    }
-    expected = expected_components | expected_adapters
+    expected = expected_components
 
     wheel = next(built_distributions.glob("cyclo_agent-*.whl"))
     with zipfile.ZipFile(wheel) as archive:
         wheel_names = set(archive.namelist())
     assert expected <= wheel_names
     assert not any("node_modules" in PurePosixPath(name).parts for name in wheel_names)
+    assert not any("__pycache__" in PurePosixPath(name).parts for name in wheel_names)
+    assert not any(PurePosixPath(name).suffix in {".pyc", ".pyo"} for name in wheel_names)
 
     sdist = next(built_distributions.glob("cyclo_agent-*.tar.gz"))
     with tarfile.open(sdist, mode="r:gz") as archive:
@@ -165,6 +154,13 @@ def test_built_distributions_contain_component_sources_without_installs(
     )
     assert not any(
         "node_modules" in PurePosixPath(name).parts for name in archive_names
+    )
+    assert not any(
+        "__pycache__" in PurePosixPath(name).parts for name in archive_names
+    )
+    assert not any(
+        PurePosixPath(name).suffix in {".pyc", ".pyo"}
+        for name in archive_names
     )
 
 

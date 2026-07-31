@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from . import __version__
-from .agentws_bundle import packaged_agentws_root
 from .authority import validate_project_authority
 from .dcomp import DCompComponentStatus, DCompStatus
 from .errors import CycloError
@@ -31,7 +30,6 @@ from .project_run import (
     load_project_teams,
     project_instance_id,
     project_run_bindings,
-    validate_pi_team_models,
     validate_run_options,
     verify_source_identities,
 )
@@ -39,16 +37,18 @@ from .project_state import decode_instance_project, encode_project_mounts
 from .provider_client import list_models
 from .runtime import CycloRuntime
 from .state import Instance, StateStore, slug
-from .task_admin import TaskAdmin, read_task_specification
 from .team import (
     Team,
     init_team,
     load_team,
     require_team_repository,
     team_generation,
-    verify_agentws_abi,
+    verify_agentws_runtime,
 )
-from .team_templates import bundled_team_template_names
+from .team.admin import TaskAdmin, read_task_specification
+from .team.compatibility import validate_pi_team_models
+from .team.resources import packaged_agentws_runtime
+from .team.templates import bundled_team_template_names
 
 
 DEFAULT_HOST_CONFIG = Path("/etc/cyclo/host.conf")
@@ -83,8 +83,8 @@ def cyclo_runtime(
 
 
 def agentws_root() -> Path:
-    root = packaged_agentws_root()
-    verify_agentws_abi(root)
+    root = packaged_agentws_runtime()
+    verify_agentws_runtime(root)
     return root
 
 
@@ -286,7 +286,7 @@ def _prepare_run_bindings(
     teams: tuple[tuple[ProjectTeam, Team], ...],
 ) -> tuple[RunBinding, ...]:
     images = {
-        team.root: runtime.build_team(team, override=args.image or "").image.id
+        team.root: runtime.build_team(team, override=args.image or "").id
         for _selected, team in teams
     }
     # project_run_bindings performs the common project/instance derivation and
@@ -422,7 +422,7 @@ def _refresh_instance(
     image = runtime.build_team(
         team,
         override=instance.image_override,
-    ).image
+    )
     identities = capture_source_identities(
         (team.root, *(mount.path for mount in definition.mounts))
     )
@@ -770,7 +770,6 @@ def _run_task_tool(
     store = state_store(args)
     with store.locked():
         instance = store.load(args.instance)
-        _ensure_task_queue(store, instance)
         result = TaskAdmin(store, instance).run(
             tool,
             arguments,
@@ -823,26 +822,6 @@ def cmd_task_state(args: argparse.Namespace) -> int:
         command.extend(("-m", args.message))
     result, _instance = _run_task_tool(args, "task-state", command)
     return result
-
-
-def _ensure_task_queue(store: StateStore, instance: Instance) -> None:
-    paths = (
-        store.queue_root(instance.id),
-        store.tasks_dir(instance.id),
-        store.jobs_dir(instance.id),
-    )
-    try:
-        for path in paths:
-            if path.is_symlink():
-                raise CycloError(f"refusing symlinked AgentWS state directory: {path}")
-            path.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(path, 0o700)
-    except CycloError:
-        raise
-    except OSError as exc:
-        raise CycloError(
-            f"cannot prepare AgentWS task queue for {instance.id}: {exc}"
-        ) from exc
 
 
 def _task_project_summary(instance: Instance) -> tuple[str, ...]:

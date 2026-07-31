@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from cyclo.agentws_bundle import packaged_agentws_root
+from cyclo.team.resources import packaged_agentws_runtime
 from cyclo.errors import CycloError
-from cyclo.team import load_team, require_team_repository, team_generation, verify_agentws_abi
+from cyclo.team import load_team, require_team_repository, team_generation, verify_agentws_runtime
 
 
 def test_loads_plain_agentws_roster(team_repo: Path) -> None:
@@ -253,4 +253,4 @@ def test_generation_does_not_execute_repository_fsmonitor(
 
 
 def test_packaged_agentws_has_external_team_abi() -> None:
-    verify_agentws_abi(packaged_agentws_root())
+    verify_agentws_runtime(packaged_agentws_runtime())

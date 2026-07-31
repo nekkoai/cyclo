@@ -5,8 +5,11 @@ import pytest
 
 from cyclo.resources import components_root
 from cyclo.errors import CycloError
-from cyclo.pi_runtime import inference_format, model_incompatibility
-from cyclo.project_run import validate_pi_team_models
+from cyclo.team.compatibility import (
+    inference_format,
+    model_incompatibility,
+    validate_pi_team_models,
+)
 
 
 MODEL_ID_CASES = json.loads(

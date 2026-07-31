@@ -10,10 +10,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .agentws_bundle import packaged_agentws_template
-from .errors import CycloError
-from .model_ids import split_public_model_id
-from .team_templates import packaged_team_template
+from ..errors import CycloError
+from ..model_ids import split_public_model_id
+from .resources import packaged_agentws_runtime
+from .templates import packaged_team_template
 
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -437,34 +437,33 @@ def team_generation(team: Team) -> str:
     return f"{commit}-content-{content}"
 
 
-def verify_agentws_abi(root: Path) -> None:
-    template = root / "template"
+def verify_agentws_runtime(runtime: Path) -> None:
     required = (
-        template / "tools" / "run_agentws",
-        template / "tools" / "agent",
-        template / "tools" / "agentws",
-        template / "bin" / "agent-new",
-        template / "bin" / "job-reset-orphans",
-        template / "bin" / "task-create",
+        runtime / "tools" / "run_agentws",
+        runtime / "tools" / "agent",
+        runtime / "tools" / "agentws",
+        runtime / "bin" / "agent-new",
+        runtime / "bin" / "job-reset-orphans",
+        runtime / "bin" / "task-create",
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise CycloError("Cyclo's bundled job-loop runtime is incomplete: " + ", ".join(missing))
     seams = {
-        template / "tools" / "run_agentws": (
+        runtime / "tools" / "run_agentws": (
             "AGENTWS_SYSTEM_PROTOCOL",
             "AGENTWS_TEAM_PROTOCOL",
             "AGENTWS_TEAM_ROLES_DIR",
             "AGENTWS_WORKSPACE",
         ),
-        template / "tools" / "agent": (
+        runtime / "tools" / "agent": (
             "AGENTWS_SYSTEM_PROTOCOL",
             "AGENTWS_TEAM_PROTOCOL",
             "AGENTWS_WORKSPACE",
         ),
-        template / "tools" / "agentws": ("--pin-root", "--read-only"),
-        template / "bin" / "agent-new": ("AGENTWS_TEAM_ROLES_DIR",),
-        template / "bin" / "job-reset-orphans": (
+        runtime / "tools" / "agentws": ("--pin-root", "--read-only"),
+        runtime / "bin" / "agent-new": ("AGENTWS_TEAM_ROLES_DIR",),
+        runtime / "bin" / "job-reset-orphans": (
             "--all-active",
             "CYCLO_RUNTIME_LOCK_FD",
         ),
@@ -475,7 +474,7 @@ def verify_agentws_abi(root: Path) -> None:
         if absent:
             raise CycloError(
                 f"Cyclo's bundled job-loop runtime lacks a required marker in "
-                f"{path.relative_to(root)}: "
+                f"{path.relative_to(runtime)}: "
                 + ", ".join(absent)
             )
 
@@ -505,7 +504,7 @@ def init_team(
     template = (
         packaged_team_template(template_name)
         if template_name is not None
-        else packaged_agentws_template()
+        else packaged_agentws_runtime()
     )
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from cyclo import container_runtime
+from cyclo.components.team import runtime as container_runtime
 
 
 CONTAINER_PROJECT_CONFIG = (

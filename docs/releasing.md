@@ -78,12 +78,12 @@ git status --short
 
 ## Image acceptance
 
-The team image uses `src/cyclo` as its build context because AgentWS and
-`container_runtime.py` are baked into the image. Gateway and pass-through
-Dockerfiles continue to use `src/cyclo/components`.
+Every component image uses `src/cyclo/components` as its build context. The
+`team/` component owns its supervisor, AgentWS tree, Pi adapter, dependency
+locks, entrypoint, and Dockerfile; shared protocol packages remain beside it.
 
 ```sh
-docker build --pull --build-arg "CYCLO_HOST_UID=$(id -u)" --build-arg "CYCLO_HOST_GID=$(id -g)" -t cyclo-team:0.2.0 -f src/cyclo/components/team-runtime/Dockerfile src/cyclo
+docker build --pull --build-arg "CYCLO_HOST_UID=$(id -u)" --build-arg "CYCLO_HOST_GID=$(id -g)" -t cyclo-team:0.2.0 -f src/cyclo/components/team/Dockerfile src/cyclo/components
 docker build --pull -t cyclo-gateway:0.2.0 -f src/cyclo/components/gateway/Dockerfile src/cyclo/components
 docker build --pull -t cyclo-passthrough:0.2.0 -f src/cyclo/components/passthrough/Dockerfile src/cyclo/components
 PYTHONPATH=src python3 -c 'from pathlib import Path; from cyclo.images import Images; images = Images(); base = images.inspect("cyclo-team:0.2.0"); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); images.build("cyclo-derived-team:0.2.0", dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))'

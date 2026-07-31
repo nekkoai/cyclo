@@ -10,12 +10,14 @@ import pytest
 from cyclo.dcomp import DCompComponentStatus, DCompStatus
 from cyclo.dcomp_system import PROVIDER_SERVICE
 from cyclo.errors import CycloError
-from cyclo.runtime import (
-    PI_SETTINGS_TEMPLATE,
-    CycloRuntime,
-    require_non_root_team_host,
-)
+from cyclo.runtime import CycloRuntime
 from cyclo.state import Instance, StateStore
+from cyclo.team.component import (
+    PI_SETTINGS_TEMPLATE,
+    make_team_component,
+    materialize_instance,
+)
+from cyclo.team.image import require_non_root_team_host
 
 
 class NoDComp:
@@ -231,10 +233,21 @@ def test_provider_graph_compiles_direct_interface_links(tmp_path: Path) -> None:
 def test_host_root_cannot_become_team_container_root(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr("cyclo.runtime.os.getuid", lambda: 0)
+    monkeypatch.setattr("cyclo.team.image.os.getuid", lambda: 0)
 
     with pytest.raises(CycloError, match="host root"):
         require_non_root_team_host()
+
+
+def test_build_team_rejects_host_root_before_binding_docker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    selected = runtime(tmp_path)
+    monkeypatch.setattr("cyclo.team.image.os.getuid", lambda: 0)
+
+    with pytest.raises(CycloError, match="host root"):
+        selected.build_team(SimpleNamespace())
 
 
 def test_pi_settings_are_an_immutable_template_outside_team_writable_state(
@@ -248,8 +261,8 @@ def test_pi_settings_are_an_immutable_template_outside_team_writable_state(
     escape.mkdir()
     (pi_root / "agent").symlink_to(escape, target_is_directory=True)
 
-    files = selected.materialize_instance(selected_instance)
-    component = selected._team_component(selected_instance)
+    files = materialize_instance(selected.store, selected_instance)
+    component = make_team_component(selected.store, selected_instance)
 
     assert not files.pi_settings.is_relative_to(pi_root)
     assert stat.S_IMODE(files.pi_settings.stat().st_mode) == 0o444

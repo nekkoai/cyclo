@@ -8,7 +8,7 @@ import pytest
 
 from cyclo.errors import CycloError
 from cyclo.state import StateStore
-from cyclo.task_admin import TaskAdmin, _bind, read_task_specification
+from cyclo.team.admin import TaskAdmin, _bind, read_task_specification
 
 
 class FakeImages:
@@ -164,7 +164,7 @@ def test_task_tool_refuses_host_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("cyclo.task_admin.os.getuid", lambda: 0)
+    monkeypatch.setattr("cyclo.team.admin.os.getuid", lambda: 0)
     store = StateStore(tmp_path / "state")
     admin = TaskAdmin(
         store,

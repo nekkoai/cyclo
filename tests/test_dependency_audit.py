@@ -80,10 +80,10 @@ def write_package_files(
 
 
 def test_exact_pi_shrinkwrap_exception_is_accepted(tmp_path: Path) -> None:
-    package_dir = tmp_path / "team-runtime"
+    package_dir = tmp_path / "team"
     exact_package_files(package_dir)
 
-    AUDIT["validate_team_runtime"](exact_report(), 1, package_dir)
+    AUDIT["validate_team_component"](exact_report(), 1, package_dir)
 
 
 @pytest.mark.parametrize(
@@ -104,7 +104,7 @@ def test_exact_pi_shrinkwrap_exception_is_accepted(tmp_path: Path) -> None:
 def test_pi_exception_fails_closed_on_policy_drift(
     tmp_path: Path, case: str
 ) -> None:
-    package_dir = tmp_path / "team-runtime"
+    package_dir = tmp_path / "team"
     package, lock = exact_package_files(package_dir)
     report = exact_report()
     returncode = 1
@@ -156,11 +156,11 @@ def test_pi_exception_fails_closed_on_policy_drift(
         write_package_files(package_dir, package, lock)
 
     with pytest.raises(AuditPolicyError):
-        AUDIT["validate_team_runtime"](report, returncode, package_dir)
+        AUDIT["validate_team_component"](report, returncode, package_dir)
 
 
 def test_unexpected_high_finding_is_rejected(tmp_path: Path) -> None:
-    package_dir = tmp_path / "team-runtime"
+    package_dir = tmp_path / "team"
     exact_package_files(package_dir)
     report = exact_report()
     report["vulnerabilities"]["unexpected"] = {
@@ -173,7 +173,7 @@ def test_unexpected_high_finding_is_rejected(tmp_path: Path) -> None:
     report["metadata"]["vulnerabilities"]["total"] = 3
 
     with pytest.raises(AuditPolicyError):
-        AUDIT["validate_team_runtime"](report, 1, package_dir)
+        AUDIT["validate_team_component"](report, 1, package_dir)
 
 
 @pytest.mark.parametrize(

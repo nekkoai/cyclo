@@ -12,14 +12,14 @@ from pathlib import Path
 
 import pytest
 
-from cyclo.agentws_bundle import packaged_agentws_template
+from cyclo.team.resources import packaged_agentws_runtime
 
 
 RETRYABLE_AGENT_EXIT = 75
 
 
 def test_agent_prompt_treats_workspace_as_an_internal_project_root() -> None:
-    agent_script = packaged_agentws_template() / "tools" / "agent"
+    agent_script = packaged_agentws_runtime() / "tools" / "agent"
     build_initial_prompt = runpy.run_path(str(agent_script))["build_initial_prompt"]
 
     prompt = build_initial_prompt(
@@ -45,7 +45,7 @@ def test_agent_prompt_treats_workspace_as_an_internal_project_root() -> None:
 
 
 def test_agent_prompt_references_project_config_without_copying_it() -> None:
-    agent_script = packaged_agentws_template() / "tools" / "agent"
+    agent_script = packaged_agentws_runtime() / "tools" / "agent"
     build_initial_prompt = runpy.run_path(str(agent_script))["build_initial_prompt"]
     project_config = (
         "name uart\n"
@@ -335,7 +335,7 @@ def write_executable(path: Path, text: str) -> None:
 
 def copy_runtime(tmp_path: Path) -> tuple[Path, Path]:
     runtime = tmp_path / "agentws"
-    shutil.copytree(packaged_agentws_template(), runtime)
+    shutil.copytree(packaged_agentws_runtime(), runtime)
     subprocess.run([str(runtime / "bin" / "job-init")], check=True, capture_output=True)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
