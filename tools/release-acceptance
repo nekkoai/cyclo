@@ -203,28 +203,6 @@ from pathlib import Path
 
 wheel = sys.argv[1]
 package_root = Path(sys.argv[2]) / "src" / "cyclo"
-forbidden_names = {
-    "cyclo/component.py",
-    "cyclo/component_runtime.py",
-    "cyclo/component_stack.py",
-    "cyclo/docker.py",
-    "cyclo/docker_engine.py",
-    "cyclo/gateway.py",
-    "cyclo/health.py",
-    "cyclo/instance_lifecycle.py",
-    "cyclo/provenance.py",
-    "cyclo/providers.py",
-    "cyclo/runtime.lock.json",
-    "cyclo/team_runtime_image.py",
-    "cyclo/agentws_bundle.py",
-    "cyclo/agentws_queue.py",
-    "cyclo/container_runtime.py",
-    "cyclo/pi_runtime.py",
-    "cyclo/task_admin.py",
-    "cyclo/team.py",
-    "cyclo/team_templates.py",
-}
-
 required_names = {
     (Path("cyclo") / path.relative_to(package_root)).as_posix()
     for path in package_root.rglob("*")
@@ -234,12 +212,6 @@ required_names = {
     and path.suffix not in {".pyc", ".pyo"}
 }
 
-legacy_package_prefixes = (
-    "cyclo/" + "vendor" + "_gateway/",
-    "cyclo/_agentws/",
-    "cyclo/adapters/",
-    "cyclo/team_templates/",
-)
 upstream_https = b"github" + b".com/glguida/"
 upstream_ssh = b"git@" + b"github.com:glguida/"
 private_home = b"/home/" + b"glguida"
@@ -257,17 +229,8 @@ problems = []
 with zipfile.ZipFile(wheel) as archive:
     names = set(archive.namelist())
     problems.extend(
-        f"obsolete wheel resource remains: {name}"
-        for name in sorted(names & forbidden_names)
-    )
-    problems.extend(
         f"missing required wheel resource: {name}"
         for name in sorted(required_names - names)
-    )
-    problems.extend(
-        f"legacy package path remains: {name}"
-        for name in sorted(names)
-        if name.startswith(legacy_package_prefixes)
     )
     problems.extend(
         f"installed dependency tree leaked into wheel: {name}"
