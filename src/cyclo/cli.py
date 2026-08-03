@@ -605,7 +605,7 @@ def _safe_status(runtime: CycloRuntime) -> DCompStatus:
 def _print_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> None:
     text = [[str(value) for value in row] for row in rows]
     widths = [
-        max(len(headers[index]), *(len(row[index]) for row in text))
+        max((len(row[index]) for row in text), default=len(headers[index]))
         for index in range(len(headers))
     ]
     print("  ".join(value.ljust(widths[index]) for index, value in enumerate(headers)))
@@ -1006,7 +1006,12 @@ def cmd_gateway(args: argparse.Namespace) -> int:
             ("COMPONENT", "STATUS", "HEALTH", "DETAIL"),
             _component_rows(("gateway",), status),
         )
-        print(f"credential store: {runtime.gateway_volume}")
+        try:
+            volume = admin.credential_volume()
+        except CycloError as exc:
+            print(f"credential store: unavailable ({exc})")
+            return 1
+        print(f"credential store: {volume}")
         return 0
     if action == "restart":
         with store.locked():
@@ -1021,8 +1026,8 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         return 0
     if action == "destroy-store":
         with store.locked():
-            admin.destroy_store(args.confirm)
-        print(f"deleted gateway credential store: {runtime.gateway_volume}")
+            volume = admin.destroy_store(args.confirm)
+        print(f"deleted gateway credential store: {volume}")
         return 0
     raise CycloError(f"unsupported gateway action: {action}")
 

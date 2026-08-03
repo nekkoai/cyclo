@@ -37,6 +37,9 @@ The host also runs two short-lived programs:
 DComp is an external executable. Cyclo discovers it through `CYCLO_DCOMP` or
 `PATH`, requires machine API version 1, and gives it
 `STATE_ROOT/dcomp` as its private state directory.
+Docker resource names owned by DComp are opaque to Cyclo. Administrative code
+resolves the gateway's declared `credentials` volume through
+`dcomp volume --json`; it does not reproduce DComp's naming rules.
 
 ## One installation-wide system
 
@@ -118,9 +121,11 @@ and define an OCI health check.
 
 ### Team repository
 
-A team repository supplies a roster, `roles/*.md`, optional `AGENTS.md`, and an
-optional Dockerfile derived from `CYCLO_TEAM_BASE`. It contains behavior and
-execution dependencies, not credentials or durable queue state.
+A team repository supplies a roster, `roles/*.md`, optional `AGENTS.md`, and a
+required Dockerfile derived from `CYCLO_TEAM_BASE`. It contains behavior and
+execution dependencies, not credentials or durable queue state. Cyclo builds
+each normal team image from this repository over its standard team-component
+image.
 
 ### Project definition
 

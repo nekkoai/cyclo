@@ -31,11 +31,16 @@ generic filesystem task/job protocol, while each repository contains only its
 loop-specific roles. No external runtime installation or source checkout is
 needed.
 
-The templates also omit `Dockerfile` because they need no packages beyond the
-standard team runtime. A team that needs extra packages can add a normal
-Dockerfile derived from `CYCLO_TEAM_BASE`; Cyclo builds and selects that image
-for the team. See the installed Cyclo documentation for the full
-team-repository contract.
+Every template includes the required pass-through Dockerfile:
+
+```dockerfile
+ARG CYCLO_TEAM_BASE
+FROM ${CYCLO_TEAM_BASE}
+```
+
+Cyclo supplies its standard team-component image as `CYCLO_TEAM_BASE`. Edit the
+Dockerfile to install tools needed by the team. See the installed Cyclo
+documentation for the full team-repository contract.
 
 ## Included loops
 

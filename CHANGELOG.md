@@ -66,6 +66,8 @@ adopt Cyclo 0.1 state or Docker resources.
 - Resume an incomplete DComp operation before applying current intent. Keep
   DComp's private state below `STATE_ROOT/dcomp` and access it only through the
   versioned machine API.
+- Resolve the gateway credential store through DComp's verified volume query;
+  never reproduce DComp's physical Docker resource naming in Cyclo.
 - Persist team instances as domain state only: immutable image ID, project/team
   generation, mount facts, options, and `running` or `stopped` intent. Remove
   container IDs, network IDs, and the duplicate Cyclo lifecycle state machine.
@@ -90,7 +92,7 @@ adopt Cyclo 0.1 state or Docker resources.
   paths and no generated host paths. Require the common agent protocol to read
   it before choosing a workspace.
 - Keep team behavior Git-defined through a roster, role prompts, optional
-  `AGENTS.md`, and optional Dockerfile.
+  `AGENTS.md`, and a required Dockerfile derived from the standard team image.
 - Bake AgentWS, Pi, the Provider adapter, and the team supervisor into the
   common image. Bind only durable tasks, jobs, agents, Pi state, team source,
   project context, and declared project directories at runtime.
@@ -98,9 +100,10 @@ adopt Cyclo 0.1 state or Docker resources.
   team component, with a separate host-side `cyclo.team` library for parsing,
   image and DComp-definition construction, queue inspection, templates,
   compatibility checks, and administration.
-- Support team Dockerfiles through `ARG CYCLO_TEAM_BASE` and a final
-  `FROM ${CYCLO_TEAM_BASE}`. Validate the fixed entrypoint, OCI health check,
-  base-image identity, and privilege-drop contract.
+- Build every normal team image from its repository Dockerfile, which declares
+  `ARG CYCLO_TEAM_BASE` and ends with `FROM ${CYCLO_TEAM_BASE}`. Validate the
+  fixed entrypoint, OCI health check, base-image identity, and privilege-drop
+  contract.
 - Preserve AgentWS tasks, jobs, comments, results, retries, planner
   notifications, and orphan recovery independently of team component
   replacement.

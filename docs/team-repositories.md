@@ -1,11 +1,12 @@
 # Team repository contract
 
-A Cyclo team is a Git repository containing agent behavior and optional
-execution-image additions. It is not a standalone daemon and does not implement
-the DComp or Provider protocols.
+A Cyclo team is a Git repository containing agent behavior and a Dockerfile
+that derives its execution image from Cyclo's standard team-component image.
+It is not a standalone daemon and does not implement the DComp or Provider
+protocols.
 
-At runtime Cyclo wraps the repository in its common team image and emits one
-DComp team component per project selection. The component consumes one
+Cyclo builds the repository's Dockerfile over its common team image and emits
+one DComp team component per project selection. The component consumes one
 `cyclo.provider.v1.Provider` input and runs the bundled AgentWS supervisor.
 
 ## Repository contents
@@ -14,6 +15,7 @@ The minimal repository is:
 
 ```text
 my-team/
+  Dockerfile
   team
   roles/
     planner.md
@@ -25,15 +27,14 @@ Optional files are:
 
 ```text
   AGENTS.md
-  Dockerfile
   .dockerignore
   README.md
   LICENSE
 ```
 
 Cyclo validates the `team` roster, every Markdown file directly under `roles/`,
-optional `AGENTS.md`, and optional Dockerfile contract. Other files are not part
-of the team definition, although agents can see them through `/team`.
+the required Dockerfile, and optional `AGENTS.md`. Other files are not part of
+the team definition, although agents can see them through `/team`.
 
 The selected directory must be the root of a Git repository. `team` is the
 canonical roster name; `default.team` remains accepted for compatibility.
@@ -144,8 +145,9 @@ Shutdown terminates both children with a bounded grace period.
 ## Team generation
 
 Cyclo records the repository's current Git commit plus a digest of the roster,
-role files, and optional `AGENTS.md`. Uncommitted definition changes are
-therefore part of the generation even though they are not a Git commit.
+role files, Dockerfile, and optional `AGENTS.md`. Uncommitted definition
+changes are therefore part of the generation even though they are not a Git
+commit.
 
 Cyclo reads definition files without following symlinks and bounds their size.
 It does not run `git status` because repository-local Git hooks and filesystem
@@ -161,11 +163,18 @@ Refresh reparses the project and team, validates current models and mounts,
 rebuilds the team image when required, updates the persisted generation, and
 applies the global DComp system.
 
-## Extra packages with a Dockerfile
+## Team image and extra packages
 
 Cyclo's common team image already contains AgentWS, Pi, the Provider adapter,
-Git, Python, Node.js, and common shell tools. A team that needs more packages
-adds a Dockerfile:
+Git, Python, Node.js, and common shell tools. Every team repository contains at
+least this pass-through Dockerfile:
+
+```dockerfile
+ARG CYCLO_TEAM_BASE
+FROM ${CYCLO_TEAM_BASE}
+```
+
+Edit it to install tools required by that team:
 
 ```dockerfile
 ARG CYCLO_TEAM_BASE
@@ -209,31 +218,12 @@ Running a team Dockerfile authorizes Docker to execute that repository's build
 steps in the trusted host domain. Review it as installed software. Runtime
 mount/network restrictions do not make a hostile Docker build safe.
 
-An operator may bypass team Dockerfiles with:
+An operator may bypass building the team Dockerfiles with:
 
 ```sh
 cyclo run project.cyclo --image OPERATOR_IMAGE
 ```
 
-Cyclo requires that image to exist and satisfy the same entrypoint, user, and
-health-check contract. It does not build or modify it.
-
-## Reusable toolchain bases
-
-An organization can extend the common runtime once, then use that approved
-image as `CYCLO_TEAM_BASE` for specialized teams:
-
-```text
-Cyclo common team image
-        |
-        v
-organization RTL toolchain
-        |
-        v
-specific RTL team
-```
-
-This is ordinary single-parent Docker inheritance. Multi-stage builds may
-compile artifacts, but they do not merge package state from multiple final
-parents. Cyclo intentionally does not add a second package-description
-language.
+Cyclo still requires a complete, valid team repository. It requires the
+operator image to exist and satisfy the same entrypoint, user, and health-check
+contract, but does not build or modify it.

@@ -75,6 +75,7 @@ def test_release_documents_and_sdist_manifest_match_the_version() -> None:
         "include tools/secret-scan",
         "recursive-include docs *.md",
         "recursive-include requirements *.in *.txt",
+        "recursive-include template README.md team Dockerfile *.md",
         "recursive-include tests *.py *.mjs",
         "include tests/fixtures/derived-team/Dockerfile",
     } <= manifest_entries

@@ -153,6 +153,59 @@ class DCompClient:
             )
         return status
 
+    def volume(self, system: str, component: str, logical_name: str) -> str:
+        """Resolve one verified DComp-owned volume to its opaque Docker name."""
+
+        self._require_compatible()
+        process = self._run(
+            ["volume", "--json", system, component, logical_name],
+            action="volume",
+        )
+        source = "dcomp volume"
+        payload = _json_object(process.stdout, source)
+        expected_fields = {
+            "api_version",
+            "system",
+            "component",
+            "logical_name",
+            "name",
+        }
+        if set(payload) != expected_fields:
+            missing = sorted(expected_fields - set(payload))
+            unknown = sorted(set(payload) - expected_fields)
+            details = []
+            if missing:
+                details.append(f"missing {', '.join(missing)}")
+            if unknown:
+                details.append(f"unknown {', '.join(unknown)}")
+            raise CycloError(
+                "invalid dcomp volume response: " + "; ".join(details)
+            )
+        api_version = _integer(payload, "api_version", source)
+        if api_version != DCOMP_API_VERSION:
+            raise CycloError(
+                "incompatible dcomp volume API: "
+                f"need {DCOMP_API_VERSION}, found {api_version}"
+            )
+        returned_system = _string(payload, "system", source)
+        returned_component = _string(payload, "component", source)
+        returned_logical_name = _string(payload, "logical_name", source)
+        if (
+            returned_system != system
+            or returned_component != component
+            or returned_logical_name != logical_name
+        ):
+            raise CycloError(
+                "invalid dcomp volume response: requested "
+                f"{system}.{component}.{logical_name}, received "
+                f"{returned_system}.{returned_component}."
+                f"{returned_logical_name}"
+            )
+        name = _string(payload, "name", source)
+        if not name:
+            raise CycloError("invalid dcomp volume response: name is empty")
+        return name
+
     def restart(self, name: str, *components: str) -> None:
         self._require_compatible()
         self._run(

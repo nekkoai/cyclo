@@ -20,6 +20,7 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SUPPORTED_ENGINES = {"pi", "pi-interactive"}
 ROSTER_NAMES = ("team", "default.team")
 MAX_TEAM_FILE_BYTES = 1024 * 1024
+_MINIMAL_TEAM_DOCKERFILE = "ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n"
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,7 @@ class Team:
     roster: Path
     roles_dir: Path
     protocol: Path | None
-    dockerfile: Path | None
+    dockerfile: Path
     agents: tuple[Agent, ...]
 
     @property
@@ -61,11 +62,20 @@ class _TeamSnapshot:
     roster: Path
     roles_dir: Path
     protocol: Path | None
+    dockerfile: Path
     files: tuple[tuple[Path, str, bytes], ...]
 
     @property
     def roster_content(self) -> bytes:
         return self.files[0][2]
+
+    @property
+    def dockerfile_content(self) -> bytes:
+        return next(
+            content
+            for path, label, content in self.files
+            if path == self.dockerfile and label == "Dockerfile"
+        )
 
     @property
     def role_names(self) -> frozenset[str]:
@@ -257,12 +267,26 @@ def _read_team_snapshot(root: Path, roster_name: str | None = None) -> _TeamSnap
                     _read_regular_file_at(root_fd, protocol_name, protocol, "protocol"),
                 )
             )
+        dockerfile = root / "Dockerfile"
+        files.append(
+            (
+                dockerfile,
+                "Dockerfile",
+                _read_regular_file_at(
+                    root_fd,
+                    "Dockerfile",
+                    dockerfile,
+                    "Dockerfile",
+                ),
+            )
+        )
         for path, label, content in files:
             _decode_team_file(content, path, label)
         return _TeamSnapshot(
             roster=roster,
             roles_dir=roles_dir,
             protocol=protocol,
+            dockerfile=dockerfile,
             files=tuple(files),
         )
     finally:
@@ -321,21 +345,15 @@ def _parse_roster(snapshot: _TeamSnapshot) -> tuple[Agent, ...]:
     return tuple(agents)
 
 
-def team_dockerfile(root: Path) -> Path | None:
-    """Validate and return a team's optional derived-image Dockerfile."""
+def _validate_team_dockerfile(snapshot: _TeamSnapshot) -> Path:
+    """Validate the required image extension owned by a team repository."""
 
-    root_fd = _open_team_root(root)
-    try:
-        if not _directory_entry_exists(root_fd, "Dockerfile"):
-            return None
-        path = root / "Dockerfile"
-        content = _decode_team_file(
-            _read_regular_file_at(root_fd, "Dockerfile", path, "Dockerfile"),
-            path,
-            "Dockerfile",
-        )
-    finally:
-        os.close(root_fd)
+    path = snapshot.dockerfile
+    content = _decode_team_file(
+        snapshot.dockerfile_content,
+        path,
+        "Dockerfile",
+    )
 
     directives = [
         line.strip()
@@ -384,7 +402,7 @@ def load_team(value: str | os.PathLike[str]) -> Team:
         roster=snapshot.roster,
         roles_dir=snapshot.roles_dir,
         protocol=snapshot.protocol,
-        dockerfile=team_dockerfile(root),
+        dockerfile=_validate_team_dockerfile(snapshot),
         agents=agents,
     )
 
@@ -424,6 +442,7 @@ def team_generation(team: Team) -> str:
         raise CycloError("team protocol changed after validation; reload the team")
     if _parse_roster(snapshot) != team.agents:
         raise CycloError("team roster changed after validation; reload the team")
+    _validate_team_dockerfile(snapshot)
     digest = hashlib.sha256()
     for path, _label, content in snapshot.files:
         digest.update(str(path.relative_to(team.root)).encode("utf-8"))
@@ -512,6 +531,10 @@ def init_team(
         if template_name is None:
             shutil.copytree(template / "roles", temporary / "roles")
             roster_source = template / "default.team"
+            (temporary / "Dockerfile").write_text(
+                _MINIMAL_TEAM_DOCKERFILE,
+                encoding="utf-8",
+            )
         else:
             shutil.copytree(
                 template,

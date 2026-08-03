@@ -21,7 +21,11 @@ def packaged_team_template(name: str) -> Path:
         candidate.relative_to(root)
     except ValueError as exc:
         raise CycloError(f"bundled team template escapes its package root: {name!r}") from exc
-    if not (candidate / "team").is_file() or not (candidate / "roles").is_dir():
+    if (
+        not (candidate / "team").is_file()
+        or not (candidate / "roles").is_dir()
+        or not (candidate / "Dockerfile").is_file()
+    ):
         raise CycloError(f"unknown bundled team template: {name}")
     return candidate
 
@@ -33,7 +37,10 @@ def bundled_team_template_names() -> tuple[str, ...]:
             sorted(
                 path.name
                 for path in root.iterdir()
-                if path.is_dir() and (path / "team").is_file() and (path / "roles").is_dir()
+                if path.is_dir()
+                and (path / "team").is_file()
+                and (path / "roles").is_dir()
+                and (path / "Dockerfile").is_file()
             )
         )
     except OSError as exc:

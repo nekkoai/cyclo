@@ -140,8 +140,8 @@ projects. The team repository is mounted at `/team` with its declared mode.
 Cyclo bakes AgentWS, Pi, the provider adapter, and the generic agent protocol
 into the common team image. At runtime it mounts only durable queue directories,
 Pi state, the team repository, the generated read-only
-`/agentws/project.cyclo`, and declared project paths. A team may add packages
-with an optional Dockerfile:
+`/agentws/project.cyclo`, and declared project paths. Every team repository
+contains a Dockerfile derived from Cyclo's standard team-component image:
 
 ```dockerfile
 ARG CYCLO_TEAM_BASE
@@ -150,8 +150,9 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends verilator
 ```
 
-The final stage must inherit `CYCLO_TEAM_BASE` and preserve Cyclo's entrypoint
-and health check.
+The two-line `ARG`/`FROM` form is sufficient when no extra packages are needed.
+Edit it to install the team's tools. Cyclo supplies `CYCLO_TEAM_BASE`; the final
+stage must inherit it and preserve Cyclo's entrypoint and health check.
 
 Run and inspect the project:
 

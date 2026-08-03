@@ -60,18 +60,18 @@ class FakeImages:
         return valid_image(reference, marker, labels=tuple(labels))
 
 
-def team(root: Path, *, dockerfile: Path | None = None) -> Team:
+def team(root: Path) -> Team:
     return Team(
         root=root,
         roster=root / "team",
         roles_dir=root / "roles",
         protocol=None,
-        dockerfile=dockerfile,
+        dockerfile=root / "Dockerfile",
         agents=(),
     )
 
 
-def test_common_image_uses_the_team_component_context_once(
+def test_common_image_uses_the_team_component_context_once_per_builder(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -83,20 +83,23 @@ def test_common_image_uses_the_team_component_context_once(
     monkeypatch.setattr("cyclo.team.image.os.getuid", lambda: 1234)
     monkeypatch.setattr("cyclo.team.image.os.getgid", lambda: 5678)
 
-    selected = team(tmp_path / "plain-team")
-    first = builder.build(selected)
-    second = builder.build(selected)
+    root = tmp_path / "plain-team"
+    root.mkdir()
+    dockerfile = root / "Dockerfile"
+    dockerfile.write_text("ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n")
+    selected = team(root)
+    builder.build(selected)
+    builder.build(selected)
 
-    assert first is second
-    assert images.builds == [
-        {
-            "reference": "cyclo-installation-team:0.2.0",
-            "dockerfile": components / "team" / "Dockerfile",
-            "context": components,
-            "build_args": (("CYCLO_HOST_UID", "1234"), ("CYCLO_HOST_GID", "5678")),
-            "labels": (),
-        }
-    ]
+    assert images.builds[0] == {
+        "reference": "cyclo-installation-team:0.2.0",
+        "dockerfile": components / "team" / "Dockerfile",
+        "context": components,
+        "build_args": (("CYCLO_HOST_UID", "1234"), ("CYCLO_HOST_GID", "5678")),
+        "labels": (),
+    }
+    assert len(images.builds) == 3
+    assert all(build["dockerfile"] == dockerfile for build in images.builds[1:])
 
 
 def test_image_override_is_validated_without_building_the_common_image(
@@ -141,7 +144,7 @@ def test_derived_team_image_records_the_exact_common_base(
     monkeypatch.setattr("cyclo.team.image.os.getuid", lambda: 1234)
     monkeypatch.setattr("cyclo.team.image.os.getgid", lambda: 5678)
 
-    derived = builder.build(team(root, dockerfile=dockerfile))
+    derived = builder.build(team(root))
 
     base = images.builds[0]
     assert images.builds[1]["dockerfile"] == dockerfile

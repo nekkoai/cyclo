@@ -82,9 +82,31 @@ fi
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/cyclo-release-acceptance.XXXXXX")
 runtime_system=
 runtime_volume=
+resolve_runtime_volume() {
+    "$venv/bin/python" - "$state_root" "$runtime_system" <<'PY'
+from pathlib import Path
+import sys
+
+from cyclo.dcomp import DCompClient
+from cyclo.state import StateStore
+
+state_root, system = sys.argv[1:]
+print(
+    DCompClient(StateStore(Path(state_root))).volume(
+        system,
+        "gateway",
+        "credentials",
+    )
+)
+PY
+}
 cleanup() {
     status=$?
     trap - 0
+    if [ -z "$runtime_volume" ] && [ -n "$runtime_system" ] \
+        && [ -n "$dcomp" ]; then
+        runtime_volume=$(resolve_runtime_volume 2>/dev/null) || runtime_volume=
+    fi
     if [ -n "$runtime_system" ] && [ -n "$dcomp" ]; then
         "$dcomp" --state-root "$state_root/dcomp" \
             down "$runtime_system" >/dev/null 2>&1 || true
@@ -334,6 +356,11 @@ expected_templates=$(printf '%s\n' \
 "$cyclo" team init "$team" \
     --template test-driven-repair \
     --model openai-codex/release-acceptance
+printf '%s\n' \
+    'ARG CYCLO_TEAM_BASE' \
+    'FROM ${CYCLO_TEAM_BASE}' \
+    | cmp - "$team/Dockerfile" >/dev/null \
+    || fail "generated team omits the standard image derivation"
 "$cyclo" validate "$team"
 
 printf '%s\n' \
@@ -383,9 +410,9 @@ print(StateStore(Path(sys.argv[1])).system)
 PY
     )
     runtime_system=cyclo-$system
-    runtime_volume=dcomp.$runtime_system.volume.gateway.credentials
 
     "$cyclo" --state-root "$state_root" gateway build
+    runtime_volume=$(resolve_runtime_volume)
     component_status=$(
         "$cyclo" --state-root "$state_root" component status gateway
     )

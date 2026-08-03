@@ -10,15 +10,22 @@ from cyclo.errors import CycloError
 from cyclo.team import load_team, require_team_repository, team_generation, verify_agentws_runtime
 
 
-def test_loads_plain_agentws_roster(team_repo: Path) -> None:
+def test_loads_team_repository(team_repo: Path) -> None:
     team = load_team(team_repo)
 
     assert team.name == "review-team"
     assert [agent.name for agent in team.agents] == ["planner-1", "reviewer-1"]
     assert team.agents[0].model == "openai-codex/gpt-test"
     assert team.providers == ("anthropic", "openai-codex")
-    assert team.dockerfile is None
+    assert team.dockerfile == team_repo / "Dockerfile"
     require_team_repository(team)
+
+
+def test_rejects_team_without_dockerfile(team_repo: Path) -> None:
+    (team_repo / "Dockerfile").unlink()
+
+    with pytest.raises(CycloError, match="Dockerfile not found"):
+        load_team(team_repo)
 
 
 def test_loads_team_dockerfile_derived_from_cyclo_base(team_repo: Path) -> None:
@@ -79,6 +86,7 @@ def test_rejects_team_dockerfile_symlink(team_repo: Path, tmp_path: Path) -> Non
         "ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n",
         encoding="utf-8",
     )
+    (team_repo / "Dockerfile").unlink()
     (team_repo / "Dockerfile").symlink_to(outside)
 
     with pytest.raises(CycloError, match="Dockerfile.*symlink"):
@@ -227,6 +235,35 @@ def test_generation_tracks_uncommitted_team_content(team_repo: Path) -> None:
     assert before.startswith("unborn-content-")
     assert after.startswith("unborn-content-")
     assert before != after
+
+
+def test_generation_tracks_uncommitted_team_dockerfile(team_repo: Path) -> None:
+    before = team_generation(load_team(team_repo))
+    (team_repo / "Dockerfile").write_text(
+        "ARG CYCLO_TEAM_BASE\n"
+        "FROM ${CYCLO_TEAM_BASE}\n"
+        "RUN apt-get update && apt-get install -y verilator\n",
+        encoding="utf-8",
+    )
+    after = team_generation(load_team(team_repo))
+
+    assert before != after
+
+
+def test_generation_rejects_replaced_dockerfile_symlink(
+    team_repo: Path, tmp_path: Path
+) -> None:
+    team = load_team(team_repo)
+    outside = tmp_path / "outside.Dockerfile"
+    outside.write_text(
+        "ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n",
+        encoding="utf-8",
+    )
+    (team_repo / "Dockerfile").unlink()
+    (team_repo / "Dockerfile").symlink_to(outside)
+
+    with pytest.raises(CycloError, match="Dockerfile.*symlink"):
+        team_generation(team)
 
 
 def test_generation_does_not_execute_repository_fsmonitor(

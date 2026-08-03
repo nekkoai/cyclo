@@ -244,6 +244,23 @@ def test_release_accepts_the_exact_built_wheel_and_rejects_generated_drift() -> 
     assert "==> using supplied release wheel:" in acceptance
     assert 'if [ -z "$provided_wheel" ]; then' in acceptance
     assert 'wheel=$wheel_directory/$(basename -- "$provided_wheel")' in acceptance
+    assert "generated team omits the standard image derivation" in acceptance
+
+
+def test_release_cleanup_resolves_the_dcomp_owned_gateway_volume() -> None:
+    acceptance = (ROOT / "tools" / "release-acceptance").read_text(
+        encoding="utf-8"
+    )
+
+    assert "DCompClient(StateStore(Path(state_root))).volume(" in acceptance
+    assert "runtime_volume=$(resolve_runtime_volume)" in acceptance
+    assert "volume.gateway.credentials" not in acceptance
+    cleanup = acceptance[
+        acceptance.index("cleanup() {") : acceptance.index("trap cleanup 0")
+    ]
+    assert cleanup.index("resolve_runtime_volume") < cleanup.index(
+        'down "$runtime_system"'
+    )
 
 
 def test_build_backend_dependencies_are_available_in_test_and_release_envs() -> None:
