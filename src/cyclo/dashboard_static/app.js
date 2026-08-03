@@ -467,7 +467,12 @@
   }
 
   function avatarColor(value) {
-    const palette = ["#b8f24a", "#66d9d2", "#85a9ff", "#f2bb4a", "#d99cff", "#ff947e"];
+    const palette = [
+      { fill: "#D8402E", ink: "#EFE7D6" },
+      { fill: "#2A5CAA", ink: "#EFE7D6" },
+      { fill: "#EFB02C", ink: "#201A12" },
+      { fill: "#3E7C5A", ink: "#EFE7D6" },
+    ];
     let hash = 0;
     for (const character of value) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
     return palette[Math.abs(hash) % palette.length];
@@ -490,7 +495,7 @@
 
   function renderSummary(summary) {
     elements.statInstances.textContent = formatCount(summary.total);
-    elements.statRunning.textContent = `${plural(summary.running, "running")} · ${formatCount(summary.total - summary.running)} not running`;
+    elements.statRunning.textContent = `${formatCount(summary.running)} running · ${formatCount(summary.total - summary.running)} not running`;
     elements.statTasks.textContent = formatCount(summary.tasks.open);
     const taskSummary = [
       plural(summary.tasks.total, "task"),
@@ -577,7 +582,9 @@
     card.dataset.state = instance.displayState;
     card.dataset.instanceId = instance.id;
     avatar.textContent = instance.team.slice(0, 2);
-    avatar.style.setProperty("--avatar-color", avatarColor(instance.team));
+    const avatarHue = avatarColor(instance.team);
+    avatar.style.setProperty("--avatar-color", avatarHue.fill);
+    avatar.style.setProperty("--avatar-ink", avatarHue.ink);
     name.textContent = instance.team;
     name.title = instance.teamReference;
     identifier.textContent = instance.id;
