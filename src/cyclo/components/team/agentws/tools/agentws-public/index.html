@@ -4,8 +4,8 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
-    <meta name="theme-color" content="#0b0e11">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#EFE7D6">
     <meta name="description" content="A local view of one Cyclo team and its AgentWS loop.">
     <title>Cyclo AgentWS</title>
     <link rel="stylesheet" href="styles.css">
@@ -18,9 +18,11 @@
       <div class="header-inner">
         <a class="brand" href="#board" aria-label="Cyclo AgentWS dashboard">
           <svg class="brand-mark" viewBox="0 0 44 44" aria-hidden="true">
-            <path d="M31.7 8.8A15.6 15.6 0 1 0 37.6 29"></path>
-            <path d="m27.8 5.5 4.5 3.2-3.4 4.7"></path>
-            <circle cx="22" cy="22" r="4.5"></circle>
+            <circle class="brand-ring" cx="22" cy="23" r="12"></circle>
+            <circle class="brand-core" cx="22" cy="23" r="2.4"></circle>
+            <circle class="brand-p1" cx="22" cy="11" r="4"></circle>
+            <circle class="brand-p2" cx="11.4" cy="28" r="3.5"></circle>
+            <circle class="brand-p3" cx="32.6" cy="29.5" r="3.5"></circle>
           </svg>
           <span>
             <span class="brand-name">cyclo</span>
@@ -33,13 +35,7 @@
             <span class="connection-dot" aria-hidden="true"></span>
             <span id="connectionLabel">Connecting</span>
           </div>
-          <button class="button button--quiet" id="refreshButton" type="button">
-            <svg viewBox="0 0 20 20" aria-hidden="true">
-              <path d="M16 7a6.5 6.5 0 1 0 .3 5"></path>
-              <path d="M16 3v4h-4"></path>
-            </svg>
-            <span>Refresh</span>
-          </button>
+          <button class="button" id="refreshButton" type="button"><span>Refresh</span></button>
         </div>
       </div>
     </header>
@@ -47,8 +43,13 @@
     <main id="main-content" class="page-shell">
       <section class="workspace-hero" aria-labelledby="page-title">
         <div>
-          <p class="eyebrow"><span aria-hidden="true">~/</span> team operations</p>
-          <h1 id="page-title">Work in motion.</h1>
+          <p class="eyebrow">
+            <span class="dot dot--rosso" aria-hidden="true"></span>
+            <span class="dot dot--blu" aria-hidden="true"></span>
+            <span class="dot dot--giallo" aria-hidden="true"></span>
+            Team operations
+          </p>
+          <h1 id="page-title">Work, <span>in motion.</span></h1>
           <p class="hero-copy">Tasks, handoffs, and agent activity for this loop.</p>
         </div>
         <div class="snapshot-meta" aria-label="Snapshot information">
@@ -61,7 +62,7 @@
       <section class="overview" aria-labelledby="overview-title">
         <div class="section-heading section-heading--compact">
           <div>
-            <p class="section-kicker">Live overview</p>
+            <p class="section-kicker"><span>01</span> Live overview</p>
             <h2 id="overview-title">Loop pulse</h2>
           </div>
         </div>
@@ -71,7 +72,7 @@
       <section class="operations" aria-labelledby="operations-title">
         <div class="section-heading">
           <div>
-            <p class="section-kicker">AgentWS runtime</p>
+            <p class="section-kicker"><span>02</span> AgentWS runtime</p>
             <h2 id="operations-title">Team activity</h2>
           </div>
           <p class="result-count" id="resultCount" role="status">Loading activity…</p>
@@ -88,10 +89,6 @@
           </nav>
 
           <label class="search-field" for="searchInput">
-            <svg viewBox="0 0 20 20" aria-hidden="true">
-              <circle cx="8.5" cy="8.5" r="5.5"></circle>
-              <path d="m12.5 12.5 4 4"></path>
-            </svg>
             <span class="visually-hidden">Search this AgentWS view</span>
             <input id="searchInput" type="search" autocomplete="off" placeholder="Search tasks…">
             <kbd aria-hidden="true">/</kbd>
@@ -108,8 +105,13 @@
     </main>
 
     <footer class="site-footer">
-      <p><span class="footer-mark" aria-hidden="true">↻</span> Observation only. Project credentials never enter this page.</p>
-      <a href="/api/snapshot">View snapshot JSON</a>
+      <div class="fregio" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <div class="site-footer__lines">
+        <p>Observation only. Project credentials never enter this page.</p>
+        <a href="/api/snapshot">View snapshot JSON</a>
+      </div>
     </footer>
 
     <button class="inspector-backdrop" id="inspectorBackdrop" type="button" aria-label="Close details" hidden></button>
