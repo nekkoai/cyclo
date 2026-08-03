@@ -61,6 +61,24 @@ def status_json(*, operational: bool = True, name: str = "cyclo-test") -> str:
     )
 
 
+def volume_json(
+    *,
+    system: str = "cyclo-test",
+    component: str = "gateway",
+    logical_name: str = "credentials",
+    name: str = "opaque-docker-volume",
+) -> str:
+    return json.dumps(
+        {
+            "api_version": DCOMP_API_VERSION,
+            "system": system,
+            "component": component,
+            "logical_name": logical_name,
+            "name": name,
+        }
+    )
+
+
 def install_fake_discovery(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -262,6 +280,80 @@ def test_parses_typed_machine_status_and_accepts_degraded_exit_one(
         "--json",
         "cyclo-test",
     ]
+
+
+def test_resolves_verified_volume_through_machine_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_discovery(monkeypatch)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_options: object):
+        commands.append(list(command))
+        stdout = (
+            VERSION
+            if command[-2:] == ["version", "--json"]
+            else volume_json()
+        )
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    client = DCompClient(
+        StateStore(tmp_path / "state"),
+        environment={"PATH": "/bin"},
+    )
+
+    assert (
+        client.volume("cyclo-test", "gateway", "credentials")
+        == "opaque-docker-volume"
+    )
+    assert commands[1] == [
+        "/opt/dcomp/bin/dcomp",
+        "--state-root",
+        str(tmp_path / "state" / "dcomp"),
+        "volume",
+        "--json",
+        "cyclo-test",
+        "gateway",
+        "credentials",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"api_version": 2}, "incompatible dcomp volume API"),
+        ({"system": "other"}, "requested cyclo-test.gateway.credentials"),
+        ({"name": ""}, "name is empty"),
+        ({"name": 7}, "name must be a string"),
+        ({"extra": True}, "unknown extra"),
+    ],
+)
+def test_volume_fails_closed_on_invalid_machine_data(
+    change: dict[str, object],
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_discovery(monkeypatch)
+    payload = json.loads(volume_json())
+    payload.update(change)
+    replies = iter((VERSION, json.dumps(payload)))
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_options: subprocess.CompletedProcess(
+            command, 0, next(replies), ""
+        ),
+    )
+    client = DCompClient(
+        StateStore(tmp_path / "state"),
+        environment={"PATH": "/bin"},
+    )
+
+    with pytest.raises(CycloError, match=message):
+        client.volume("cyclo-test", "gateway", "credentials")
 
 
 @pytest.mark.parametrize(

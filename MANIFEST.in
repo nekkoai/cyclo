@@ -16,7 +16,7 @@ recursive-include .github *.yml
 recursive-include docs *.md
 include docs/assets/cyclo-logo.svg
 recursive-include requirements *.in *.txt
-recursive-include template README.md team *.md
+recursive-include template README.md team Dockerfile *.md
 recursive-include tests *.py *.mjs
 include tests/fixtures/derived-team/Dockerfile
 

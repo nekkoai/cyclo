@@ -13,6 +13,7 @@ from cyclo.cli import (
     build_parser,
     cmd_component,
     cmd_doctor,
+    cmd_gateway,
     cmd_models,
     cmd_ps,
     cmd_refresh,
@@ -89,6 +90,56 @@ def component(name: str) -> DCompComponentStatus:
         problem="",
         published_ports=(),
     )
+
+
+def test_ps_prints_headers_for_an_empty_installation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = MemoryStore()
+
+    class Runtime:
+        host = SimpleNamespace()
+
+        @staticmethod
+        def status():
+            return dcomp_status()
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.cyclo_runtime", lambda _args, _store: Runtime())
+
+    assert cmd_ps(namespace()) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "INSTANCE  TEAM  PROJECT  DESIRED  STATUS  PORT"
+    ]
+
+
+def test_gateway_status_reports_unavailable_credential_store(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = MemoryStore()
+
+    class DComp:
+        @staticmethod
+        def volume(_system: str, _component: str, _logical_name: str) -> str:
+            raise CycloError("dcomp volume failed with status 1: volume is absent")
+
+    class Runtime:
+        name = "cyclo-test"
+        dcomp = DComp()
+
+        @staticmethod
+        def status():
+            return dcomp_status(component("gateway"))
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.cyclo_runtime", lambda _args, _store: Runtime())
+
+    assert cmd_gateway(namespace(gateway_action="status")) == 1
+    output = capsys.readouterr().out
+    assert "gateway" in output
+    assert "credential store: unavailable (dcomp volume failed" in output
 
 
 def test_cli_surface_has_declarative_provider_and_component_commands() -> None:

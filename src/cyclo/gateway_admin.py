@@ -15,6 +15,8 @@ from .runtime import CycloRuntime, GATEWAY_STORE
 
 _ENVIRONMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOOL_LABEL = "io.cyclo.gateway-tool"
+_GATEWAY_COMPONENT = "gateway"
+_CREDENTIALS_VOLUME = "credentials"
 
 
 class GatewayAdmin:
@@ -25,16 +27,16 @@ class GatewayAdmin:
 
     def providers(self) -> str:
         image = self.runtime.build_gateway()
-        result = self._tool(image, ("providers",), store=False, capture=True)
+        result = self._tool(image, ("providers",), capture=True)
         return (result.stdout or "").rstrip()
 
     def usage(self) -> dict[str, object]:
-        self._prepare_store()
+        volume = self._prepare_store()
         image = self.runtime.build_gateway()
         result = self._tool(
             image,
             ("usage",),
-            store=True,
+            volume=volume,
             read_only=True,
             capture=True,
         )
@@ -58,7 +60,7 @@ class GatewayAdmin:
     ) -> None:
         if not arguments or any(not item for item in arguments):
             raise CycloError("gateway login requires a provider")
-        self._prepare_store()
+        volume = self._prepare_store()
         image = self.runtime.build_gateway()
         selected = list(arguments)
         indexes = [
@@ -83,7 +85,7 @@ class GatewayAdmin:
         self._tool(
             image,
             ("login", *selected),
-            store=True,
+            volume=volume,
             network="none" if "--api-key-stdin" in selected else "bridge",
             input_data=input_data,
             capture=False,
@@ -92,9 +94,9 @@ class GatewayAdmin:
         self._restart_gateway()
 
     def _restart_gateway(self) -> None:
-        self.runtime.dcomp.restart(self.runtime.name, "gateway")
+        self.runtime.dcomp.restart(self.runtime.name, _GATEWAY_COMPONENT)
         observed = self.runtime.wait_status()
-        gateway = observed.component("gateway")
+        gateway = observed.component(_GATEWAY_COMPONENT)
         if (
             gateway is None
             or gateway.status != "running"
@@ -106,32 +108,40 @@ class GatewayAdmin:
                 + (f": {detail}" if detail else "")
             )
 
-    def destroy_store(self, confirmation: str) -> None:
-        if confirmation != self.runtime.gateway_volume:
+    def credential_volume(self) -> str:
+        return self.runtime.dcomp.volume(
+            self.runtime.name,
+            _GATEWAY_COMPONENT,
+            _CREDENTIALS_VOLUME,
+        )
+
+    def destroy_store(self, confirmation: str) -> str:
+        volume = self.credential_volume()
+        if confirmation != volume:
             raise CycloError(
                 "confirmation must exactly match the gateway volume name: "
-                f"{self.runtime.gateway_volume}"
+                f"{volume}"
             )
-        self._prepare_store()
         self.runtime.dcomp.down(self.runtime.name)
         result = self.runtime.images.command(
-            ["volume", "rm", "--", self.runtime.gateway_volume],
+            ["volume", "rm", "--", volume],
             check=False,
         )
         if result.returncode != 0:
             inspected = self.runtime.images.command(
-                ["volume", "inspect", "--", self.runtime.gateway_volume],
+                ["volume", "inspect", "--", volume],
                 check=False,
             )
             if inspected.returncode != 0:
-                return
+                return volume
             detail = (result.stderr or result.stdout or "").strip()
             raise CycloError(
                 "cannot delete gateway store"
                 + (f": {detail}" if detail else "")
             )
+        return volume
 
-    def _prepare_store(self) -> None:
+    def _prepare_store(self) -> str:
         """Ensure DComp has verified the store without reconciling unrelated work."""
 
         status = self.runtime.status()
@@ -140,8 +150,8 @@ class GatewayAdmin:
             status = self.runtime.status()
         if not status.desired:
             self.runtime.apply_gateway()
-            return
-        gateway = status.component("gateway")
+            return self.credential_volume()
+        gateway = status.component(_GATEWAY_COMPONENT)
         if (
             gateway is None
             or not gateway.container_id
@@ -151,22 +161,14 @@ class GatewayAdmin:
                 "gateway component is absent from the applied system; "
                 "run `cyclo repair` before gateway administration"
             )
-        volume = self.runtime.images.command(
-            ["volume", "inspect", "--", self.runtime.gateway_volume],
-            check=False,
-        )
-        if volume.returncode != 0:
-            raise CycloError(
-                "gateway credential store is absent from the applied system; "
-                "run `cyclo repair`"
-            )
+        return self.credential_volume()
 
     def _tool(
         self,
         image: Image,
         command: Sequence[str],
         *,
-        store: bool,
+        volume: str | None = None,
         read_only: bool = False,
         network: str = "none",
         input_data: str | None = None,
@@ -195,10 +197,9 @@ class GatewayAdmin:
                 "256",
             ]
         )
-        if store:
+        if volume is not None:
             mount = (
-                f"type=volume,src={self.runtime.gateway_volume},"
-                f"dst={GATEWAY_STORE}"
+                f"type=volume,src={volume},dst={GATEWAY_STORE}"
             )
             if read_only:
                 mount += ",readonly"

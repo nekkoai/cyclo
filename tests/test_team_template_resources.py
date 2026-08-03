@@ -23,8 +23,10 @@ EXPECTED = (
 def test_all_example_teams_are_packaged() -> None:
     assert bundled_team_template_names() == EXPECTED
     for name in EXPECTED:
-        team = load_team(packaged_team_template(name))
+        root = packaged_team_template(name)
+        team = load_team(root)
         assert team.agents
+        assert team.dockerfile == root / "Dockerfile"
 
 
 def test_packaged_examples_match_source_examples() -> None:

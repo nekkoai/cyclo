@@ -48,6 +48,7 @@ def test_example_team_is_complete_and_copy_ready(
     assert {agent.model for agent in team.agents} <= AVAILABLE_EXAMPLE_MODELS
     assert len({agent.model for agent in team.agents}) > 1
     assert (destination / "README.md").is_file()
+    assert team.dockerfile == destination / "Dockerfile"
     assert team_generation(team).startswith("unborn-content-")
 
 

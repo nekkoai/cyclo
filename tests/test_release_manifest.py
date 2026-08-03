@@ -129,6 +129,12 @@ def test_built_distributions_contain_component_sources_without_installs(
     with zipfile.ZipFile(wheel) as archive:
         wheel_names = set(archive.namelist())
     assert expected <= wheel_names
+    for template in (
+        "adversarial-audit",
+        "plan-execute-verify",
+        "test-driven-repair",
+    ):
+        assert f"cyclo/team/templates/{template}/Dockerfile" in wheel_names
     assert not any("node_modules" in PurePosixPath(name).parts for name in wheel_names)
     assert not any("__pycache__" in PurePosixPath(name).parts for name in wheel_names)
     assert not any(PurePosixPath(name).suffix in {".pyc", ".pyo"} for name in wheel_names)
@@ -152,6 +158,17 @@ def test_built_distributions_contain_component_sources_without_installs(
         f"cyclo_agent-{cyclo.__version__}/tools/publish-release"
         in archive_names
     )
+    for template in (
+        "adversarial-audit",
+        "plan-execute-verify",
+        "test-driven-repair",
+    ):
+        prefix = f"cyclo_agent-{cyclo.__version__}"
+        assert (
+            f"{prefix}/src/cyclo/team/templates/{template}/Dockerfile"
+            in archive_names
+        )
+        assert f"{prefix}/template/{template}/Dockerfile" in archive_names
     assert not any(
         "node_modules" in PurePosixPath(name).parts for name in archive_names
     )

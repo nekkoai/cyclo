@@ -13,6 +13,9 @@ from cyclo.runtime import CycloRuntime
 from cyclo.state import StateStore
 
 
+VOLUME_NAME = "opaque-volume-from-dcomp"
+
+
 def component(
     name: str = "gateway",
     *,
@@ -56,28 +59,27 @@ def status(
 
 
 class FakeImages:
-    def __init__(self, *, volume_exists: bool = True) -> None:
-        self.volume_exists = volume_exists
+    def __init__(self) -> None:
         self.calls: list[tuple[list[str], dict[str, object]]] = []
 
     def command(self, arguments, **options):
         selected = list(arguments)
         self.calls.append((selected, dict(options)))
-        if selected[:3] == ["volume", "inspect", "--"]:
-            return subprocess.CompletedProcess(
-                selected,
-                0 if self.volume_exists else 1,
-                "",
-                "" if self.volume_exists else "No such volume",
-            )
         if selected[:3] == ["container", "ls", "--all"]:
             return subprocess.CompletedProcess(selected, 0, "", "")
         return subprocess.CompletedProcess(selected, 0, "", "")
 
 
 class FakeDComp:
-    def __init__(self) -> None:
+    def __init__(self, *, volume_available: bool = True) -> None:
         self.calls: list[tuple[str, ...]] = []
+        self.volume_available = volume_available
+
+    def volume(self, system: str, component: str, logical_name: str) -> str:
+        self.calls.append(("volume", system, component, logical_name))
+        if not self.volume_available:
+            raise CycloError("dcomp volume failed with status 1: volume is absent")
+        return VOLUME_NAME
 
     def restart(self, name: str, *components: str) -> None:
         self.calls.append(("restart", name, *components))
@@ -104,17 +106,16 @@ class FakeRuntime:
     def __init__(
         self,
         *statuses: DCompStatus,
-        volume_exists: bool = True,
+        volume_available: bool = True,
         waited: DCompStatus | None = None,
     ) -> None:
         self._statuses = list(statuses) or [status(component())]
         self._waited = waited or status(component())
         self.status_calls = 0
         self.apply_gateway_calls = 0
-        self.images = FakeImages(volume_exists=volume_exists)
-        self.dcomp = FakeDComp()
+        self.images = FakeImages()
+        self.dcomp = FakeDComp(volume_available=volume_available)
         self.store = SimpleNamespace(list=lambda: [], system="123456789abc")
-        self.gateway_volume = "dcomp.cyclo-test.volume.gateway.credentials"
         self.name = "cyclo-test"
 
     def status(self) -> DCompStatus:
@@ -157,7 +158,10 @@ def test_api_key_environment_is_passed_only_on_stdin() -> None:
     assert calls == [
         (("login", "openai", "--api-key-stdin"), "private\n", True),
     ]
-    assert runtime.dcomp.calls == [("restart", "cyclo-test", "gateway")]
+    assert runtime.dcomp.calls == [
+        ("volume", "cyclo-test", "gateway", "credentials"),
+        ("restart", "cyclo-test", "gateway"),
+    ]
     assert runtime.apply_gateway_calls == 0
     assert "private" not in repr(calls[0][0])
 
@@ -166,36 +170,31 @@ def test_prepare_store_applies_only_gateway_for_fresh_installation() -> None:
     runtime = FakeRuntime(status(desired=False))
     admin = GatewayAdmin(runtime)  # type: ignore[arg-type]
 
-    admin._prepare_store()
+    assert admin._prepare_store() == VOLUME_NAME
 
     assert runtime.apply_gateway_calls == 1
-    assert runtime.dcomp.calls == []
+    assert runtime.dcomp.calls == [
+        ("volume", "cyclo-test", "gateway", "credentials")
+    ]
     assert runtime.images.calls == []
 
 
-def test_prepare_store_resumes_pending_operation_before_inspection() -> None:
+def test_prepare_store_resumes_pending_operation_before_volume_resolution() -> None:
     runtime = FakeRuntime(
         status(component(), operation="up"),
         status(component()),
     )
     admin = GatewayAdmin(runtime)  # type: ignore[arg-type]
 
-    admin._prepare_store()
+    assert admin._prepare_store() == VOLUME_NAME
 
     assert runtime.status_calls == 2
-    assert runtime.dcomp.calls == [("resume", "cyclo-test")]
-    assert runtime.apply_gateway_calls == 0
-    assert runtime.images.calls == [
-        (
-            [
-                "volume",
-                "inspect",
-                "--",
-                "dcomp.cyclo-test.volume.gateway.credentials",
-            ],
-            {"check": False},
-        )
+    assert runtime.dcomp.calls == [
+        ("resume", "cyclo-test"),
+        ("volume", "cyclo-test", "gateway", "credentials"),
     ]
+    assert runtime.apply_gateway_calls == 0
+    assert runtime.images.calls == []
 
 
 @pytest.mark.parametrize(
@@ -221,10 +220,10 @@ def test_prepare_store_rejects_desired_system_without_gateway_container(
 
 
 def test_prepare_store_rejects_missing_gateway_volume() -> None:
-    runtime = FakeRuntime(status(component()), volume_exists=False)
+    runtime = FakeRuntime(status(component()), volume_available=False)
     admin = GatewayAdmin(runtime)  # type: ignore[arg-type]
 
-    with pytest.raises(CycloError, match="credential store is absent"):
+    with pytest.raises(CycloError, match="dcomp volume failed"):
         admin._prepare_store()
 
     assert runtime.apply_gateway_calls == 0
@@ -252,7 +251,10 @@ def test_login_reports_gateway_that_does_not_recover_after_restart() -> None:
     ):
         admin.login(("openai", "--api-key-stdin"))
 
-    assert runtime.dcomp.calls == [("restart", "cyclo-test", "gateway")]
+    assert runtime.dcomp.calls == [
+        ("volume", "cyclo-test", "gateway", "credentials"),
+        ("restart", "cyclo-test", "gateway"),
+    ]
 
 
 def test_restart_prepares_and_restarts_only_gateway() -> None:
@@ -262,7 +264,10 @@ def test_restart_prepares_and_restarts_only_gateway() -> None:
     admin.restart()
 
     assert runtime.apply_gateway_calls == 0
-    assert runtime.dcomp.calls == [("restart", "cyclo-test", "gateway")]
+    assert runtime.dcomp.calls == [
+        ("volume", "cyclo-test", "gateway", "credentials"),
+        ("restart", "cyclo-test", "gateway"),
+    ]
     assert runtime.status_calls == 1
 
 
@@ -286,6 +291,36 @@ def test_restart_reports_gateway_that_does_not_recover() -> None:
         admin.restart()
 
 
+def test_destroy_store_resolves_name_without_reapplying_gateway() -> None:
+    runtime = FakeRuntime(status(desired=False))
+    admin = GatewayAdmin(runtime)  # type: ignore[arg-type]
+
+    assert admin.destroy_store(VOLUME_NAME) == VOLUME_NAME
+
+    assert runtime.status_calls == 0
+    assert runtime.apply_gateway_calls == 0
+    assert runtime.dcomp.calls == [
+        ("volume", "cyclo-test", "gateway", "credentials"),
+        ("down", "cyclo-test"),
+    ]
+    assert runtime.images.calls == [
+        (["volume", "rm", "--", VOLUME_NAME], {"check": False})
+    ]
+
+
+def test_destroy_store_rejects_wrong_resolved_name_before_mutation() -> None:
+    runtime = FakeRuntime(status(desired=False))
+    admin = GatewayAdmin(runtime)  # type: ignore[arg-type]
+
+    with pytest.raises(CycloError, match=VOLUME_NAME):
+        admin.destroy_store("guessed-volume-name")
+
+    assert runtime.dcomp.calls == [
+        ("volume", "cyclo-test", "gateway", "credentials")
+    ]
+    assert runtime.images.calls == []
+
+
 def test_interactive_gateway_tool_attaches_container_stdin() -> None:
     calls: list[tuple[list[str], dict[str, object]]] = []
 
@@ -297,7 +332,6 @@ def test_interactive_gateway_tool_attaches_container_stdin() -> None:
     runtime = SimpleNamespace(
         images=Images(),
         store=SimpleNamespace(system="123456789abc"),
-        gateway_volume="dcomp.cyclo-test.volume.gateway.credentials",
         name="cyclo-test",
     )
     admin = GatewayAdmin(runtime)  # type: ignore[arg-type]
@@ -305,7 +339,7 @@ def test_interactive_gateway_tool_attaches_container_stdin() -> None:
     admin._tool(
         SimpleNamespace(id="sha256:" + "a" * 64),
         ("login", "openai", "--api-key-stdin"),
-        store=False,
+        volume=VOLUME_NAME,
         input_data="private\n",
         capture=False,
         interactive=True,
@@ -313,6 +347,9 @@ def test_interactive_gateway_tool_attaches_container_stdin() -> None:
 
     arguments, options = calls[-1]
     assert arguments[:2] == ["run", "--interactive"]
+    assert arguments[arguments.index("--mount") + 1] == (
+        f"type=volume,src={VOLUME_NAME},dst=/var/lib/cyclo-gateway"
+    )
     assert options["input_data"] == "private\n"
 
 
@@ -356,7 +393,10 @@ def test_gateway_administration_ignores_malformed_provider_configuration(
     admin.restart()
     admin.login(("openai", "--api-key-stdin"))
     assert dcomp.calls == [
+        ("volume", runtime.name, "gateway", "credentials"),
+        ("volume", runtime.name, "gateway", "credentials"),
         ("restart", runtime.name, "gateway"),
+        ("volume", runtime.name, "gateway", "credentials"),
         ("restart", runtime.name, "gateway"),
     ]
 

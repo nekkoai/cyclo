@@ -130,6 +130,9 @@ def test_packaged_agentws_initializes_a_team_without_a_checkout(tmp_path: Path) 
     assert {agent.model for agent in team.agents} == {"openai-codex/test-model"}
     assert not (destination / "AGENTS.md").exists()
     assert (destination / "roles" / "planner.md").is_file()
+    assert (destination / "Dockerfile").read_text(encoding="utf-8") == (
+        "ARG CYCLO_TEAM_BASE\nFROM ${CYCLO_TEAM_BASE}\n"
+    )
 
 
 def test_packaged_agentws_viewer_is_observation_only(tmp_path: Path) -> None:

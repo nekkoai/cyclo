@@ -30,9 +30,6 @@ class TeamImageBuilder:
             return image
 
         base = self._base_image()
-        if team.dockerfile is None:
-            return base
-
         identity = hashlib.sha256(str(team.root).encode("utf-8")).hexdigest()[:12]
         reference = (
             f"cyclo-{self.system}-team-"

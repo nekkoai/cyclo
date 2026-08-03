@@ -181,6 +181,18 @@ All stateful calls MUST include:
 --state-root STATE_ROOT/dcomp
 ```
 
+Cyclo MUST resolve a DComp-owned volume only through:
+
+```text
+dcomp volume --json SYSTEM COMPONENT LOGICAL_NAME
+```
+
+Machine API 1 MUST return exactly `api_version`, `system`, `component`,
+`logical_name`, and `name`. Cyclo MUST require API version 1, require all three
+logical identifiers to match the request, and treat the returned nonempty
+`name` as opaque. A nonzero exit or malformed response MUST fail the operation.
+Cyclo MUST NOT reproduce DComp's physical resource-naming rules.
+
 When the installation is bound to Docker, Cyclo MUST pass that endpoint through
 `DOCKER_HOST` and remove `DOCKER_CONTEXT` from the DComp environment.
 
@@ -239,6 +251,7 @@ output. If none is declared, it MUST be `gateway.provider`.
 A team repository MUST be a Git repository root and contain:
 
 ```text
+Dockerfile
 team
 roles/*.md
 ```
@@ -255,8 +268,14 @@ Agent names MUST be unique, every role MUST have a corresponding role file, and
 at least one agent MUST have role `planner`. Supported engines are `pi` and
 `pi-interactive`.
 
-Optional `AGENTS.md` supplies team-wide policy. Optional `Dockerfile` supplies
-extra execution dependencies.
+Optional `AGENTS.md` supplies team-wide policy. The required Dockerfile MUST
+declare `ARG CYCLO_TEAM_BASE` before its final base selection and MUST use that
+value as its final stage's base. The minimal valid Dockerfile is:
+
+```dockerfile
+ARG CYCLO_TEAM_BASE
+FROM ${CYCLO_TEAM_BASE}
+```
 
 Cyclo MUST read team-definition files without following symlinks and MUST bound
 their size.
@@ -349,9 +368,8 @@ The common team image MUST contain:
 AgentWS implementation files MUST be image content. They MUST NOT be supplied
 through an overlapping read-only parent bind with writable child overlays.
 
-A derived team Dockerfile MUST declare `ARG CYCLO_TEAM_BASE` before its final
-base selection and MUST use that value as the final stage's base. The completed
-image MUST preserve:
+Every non-override team image MUST be built from its repository Dockerfile. The
+completed image MUST preserve:
 
 - `/usr/local/bin/cyclo-container-entrypoint`;
 - the inherited OCI health check;
@@ -569,6 +587,7 @@ Cyclo MUST:
 - remove abandoned labeled tool containers before starting another;
 - use `--rm`;
 - mount the credential volume only when required;
+- obtain its physical Docker name from DComp's verified volume lookup;
 - mount it read-only for usage inspection;
 - use no network for API-key login and provider enumeration;
 - grant ordinary bridge access only to interactive login flows; and
@@ -592,9 +611,11 @@ Provider or team components.
 If the host fails after credential commit, the committed store remains valid.
 A later `models`, `repair`, or other apply operation MUST recover service state.
 
-Destroying the store MUST require exact confirmation of the installation's
-gateway volume name, stop the complete DComp system, and then delete that
-volume. Ordinary stop, refresh, repair, or forget MUST NOT delete credentials.
+Destroying the store MUST resolve the existing installation gateway volume
+through DComp, require exact confirmation of the returned name, stop the
+complete DComp system, and then delete that volume. It MUST NOT reapply a
+stopped gateway merely to destroy a surviving credential volume. Ordinary
+stop, refresh, repair, or forget MUST NOT delete credentials.
 
 ## 11. Team runtime
 
@@ -717,7 +738,8 @@ overwritten.
 
 The contents and schema of `STATE_ROOT/dcomp` belong exclusively to DComp.
 Cyclo MUST NOT import or parse those files. It MUST use `version --json`,
-`status --json`, and the documented DComp command exit contracts.
+`status --json`, `volume --json`, and the documented DComp command exit
+contracts.
 
 ### 13.3 Gateway state
 

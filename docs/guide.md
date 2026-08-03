@@ -107,7 +107,8 @@ cyclo gateway destroy-store --confirm VOLUME
 and restarts the gateway. Other operations that need the gateway image also
 invoke Docker build; Docker decides layer-cache reuse. `destroy-store` is
 destructive: first copy the exact volume name reported by
-`cyclo gateway status`.
+`cyclo gateway status`. Cyclo obtains that opaque Docker name from DComp's
+verified volume lookup rather than constructing it itself.
 
 ## 4. Configure Provider components
 
@@ -187,6 +188,7 @@ The repository contains:
 
 ```text
 jon-rtl/
+  Dockerfile
   team
   roles/
     planner.md
@@ -194,8 +196,9 @@ jon-rtl/
     verifier.md
 ```
 
-It may add `AGENTS.md` for team-wide instructions and a `Dockerfile` for extra
-packages. The roster format is:
+It may add `AGENTS.md` for team-wide instructions. Its required Dockerfile
+derives the team's runnable image from Cyclo's standard team-component image.
+The roster format is:
 
 ```text
 NAME ROLE ENGINE PROVIDER/MODEL
@@ -211,7 +214,8 @@ Validate a team:
 cyclo validate ./teams/jon-rtl
 ```
 
-Teams requiring extra tools inherit the common runtime:
+The generated Dockerfile is a two-line pass-through. Edit it when the team
+requires extra tools:
 
 ```dockerfile
 ARG CYCLO_TEAM_BASE
@@ -220,9 +224,9 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends verilator
 ```
 
-The final stage must use `CYCLO_TEAM_BASE` and preserve Cyclo's entrypoint and
-health check. Team and provider Dockerfiles are trusted host build inputs;
-review them before running Cyclo.
+Cyclo supplies `CYCLO_TEAM_BASE`. The final stage must use it and preserve
+Cyclo's entrypoint and health check. Team and provider Dockerfiles are trusted
+host build inputs; review them before running Cyclo.
 
 ## 6. Define a project
 

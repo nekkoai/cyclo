@@ -87,10 +87,6 @@ class CycloRuntime:
             self._host = load_host(self.host_config)
         return self._host
 
-    @property
-    def gateway_volume(self) -> str:
-        return f"dcomp.{self.name}.volume.gateway.credentials"
-
     def prepare(self) -> None:
         self.store.ensure()
 

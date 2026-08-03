@@ -182,12 +182,13 @@ are:
 ```
 
 `--image` selects one operator-built compatible team image for all teams in the
-definition and bypasses team Dockerfiles. Cyclo validates but does not build
-that image.
+definition and bypasses building their Dockerfiles. Every selected repository
+must still contain a valid Dockerfile. Cyclo validates but does not build the
+operator image.
 
-Without `--image`, Cyclo invokes Docker build for its common team image. A team
-with a Dockerfile receives a derived build with the exact common image as
-`CYCLO_TEAM_BASE`. Docker owns context filtering and layer-cache reuse.
+Without `--image`, Cyclo invokes Docker build for its common team image. Every
+team receives a derived build with that common image as `CYCLO_TEAM_BASE`.
+Docker owns context filtering and layer-cache reuse.
 
 `--offline` removes a team's direct external network and AgentWS dashboard
 publication while preserving its private DComp Provider link.
