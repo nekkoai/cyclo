@@ -484,7 +484,7 @@ function isEdgeSelected(edge) {
 function renderGraphNode(node) {
   return `
     <g class="graph-node" tabindex="0" data-select-type="${escapeAttr(node.type)}" data-select-id="${escapeAttr(node.id)}">
-      <rect x="${node.x}" y="${node.y}" width="${node.w}" height="${node.h}" rx="8"></rect>
+      <rect x="${node.x}" y="${node.y}" width="${node.w}" height="${node.h}"></rect>
       <text x="${node.x + 12}" y="${node.y + 20}">${escapeHtml(fitText(node.title, 28))}</text>
       <text class="graph-sub" x="${node.x + 12}" y="${node.y + 36}">${escapeHtml(fitText(node.sub, 32))}</text>
     </g>
