@@ -1,8 +1,4 @@
-<p align="center"><img src="docs/assets/cyclo-logo.svg" alt="Cyclo" width="176"></p>
-
-<h1 align="center">Cyclo</h1>
-
-<p align="center"><strong>Agentic systems, in a Git loop.</strong></p>
+<img src="docs/assets/banner.svg" alt="cyclo — Agentic systems, in a Git loop. A local-first agent runtime. V0.2.0, MIT, Linux, Python 3.10+, DComp." width="100%">
 
 Cyclo runs Git-defined agent teams against explicitly mounted projects. A
 credential gateway owns provider logins, optional provider components transform
@@ -14,7 +10,7 @@ component links. Cyclo builds images and compiles one installation-wide DComp
 system; DComp reconciles its containers, networks, volumes, and crash-recovery
 state. Neither program is in the inference data path after startup.
 
-## Requirements
+## 01 · Requirements
 
 - Linux;
 - Python 3.10 or newer;
@@ -35,7 +31,7 @@ who owns the project files and may access Docker.
 Cyclo 0.2 is a fresh-install boundary. It does not import Cyclo 0.1 state or
 Docker resources.
 
-## First installation
+## 02 · First installation
 
 Install the Python package on the host and select a state root:
 
@@ -64,7 +60,7 @@ creates only that fixed gateway/store boundary first; unrelated Provider or
 team failures cannot block login. API keys and OAuth sessions are never mounted
 into provider or team components.
 
-## Provider composition
+## 03 · Provider composition
 
 The gateway is always the root Provider. Each non-gateway provider is an
 ordinary source directory containing `component.dcomp` and, when Cyclo should
@@ -109,7 +105,7 @@ DComp gives each direct interface link a private internal TCP network.
 Components receive only the targets for their declared inputs, such as
 `DCOMP_LINK_UPSTREAM=dns:///trace:50051`.
 
-## Teams and projects
+## 04 · Teams and projects
 
 Create a team repository and a project definition:
 
@@ -173,7 +169,7 @@ and apply the resulting installation-wide DComp system. Use `cyclo stop`,
 runs the required host Docker builds, reapplies the current host configuration
 and persisted instance intent, and resumes an interrupted DComp operation.
 
-## Runtime model
+## 05 · Runtime model
 
 One canonical state root defines one Cyclo installation and one DComp system:
 
@@ -198,7 +194,7 @@ The configured outer Provider is the only route. A failed component remains
 inspectable through `cyclo component status` and makes the system
 non-operational until it is fixed or removed from `host.conf`.
 
-## Multiple installations
+## 06 · Multiple installations
 
 Use a different state root for each installation:
 
@@ -213,7 +209,7 @@ Each installation binds itself to the selected local Docker Unix socket on its
 first operation that needs a Docker endpoint and rejects later attempts to
 retarget it.
 
-## Documentation
+## 07 · Documentation
 
 - [Architecture](docs/architecture.md)
 - [Operations guide](docs/guide.md)
@@ -225,3 +221,5 @@ retarget it.
 Cyclo ships its gateway, provider protocol, team runtime, AgentWS runtime,
 dashboard, and team templates. DComp is a separate required executable;
 external `agentws` and `multiagent` checkouts are not runtime dependencies.
+
+<img src="docs/assets/fregio.svg" alt="cyclo · MIT licence" width="100%">

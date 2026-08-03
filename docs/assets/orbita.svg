@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" role="img" aria-label="The team repository mounts read-only and the project mounts writable into the runtime. The runtime reaches the gateway with a scoped capability; credentials orbit the gateway alone, and only the gateway carries model traffic to the provider.">
+  <rect width="1200" height="340" fill="#EFE7D6"/>
+  <g stroke="#201A12" stroke-width="2.5">
+    <line x1="150" y1="100" x2="470" y2="170"/>
+    <line x1="150" y1="240" x2="470" y2="170"/>
+    <line x1="470" y1="170" x2="820" y2="170"/>
+    <line x1="820" y1="170" x2="1090" y2="170"/>
+  </g>
+  <circle cx="820" cy="170" r="62" fill="none" stroke="#928B7E" stroke-width="2.5" stroke-dasharray="8 11"/>
+  <circle cx="150" cy="100" r="18" fill="#D8402E"/>
+  <circle cx="150" cy="240" r="18" fill="#EFB02C"/>
+  <circle cx="470" cy="170" r="46" fill="#2A5CAA"/>
+  <circle cx="820" cy="170" r="28" fill="#3E7C5A"/>
+  <circle cx="820" cy="108" r="10" fill="#D8402E"/>
+  <circle cx="1090" cy="170" r="18" fill="#EFE7D6" stroke="#201A12" stroke-width="3.5"/>
+  <g font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-weight="700" fill="#201A12">
+    <text x="150" y="147" text-anchor="middle" font-size="10.5" letter-spacing="2.2">TEAM · GIT</text>
+    <text x="150" y="287" text-anchor="middle" font-size="10.5" letter-spacing="2.2">PROJECT</text>
+    <text x="470" y="246" text-anchor="middle" font-size="10.5" letter-spacing="2.2">RUNTIME · JOB LOOP</text>
+    <text x="820" y="262" text-anchor="middle" font-size="10.5" letter-spacing="2.2">GATEWAY · POLICY</text>
+    <text x="820" y="88" text-anchor="middle" font-size="10.5" letter-spacing="2.2">CREDENTIALS</text>
+    <text x="1090" y="217" text-anchor="middle" font-size="10.5" letter-spacing="2.2">MODEL PROVIDER</text>
+    <text x="300" y="116" text-anchor="middle" font-size="9.5" letter-spacing="2">/TEAM · READ-ONLY</text>
+    <text x="300" y="230" text-anchor="middle" font-size="9.5" letter-spacing="2">/WORKSPACE · WRITABLE</text>
+    <text x="645" y="156" text-anchor="middle" font-size="9.5" letter-spacing="2">SCOPED CAPABILITY</text>
+    <text x="972" y="156" text-anchor="middle" font-size="9.5" letter-spacing="2">MODEL TRAFFIC</text>
+  </g>
+</svg>
