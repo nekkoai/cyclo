@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
-    <meta name="theme-color" content="#0b0e11">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#EFE7D6">
     <meta name="description" content="A local overview of Cyclo agentic teams and their work.">
     <title>Cyclo Fleet</title>
     <link rel="stylesheet" href="/static/styles.css">
@@ -17,9 +17,11 @@
       <div class="header-inner">
         <a class="brand" href="/" aria-label="Cyclo fleet dashboard">
           <svg class="brand-mark" viewBox="0 0 44 44" aria-hidden="true">
-            <path d="M31.7 8.8A15.6 15.6 0 1 0 37.6 29" />
-            <path d="m27.8 5.5 4.5 3.2-3.4 4.7" />
-            <circle cx="22" cy="22" r="4.5" />
+            <circle class="brand-ring" cx="22" cy="23" r="12" />
+            <circle class="brand-core" cx="22" cy="23" r="2.4" />
+            <circle class="brand-p1" cx="22" cy="11" r="4" />
+            <circle class="brand-p2" cx="11.4" cy="28" r="3.5" />
+            <circle class="brand-p3" cx="32.6" cy="29.5" r="3.5" />
           </svg>
           <span>
             <span class="brand-name">cyclo</span>
@@ -32,13 +34,7 @@
             <span class="connection-dot" aria-hidden="true"></span>
             <span id="connection-label">Connecting</span>
           </div>
-          <button class="button button--quiet" id="refresh-button" type="button">
-            <svg viewBox="0 0 20 20" aria-hidden="true">
-              <path d="M16 7a6.5 6.5 0 1 0 .3 5" />
-              <path d="M16 3v4h-4" />
-            </svg>
-            <span>Refresh</span>
-          </button>
+          <button class="button" id="refresh-button" type="button">Refresh</button>
         </div>
       </div>
     </header>
@@ -46,7 +42,12 @@
     <main id="main-content" class="page-shell">
       <section class="hero" aria-labelledby="page-title">
         <div>
-          <p class="eyebrow"><span aria-hidden="true">~/</span> local operations</p>
+          <p class="eyebrow">
+            <span class="dot dot--rosso" aria-hidden="true"></span>
+            <span class="dot dot--blu" aria-hidden="true"></span>
+            <span class="dot dot--giallo" aria-hidden="true"></span>
+            Local operations
+          </p>
           <h1 id="page-title">Agentic loops,<br><span>at a glance.</span></h1>
           <p class="hero-copy">One quiet place to see every team and the work in motion.</p>
         </div>
@@ -58,10 +59,7 @@
       </section>
 
       <div class="notice" id="notice" role="status" aria-live="polite" hidden>
-        <svg viewBox="0 0 20 20" aria-hidden="true">
-          <path d="M10 2.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15Z" />
-          <path d="M10 6v4.5M10 14h.01" />
-        </svg>
+        <span class="notice-dot" aria-hidden="true"></span>
         <span id="notice-message"></span>
         <button id="notice-dismiss" type="button" aria-label="Dismiss message">Dismiss</button>
       </div>
@@ -69,16 +67,14 @@
       <section class="fleet-overview" aria-labelledby="overview-title">
         <div class="section-heading section-heading--compact">
           <div>
-            <p class="section-kicker">Live overview</p>
+            <p class="section-kicker"><span>01</span> Live overview</p>
             <h2 id="overview-title">Fleet pulse</h2>
           </div>
         </div>
 
         <div class="stat-grid" id="fleet-stats" aria-live="polite">
           <article class="stat stat--primary">
-            <div class="stat__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="2" /><rect x="3" y="14" width="18" height="6" rx="2" /><path d="M7 7h.01M7 17h.01" /></svg>
-            </div>
+            <span class="stat__dot stat__dot--rosso" aria-hidden="true"></span>
             <div>
               <span class="stat__label">Instances</span>
               <strong class="stat__value" id="stat-instances">—</strong>
@@ -86,9 +82,7 @@
             </div>
           </article>
           <article class="stat">
-            <div class="stat__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><path d="M8.5 19a3.5 3.5 0 0 0 7 0M12 15v4M7 9a5 5 0 0 1 10 0v2.5l2 3.5H5l2-3.5Z" /></svg>
-            </div>
+            <span class="stat__dot stat__dot--blu" aria-hidden="true"></span>
             <div>
               <span class="stat__label">Open tasks</span>
               <strong class="stat__value" id="stat-tasks">—</strong>
@@ -96,9 +90,7 @@
             </div>
           </article>
           <article class="stat">
-            <div class="stat__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><path d="M5 5h14v14H5zM9 9h6v6H9z" /><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3" /></svg>
-            </div>
+            <span class="stat__dot stat__dot--giallo" aria-hidden="true"></span>
             <div>
               <span class="stat__label">Active agents</span>
               <strong class="stat__value" id="stat-agents">—</strong>
@@ -106,9 +98,7 @@
             </div>
           </article>
           <article class="stat stat--attention" id="attention-stat">
-            <div class="stat__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><path d="M12 3 2.8 20h18.4L12 3Z" /><path d="M12 9v4M12 17h.01" /></svg>
-            </div>
+            <span class="stat__dot stat__dot--attention" aria-hidden="true"></span>
             <div>
               <span class="stat__label">Needs attention</span>
               <strong class="stat__value" id="stat-attention">—</strong>
@@ -121,7 +111,7 @@
       <section class="fleet" aria-labelledby="fleet-title">
         <div class="section-heading">
           <div>
-            <p class="section-kicker">Workspaces</p>
+            <p class="section-kicker"><span>02</span> Workspaces</p>
             <h2 id="fleet-title">Teams</h2>
           </div>
           <p class="result-count" id="result-count" role="status">Loading instances…</p>
@@ -129,7 +119,6 @@
 
         <form class="filters" id="filters" aria-label="Filter team instances">
           <label class="search-field" for="search-input">
-            <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" /><path d="m12.5 12.5 4 4" /></svg>
             <span class="visually-hidden">Search instances</span>
             <input id="search-input" name="query" type="search" autocomplete="off" placeholder="Search teams, projects, instances…">
             <kbd aria-hidden="true">/</kbd>
@@ -181,7 +170,7 @@
           <div class="empty-state__orbit" aria-hidden="true"><span></span></div>
           <h3 id="empty-title">No instances yet</h3>
           <p id="empty-message">Start a team with <code>cyclo run</code> and it will appear here.</p>
-          <button class="button button--quiet" id="clear-filters" type="button" hidden>Clear filters</button>
+          <button class="button" id="clear-filters" type="button" hidden>Clear filters</button>
         </div>
 
         <div class="instance-grid" id="instance-grid" aria-live="polite" hidden></div>
@@ -190,7 +179,7 @@
       <section class="activity-panel" id="activity-panel" aria-labelledby="activity-title" hidden>
         <div class="section-heading">
           <div>
-            <p class="section-kicker">Across the fleet</p>
+            <p class="section-kicker"><span>03</span> Across the fleet</p>
             <h2 id="activity-title">Recent activity</h2>
           </div>
         </div>
@@ -199,8 +188,13 @@
     </main>
 
     <footer class="site-footer">
-      <p><span class="footer-mark" aria-hidden="true">↻</span> Cyclo runs locally. This page contains no credentials.</p>
-      <p><a href="/api/snapshot">View snapshot JSON</a></p>
+      <div class="fregio" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <div class="site-footer__lines">
+        <p>Cyclo runs locally. This page contains no credentials.</p>
+        <p><a href="/api/snapshot">View snapshot JSON</a></p>
+      </div>
     </footer>
 
     <template id="instance-card-template">
@@ -218,7 +212,6 @@
           </div>
           <a class="agentws-link" target="_blank" rel="noreferrer">
             <span>Open AgentWS</span>
-            <svg viewBox="0 0 18 18" aria-hidden="true"><path d="M7 4h7v7M14 4 6 12" /><path d="M12 10v4H4V6h4" /></svg>
           </a>
         </header>
 
@@ -255,7 +248,7 @@
 
         <div class="instance-errors" hidden>
           <div class="instance-errors__heading">
-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m10 2.5 8 15H2l8-15Z" /><path d="M10 7v4M10 14.5h.01" /></svg>
+            <span class="notice-dot" aria-hidden="true"></span>
             <strong></strong>
           </div>
           <ul></ul>
