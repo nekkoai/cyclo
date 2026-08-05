@@ -1,3 +1,5 @@
+import { setTimeout as delay } from "node:timers/promises";
+
 import { Code, ConnectError } from "@connectrpc/connect";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { Modality } from "@cyclo/provider/contract";
@@ -7,10 +9,13 @@ import {
   PI_INFERENCE_FORMAT,
   splitPublicModelId,
 } from "@cyclo/provider/protocol";
+import { resourceExhaustedRetryAt } from "@cyclo/provider/errors";
 
 const API = "cyclo-pi";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 const MAX_SAFE_UINT64 = BigInt(Number.MAX_SAFE_INTEGER);
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const MIN_EXHAUSTION_RETRY_DELAY_MS = 1_000;
 
 export function groupModels(models, { onInvalid = console.warn } = {}) {
   if (!Array.isArray(models)) throw new TypeError("Provider catalogue has no model list");
@@ -49,22 +54,53 @@ function diagnosticMessage(error) {
 
 // This is the only Pi-to-wire boundary. Context and inference options are
 // serialized once, then every Provider component sees one opaque string.
-export function streamProvider(client, publicId, model, context, options = {}) {
+export function streamProvider(
+  client,
+  publicId,
+  model,
+  context,
+  options = {},
+  { now = Date.now, sleep = abortableSleep } = {},
+) {
   const output = createAssistantMessageEventStream();
-  void pump(output, client, publicId, model, context, options);
+  void pump(output, client, publicId, model, context, options, now, sleep);
   return output;
 }
 
-async function pump(output, client, publicId, model, context, options) {
+async function pump(output, client, publicId, model, context, options, now, sleep) {
   try {
-    const request = {
+    const request = Object.freeze({
       model: publicId,
       payload: encodePayload({ context, options: inferenceOptions(options) }),
-    };
-    for await (const response of client.infer(request, callOptions(options))) {
-      output.push(decodePayload(response.payload));
+    });
+    // Relays and poolers get the first chance to handle exhaustion. If it
+    // reaches this terminal adapter, keep Pi's stream open and wait outside the
+    // completed RPC before replaying the same request.
+    while (true) {
+      let receivedResponse = false;
+      try {
+        for await (const response of client.infer(
+          request,
+          cancellationOptions(options.signal),
+        )) {
+          receivedResponse = true;
+          output.push(decodePayload(response.payload));
+        }
+        output.end();
+        return;
+      } catch (error) {
+        const retryAt = receivedResponse || options.signal?.aborted
+          ? undefined
+          : resourceExhaustedRetryAt(error);
+        if (retryAt === undefined) throw error;
+        const delayMs = Math.max(
+          MIN_EXHAUSTION_RETRY_DELAY_MS,
+          retryAt.getTime() - now(),
+        );
+        await sleep(delayMs, options.signal);
+        options.signal?.throwIfAborted();
+      }
     }
-    output.end();
   } catch (error) {
     const aborted = options.signal?.aborted
       || (error instanceof ConnectError && error.code === Code.Canceled);
@@ -78,6 +114,15 @@ async function pump(output, client, publicId, model, context, options) {
       reason: message.stopReason,
       error: message,
     });
+  }
+}
+
+async function abortableSleep(delayMs, signal) {
+  let remaining = delayMs;
+  while (remaining > 0) {
+    const chunk = Math.min(remaining, MAX_TIMER_DELAY_MS);
+    await delay(chunk, undefined, { signal });
+    remaining -= chunk;
   }
 }
 
@@ -103,11 +148,12 @@ function inferenceOptions(options) {
   return inference;
 }
 
-function callOptions(options) {
-  const result = {};
-  if (options.signal !== undefined) result.signal = options.signal;
-  if (options.timeoutMs !== undefined) result.timeoutMs = options.timeoutMs;
-  return result;
+// Infer has no pipeline-wide deadline. Pi's timeout controls describe its
+// native provider request, which is owned by the gateway, and must not become
+// an absolute ConnectRPC deadline across every provider component. Operator
+// cancellation is the only Pi process control propagated through the call.
+function cancellationOptions(signal) {
+  return signal === undefined ? {} : { signal };
 }
 
 function providerErrorMessage(error) {

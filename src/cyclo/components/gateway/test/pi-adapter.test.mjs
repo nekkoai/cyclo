@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { Code, ConnectError } from "@connectrpc/connect";
+import { resourceExhaustedRetryAt } from "@cyclo/provider/errors";
 import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
 
 import { createPiAdapter } from "../src/pi-adapter.mjs";
@@ -80,6 +81,202 @@ test("decodes only the Pi call frame and preserves every native event", async ()
     cachedInputTokens: 3,
     reasoningTokens: 2,
   });
+});
+
+test("disables native SDK retries for every supported Pi API", async () => {
+  const expected = new Map([
+    ["anthropic-messages", { maxRetries: 0 }],
+    ["openai-codex-responses", {
+      maxRetries: 0,
+      transport: "sse",
+    }],
+    ["openai-responses", { maxRetries: 0 }],
+  ]);
+
+  for (const [api, retry] of expected) {
+    let invocation;
+    const adapter = createPiAdapter({
+      streamers: {
+        [api]: (_model, _context, options) => {
+          invocation = options;
+          return stream([]);
+        },
+      },
+    });
+    await collect(adapter.infer(
+      route(api),
+      JSON.stringify({
+        context: {},
+        options: {
+          maxRetries: 99,
+          maxRetryDelayMs: 999_999,
+          transport: "websocket",
+        },
+      }),
+      { apiKey: "gateway-key" },
+      new AbortController().signal,
+    ));
+
+    assert.equal(invocation.maxRetries, retry.maxRetries, api);
+    assert.equal(invocation.maxRetryDelayMs, retry.maxRetryDelayMs, api);
+    assert.equal(invocation.transport, retry.transport, api);
+  }
+});
+
+test("returns typed Codex exhaustion immediately from Retry-After", async () => {
+  const now = Date.parse("2031-02-03T04:05:06Z");
+  let calls = 0;
+  const adapter = createPiAdapter({
+    now: () => now,
+    streamers: {
+      "openai-codex-responses": (_model, _context, options) => {
+        calls += 1;
+        return terminalUsageLimit(
+          options,
+          { "retry-after": "7200" },
+          () => {},
+          "You have hit your ChatGPT usage limit for private-account-name.",
+        );
+      },
+    },
+  });
+
+  await assert.rejects(
+    collect(adapter.infer(
+      route("openai-codex-responses"),
+      JSON.stringify({ context: {}, options: {} }),
+      { apiKey: "gateway-key" },
+      new AbortController().signal,
+    )),
+    (error) => error instanceof ConnectError
+      && error.code === Code.ResourceExhausted
+      && error.rawMessage === "provider resource exhausted"
+      && resourceExhaustedRetryAt(error)?.getTime() === now + 7_200_000
+      && !error.message.includes("private-account-name"),
+  );
+
+  assert.equal(calls, 1);
+});
+
+test("returns typed exhaustion for every native API", async () => {
+  const now = Date.parse("2031-02-03T04:05:06Z");
+  for (const [api, headers] of [
+    ["anthropic-messages", { "retry-after": "41" }],
+    ["openai-responses", new Headers({ "retry-after": "41" })],
+  ]) {
+    let calls = 0;
+    const adapter = createPiAdapter({
+      now: () => now,
+      streamers: {
+        [api]: (_model, _context, options) => {
+          calls += 1;
+          return terminalUsageLimit(options, headers);
+        },
+      },
+    });
+
+    await assert.rejects(
+      collect(adapter.infer(
+        route(api),
+        JSON.stringify({ context: {}, options: {} }),
+        { apiKey: "gateway-key" },
+        new AbortController().signal,
+      )),
+      (error) => error instanceof ConnectError
+        && error.code === Code.ResourceExhausted
+        && resourceExhaustedRetryAt(error)?.getTime() === now + 41_000,
+      api,
+    );
+    assert.equal(calls, 1, api);
+  }
+});
+
+test("returns typed Codex exhaustion from a body-only reset", async () => {
+  const now = Date.parse("2031-02-03T04:05:06Z");
+  let calls = 0;
+  const adapter = createPiAdapter({
+    now: () => now,
+    streamers: {
+      "openai-codex-responses": (_model, _context, options) => {
+        calls += 1;
+        return terminalUsageLimit(
+          options,
+          {},
+          () => {},
+          "You have hit your ChatGPT usage limit. Try again in ~37 min.",
+        );
+      },
+    },
+  });
+
+  await assert.rejects(
+    collect(adapter.infer(
+      route("openai-codex-responses"),
+      JSON.stringify({ context: {}, options: {} }),
+      { apiKey: "gateway-key" },
+      new AbortController().signal,
+    )),
+    (error) => resourceExhaustedRetryAt(error)?.getTime() === now + 37 * 60_000,
+  );
+
+  assert.equal(calls, 1);
+});
+
+test("never replays ambiguous native failures", async () => {
+  for (const [name, failure] of [
+    ["server response", (options) => terminalProviderError(options, 503)],
+    ["transport message", () => stream([{
+      type: "error",
+      reason: "error",
+      error: { errorMessage: "fetch failed", usage: usage() },
+    }])],
+  ]) {
+    let calls = 0;
+    const adapter = createPiAdapter({
+      streamers: {
+        "openai-codex-responses": (_model, _context, options) => {
+          calls += 1;
+          return failure(options);
+        },
+      },
+    });
+
+    const responses = await collect(adapter.infer(
+      route("openai-codex-responses"),
+      JSON.stringify({ context: {}, options: {} }),
+      { apiKey: "gateway-key" },
+      new AbortController().signal,
+    ));
+
+    assert.equal(calls, 1, name);
+    assert.deepEqual(
+      responses.map(({ payload }) => JSON.parse(payload).type),
+      ["error"],
+      name,
+    );
+  }
+});
+
+test("never retries Codex after native output has started", async () => {
+  let calls = 0;
+  const adapter = createPiAdapter({
+    streamers: {
+      "openai-codex-responses": (_model, _context, options) => {
+        calls += 1;
+        return partialThenLimited(options);
+      },
+    },
+  });
+
+  const responses = await collect(adapter.infer(
+    route("openai-codex-responses"),
+    JSON.stringify({ context: {}, options: {} }),
+    { apiKey: "gateway-key" },
+    new AbortController().signal,
+  ));
+
+  assert.equal(calls, 1);
+  assert.deepEqual(responses.map(({ payload }) => JSON.parse(payload).type), ["start", "error"]);
 });
 
 test("preserves Pi event content that contains no gateway credential", async () => {
@@ -224,13 +421,13 @@ test("maps cancellation and upstream failures to transport errors", async () => 
   );
 });
 
-function route() {
+function route(api = "openai-responses") {
   return {
     publicModel: { id: "work/model" },
     rawModel: {
       id: "model",
       provider: "openai",
-      api: "openai-responses",
+      api,
       baseUrl: "https://example.invalid/v1",
     },
   };
@@ -254,6 +451,49 @@ async function* stream(events) {
 
 async function* failingStream(error) {
   throw error;
+}
+
+async function* terminalUsageLimit(
+  options,
+  headers = {},
+  responseSeen = () => {},
+  errorMessage = "You have hit your ChatGPT usage limit.",
+) {
+  await options.onResponse({ status: 429, headers });
+  responseSeen();
+  yield {
+    type: "error",
+    reason: "error",
+    error: {
+      errorMessage,
+      usage: usage(),
+    },
+  };
+}
+
+async function* terminalProviderError(
+  options,
+  status,
+  headers = {},
+  responseSeen = () => {},
+) {
+  await options.onResponse({ status, headers });
+  responseSeen();
+  yield {
+    type: "error",
+    reason: "error",
+    error: { errorMessage: "provider request failed", usage: usage() },
+  };
+}
+
+async function* partialThenLimited(options) {
+  await options.onResponse({ status: 429, headers: { "retry-after": "7200" } });
+  yield { type: "start", partial: {} };
+  yield {
+    type: "error",
+    reason: "error",
+    error: { errorMessage: "You have hit your ChatGPT usage limit.", usage: usage() },
+  };
 }
 
 async function collect(values) {

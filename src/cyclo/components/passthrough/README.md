@@ -19,7 +19,8 @@ The pass-through never parses or reserializes `Infer.payload`. Whitespace,
 property order, unknown Pi fields, and future events are preserved as strings.
 It forwards no caller HTTP headers and owns no bearer, API key, URL, or model
 credential. ConnectRPC propagates streaming, backpressure, cancellation,
-deadlines, and transport errors.
+and transport errors. The pass-through adds no `Infer` deadline; its bounded
+deadline is used only while probing the upstream catalogue for health.
 
 `Component.Health` makes a bounded `ListModels` call and reports only `ready`
 or a generic dependency failure.

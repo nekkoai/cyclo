@@ -14,6 +14,7 @@
       "types": "./gen/cyclo/provider/v1/provider_pb.d.ts",
       "default": "./gen/cyclo/provider/v1/provider_pb.js"
     },
+    "./errors": "./src/errors.mjs",
     "./protocol": "./src/protocol.mjs",
     "./schema.json": "./gen/schema.json"
   },

@@ -4,7 +4,7 @@
 
 import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import type { Message } from "@bufbuild/protobuf";
-import type { Any } from "@bufbuild/protobuf/wkt";
+import type { Any, Timestamp } from "@bufbuild/protobuf/wkt";
 
 /**
  * Describes the file cyclo/provider/v1/provider.proto.
@@ -200,6 +200,27 @@ export declare type InferResponse = Message<"cyclo.provider.v1.InferResponse"> &
  * Use `create(InferResponseSchema)` to create a new message.
  */
 export declare const InferResponseSchema: GenMessage<InferResponse>;
+
+/**
+ * ResourceExhaustion is attached to a RESOURCE_EXHAUSTED Connect error when
+ * Infer was rejected before the provider admitted it and before any response
+ * was streamed. The absolute time lets relays combine independent providers
+ * without accumulating relative-delay error.
+ *
+ * @generated from message cyclo.provider.v1.ResourceExhaustion
+ */
+export declare type ResourceExhaustion = Message<"cyclo.provider.v1.ResourceExhaustion"> & {
+  /**
+   * @generated from field: google.protobuf.Timestamp retry_at = 1;
+   */
+  retryAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message cyclo.provider.v1.ResourceExhaustion.
+ * Use `create(ResourceExhaustionSchema)` to create a new message.
+ */
+export declare const ResourceExhaustionSchema: GenMessage<ResourceExhaustion>;
 
 /**
  * @generated from enum cyclo.provider.v1.Modality

@@ -45,9 +45,25 @@ The package exports the public-ID helpers plus `PI_INFERENCE_FORMAT`,
 payload helpers provide JSON framing only. They contain no inference
 validation.
 
-Cancellation and deadlines travel through ConnectRPC, not inside JSON.
-Connect errors report routing, transport, dependency, or framing failures.
-Provider/model failures represented by Pi remain Pi events in the payload.
+Cancellation travels through ConnectRPC, not inside JSON. `Infer` has no
+protocol-wide absolute deadline; a provider endpoint owns the timeout for the
+native request it performs. Health and catalogue callers use their own bounded
+deadlines. Connect errors report routing, transport, dependency, or framing failures.
+Provider/model failures represented by Pi remain Pi events in the payload,
+except for a request rejected for exhausted capacity before inference starts.
+
+An `Infer` implementation may return `RESOURCE_EXHAUSTED` with a typed
+`cyclo.provider.v1.ResourceExhaustion` detail containing an absolute
+`retry_at`. This error is valid only before the first streamed response and
+means the request was not admitted, so replay through another provider is
+safe. Relays propagate it unchanged; a component with another route may try
+that route, and the terminal caller waits until `retry_at` only when no route
+remains. An error after streaming begins must remain in the Pi event stream and
+must never trigger replay.
+
+`@cyclo/provider/errors` exports `createResourceExhaustedError()` and
+`resourceExhaustedRetryAt()` so every component constructs and reads the detail
+the same way.
 
 An intermediate component declares its graph edges in `component.conf`:
 

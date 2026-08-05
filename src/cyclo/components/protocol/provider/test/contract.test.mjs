@@ -6,7 +6,7 @@ import { Component } from "@cyclo/component/contract";
 import { registerProvides, resolveBindings } from "@cyclo/component/bindings";
 import { parseDeclaration } from "@cyclo/component/declaration";
 import { servicesFromDescriptorSet } from "@cyclo/component/schema";
-import { Provider } from "@cyclo/provider/contract";
+import { Provider, ResourceExhaustionSchema } from "@cyclo/provider/contract";
 
 const schemaUrl = new URL("../gen/schema.json", import.meta.url);
 
@@ -18,6 +18,13 @@ test("exports the versioned Provider service contract", () => {
       { name: "ListModels", methodKind: "unary" },
       { name: "Infer", methodKind: "server_streaming" },
     ],
+  );
+});
+
+test("exports the typed resource-exhaustion detail", () => {
+  assert.equal(
+    ResourceExhaustionSchema.typeName,
+    "cyclo.provider.v1.ResourceExhaustion",
   );
 });
 

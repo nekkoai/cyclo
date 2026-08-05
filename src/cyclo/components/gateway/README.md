@@ -58,6 +58,13 @@ intermediate provider may supply its own catalogue; it logs and ignores only
 the bad entry. Intermediate relays preserve the typed catalogue fields
 unchanged.
 
+A definite native HTTP 429 before the first Pi event becomes the Provider
+protocol's typed `RESOURCE_EXHAUSTED` error. The gateway reports the absolute
+retry time immediately instead of sleeping, allowing an intermediate pooler to
+select another account. It never includes the native error text, account, or
+headers in that error. Ambiguous transport and server failures are not replayed;
+no request is retried after output starts.
+
 Usage is observed at the native Pi endpoint and appended to the private audit
 file. Accounting observes terminal event usage but does not alter or reorder
 the payload stream. A client-abandoned or failed stream is recorded with its

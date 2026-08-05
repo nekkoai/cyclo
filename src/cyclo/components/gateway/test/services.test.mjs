@@ -11,6 +11,10 @@ import { HealthStatus } from "@cyclo/component/contract";
 import { closeComponentServer, listenComponentServer } from "@cyclo/component/server";
 import { createDockerTransport } from "@cyclo/component/transport";
 import { Modality, Provider } from "@cyclo/provider/contract";
+import {
+  createResourceExhaustedError,
+  resourceExhaustedRetryAt,
+} from "@cyclo/provider/errors";
 import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
 
 import { aggregateUsageFile } from "../src/audit.mjs";
@@ -135,6 +139,43 @@ test("commits usage before releasing the final opaque response", async () => {
     done: false,
   });
   assert.deepEqual(await iterator.next(), { value: undefined, done: true });
+});
+
+test("preserves typed pre-stream exhaustion through audit and ConnectRPC", async () => {
+  const retryAt = new Date("2031-02-03T04:05:06.789Z");
+  const model = publicModel("work/gpt-test");
+  const audit = [];
+  const services = createGatewayServices({
+    catalogue: {
+      models: [model],
+      routes: Object.assign(Object.create(null), {
+        [model.id]: { publicModel: model, rawModel: {} },
+      }),
+    },
+    credentials: { async resolve() { return { apiKey: "key" }; } },
+    backend: {
+      async *infer() {
+        throw createResourceExhaustedError(retryAt);
+      },
+    },
+    audit: { async record(value) { audit.push(value); } },
+  });
+  const server = await createGatewayServer({ services });
+
+  try {
+    const target = await listenTarget(server);
+    const client = createClient(Provider, createDockerTransport(target));
+    await assert.rejects(
+      collect(client.infer({ model: model.id, payload: "opaque" })),
+      (error) => error instanceof ConnectError
+        && error.code === Code.ResourceExhausted
+        && resourceExhaustedRetryAt(error)?.toISOString() === retryAt.toISOString(),
+    );
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0].outcome, `rpc_${Code.ResourceExhausted}`);
+  } finally {
+    await closeComponentServer(server);
+  }
 });
 
 test("never returns a gateway credential reflected by a native upstream", async () => {
@@ -510,6 +551,12 @@ async function* endlessBackend() {
 
 async function* backendEvents(events) {
   for (const event of events) yield event;
+}
+
+async function collect(values) {
+  const result = [];
+  for await (const value of values) result.push(value);
+  return result;
 }
 
 async function listenTarget(server) {

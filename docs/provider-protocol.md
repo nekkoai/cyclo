@@ -167,9 +167,24 @@ A component may intentionally inspect payloads to implement policy, auditing,
 fusion, or routing. Such inspection is the component's advertised behavior,
 not a requirement of the Provider transport.
 
-Cancellation and deadlines travel through ConnectRPC. Routing and transport
-failures use Connect errors. Provider/model failures represented by Pi remain
-opaque Pi events.
+Cancellation travels through ConnectRPC. `Infer` has no pipeline-wide absolute
+deadline: Pi's native-provider timeout must not be converted into a deadline
+covering every provider component. The endpoint that invokes the native API
+owns that request's network timeout; health and catalogue callers retain their
+own bounded deadlines. Routing and transport failures use Connect errors.
+Provider/model failures represented by Pi remain opaque Pi events, with one
+pre-stream control-plane exception:
+
+- A provider that rejects an unadmitted request for exhausted capacity returns
+  `RESOURCE_EXHAUSTED` with a typed
+  `cyclo.provider.v1.ResourceExhaustion.retry_at` absolute timestamp.
+- This error is valid only before the first streamed response. It explicitly
+  means replay through another provider is safe.
+- An intermediate provider either handles it by selecting another route or
+  propagates it unchanged. If no component handles it, the terminal team
+  adapter waits until `retry_at` and retries the identical request.
+- Once any response has been streamed, neither the gateway nor an intermediate
+  component may convert a later failure into this error or replay the request.
 
 ## Health
 

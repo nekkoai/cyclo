@@ -3,6 +3,9 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import test from "node:test";
 
+import { Code, ConnectError } from "@connectrpc/connect";
+import { resourceExhaustedRetryAt } from "@cyclo/provider/errors";
+
 import { createPiAdapter } from "../src/pi-adapter.mjs";
 
 test("the real Pi adapter sends an arbitrary tool schema unchanged", async (t) => {
@@ -55,14 +58,124 @@ test("the real Pi adapter sends an arbitrary tool schema unchanged", async (t) =
   assert.equal(output[2].delta, "native ok");
 });
 
-function route(baseUrl) {
+test("the real Codex adapter returns body-only exhaustion without sleeping", async (t) => {
+  const now = Date.now();
+  let requests = 0;
+  const upstream = createServer(async (incoming, response) => {
+    for await (const _chunk of incoming) {
+      // Drain the request before replying.
+    }
+    requests += 1;
+    if (requests === 1) {
+      response.writeHead(429, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        error: {
+          code: "usage_limit_reached",
+          message: "Monthly usage limit reached",
+          plan_type: "plus",
+          resets_at: Math.floor(now / 1000) + 5 * 60,
+        },
+      }));
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    for (const event of nativeEvents()) response.write(`data: ${JSON.stringify(event)}\n\n`);
+    response.end("data: [DONE]\n\n");
+  });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const { port } = upstream.address();
+  const adapter = createPiAdapter({
+    now: () => now,
+  });
+
+  await assert.rejects(
+    collect(adapter.infer(
+      route(`http://127.0.0.1:${port}`, "openai-codex-responses"),
+      JSON.stringify({
+        context: { messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+        options: { maxTokens: 32 },
+      }),
+      { apiKey: codexToken() },
+      new AbortController().signal,
+    )),
+    (error) => error instanceof ConnectError
+      && error.code === Code.ResourceExhausted
+      && resourceExhaustedRetryAt(error)?.getTime() === now + 5 * 60_000,
+  );
+
+  assert.equal(requests, 1);
+});
+
+test("the real Anthropic and OpenAI adapters expose SDK 429s as exhaustion", async (t) => {
+  const now = Date.parse("2031-02-03T04:05:06Z");
+  const cases = [
+    ["anthropic-messages", {
+      type: "error",
+      error: { type: "rate_limit_error", message: "private Anthropic quota detail" },
+    }],
+    ["openai-responses", {
+      error: {
+        type: "rate_limit_error",
+        code: "rate_limit_exceeded",
+        message: "private OpenAI quota detail",
+      },
+    }],
+  ];
+
+  for (const [api, errorBody] of cases) {
+    await t.test(api, async (subtest) => {
+      let requests = 0;
+      const upstream = createServer(async (incoming, response) => {
+        for await (const _chunk of incoming) {
+          // Drain the request before replying.
+        }
+        requests += 1;
+        response.writeHead(429, {
+          "content-type": "application/json",
+          "retry-after": "7200",
+        });
+        response.end(JSON.stringify(errorBody));
+      });
+      upstream.listen(0, "127.0.0.1");
+      await once(upstream, "listening");
+      subtest.after(() => new Promise((resolve) => upstream.close(resolve)));
+      const { port } = upstream.address();
+
+      await assert.rejects(
+        collect(createPiAdapter({ now: () => now }).infer(
+          route(`http://127.0.0.1:${port}${api === "openai-responses" ? "/v1" : ""}`, api),
+          JSON.stringify({
+            context: { messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+            options: { maxTokens: 32 },
+          }),
+          { apiKey: "test-only-key" },
+          new AbortController().signal,
+        )),
+        (error) => error instanceof ConnectError
+          && error.code === Code.ResourceExhausted
+          && resourceExhaustedRetryAt(error)?.getTime() === now + 60_000
+          && !error.message.includes("private"),
+      );
+      assert.equal(requests, 1);
+    });
+  }
+});
+
+function route(baseUrl, api = "openai-responses") {
+  const provider = api === "anthropic-messages"
+    ? "anthropic"
+    : api === "openai-codex-responses"
+      ? "openai-codex"
+      : "openai";
   return {
     publicModel: { id: "work/gpt-test" },
     rawModel: {
       id: "gpt-test",
       name: "GPT test",
-      provider: "openai",
-      api: "openai-responses",
+      provider,
+      api,
       baseUrl,
       reasoning: false,
       input: ["text"],
@@ -71,6 +184,14 @@ function route(baseUrl) {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     },
   };
+}
+
+function codexToken() {
+  const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({
+    "https://api.openai.com/auth": { chatgpt_account_id: "test-account" },
+  })).toString("base64url");
+  return `${header}.${payload}.signature`;
 }
 
 function nativeEvents() {
@@ -103,4 +224,10 @@ function nativeEvents() {
     { type: "response.output_item.done", output_index: 0, item },
     { type: "response.completed", response: { ...response, output: [item] } },
   ];
+}
+
+async function collect(values) {
+  const result = [];
+  for await (const value of values) result.push(value);
+  return result;
 }

@@ -3,14 +3,16 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import test from "node:test";
 
+import { Code, ConnectError } from "@connectrpc/connect";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
-import { Modality, Provider } from "@cyclo/provider/contract";
+import { Modality, Provider, ResourceExhaustionSchema } from "@cyclo/provider/contract";
+import { createResourceExhaustedError } from "@cyclo/provider/errors";
 import { PI_INFERENCE_FORMAT } from "@cyclo/provider/protocol";
 
 import { createPiAdapter } from "../../../gateway/src/pi-adapter.mjs";
 import { createGatewayServices } from "../../../gateway/src/services.mjs";
 import { groupModels, streamProvider } from "../src/adapter.mjs";
-import { registerCycloProviders } from "../src/extension.mjs";
+import { providerClient, registerCycloProviders } from "../src/extension.mjs";
 
 const MODEL_ID_CASES = JSON.parse(await readFile(
   new URL("../../../protocol/provider/test/model-id-cases.json", import.meta.url),
@@ -180,6 +182,92 @@ test("turns a gateway audit failure into a Pi error before done", async () => {
   assert.match(events.at(-1).error.errorMessage, /usage audit unavailable/u);
 });
 
+test("waits and replays after gateway 429 exhaustion crosses real ConnectRPC", async () => {
+  const now = Date.parse("2031-02-03T04:05:06Z");
+  const model = portableModel("work/model-a");
+  const selected = {
+    api: "cyclo-pi",
+    provider: "work",
+    id: "model-a",
+    maxTokens: 4_096,
+  };
+  const requests = [];
+  const waits = [];
+  const audit = [];
+  let nativeCalls = 0;
+  const services = createGatewayServices({
+    catalogue: {
+      models: [model],
+      routes: Object.assign(Object.create(null), {
+        [model.id]: {
+          publicModel: model,
+          rawModel: {
+            id: "model-a",
+            provider: "openai",
+            api: "openai-responses",
+          },
+        },
+      }),
+    },
+    credentials: { async resolve() { return { apiKey: "gateway-key" }; } },
+    backend: createPiAdapter({
+      now: () => now,
+      streamers: {
+        "openai-responses": (_model, _context, options) => {
+          nativeCalls += 1;
+          return nativeCalls === 1
+            ? nativeUsageLimit(options, { "retry-after-ms": "1500" })
+            : nativeStream(successfulEvents(selected));
+        },
+      },
+    }),
+    audit: { async record(entry) { audit.push(entry); } },
+  });
+  const provider = {
+    listModels: services.provider.listModels,
+    async *infer(request, context) {
+      requests.push({ model: request.model, payload: request.payload });
+      yield* services.provider.infer(request, context);
+    },
+  };
+  const server = createServer(connectNodeAdapter({
+    connect: true,
+    grpc: false,
+    grpcWeb: false,
+    routes(router) { router.service(Provider, provider); },
+  }));
+
+  try {
+    const port = await listen(server);
+    const events = [];
+    for await (const event of streamProvider(
+      providerClient(`dns:///127.0.0.1:${port}`),
+      model.id,
+      selected,
+      { messages: [{ role: "user", content: "retry through gateway", timestamp: 0 }] },
+      {},
+      {
+        now: () => now,
+        async sleep(milliseconds) { waits.push(milliseconds); },
+      },
+    )) events.push(event);
+
+    assert.equal(nativeCalls, 2);
+    assert.deepEqual(waits, [1_500]);
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[1], requests[0]);
+    assert.equal(requests[0].model, model.id);
+    assert.deepEqual(audit.map(({ outcome }) => outcome), [
+      `rpc_${Code.ResourceExhausted}`,
+      "ok",
+    ]);
+    assert.equal(events.some(({ type }) => type === "error"), false);
+    assert.deepEqual(events, successfulEvents(selected));
+  } finally {
+    await close(server);
+  }
+});
+
 test("propagates cancellation through ConnectRPC", async () => {
   await withProvider(async ({ target, state }) => {
     const registration = await oneRegistration(target);
@@ -211,6 +299,177 @@ test("turns transport and JSON failures into Pi error terminals", async () => {
     assert.deepEqual(events.map(({ type }) => type), ["error"]);
     assert.match(events[0].error.errorMessage, /^Cyclo provider request failed:/u);
   });
+});
+
+test("does not turn Pi's provider timeout into an Infer RPC deadline", async () => {
+  const controller = new AbortController();
+  let callOptions;
+  const selected = { provider: "work", id: "model-a", maxTokens: 4_096 };
+  const client = {
+    async *infer(_request, options) {
+      callOptions = options;
+      for (const event of successfulEvents(selected)) {
+        yield { payload: JSON.stringify(event) };
+      }
+    },
+  };
+
+  const events = [];
+  for await (const event of streamProvider(
+    client,
+    "work/model-a",
+    selected,
+    { messages: [{ role: "user", content: "long inference", timestamp: 0 }] },
+    { signal: controller.signal, timeoutMs: 1 },
+  )) events.push(event);
+
+  assert.equal(callOptions.signal, controller.signal);
+  assert.equal("timeoutMs" in callOptions, false);
+  assert.deepEqual(events, successfulEvents(selected));
+});
+
+test("waits outside exhausted RPCs and retries the identical request until it succeeds", async () => {
+  const selected = { provider: "work", id: "model-a", maxTokens: 4_096 };
+  const requests = [];
+  const waits = [];
+  let attempt = 0;
+  const client = {
+    async *infer(request) {
+      requests.push(request);
+      attempt += 1;
+      if (attempt === 1) throw createResourceExhaustedError(new Date(10_500));
+      if (attempt === 2) throw createResourceExhaustedError(new Date(11_500));
+      for (const event of successfulEvents(selected)) {
+        yield { payload: JSON.stringify(event) };
+      }
+    },
+  };
+
+  const events = [];
+  for await (const event of streamProvider(
+    client,
+    "work/model-a",
+    selected,
+    { messages: [{ role: "user", content: "retry", timestamp: 0 }] },
+    {},
+    {
+      now: () => 10_000,
+      async sleep(milliseconds) { waits.push(milliseconds); },
+    },
+  )) events.push(event);
+
+  assert.deepEqual(waits, [1_000, 1_500]);
+  assert.equal(requests.length, 3);
+  assert.equal(requests[1], requests[0]);
+  assert.equal(requests[2], requests[0]);
+  assert.equal(requests[0].model, "work/model-a");
+  assert.deepEqual(events, successfulEvents(selected));
+});
+
+test("cancellation interrupts an exhaustion wait without starting another RPC", async () => {
+  const controller = new AbortController();
+  const waiting = deferred();
+  let calls = 0;
+  const client = {
+    async *infer() {
+      calls += 1;
+      throw createResourceExhaustedError(new Date(20_000));
+    },
+  };
+  const stream = streamProvider(
+    client,
+    "work/model-a",
+    { provider: "work", id: "model-a", maxTokens: 4_096 },
+    { messages: [{ role: "user", content: "cancel-wait", timestamp: 0 }] },
+    { signal: controller.signal },
+    {
+      now: () => 10_000,
+      sleep(_milliseconds, signal) {
+        waiting.resolve();
+        return new Promise((resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    },
+  );
+  const terminal = stream[Symbol.asyncIterator]().next();
+
+  await waiting.promise;
+  controller.abort();
+
+  const result = await withTimeout(terminal);
+  assert.equal(result.value.type, "error");
+  assert.equal(result.value.reason, "aborted");
+  assert.equal(calls, 1);
+});
+
+test("does not retry exhaustion after the Provider emitted a response", async () => {
+  const waits = [];
+  let calls = 0;
+  const client = {
+    async *infer() {
+      calls += 1;
+      yield { payload: JSON.stringify(startEvent("model-a")) };
+      throw createResourceExhaustedError(new Date(20_000));
+    },
+  };
+  const events = [];
+
+  for await (const event of streamProvider(
+    client,
+    "work/model-a",
+    { provider: "work", id: "model-a", maxTokens: 4_096 },
+    { messages: [{ role: "user", content: "partial", timestamp: 0 }] },
+    {},
+    {
+      now: () => 10_000,
+      async sleep(milliseconds) { waits.push(milliseconds); },
+    },
+  )) events.push(event);
+
+  assert.equal(calls, 1);
+  assert.deepEqual(waits, []);
+  assert.deepEqual(events.map(({ type }) => type), ["start", "error"]);
+});
+
+test("only retries typed pre-stream resource exhaustion with a valid retry time", async () => {
+  const malformed = new ConnectError("quota", Code.ResourceExhausted);
+  malformed.details.push({
+    type: ResourceExhaustionSchema.typeName,
+    value: Uint8Array.of(0xff),
+  });
+  const cases = [
+    ["missing detail", new ConnectError("quota", Code.ResourceExhausted), "error"],
+    ["malformed detail", malformed, "error"],
+    ["deadline", new ConnectError("deadline", Code.DeadlineExceeded), "error"],
+    ["unavailable", new ConnectError("offline", Code.Unavailable), "error"],
+    ["canceled", new ConnectError("canceled", Code.Canceled), "aborted"],
+  ];
+
+  for (const [name, failure, reason] of cases) {
+    let calls = 0;
+    let sleeps = 0;
+    const client = {
+      async *infer() {
+        calls += 1;
+        throw failure;
+      },
+    };
+    const events = [];
+    for await (const event of streamProvider(
+      client,
+      "work/model-a",
+      { provider: "work", id: "model-a", maxTokens: 4_096 },
+      { messages: [{ role: "user", content: name, timestamp: 0 }] },
+      {},
+      { async sleep() { sleeps += 1; } },
+    )) events.push(event);
+
+    assert.equal(calls, 1, name);
+    assert.equal(sleeps, 0, name);
+    assert.deepEqual(events.map(({ type }) => type), ["error"], name);
+    assert.equal(events[0].reason, reason, name);
+  }
 });
 
 test("isolates incompatible catalogue entries without hiding valid models", () => {
@@ -341,6 +600,18 @@ function zeroUsage() {
 
 async function* nativeStream(events) {
   for (const event of events) yield event;
+}
+
+async function* nativeUsageLimit(options, headers) {
+  await options.onResponse({ status: 429, headers });
+  yield {
+    type: "error",
+    reason: "error",
+    error: {
+      errorMessage: "provider account exhausted",
+      usage: zeroUsage(),
+    },
+  };
 }
 
 async function oneRegistration(target) {

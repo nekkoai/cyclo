@@ -2,6 +2,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { streamSimple as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { streamSimple as streamCodex } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { streamSimple as streamOpenAI } from "@earendil-works/pi-ai/api/openai-responses";
+import { createResourceExhaustedError } from "@cyclo/provider/errors";
 import { decodePayload, encodePayload } from "@cyclo/provider/protocol";
 
 const DEFAULT_STREAMERS = Object.freeze({
@@ -10,21 +11,32 @@ const DEFAULT_STREAMERS = Object.freeze({
   "openai-responses": streamOpenAI,
 });
 
+const DEFAULT_EXHAUSTION_RETRY_MS = 60_000;
+
 class GatewayResponseError extends Error {}
+class GatewayResourceExhaustion extends Error {
+  constructor(retryAt) {
+    super("provider resource exhausted");
+    this.retryAt = retryAt;
+  }
+}
 
 // The gateway terminates the opaque transport because this is where a Pi call
-// becomes a native provider request. It understands only the Pi call frame; it
-// does not interpret messages, tools, schemas, arguments, or emitted events.
-// It does enforce its own credential boundary on serialized native events.
-export function createPiAdapter({ streamers = DEFAULT_STREAMERS } = {}) {
+// becomes a native provider request. It does not interpret messages, tools,
+// schemas, arguments, or successful model output. It disables native replay
+// and enforces its credential boundary on serialized Pi events.
+export function createPiAdapter({
+  streamers = DEFAULT_STREAMERS,
+  now = Date.now,
+} = {}) {
   return Object.freeze({
     infer(route, payload, credential, signal) {
-      return dispatch(route, payload, credential, signal, streamers);
+      return dispatch(route, payload, credential, signal, streamers, now);
     },
   });
 }
 
-async function* dispatch(route, payload, credential, signal, streamers) {
+async function* dispatch(route, payload, credential, signal, streamers, now) {
   const stream = streamers[route.rawModel.api];
   if (typeof stream !== "function") {
     throw new ConnectError("model adapter is unavailable", Code.Unavailable);
@@ -35,23 +47,21 @@ async function* dispatch(route, payload, credential, signal, streamers) {
   const dispatchSignal = signal
     ? AbortSignal.any([signal, localAbort.signal])
     : localAbort.signal;
-  const options = gatewayOptions(
-    frame.options,
-    credential.apiKey,
-    dispatchSignal,
-    route.rawModel.api,
-  );
   const reflectionGuard = credentialReflectionGuard(credential);
 
-  let native;
   try {
-    native = stream(route.rawModel, frame.context, options);
-  } catch (error) {
-    localAbort.abort(new Error("gateway native dispatch stopped"));
-    throw upstreamFailure(error, signal);
-  }
+    const api = route.rawModel.api;
+    let response;
+    const options = gatewayOptions(
+      frame.options,
+      credential.apiKey,
+      dispatchSignal,
+      api,
+      (value) => { response = value; },
+    );
+    const native = stream(route.rawModel, frame.context, options);
+    let emitted = false;
 
-  try {
     for await (const event of native) {
       let encoded;
       try {
@@ -62,12 +72,24 @@ async function* dispatch(route, payload, credential, signal, streamers) {
         );
       }
       reflectionGuard.check(encoded);
+
+      if (!emitted) {
+        const retryAt = providerExhaustionRetryAt(api, response, event, now);
+        if (retryAt !== undefined) {
+          throw new GatewayResourceExhaustion(retryAt);
+        }
+      }
+
+      emitted = true;
       yield {
         payload: encoded,
         usage: eventUsage(event),
       };
     }
   } catch (error) {
+    if (error instanceof GatewayResourceExhaustion) {
+      throw createResourceExhaustedError(error.retryAt);
+    }
     if (error instanceof GatewayResponseError) {
       throw new ConnectError(error.message, Code.DataLoss);
     }
@@ -97,7 +119,7 @@ function piCallFrame(payload) {
 // native transport/retry/timeout controls belong to the gateway process. They
 // cannot be selected through the data plane. Every other JSON option is
 // forwarded without a Cyclo allowlist.
-function gatewayOptions(options, apiKey, signal, api) {
+function gatewayOptions(options, apiKey, signal, api, onResponse) {
   const {
     apiKey: _apiKey,
     signal: _signal,
@@ -118,8 +140,75 @@ function gatewayOptions(options, apiKey, signal, api) {
     apiKey,
     signal,
     maxRetries: 0,
-    ...(api === "openai-codex-responses" ? { transport: "sse" } : {}),
+    onResponse,
+    ...(api === "openai-codex-responses"
+      ? { transport: "sse" }
+      : {}),
   };
+}
+
+// Account exhaustion is never slept on here: before any output it becomes the
+// compositional Provider RESOURCE_EXHAUSTED contract, so another component may
+// select another route. All ambiguous failures remain ordinary failures.
+function providerExhaustionRetryAt(api, response, event, now) {
+  if (event?.type !== "error" || nativeErrorStatus(api, response, event) !== 429) {
+    return undefined;
+  }
+
+  const nowMs = now();
+  const waitMs = retryAfterMs(response?.headers, nowMs)
+    ?? (api === "openai-codex-responses" ? codexResetWaitMs(event) : undefined)
+    ?? DEFAULT_EXHAUSTION_RETRY_MS;
+  const retryAt = new Date(nowMs + Math.max(1_000, waitMs));
+  return Number.isFinite(retryAt.getTime())
+    ? retryAt
+    : new Date(nowMs + DEFAULT_EXHAUSTION_RETRY_MS);
+}
+
+function nativeErrorStatus(api, response, event) {
+  if (Number.isInteger(response?.status)) return response.status;
+  const message = event?.error?.errorMessage;
+  if (typeof message !== "string") return undefined;
+
+  // The pinned Anthropic and OpenAI Pi adapters catch SDK errors before their
+  // onResponse hook runs. These exact prefixes are produced from the SDK's
+  // numeric status by those pinned adapters; arbitrary body text follows them.
+  if (api === "anthropic-messages" && /^429(?:\s|$)/u.test(message)) return 429;
+  if (api === "openai-responses" && message.startsWith("OpenAI API error (429):")) {
+    return 429;
+  }
+  return undefined;
+}
+
+function codexResetWaitMs(event) {
+  const message = event?.error?.errorMessage;
+  if (typeof message !== "string") return undefined;
+  const match = /\bTry again in ~(\d+) min\./u.exec(message);
+  if (!match) return undefined;
+  const minutes = Number(match[1]);
+  return Number.isSafeInteger(minutes) ? Math.max(1, minutes) * 60_000 : undefined;
+}
+
+function retryAfterMs(headers = {}, nowMs = Date.now()) {
+  const millisecondsValue = headerValue(headers, "retry-after-ms");
+  const milliseconds = Number(millisecondsValue);
+  if (millisecondsValue?.trim() && Number.isFinite(milliseconds)) {
+    return Math.max(0, milliseconds);
+  }
+
+  const value = headerValue(headers, "retry-after")?.trim();
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1_000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - nowMs) : undefined;
+}
+
+function headerValue(headers, name) {
+  const value = typeof headers?.get === "function"
+    ? headers.get(name)
+    : headers?.[name];
+  return typeof value === "string" ? value : undefined;
 }
 
 function eventUsage(event) {

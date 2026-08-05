@@ -3,6 +3,7 @@ syntax = "proto3";
 package cyclo.provider.v1;
 
 import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
 
 // Provider has a typed control plane and an opaque inference data plane.
 //
@@ -74,4 +75,12 @@ message InferRequest {
 // additional Cyclo semantics.
 message InferResponse {
   string payload = 1;
+}
+
+// ResourceExhaustion is attached to a RESOURCE_EXHAUSTED Connect error when
+// Infer was rejected before the provider admitted it and before any response
+// was streamed. The absolute time lets relays combine independent providers
+// without accumulating relative-delay error.
+message ResourceExhaustion {
+  google.protobuf.Timestamp retry_at = 1;
 }
