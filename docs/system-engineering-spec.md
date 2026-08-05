@@ -264,9 +264,16 @@ Each roster record MUST contain:
 AGENT ROLE ENGINE PROVIDER/MODEL
 ```
 
-Agent names MUST be unique, every role MUST have a corresponding role file, and
-at least one agent MUST have role `planner`. Supported engines are `pi` and
-`pi-interactive`.
+Agent names MUST be unique. Every role MUST have a corresponding role file.
+Every role MUST be a bounded identifier. At least one agent MUST have role
+`planner`. Supported engines are `pi` and `pi-interactive`.
+
+Jobs MUST persist exactly one role. A worker supervisor MUST pass the role from
+the selected roster entry to the queue wait and claim operations, and the claim
+MUST select only a pending job with that role. The role MUST also select the
+worker's behavioral instructions. Multiple agents MAY share one role. New-task
+authority and terminal planner-notification suppression MUST depend on role
+`planner`.
 
 Optional `AGENTS.md` supplies team-wide policy. The required Dockerfile MUST
 declare `ARG CYCLO_TEAM_BASE` before its final base selection and MUST use that
@@ -384,22 +391,27 @@ A queue-only one-shot administration mode MAY skip Pi initialization, but only
 when Docker starts it directly as the mapped non-root identity and without
 receiving a Pi mount. Host UID zero MUST be rejected.
 
-Task administration MUST allowlist the exact AgentWS task programs. A one-shot
-task tool MUST have a read-only root filesystem, no network, no project/team/Pi
+Queue administration MUST allowlist the exact AgentWS programs. A one-shot
+queue tool MUST have a read-only root filesystem, no network, no project/team/Pi
 or credential mount, no Docker socket, no added capability, and no-new-
 privileges. It MUST receive only the queue roots needed by its operation:
 
 - list/show: tasks read-only;
-- comment/state: tasks read-write; and
-- create: tasks and jobs read-write plus a read-only private snapshot of the
-  selected specification.
+- comment/state: tasks read-write;
+- task creation: tasks and jobs read-write plus a read-only private snapshot of
+  the selected specification; and
+- explicit job creation: tasks read-only, jobs read-write, plus a read-only
+  private snapshot of the selected specification.
+
+Explicit job creation MUST receive a task ID, new job ID, role, and complete
+specification. It MUST route by role.
 
 Before staging that snapshot, Cyclo MUST walk and open the host path without
 following any symlink, require a regular file, and enforce a fixed size bound.
 The one-shot container MUST NOT receive the original project path.
 
 The one-shot container MUST carry an installation ownership label so a later
-serialized task operation can remove an abandoned predecessor.
+serialized queue operation can remove an abandoned predecessor.
 
 Cyclo MUST build the common team image under its stable tag with the invoking
 host UID/GID as build arguments. A derived team image MUST use a stable tag
@@ -557,8 +569,11 @@ Components explicitly designed for policy, audit, fusion, or transformation MAY
 inspect payloads. Their behavior MUST be treated as part of their component
 contract, not the base transport.
 
-Cancellation and deadlines MUST use ConnectRPC transport semantics rather than
-fields inside the opaque payload.
+Cancellation MUST use ConnectRPC transport semantics rather than a field inside
+the opaque payload. The Provider pipeline MUST NOT derive an absolute `Infer`
+deadline from Pi or native-provider options. The endpoint invoking a native API
+MUST own that request's network timeout. Health, catalogue, and other bounded
+control operations MAY set their own RPC deadlines.
 
 ### 9.3 Route failure
 
@@ -1009,6 +1024,12 @@ A release implementation SHOULD demonstrate:
 - refresh adopts current running project/team sources;
 - repair does not rewrite persisted team/project state from mutable definitions;
 - stopped tasks remain inspectable;
+- a job outside role `planner` cannot become `done` or `failed` until its
+  deterministic, same-task planner notification is durably visible;
+- a prepublished terminal notification cannot be claimed until its source is
+  `done` or `failed`;
+- interrupted repetition reuses that exact notification, while collision or
+  publication failure leaves the source nonterminal;
 - forget requires stopped intent and exact confirmation; and
 - a killed one-shot gateway tool is cleaned without deleting credentials.
 
