@@ -33,6 +33,7 @@ def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() ->
     expected = {
         "@earendil-works/pi-coding-agent": "0.81.1",
         "pi-lens": "3.8.68",
+        "pi-safe-compact": "0.4.0",
         "pi-simplify": "0.2.2",
         "pi-web-access": "0.13.0",
     }
@@ -79,6 +80,11 @@ def test_pi_extension_shares_the_cli_pi_ai_without_replacing_legacy_peers() -> N
         "ln -s /opt/cyclo-agent-tools/lib/node_modules/@earendil-works/pi-ai"
         not in dockerfile
     )
+    assert "npm ci --legacy-peer-deps" in dockerfile
+    assert (
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/"
+        "pi-safe-compact"
+    ) in dockerfile
 
 
 def test_gateway_node_install_is_locked_to_the_runtime_pi_generation() -> None:

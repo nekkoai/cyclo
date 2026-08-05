@@ -5,6 +5,7 @@
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.81.1",
     "pi-lens": "3.8.68",
+    "pi-safe-compact": "0.4.0",
     "pi-simplify": "0.2.2",
     "pi-web-access": "0.13.0"
   }

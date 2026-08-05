@@ -48,6 +48,7 @@ def test_packaged_agentws_preserves_executable_modes() -> None:
     for path in (
         template / "AGENTS.md",
         template / "default.team",
+        template / "tools" / "pi_rpc.py",
         template / "tools" / "agentws-public" / "app.js",
     ):
         assert not path.stat().st_mode & stat.S_IXUSR, path

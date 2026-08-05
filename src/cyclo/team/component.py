@@ -150,6 +150,11 @@ def _materialize_pi_settings(store: StateStore, instance: Instance) -> Path:
                     "npm:pi-web-access",
                     "npm:pi-lens",
                     "npm:pi-simplify",
+                    (
+                        "/opt/cyclo-agent-tools/lib/node_modules/"
+                        "@earendil-works/pi-coding-agent/node_modules/"
+                        "pi-safe-compact"
+                    ),
                     "/opt/cyclo/team/pi",
                 ],
             },

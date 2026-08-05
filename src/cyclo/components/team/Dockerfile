@@ -3,9 +3,13 @@ FROM node:22-trixie-slim@sha256:e6d9a389d34ff9678438af985c9913fbd1eb6ed36e80fea5
 WORKDIR /opt/cyclo-agent-tools/lib
 COPY team/package.json team/package-lock.json ./
 # pi-simplify 0.2.2 declares Pi 0.75 peers. The lock keeps those peer libraries
-# alongside the security-fixed Pi 0.81 CLI; --force accepts only that locked,
-# intentionally side-by-side resolution.
-RUN npm ci --force --omit=dev --no-audit --no-fund \
+# alongside the security-fixed Pi 0.81 CLI. Ignore peer-range resolution and
+# install exactly that side-by-side lockfile layout.
+# A second pi-safe-compact package location beside Pi makes both use the same
+# pi-ai provider registry; the locked npm installation remains intact.
+RUN npm ci --legacy-peer-deps --omit=dev --no-audit --no-fund \
+    && cp -a node_modules/pi-safe-compact \
+        node_modules/@earendil-works/pi-coding-agent/node_modules/pi-safe-compact \
     && npm cache clean --force
 
 # Install the ConnectRPC client packages beside the agent tools. Keeping the

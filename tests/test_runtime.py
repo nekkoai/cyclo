@@ -266,9 +266,12 @@ def test_pi_settings_are_an_immutable_template_outside_team_writable_state(
 
     assert not files.pi_settings.is_relative_to(pi_root)
     assert stat.S_IMODE(files.pi_settings.stat().st_mode) == 0o444
-    assert json.loads(files.pi_settings.read_text(encoding="utf-8"))[
-        "defaultModel"
-    ] == "model"
+    settings = json.loads(files.pi_settings.read_text(encoding="utf-8"))
+    assert settings["defaultModel"] == "model"
+    assert any(
+        package.endswith("/pi-safe-compact")
+        for package in settings["packages"]
+    )
     assert not (escape / "settings.json").exists()
     settings_bind = next(
         bind

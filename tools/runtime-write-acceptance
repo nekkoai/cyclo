@@ -86,6 +86,7 @@ cat > "$settings_template" <<'EOF'
     "npm:pi-web-access",
     "npm:pi-lens",
     "npm:pi-simplify",
+    "/opt/cyclo-agent-tools/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/pi-safe-compact",
     "/opt/cyclo/team/pi"
   ]
 }

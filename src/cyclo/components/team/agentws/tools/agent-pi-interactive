@@ -24,6 +24,13 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 agent_mod = importlib.machinery.SourceFileLoader("agentws_agent", str(SCRIPT_DIR / "agent")).load_module()
+from pi_rpc import (
+    CommandRejected as PiCommandRejected,
+    ProcessExited as PiProcessExited,
+    ProtocolError as PiProtocolError,
+    Session as PiSession,
+    command as pi_command,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,18 +58,6 @@ def ensure_fifo(path: Path) -> None:
     except FileNotFoundError:
         pass
     os.mkfifo(path, 0o600)
-
-
-def write_json_line(stream, value: dict[str, Any], lock: threading.Lock) -> bool:
-    with lock:
-        if stream.closed:
-            return False
-        try:
-            stream.write(json.dumps(value) + "\n")
-            stream.flush()
-            return True
-        except BrokenPipeError:
-            return False
 
 
 def acquire_interactive_lock(agent_dir: Path, agent_name: str):
@@ -182,11 +177,11 @@ def main() -> int:
     error_files = [agent_error.open("a", encoding="utf-8", buffering=1)]
 
     proc: subprocess.Popen[str] | None = None
+    rpc_session: PiSession | None = None
     stop_event = threading.Event()
     is_streaming = threading.Event()
-    initial_command_failed = threading.Event()
+    rpc_command_failed = threading.Event()
     attempt_settled = threading.Event()
-    stdin_lock = threading.Lock()
     shutdown_signals = (signal.SIGTERM, signal.SIGINT)
     previous_handlers = {signum: signal.getsignal(signum) for signum in shutdown_signals}
     process_status = 1
@@ -280,12 +275,11 @@ def main() -> int:
             ),
         )
 
-        command = ["pi", "--mode", "rpc"]
-        if args.model:
-            command.extend(["--model", args.model])
-        if args.console:
-            command.extend(["--append-system-prompt", prompt])
-        command.extend(["--session-dir", str(agent_dir / "pi-session")])
+        command = pi_command(
+            args.model,
+            agent_dir / "pi-session",
+            append_system_prompt=prompt if args.console else None,
+        )
 
         proc = agent_mod.launch_engine(
             command,
@@ -312,44 +306,33 @@ def main() -> int:
                 sys.stderr.write(prefix + line)
                 sys.stderr.flush()
 
-        def read_rpc_stdout() -> None:
-            renderer = agent_mod.Renderer(transcript, "pi")
-            assert proc is not None and proc.stdout is not None
-            for raw in proc.stdout:
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    renderer.render_line(raw)
-                    continue
-                if isinstance(event, dict):
-                    typ = event.get("type")
-                    initial_response = (
-                        typ == "response" and event.get("id") == "initial"
-                    )
-                    if typ in ("agent_start", "turn_start"):
-                        set_streaming(True)
-                    elif typ in ("agent_end", "turn_end"):
-                        set_streaming(False)
-                    if typ == "message":
-                        message = event.get("message")
-                        if isinstance(message, dict) and message.get("role") == "assistant" and message.get("stopReason"):
-                            set_streaming(False)
-                    if typ == "response":
-                        set_streaming(False)
-                    if typ == "response" and event.get("success") is False:
-                        transcript.event("pi rpc error", str(event.get("error") or event))
-                        if not args.console and initial_response:
-                            initial_command_failed.set()
-                            stop_event.set()
-                        continue
-                    if typ == "agent_settled" and not args.console:
-                        set_streaming(False)
-                        attempt_settled.set()
-                        stop_event.set()
-                renderer.render_line(raw)
+        renderer = agent_mod.Renderer(transcript, "pi")
+
+        def render_rpc_event(raw: str, event: dict[str, Any]) -> None:
+            typ = event.get("type")
+            if typ in ("agent_start", "turn_start"):
+                set_streaming(True)
+            elif typ in ("agent_end", "turn_end", "agent_settled"):
+                set_streaming(False)
+            if typ == "response" and event.get("success") is False:
+                transcript.event("pi rpc error", str(event.get("error") or event))
+            renderer.render_line(raw)
+
+        def handle_rpc_error(error: PiProtocolError) -> None:
+            if args.console:
+                transcript.event("pi rpc error", str(error))
+            rpc_command_failed.set()
+            stop_event.set()
+
+        rpc_session = PiSession(
+            proc,
+            on_event=render_rpc_event,
+            on_error=handle_rpc_error,
+        )
+        rpc_session.start()
 
         def read_browser_input() -> None:
-            assert proc is not None and proc.stdin is not None
+            assert rpc_session is not None
             while not stop_event.is_set():
                 with input_fifo.open("r", encoding="utf-8") as fifo:
                     for line in fifo:
@@ -362,6 +345,12 @@ def main() -> int:
                             continue
                         message = str(payload.get("message") or "").strip()
                         if not message:
+                            continue
+                        if not args.console and not is_streaming.is_set():
+                            transcript.event(
+                                "interactive input ignored",
+                                "the queued agent is not currently running a turn",
+                            )
                             continue
                         mode = payload.get("mode") or "follow_up"
                         if mode not in {"follow_up", "steer", "prompt"}:
@@ -377,10 +366,10 @@ def main() -> int:
                             set_streaming(True)
                         elif command_type == "steer":
                             set_streaming(False)
-                        sent = write_json_line(
-                            proc.stdin,
-                            {"id": f"web-{time.time_ns()}", "type": command_type, "message": message},
-                            stdin_lock,
+                        sent = rpc_session.send_message(
+                            f"web-{time.time_ns()}",
+                            command_type,
+                            message,
                         )
                         if not sent:
                             set_streaming(False)
@@ -397,21 +386,31 @@ def main() -> int:
                         proc.terminate()
                     return
 
+        def run_claimed_job() -> None:
+            assert rpc_session is not None
+            assert job_dir is not None
+            try:
+                rpc_session.run_prompt("initial", prompt)
+                attempt_settled.set()
+            except PiProcessExited:
+                pass
+            except PiCommandRejected:
+                rpc_command_failed.set()
+            except PiProtocolError as exc:
+                transcript.event("pi rpc error", str(exc))
+                rpc_command_failed.set()
+            finally:
+                stop_event.set()
+
         stderr_thread = threading.Thread(target=copy_stderr, daemon=True)
-        stdout_thread = threading.Thread(target=read_rpc_stdout, daemon=True)
         input_thread = threading.Thread(target=read_browser_input, daemon=True)
-        reader_threads = [stderr_thread, stdout_thread, input_thread]
+        reader_threads = [stderr_thread, rpc_session.reader_thread, input_thread]
         if job_dir is not None:
             reader_threads.append(threading.Thread(target=watch_job_status, daemon=True))
+            reader_threads.append(threading.Thread(target=run_claimed_job, daemon=True))
         for thread in reader_threads:
-            thread.start()
-
-        if not args.console:
-            set_streaming(True)
-            if not write_json_line(proc.stdin, {"id": "initial", "type": "prompt", "message": prompt}, stdin_lock):
-                initial_command_failed.set()
-                stop_event.set()
-                set_streaming(False)
+            if thread is not rpc_session.reader_thread:
+                thread.start()
 
         while proc.poll() is None and not stop_event.is_set():
             time.sleep(0.2)
@@ -462,7 +461,7 @@ def main() -> int:
             )
             process_status = agent_mod.FATAL_AGENT_EXIT
         elif cleanup_clean and not interrupted:
-            if initial_command_failed.is_set():
+            if rpc_command_failed.is_set():
                 # Rejection happens before Pi accepts the queued attempt.
                 process_status = 1
             elif attempt_settled.is_set():
