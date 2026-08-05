@@ -1,6 +1,6 @@
 # Releasing Cyclo
 
-Cyclo uses semantic versions. `0.2.0` is a stable release; a version below
+Cyclo uses semantic versions. `0.2.1` is a stable release; a version below
 `1.0.0` does not imply an alpha or preview build. The Python distribution is `cyclo-agent`,
 while the command, import package, repository, and image names retain `cyclo`.
 
@@ -83,13 +83,13 @@ Every component image uses `src/cyclo/components` as its build context. The
 locks, entrypoint, and Dockerfile; shared protocol packages remain beside it.
 
 ```sh
-docker build --pull --build-arg "CYCLO_HOST_UID=$(id -u)" --build-arg "CYCLO_HOST_GID=$(id -g)" -t cyclo-team:0.2.0 -f src/cyclo/components/team/Dockerfile src/cyclo/components
-docker build --pull -t cyclo-gateway:0.2.0 -f src/cyclo/components/gateway/Dockerfile src/cyclo/components
-docker build --pull -t cyclo-passthrough:0.2.0 -f src/cyclo/components/passthrough/Dockerfile src/cyclo/components
-PYTHONPATH=src python3 -c 'from pathlib import Path; from cyclo.images import Images; images = Images(); base = images.inspect("cyclo-team:0.2.0"); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); images.build("cyclo-derived-team:0.2.0", dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))'
-docker run --rm --network none --entrypoint /bin/sh cyclo-derived-team:0.2.0 -ceu 'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
-PYTHONPATH=src tools/runtime-write-acceptance cyclo-team:0.2.0
-docker run --rm --network none cyclo-gateway:0.2.0 providers
+docker build --pull --build-arg "CYCLO_HOST_UID=$(id -u)" --build-arg "CYCLO_HOST_GID=$(id -g)" -t cyclo-team:0.2.1 -f src/cyclo/components/team/Dockerfile src/cyclo/components
+docker build --pull -t cyclo-gateway:0.2.1 -f src/cyclo/components/gateway/Dockerfile src/cyclo/components
+docker build --pull -t cyclo-passthrough:0.2.1 -f src/cyclo/components/passthrough/Dockerfile src/cyclo/components
+PYTHONPATH=src python3 -c 'from pathlib import Path; from cyclo.images import Images; images = Images(); base = images.inspect("cyclo-team:0.2.1"); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); images.build("cyclo-derived-team:0.2.1", dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))'
+docker run --rm --network none --entrypoint /bin/sh cyclo-derived-team:0.2.1 -ceu 'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
+PYTHONPATH=src tools/runtime-write-acceptance cyclo-team:0.2.1
+docker run --rm --network none cyclo-gateway:0.2.1 providers
 ```
 
 `tools/runtime-write-acceptance` uses the image-baked AgentWS tools and
@@ -138,12 +138,12 @@ toolchain, runs Python, Node, shell, dependency, secret, package, Docker, baked
 runtime, and DComp integration acceptance, and writes:
 
 ```text
-release/cyclo-agent-0.2.0/
-  cyclo_agent-0.2.0-py3-none-any.whl
-  cyclo_agent-0.2.0.tar.gz
+release/cyclo-agent-0.2.1/
+  cyclo_agent-0.2.1-py3-none-any.whl
+  cyclo_agent-0.2.1.tar.gz
   SHA256SUMS
   release-manifest.json
-  cyclo-agent-0.2.0.spdx.json
+  cyclo-agent-0.2.1.spdx.json
 ```
 
 The wheel and source archive are normalized before checksums and the SBOM are
@@ -151,9 +151,10 @@ created. Protocol generation must leave the archived commit byte-for-byte
 unchanged. The SPDX SBOM enumerates every shipped Node lockfile.
 
 The high-severity dependency gate is implemented once in
-`tools/dependency-audit` and is shared by CI and the local builder. The narrow
-`TEMPORARY WAIVER` for Pi documented in `SECURITY.md` remains visible and fails
-closed on any policy drift.
+`tools/dependency-audit` and is shared by CI and the local builder. The exact
+`TEMPORARY WAIVER` for Pi's published shrinkwrap is documented in `SECURITY.md`.
+It fails closed if any allowed package, version, nested path, or advisory in the
+shipped lock changes, and expires when upstream fixes either dependency.
 
 The completed bundle is copied to a private sibling staging directory and
 published with Linux `renameat2(RENAME_NOREPLACE)`. An interrupted build cannot
@@ -170,11 +171,11 @@ Copy the complete release bundle and a separately obtained DComp executable to
 a disposable Linux host:
 
 ```sh
-cd ./cyclo-agent-0.2.0
+cd ./cyclo-agent-0.2.1
 sha256sum --check SHA256SUMS
 python3 -m venv /tmp/cyclo-release
 . /tmp/cyclo-release/bin/activate
-python -m pip install ./cyclo_agent-0.2.0-py3-none-any.whl
+python -m pip install ./cyclo_agent-0.2.1-py3-none-any.whl
 export CYCLO_DCOMP=/absolute/path/to/dcomp
 "$CYCLO_DCOMP" version --json
 cyclo --version

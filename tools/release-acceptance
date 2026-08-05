@@ -299,13 +299,13 @@ case $installed_root in
 esac
 
 printf '%s\n' '==> checking wheel-only commands and package resources'
-[ "$("$cyclo" --version)" = "cyclo 0.2.0" ] \
+[ "$("$cyclo" --version)" = "cyclo 0.2.1" ] \
     || fail "installed command reports an unexpected release version"
 "$venv/bin/python" -c '
 from importlib.metadata import distribution
 dist = distribution("cyclo-agent")
 assert dist.metadata["Name"] == "cyclo-agent"
-assert dist.version == "0.2.0"
+assert dist.version == "0.2.1"
 import cyclo
 assert cyclo.__version__ == dist.version
 '

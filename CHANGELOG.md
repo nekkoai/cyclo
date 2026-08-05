@@ -2,6 +2,48 @@
 
 All notable changes to Cyclo are documented in this file.
 
+## [0.2.1] - 2026-08-05
+
+Cyclo 0.2.1 strengthens long-running provider requests and durable team
+coordination while preserving the 0.2 component architecture and state format.
+
+### Provider resilience
+
+- Add a typed pre-stream `RESOURCE_EXHAUSTED` Provider error carrying an
+  absolute retry time. Intermediate providers may safely select another route;
+  if none does, the terminal team adapter waits cancellably and replays the
+  identical request.
+- Translate native provider exhaustion into that typed error without replaying
+  after output begins. Keep native SDK retry disabled so retry ownership is
+  explicit and usage accounting remains exact.
+- Remove the accidental pipeline-wide `Infer` deadline. The gateway owns the
+  native request timeout, while cancellation continues across the component
+  pipeline and bounded control-plane operations retain their deadlines.
+
+### Agent runtime and coordination
+
+- Install the pinned `pi-safe-compact` extension for standard Pi workers, which
+  continue to use print/JSON mode while Pi owns automatic compaction and output
+  continuation. Share a local RPC session client only with interactive workers
+  and the console.
+- Make every terminal transition outside role `planner` publish one
+  deterministic planner notification before changing source status. Gate the
+  notification from claims until the source is terminal, reuse it across crash
+  recovery, and leave the source nonterminal if publication fails.
+- Add `cyclo task add-job` for explicit role-routed recovery and handoff work
+  without requiring a running team component.
+- Report long build, apply, catalogue, and readiness phases on standard error
+  while preserving machine-consumable command results on standard output.
+
+### Supply-chain policy
+
+- Update the independently resolved `brace-expansion` runtime dependency to
+  5.0.9.
+- Refresh the fail-closed temporary exception for the exact high-severity
+  dependencies in Pi's published shrinkwrap. The release gate continues to
+  reject unknown findings and expires the exception when upstream fixes either
+  dependency.
+
 ## [0.2.0] - 2026-07-31
 
 Cyclo 0.2 introduces DComp-backed composition, explicit project authority, and
