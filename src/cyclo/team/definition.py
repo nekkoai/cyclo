@@ -461,7 +461,10 @@ def verify_agentws_runtime(runtime: Path) -> None:
         runtime / "tools" / "run_agentws",
         runtime / "tools" / "agent",
         runtime / "tools" / "agentws",
+        runtime / "tools" / "pi_rpc.py",
+        runtime / "tools" / "planner_notification.py",
         runtime / "bin" / "agent-new",
+        runtime / "bin" / "job-notify-planner",
         runtime / "bin" / "job-reset-orphans",
         runtime / "bin" / "task-create",
     )

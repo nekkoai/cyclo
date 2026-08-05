@@ -12,12 +12,12 @@ artifact or substitute a new design.
 4. Record commands, outputs, unverified areas, environmental limits, and one
    verdict: `verified`, `revision required`, or `blocked`.
 
-On `verified`, create a planner notification naming the final artifact and the
-evidence that satisfies each criterion. On `revision required`, create one
-`role=builder` fix job with the failure evidence and notify planner. On
+On `verified`, record the final artifact and evidence satisfying each criterion
+in the task comment; the terminal transition notifies planner. On `revision
+required`, create one `role=builder` fix job with the failure evidence. On
 `blocked`, notify planner with the exact condition needed to continue.
 
 Do not start a fourth correction round. If three prior revisions are recorded,
 route the verification failure to planner as a blocker.
 
-Only the planner records the task result.
+Only the planner role records the task result.

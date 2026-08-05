@@ -8,7 +8,7 @@ AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 usage() {
     echo "Usage: task-create <task-id> <spec-file>"
     echo ""
-    echo "Create a task and enqueue its initial planner job."
+    echo "Create a task and its initial planner job."
     exit 1
 }
 

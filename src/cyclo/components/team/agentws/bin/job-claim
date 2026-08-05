@@ -21,6 +21,7 @@ usage() {
 JOB_ID=""
 JOB_ROLE=""
 AGENT_ID=""
+CLAIM_WAITING_SOURCE=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -81,6 +82,12 @@ claim_job() {
         return 1
     fi
 
+    if ! terminal_notice_ready_locked "$job_dir"; then
+        CLAIM_WAITING_SOURCE="$TERMINAL_NOTICE_SOURCE"
+        release_job_control_lock
+        return 1
+    fi
+
     finalize_pending_task_creation_locked "$job_dir"
 
     if ! repair_pending_ownership_locked "$job_dir"; then
@@ -110,6 +117,9 @@ if [ -n "$JOB_ID" ]; then
 
     status="$(cat "$JOBS_DIR/$JOB_ID/status" 2>/dev/null || echo "unknown")"
     [ "$status" = "pending" ] || die "cannot claim job '$JOB_ID' from status '$status' (expected: pending)"
+    if [ -n "$CLAIM_WAITING_SOURCE" ]; then
+        die "cannot claim job '$JOB_ID': waiting for source job '$CLAIM_WAITING_SOURCE' to become terminal"
+    fi
     [ ! -d "$JOBS_DIR/$JOB_ID/lock" ] || die "cannot claim job '$JOB_ID': lock directory already exists"
     die "could not claim job '$JOB_ID' due to a concurrent claim race"
 fi

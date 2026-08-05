@@ -22,6 +22,6 @@ exact path/line evidence, reachability, impact, counterevidence, provisional
 severity, confidence, safe reasoning, remediation, and open questions. A
 suspicious pattern without demonstrated reachability is not confirmed.
 
-Write `jobs/<job-id>/workspace/inspection.md`. Notify planner with its path,
-scope, candidate IDs, rejected hypotheses, gaps, and command record. Planner
-owns the challenger handoff.
+Write `jobs/<job-id>/workspace/inspection.md`. Put its path, scope, candidate
+IDs, rejected hypotheses, gaps, and command record in the task comment. The
+terminal transition notifies planner, which owns the challenger handoff.

@@ -22,7 +22,7 @@ authoritative.
    attack surfaces and record every expected job ID.
 3. Wait for all expected inspections before creating one `role=challenger` job
    naming every candidate-finding artifact.
-4. Route unresolved evidence gaps to narrowly scoped inspector jobs.
+4. Route unresolved evidence gaps to narrowly scoped `role=inspector` jobs.
 5. Create one `role=synthesizer` job only after findings have been challenged.
 
 Two inspectors are available for genuinely separate scopes; do not duplicate

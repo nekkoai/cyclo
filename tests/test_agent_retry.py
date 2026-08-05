@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import runpy
 import shutil
@@ -9,6 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -16,6 +18,30 @@ from cyclo.team.resources import packaged_agentws_runtime
 
 
 RETRYABLE_AGENT_EXIT = 75
+
+
+def test_standard_pi_agent_uses_print_json_mode() -> None:
+    agent_script = packaged_agentws_runtime() / "tools" / "agent"
+    build_command = runpy.run_path(str(agent_script))["build_command"]
+
+    command = build_command(
+        "pi",
+        "provider/model",
+        Path("/agentws/agents/planner"),
+        "Do the job.",
+    )
+
+    assert command == [
+        "pi",
+        "-p",
+        "--mode",
+        "json",
+        "--model",
+        "provider/model",
+        "--session-dir",
+        "/agentws/agents/planner/pi-session",
+        "Do the job.",
+    ]
 
 
 def test_agent_prompt_treats_workspace_as_an_internal_project_root() -> None:
@@ -316,7 +342,12 @@ def test_python_agent_worker_rejects_hidden_agent_id(tmp_path: Path) -> None:
     environment = agent_environment(tmp_path, workspace, "#!/bin/sh\nexit 0\n")
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", ".hidden"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            ".hidden",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -380,6 +411,10 @@ def create_role_job(
         text=True,
     )
     return runtime / "jobs" / job_id
+
+
+def planner_notification_module(runtime: Path) -> dict[str, Any]:
+    return runpy.run_path(str(runtime / "tools" / "planner_notification.py"))
 
 
 def agent_environment(
@@ -453,7 +488,12 @@ printf '%s\n' "$count" > "$FAKE_PI_COUNT"
 exit 23
 """,
     )
-    command = [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"]
+    command = [
+        str(runtime / "tools" / "agent"),
+        "--pi",
+        "planner",
+        "planner-1",
+    ]
 
     first = subprocess.run(
         command,
@@ -506,7 +546,12 @@ def test_stored_retry_exhaustion_fails_job_without_launching_engine(
     )
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -542,7 +587,12 @@ def test_terminal_engine_crash_notifies_planner_before_failing_job(
     jobs_before = sorted(path.name for path in (runtime / "jobs").iterdir())
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "implementer", "impl-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "implementer",
+            "impl-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -561,13 +611,14 @@ def test_terminal_engine_crash_notifies_planner_before_failing_job(
     spec = (notification / "spec.md").read_text(encoding="utf-8")
     assert "# Notify Planner: uart-implementation" in spec
     assert "## Source Job\nuart-implementation" in spec
-    assert "did not finish the source job" in spec
+    assert "## Source Role\nimplementer" in spec
+    assert "source job terminal transition" in spec
     source_log = (job / "log.md").read_text(encoding="utf-8")
     assert "process exited with status 23" in source_log
     assert "retry safety budget exhausted (1/1)" in source_log
 
 
-def test_existing_engine_failure_notification_is_reused_after_crash_boundary(
+def test_existing_planner_notification_is_reused_after_crash_boundary(
     tmp_path: Path,
 ) -> None:
     runtime, workspace = copy_runtime(tmp_path)
@@ -579,11 +630,14 @@ def test_existing_engine_failure_notification_is_reused_after_crash_boundary(
         role="implementer",
     )
     agent_module = runpy.run_path(str(runtime / "tools" / "agent"))
+    notification_module = planner_notification_module(runtime)
     (job / ".agent-attempts").write_text("7\n", encoding="utf-8")
     subprocess.run(
         [
             str(runtime / "bin" / "job-claim"),
             job.name,
+            "-r",
+            "implementer",
             "--agent-id",
             "impl-before-crash",
         ],
@@ -591,19 +645,38 @@ def test_existing_engine_failure_notification_is_reused_after_crash_boundary(
         capture_output=True,
         text=True,
     )
-    assert agent_module["ensure_automatic_failure_notification"](
+    assert agent_module["ensure_planner_visibility"](
         runtime,
         job,
         job.name,
     )
-    notification_id = agent_module["automatic_failure_notification_id"](
+    notification_id = notification_module["planner_notification_id"](
         "crash-boundary",
         job.name,
     )
     notification = runtime / "jobs" / notification_id
     original_spec = (notification / "spec.md").read_text(encoding="utf-8")
     assert (job / "status").read_text(encoding="utf-8").strip() == "claimed"
-    assert "source may still be claimed briefly" in original_spec
+    assert "queue keeps it unclaimable" in original_spec
+    assert (
+        notification / ".terminal-notice-source"
+    ).read_text(encoding="utf-8").strip() == job.name
+    premature_claim = subprocess.run(
+        [
+            str(runtime / "bin" / "job-claim"),
+            notification_id,
+            "-r",
+            "planner",
+            "--agent-id",
+            "planner-before-terminal",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert premature_claim.returncode != 0
+    assert "waiting for source job" in premature_claim.stderr
+    assert (notification / "status").read_text(encoding="utf-8").strip() == "pending"
     subprocess.run(
         [str(runtime / "bin" / "job-reset-orphans")],
         check=True,
@@ -620,7 +693,12 @@ def test_existing_engine_failure_notification_is_reused_after_crash_boundary(
     jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "implementer", "impl-after-crash"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "implementer",
+            "impl-after-crash",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -633,9 +711,23 @@ def test_existing_engine_failure_notification_is_reused_after_crash_boundary(
     assert not (tmp_path / "pi-started").exists()
     assert {path.name for path in (runtime / "jobs").iterdir()} == jobs_before
     assert (notification / "spec.md").read_text(encoding="utf-8") == original_spec
+    terminal_claim = subprocess.run(
+        [
+            str(runtime / "bin" / "job-claim"),
+            notification_id,
+            "-r",
+            "planner",
+            "--agent-id",
+            "planner-after-terminal",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert terminal_claim.returncode == 0, terminal_claim.stderr
 
 
-def test_mismatched_engine_failure_notification_collision_is_container_fatal(
+def test_mismatched_planner_notification_collision_is_container_fatal(
     tmp_path: Path,
 ) -> None:
     runtime, workspace = copy_runtime(tmp_path)
@@ -646,19 +738,19 @@ def test_mismatched_engine_failure_notification_collision_is_container_fatal(
         job_id="notice-collision-work",
         role="implementer",
     )
-    agent_module = runpy.run_path(str(runtime / "tools" / "agent"))
-    notification_id = agent_module["automatic_failure_notification_id"](
+    notification_module = planner_notification_module(runtime)
+    notification_id = notification_module["planner_notification_id"](
         "notice-collision",
         job.name,
     )
     foreign_spec = tmp_path / "foreign-notification.md"
-    canonical_spec = agent_module["automatic_failure_notification_spec"](
+    canonical_spec = notification_module["planner_notification_spec"](
         "notice-collision",
         job.name,
         "implementer",
     )
     foreign_spec.write_text(
-        canonical_spec.replace("bounded", "unbounded", 1),
+        canonical_spec.replace("terminal transition", "terminal replacement", 1),
         encoding="utf-8",
     )
     subprocess.run(
@@ -684,7 +776,12 @@ def test_mismatched_engine_failure_notification_collision_is_container_fatal(
     jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "implementer", "impl-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "implementer",
+            "impl-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -703,12 +800,12 @@ def test_notification_metadata_checks_reject_fifo_without_blocking(
     tmp_path: Path,
 ) -> None:
     runtime, _workspace = copy_runtime(tmp_path)
-    agent_module = runpy.run_path(str(runtime / "tools" / "agent"))
+    notification_module = planner_notification_module(runtime)
     fifo = tmp_path / "metadata-fifo"
     os.mkfifo(fifo)
 
-    assert agent_module["_read_regular_text"](fifo, 1024) is None
-    assert agent_module["_is_regular_file"](fifo) is False
+    assert notification_module["_read_regular_text"](fifo, 1024) is None
+    assert notification_module["_is_regular_file"](fifo) is False
 
 
 def test_planner_notification_creation_failure_leaves_source_claimed(
@@ -732,7 +829,12 @@ def test_planner_notification_creation_failure_leaves_source_claimed(
     jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "implementer", "impl-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "implementer",
+            "impl-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -747,7 +849,7 @@ def test_planner_notification_creation_failure_leaves_source_claimed(
     assert {path.name for path in (runtime / "jobs").iterdir()} == jobs_before
 
 
-def test_public_nonplanner_job_fail_remains_terminal_when_engine_exits(
+def test_public_nonplanner_job_fail_publishes_planner_notice(
     tmp_path: Path,
 ) -> None:
     runtime, workspace = copy_runtime(tmp_path)
@@ -774,10 +876,15 @@ exit 23
             "FAKE_JOB_ID": job.name,
         }
     )
-    jobs_before = sorted(path.name for path in (runtime / "jobs").iterdir())
+    jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "implementer", "impl-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "implementer",
+            "impl-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -790,7 +897,18 @@ exit 23
     assert "private direct failure detail" in (job / "log.md").read_text(
         encoding="utf-8"
     )
-    assert sorted(path.name for path in (runtime / "jobs").iterdir()) == jobs_before
+    created = {
+        path.name for path in (runtime / "jobs").iterdir()
+    } - jobs_before
+    assert len(created) == 1
+    notification = runtime / "jobs" / created.pop()
+    assert (notification / "role").read_text(encoding="utf-8").strip() == "planner"
+    assert (notification / "task-id").read_text(encoding="utf-8").strip() == (
+        "public-fail"
+    )
+    spec = (notification / "spec.md").read_text(encoding="utf-8")
+    assert "# Notify Planner: public-fail-work" in spec
+    assert "## Source Job\npublic-fail-work" in spec
 
 
 def test_public_planner_job_fail_remains_terminal_when_engine_exits(
@@ -817,7 +935,12 @@ exit 23
     jobs_before = sorted(path.name for path in (runtime / "jobs").iterdir())
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -876,7 +999,12 @@ def test_job_release_failure_fails_owned_job_closed(
     jobs_before = sorted(path.name for path in (runtime / "jobs").iterdir())
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", role, agent_name],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            role,
+            agent_name,
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -886,7 +1014,33 @@ def test_job_release_failure_fails_owned_job_closed(
 
     assert result.returncode == 70
     assert (job / "status").read_text(encoding="utf-8").strip() == "failed"
-    assert sorted(path.name for path in (runtime / "jobs").iterdir()) == jobs_before
+    jobs_after = {path.name for path in (runtime / "jobs").iterdir()}
+    created = jobs_after - set(jobs_before)
+    if role == "planner":
+        assert not created
+    else:
+        assert len(created) == 1
+        notification = runtime / "jobs" / created.pop()
+        assert (notification / "role").read_text(encoding="utf-8").strip() == (
+            "planner"
+        )
+        assert (
+            notification / ".terminal-notice-source"
+        ).read_text(encoding="utf-8").strip() == job.name
+        claimed = subprocess.run(
+            [
+                str(runtime / "bin" / "job-claim"),
+                notification.name,
+                "-r",
+                "planner",
+                "--agent-id",
+                "planner-after-fallback",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert claimed.returncode == 0, claimed.stderr
 
 
 def test_signal_shutdown_releases_job_without_consuming_attempt(tmp_path: Path) -> None:
@@ -902,7 +1056,12 @@ exec sleep 30
 """,
     )
     process = subprocess.Popen(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         stdout=subprocess.PIPE,
@@ -954,7 +1113,12 @@ os._exit(23)
 
     started = time.monotonic()
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -988,7 +1152,12 @@ exit 23
     environment["FAKE_PI_CHILD"] = str(child_file)
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -1017,7 +1186,12 @@ def test_prelaunch_failure_still_settles_claimed_job(tmp_path: Path) -> None:
     )
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -1044,7 +1218,12 @@ def test_transition_failure_fails_closed_and_returns_fatal_status(
     )
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -1075,6 +1254,8 @@ def test_fallback_rechecks_ownership_before_failing_job(
         [
             str(runtime / "bin" / "job-claim"),
             job.name,
+            "-r",
+            "implementer",
             "--agent-id",
             "impl-1",
         ],
@@ -1172,7 +1353,9 @@ def supervisor_environment(
     protocol = team_root / "AGENTS.md"
     protocol.write_text("Use the queue.\n", encoding="utf-8")
     roster = team_root / "team"
-    roster.write_text("planner-1 planner pi test/model\n", encoding="utf-8")
+    roster.write_text(
+        "planner-1 planner pi test/model\n", encoding="utf-8"
+    )
     environment = os.environ.copy()
     environment.update(
         {

@@ -21,5 +21,6 @@ planner of the blocker.
 
 On success, create one `role=judge` job naming the base commit, worktree, work
 branch, exact candidate commit, pre-fix evidence, regression test, changed
-files, all verification results, and checks the judge must repeat. Also create
-the required planner notification. Do not create an integration job.
+files, all verification results, and checks the judge must repeat. The terminal
+transition publishes the required planner notification. Do not create an
+integration job.

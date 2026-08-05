@@ -49,6 +49,10 @@ has_pending_job() {
         fi
 
         acquire_job_control_lock "$job_dir"
+        if ! terminal_notice_ready_locked "$job_dir"; then
+            release_job_control_lock
+            continue
+        fi
         finalize_pending_task_creation_locked "$job_dir"
         if ! repair_pending_ownership_locked "$job_dir"; then
             release_job_control_lock

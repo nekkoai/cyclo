@@ -63,12 +63,13 @@ lifetime lock, so a live agent cannot invoke the all-active reset.
 
 Each claimed job receives at most three model-process attempts by default. If a
 process exits while it still owns the job, the per-agent worker releases it
-only while attempts remain. On the final automatic failure of a non-planner
-job, it first creates or verifies one deterministic planner recovery job for
-the same task, then marks the source job failed. Repeating settlement reuses
-that job, and a planner failure never creates another planner job. This does
-not change explicit agent-driven `job-fail`: the agent remains responsible for
-the protocol-required follow-up work in that case.
+only while attempts remain. Every `job-done` or `job-fail` outside role
+`planner`, whether agent-driven or automatic, first creates or verifies one
+deterministic planner job for the same task and source. Repeating settlement
+reuses that job, and a planner transition never creates another planner job.
+Notification is published before terminal status but remains mechanically
+unclaimable until the source is `done` or `failed`. If it cannot be published,
+the source stays nonterminal instead of disappearing from the workflow.
 AgentWS does not probe model services or infer why an engine exited. An engine
 failure follows this same bounded settlement path; only an operator-requested
 shutdown restores the previous attempt count.
@@ -95,13 +96,15 @@ Team file format:
 # <name> <role> <agent> [model]
 planner-1 planner pi
 implementer-1 implementer codex
+implementer-2 implementer pi model-id
 reviewer-1 reviewer claude sonnet
 judge-1 judge pi
 ```
 
-Role names are project-defined. Add `roles/<role>.md`, then use that role in a
-team entry and in jobs. The runner and web pipeline do not require roles to be
-registered in code.
+Role names are project-defined. A job stores a role; an agent may claim only the
+role in its team entry, and `roles/<role>.md` defines how that agent handles the
+work. Multiple agents may share a role. Task coordination authority belongs to
+role `planner`.
 
 Use `pi-interactive` for a Pi agent that keeps the normal AgentWS role and job
 protocol while exposing Pi's RPC input FIFO to external tooling:
@@ -111,14 +114,15 @@ planner-1 planner pi-interactive
 ```
 
 The built-in `console` assistant is different: `agentws/tools/agentws` can start
-it as agent `console` with role `console`. It is not listed in the team file and
-has no queued job. Cyclo starts its AgentWS viewer with `--no-console`.
+it as agent `console` with role `console`. The console is not listed in the team
+file and never waits for or claims a queued job. Cyclo starts its AgentWS viewer
+with `--no-console`.
 
 ## `agent`
 
 `agent` starts one named agent, claims one pending job for that agent's role,
-records the job in `agents/<agent-name>/current-job`, and renders CLI event
-output to `agents/<agent-name>/transcript.log`.
+records the job in `agents/<agent-name>/current-job`, and renders CLI
+event output to `agents/<agent-name>/transcript.log`.
 By default it also prints the rendered transcript to stdout. Use `--headless`
 to write files only.
 
@@ -151,17 +155,26 @@ starts and completes the claimed job according to
 `AGENTS.md`. The rendered transcript is stored only in
 `agents/<agent-name>/transcript.log`; the job log points to that file.
 
+Pi runs in its ordinary print/JSON mode. The team image loads the pinned
+`pi-safe-compact` extension, which keeps successful automatic compaction and
+output-length continuation inside Pi. AgentWS only observes the process and the
+job's durable state; it does not implement Pi's context loop. Native endpoints
+surface typed pre-stream exhaustion, and the terminal team Provider adapter
+waits and replays it. Neither behavior belongs to AgentWS or the opaque
+Provider transport itself.
+
 ## `agent-pi-interactive`
 
 `agent-pi-interactive` is launched by `run_agentws` for team entries that use
 `pi-interactive`, and by `agentws` itself for the built-in console assistant.
-It starts `pi --mode rpc`, writes the rendered transcript to
-`agents/<agent-name>/transcript.log`, and exposes a local `input.fifo` for
-external RPC tooling. The AgentWS web viewer displays transcripts and errors
-but never sends or steers agent input. For a queued agent, Pi's
-`agent_settled` event ends the current attempt; AgentWS then reads the durable
-job state and either accepts its completion or applies the normal bounded-retry
-settlement. The queue-less console remains alive for later input.
+It uses a local Pi RPC client, writes the rendered transcript to
+`agents/<agent-name>/transcript.log`, and exposes a local
+`input.fifo` for external RPC tooling. The AgentWS web viewer displays
+transcripts and errors but never sends or steers agent input. For a queued
+agent, Pi's `agent_settled` event ends the current attempt after Pi and its
+extensions have exhausted queued work. The queue-less console remains alive for
+later input. A queued interactive agent accepts FIFO steering and follow-ups
+only while its assigned turn is active.
 
 ## Task Commands
 
@@ -186,5 +199,15 @@ not turn a multi-file update into a crash transaction.
 ## `bin/agent-new`
 
 `bin/agent-new <agent-id> <role>` creates a named agent directory when needed
-and prints its path. If the agent already has a claimed or running job, it exits
-with an error instead.
+and prints its path. The role is both its queue route and prompt name. If the
+agent already has a claimed or running job, it exits with an error instead.
+
+Create a role-scoped job with a complete specification:
+
+```sh
+agentws/bin/job-create <job-id> --role <role> --task-id <task-id> <spec-file>
+```
+
+The worker supervisor passes the roster role to `job-wait --role <role>` and
+`job-claim [job-id] --role <role> --agent-id <agent-id>`. The claim records the
+named agent as owner only after selecting a pending job with that role.

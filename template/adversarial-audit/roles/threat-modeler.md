@@ -18,5 +18,5 @@ contact external services, or follow symlinks outside the project root.
 
 Write `jobs/<job-id>/workspace/threat-model.md` with the scope, boundary map,
 hypotheses, inspector slices, blind spots, and read-only evidence commands.
-Create the required planner notification naming the artifact; let planner
-create inspection jobs.
+Name the artifact in the task comment; the terminal transition notifies planner,
+which creates inspection jobs.

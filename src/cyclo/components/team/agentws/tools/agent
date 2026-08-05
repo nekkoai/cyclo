@@ -7,7 +7,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import fcntl
-import hashlib
 import json
 import os
 import re
@@ -16,7 +15,6 @@ import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
@@ -24,6 +22,13 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from planner_notification import ensure_planner_notification
 
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -340,6 +345,7 @@ def run_job_transition(
 
 
 def force_fail_owned_job(
+    root: Path,
     job_dir: Path,
     job_id: str,
     agent_name: str,
@@ -358,6 +364,9 @@ def force_fail_owned_job(
                     f"warning: cannot fail job {job_id} safely: ownership was lost",
                     file=sys.stderr,
                 )
+                return False
+
+            if not ensure_planner_visibility(root, job_dir, job_id):
                 return False
 
             append_job_log(job_dir, "Failed by agent safety fallback", message)
@@ -394,237 +403,28 @@ def transition_or_fail_closed(
         "closed to prevent an unbounded retry or a stranded owned job."
     )
     return (
-        force_fail_owned_job(job_dir, job_id, agent_name, fallback_message),
+        force_fail_owned_job(
+            root,
+            job_dir,
+            job_id,
+            agent_name,
+            fallback_message,
+        ),
         True,
     )
 
 
-def _read_regular_text(path: Path, maximum: int) -> str | None:
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            return None
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            raw = stream.read(maximum + 1)
-    except OSError:
-        return None
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    if len(raw) > maximum:
-        return None
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-
-def _is_regular_file(path: Path) -> bool:
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
-        return stat.S_ISREG(os.fstat(descriptor).st_mode)
-    except OSError:
-        return False
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def automatic_failure_notification_id(task_id: str, job_id: str) -> str:
-    digest = hashlib.sha256(f"{task_id}\0{job_id}".encode()).hexdigest()[:20]
-    stem = job_id[:40].rstrip("._-")
-    return f"{stem}-engine-failure-{digest}"
-
-
-def automatic_failure_notification_spec(
-    task_id: str,
-    job_id: str,
-    source_role: str,
-) -> str:
-    return f"""# Notify Planner: {job_id}
-
-## Task
-{task_id}
-
-## Source Job
-{job_id}
-
-## Source Role
-{source_role}
-
-## Event
-terminal engine failure
-
-## Reason
-The model engine did not finish the source job within AgentWS's bounded
-automatic retry lifecycle.
-
-## Settlement
-AgentWS publishes this notice before terminally failing the source job so a
-worker crash cannot lose the alert. The source may still be claimed briefly;
-restart recovery reuses this exact notice and completes settlement. The source
-job's log.md will contain the precise terminal error once settlement completes.
-
-## Follow-Up Jobs Created
-none
-
-## Documentation Requests Created
-none
-
-## Evidence
-After settlement, read jobs/{job_id}/log.md for the exact terminal engine error
-and retry history.
-
-## When Done
-Record the failure on the task, decide how the task should recover, and mark
-this planner notification done.
-"""
-
-
-def automatic_failure_notification_matches(
-    notification_dir: Path,
-    *,
-    task_id: str,
-    expected_spec: str,
-) -> bool:
-    try:
-        directory_info = notification_dir.lstat()
-        workspace_info = (notification_dir / "workspace").lstat()
-    except OSError:
-        return False
-    if not stat.S_ISDIR(directory_info.st_mode) or not stat.S_ISDIR(
-        workspace_info.st_mode
-    ):
-        return False
-    role = _read_regular_text(notification_dir / "role", 1024)
-    task = _read_regular_text(notification_dir / "task-id", 1024)
-    status = _read_regular_text(notification_dir / "status", 1024)
-    spec = _read_regular_text(notification_dir / "spec.md", 256 * 1024)
-    return (
-        role is not None
-        and role.strip() == "planner"
-        and task is not None
-        and task.strip() == task_id
-        and status is not None
-        and status.strip() in {"pending", "claimed", "running", "done", "failed"}
-        and spec is not None
-        and spec == expected_spec
-        and _is_regular_file(notification_dir / "log.md")
-        and _is_regular_file(notification_dir / ".control.lock")
-    )
-
-
-def ensure_automatic_failure_notification(
+def ensure_planner_visibility(
     root: Path,
     job_dir: Path,
     job_id: str,
 ) -> bool:
-    source_role_text = _read_regular_text(job_dir / "role", 1024)
-    if source_role_text is None:
-        print(
-            f"warning: cannot notify planner for {job_id}: invalid source role",
-            file=sys.stderr,
-        )
-        return False
-    source_role = source_role_text.strip()
-    if source_role == "planner":
-        return True
-
-    task_text = _read_regular_text(job_dir / "task-id", 1024)
-    task_id = task_text.strip() if task_text is not None else ""
-    if not NAME_RE.fullmatch(source_role) or not NAME_RE.fullmatch(task_id):
-        print(
-            f"warning: cannot notify planner for {job_id}: invalid role or task ID",
-            file=sys.stderr,
-        )
-        return False
-
-    notification_id = automatic_failure_notification_id(task_id, job_id)
-    notification_dir = root / "jobs" / notification_id
-    spec = automatic_failure_notification_spec(task_id, job_id, source_role)
-    if notification_dir.exists() or notification_dir.is_symlink():
-        if automatic_failure_notification_matches(
-            notification_dir,
-            task_id=task_id,
-            expected_spec=spec,
-        ):
-            return True
-        print(
-            f"warning: planner notification collision for {job_id}: "
-            f"{notification_id}",
-            file=sys.stderr,
-        )
-        return False
-
-    descriptor = -1
-    temporary: Path | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix="agentws-engine-failure-",
-            suffix=".md",
-        )
-        temporary = Path(temporary_name)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            descriptor = -1
-            stream.write(spec)
-        process = subprocess.run(
-            [
-                str(root / "bin" / "job-create"),
-                notification_id,
-                "-r",
-                "planner",
-                "-t",
-                task_id,
-                str(temporary),
-            ],
-            cwd=root,
-            text=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=5,
-        )
-        if automatic_failure_notification_matches(
-            notification_dir,
-            task_id=task_id,
-            expected_spec=spec,
-        ):
-            return True
-        detail = (process.stderr or "").strip() or f"exit status {process.returncode}"
-        print(
-            f"warning: planner notification creation failed for {job_id}: {detail}",
-            file=sys.stderr,
-        )
+        ensure_planner_notification(root, job_dir, job_id)
+    except RuntimeError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
         return False
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(
-            f"warning: planner notification creation failed for {job_id}: {exc}",
-            file=sys.stderr,
-        )
-        return False
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if temporary is not None:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+    return True
 
 
 def settle_stored_retry_budget_exhaustion(
@@ -641,12 +441,6 @@ def settle_stored_retry_budget_exhaustion(
         f"Agent retry safety budget exhausted after {maximum} unsuccessful "
         "process attempts; refusing another model launch."
     )
-    if not ensure_automatic_failure_notification(
-        root,
-        job_dir,
-        job_id,
-    ):
-        return FATAL_AGENT_EXIT
     settled, used_fallback = transition_or_fail_closed(
         root,
         job_dir,
@@ -710,12 +504,6 @@ def settle_job_after_process(
                 f"finishing the job; retry safety budget exhausted "
                 f"({attempt}/{maximum})."
             )
-            if not ensure_automatic_failure_notification(
-                root,
-                job_dir,
-                job_id,
-            ):
-                return FATAL_AGENT_EXIT
             settled, used_fallback = transition_or_fail_closed(
                 root,
                 job_dir,
@@ -739,7 +527,7 @@ def settle_job_after_process(
         return RETRYABLE_AGENT_EXIT
 
     # A deliberate job-release leaves the job pending. Preserve its attempt
-    # counter and make the supervisor back off before this role can reclaim it.
+    # counter and make the supervisor back off before this worker can reclaim it.
     if status == "pending":
         return RETRYABLE_AGENT_EXIT
 
@@ -1383,7 +1171,12 @@ def main() -> int:
         "AGENTWS_MAX_JOB_ATTEMPTS", DEFAULT_MAX_JOB_ATTEMPTS
     )
 
-    agent_dir_out = run_bin(root, "agent-new", args.agent_name, args.role).stdout.strip()
+    agent_dir_out = run_bin(
+        root,
+        "agent-new",
+        args.agent_name,
+        args.role,
+    ).stdout.strip()
     if not agent_dir_out:
         die("agent-new returned no agent directory")
     agent_dir = Path(agent_dir_out)
@@ -1423,7 +1216,13 @@ def main() -> int:
             signal.signal(signum, request_shutdown)
 
         while True:
-            run_bin(root, "job-wait", "-r", args.role, capture=True)
+            run_bin(
+                root,
+                "job-wait",
+                "-r",
+                args.role,
+                capture=True,
+            )
             defer_shutdown = True
             try:
                 claim = run_bin(

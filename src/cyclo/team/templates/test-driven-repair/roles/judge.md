@@ -19,9 +19,10 @@ Record commands, results, findings, and exactly one verdict:
   base branch and expected base commit, integration action, and post-integration
   verification;
 - `revise`: create one `role=implementer` job with exact changes and checks;
-- `block`: create a planner coordination job with concrete evidence.
+- `block`: create a `role=planner` coordination job with concrete evidence.
 
-Always create the required planner notification. Never accept solely on the
-implementer's report. Before a `revise` handoff, count prior revision verdicts;
+The terminal transition publishes the required planner notification. Never
+accept solely on the implementer's report. Before a `revise` handoff, count
+prior revision verdicts;
 after three unsuccessful rounds, notify planner with the remaining failure
 instead of creating another implementer job.

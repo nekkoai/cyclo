@@ -14,15 +14,15 @@ continue without reading every agent transcript. Record what is known, what is
 still unknown, which jobs exist, which artifact or branch is authoritative, and
 the next expected decision.
 
-Only the planner may decide that a task is complete. When complete, write a
-result file and record it with:
+Only the planner role may decide that a task is complete. When complete, write
+a result file and record it with:
 
 ```text
 bin/task-result <task-id> <result-file>
 ```
 
-Only the planner may create new tasks. If a planner job is an intake or split
-request, create the task first, then create jobs linked to that new task.
+Only the planner role may create new tasks. If the current job is an intake or
+split request, create the task first, then create jobs linked to that new task.
 
 ## Spec Completion Rule
 
@@ -53,8 +53,8 @@ For an initial "Plan for task" job:
    current evidence.
 4. Include the task workspace details and verification commands in every
    implementer, reviewer, judge, and integration job spec.
-5. Create those jobs with `bin/job-create <job-id> -r <role> -t <task-id>
-   <spec-file>`.
+5. Create those jobs with `bin/job-create <job-id> --role <role> --task-id
+   <task-id> <spec-file>`.
 6. Record the plan and created job IDs with `bin/task-comment`.
 
 ## Notification Jobs

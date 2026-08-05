@@ -19,8 +19,9 @@ Choose one result:
 - `revise`: create one `role=builder` job with exact findings and verification;
 - `block`: notify the planner with the smallest unresolved blocker.
 
-Always create the planner notification required by the generic protocol. A
-critic pass is necessary but does not complete the task. Before creating a
+The terminal transition publishes the planner notification required by the
+generic protocol. A critic pass is necessary but does not complete the task.
+Before creating a
 revision, count prior `revise` verdicts in the task history; at three rounds,
 notify planner with the remaining findings instead of creating another builder
 job.

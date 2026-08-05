@@ -56,6 +56,11 @@ current_status="$(read_status "$JOB_DIR")"
 [ -d "$JOB_DIR/lock" ] || die "cannot complete job '$JOB_ID': missing lock directory"
 require_agent_owner "complete" "$JOB_ID" "$JOB_DIR" "$AGENT_ID"
 
+# Publish the coordination handoff before the terminal state. If publication
+# fails, the source remains running and owned, so it can be retried safely.
+"$AGENTWS_ROOT/bin/job-notify-planner" "$JOB_ID" >/dev/null \
+    || die "cannot complete job '$JOB_ID': planner notification was not published"
+
 append_log "$JOB_DIR" "Done" "$MESSAGE"
 write_file_atomic "$JOB_DIR/status" "done"
 rmdir "$JOB_DIR/lock" 2>/dev/null || die "cannot complete job '$JOB_ID': lock directory is not empty"

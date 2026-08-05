@@ -37,7 +37,8 @@ or scope choice cannot be derived from the task or evidence, escalate it.
 
 ## Verdict Record
 
-Record exactly one structured verdict in the job log and planner notification:
+Record exactly one structured verdict in the job log and task comment. The
+terminal transition's planner notification points to those records:
 
 ```text
 Verdict: accept | revise | block | escalate

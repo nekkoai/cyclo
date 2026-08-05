@@ -20,5 +20,5 @@ confidence, and the next decisive check for each disposition. Do not reject a
 claim merely because exploitation was unsafe to attempt.
 
 Write `jobs/<job-id>/workspace/challenge.md`, listing newly discovered
-candidates separately. Create the required planner notification and let planner
-decide between more inspection and synthesis.
+candidates separately. The terminal transition notifies planner, which decides
+between more inspection and synthesis.

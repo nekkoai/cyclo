@@ -155,6 +155,51 @@ release_job_control_lock() {
     exec 8>&-
 }
 
+# A deterministic terminal notice is published before its source becomes
+# terminal, but it must not run before the terminal status is visible. Source
+# terminal states are monotonic and status writes are atomic, so reading the
+# source status while holding the notice lock is sufficient to open this gate.
+terminal_notice_ready_locked() {
+    _notice_dir="$1"
+    _notice_marker="$_notice_dir/.terminal-notice-source"
+    TERMINAL_NOTICE_SOURCE=""
+
+    if [ ! -e "$_notice_marker" ] && [ ! -L "$_notice_marker" ]; then
+        return 0
+    fi
+    [ -f "$_notice_marker" ] && [ ! -L "$_notice_marker" ] \
+        || die "terminal notice '$(basename "$_notice_dir")' has an invalid source marker"
+
+    TERMINAL_NOTICE_SOURCE="$(cat "$_notice_marker" 2>/dev/null || true)"
+    validate_job_id "$TERMINAL_NOTICE_SOURCE"
+    _notice_source_dir="$JOBS_DIR/$TERMINAL_NOTICE_SOURCE"
+    [ -d "$_notice_source_dir" ] && [ ! -L "$_notice_source_dir" ] \
+        || die "terminal notice '$(basename "$_notice_dir")' has no valid source job '$TERMINAL_NOTICE_SOURCE'"
+    for _notice_source_name in role task-id status; do
+        [ -f "$_notice_source_dir/$_notice_source_name" ] \
+            && [ ! -L "$_notice_source_dir/$_notice_source_name" ] \
+            || die "source job '$TERMINAL_NOTICE_SOURCE' has invalid $_notice_source_name"
+    done
+
+    _notice_role="$(cat "$_notice_dir/role" 2>/dev/null || true)"
+    _notice_task="$(cat "$_notice_dir/task-id" 2>/dev/null || true)"
+    _notice_source_role="$(cat "$_notice_source_dir/role" 2>/dev/null || true)"
+    _notice_source_task="$(cat "$_notice_source_dir/task-id" 2>/dev/null || true)"
+    [ "$_notice_role" = "planner" ] \
+        || die "terminal notice '$(basename "$_notice_dir")' does not have role planner"
+    [ "$_notice_source_role" != "planner" ] \
+        || die "terminal notice source '$TERMINAL_NOTICE_SOURCE' is a planner job"
+    [ "$_notice_task" = "$_notice_source_task" ] \
+        || die "terminal notice '$(basename "$_notice_dir")' and source '$TERMINAL_NOTICE_SOURCE' belong to different tasks"
+
+    _notice_source_status="$(read_status "$_notice_source_dir")"
+    case "$_notice_source_status" in
+        done|failed) return 0 ;;
+        pending|claimed|running) return 1 ;;
+        *) die "source job '$TERMINAL_NOTICE_SOURCE' has invalid status '$_notice_source_status'" ;;
+    esac
+}
+
 # Task comments, state, and results are shared by every role working on the
 # task. Keep one persistent inode per task and hold it across each complete
 # logical mutation so records and finalization cannot interleave.

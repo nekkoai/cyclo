@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+import runpy
 import shutil
 import signal
 import subprocess
@@ -108,6 +109,83 @@ def make_task(runtime: Path, root: Path, task_id: str = "shared-task") -> Path:
     return runtime / "tasks" / task_id
 
 
+def make_running_job(
+    runtime: Path,
+    root: Path,
+    *,
+    task_id: str,
+    job_id: str,
+    role: str,
+    agent_id: str,
+) -> Path:
+    if not (runtime / "tasks" / task_id).is_dir():
+        make_task(runtime, root, task_id)
+    spec = root / f"{job_id}-spec.md"
+    spec.write_text(f"# Work for {role}\n", encoding="utf-8")
+    created = subprocess.run(
+        [
+            str(runtime / "bin" / "job-create"),
+            job_id,
+            "-r",
+            role,
+            "-t",
+            task_id,
+            str(spec),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert created.returncode == 0, created.stderr
+    claimed = subprocess.run(
+        [
+            str(runtime / "bin" / "job-claim"),
+            job_id,
+            "-r",
+            role,
+            "--agent-id",
+            agent_id,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert claimed.returncode == 0, claimed.stderr
+    started = subprocess.run(
+        [
+            str(runtime / "bin" / "job-start"),
+            job_id,
+            "--agent-id",
+            agent_id,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert started.returncode == 0, started.stderr
+    return runtime / "jobs" / job_id
+
+
+def complete_job(
+    runtime: Path,
+    job_id: str,
+    agent_id: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            str(runtime / "bin" / "job-done"),
+            job_id,
+            "--agent-id",
+            agent_id,
+            "-m",
+            "test completion",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_task_and_job_ids_must_start_alphanumeric(tmp_path: Path) -> None:
     runtime = runtime_copy(tmp_path)
     spec = tmp_path / "spec.md"
@@ -134,6 +212,353 @@ def test_task_and_job_ids_must_start_alphanumeric(tmp_path: Path) -> None:
 
     assert not (runtime / "tasks" / ".hidden").exists()
     assert not (runtime / "jobs" / ".hidden").exists()
+
+
+def test_nonplanner_job_done_publishes_planner_notice_before_terminal_state(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_copy(tmp_path)
+    source = make_running_job(
+        runtime,
+        tmp_path,
+        task_id="handoff",
+        job_id="handoff-implementation",
+        role="implementer",
+        agent_id="implementer-1",
+    )
+    jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
+
+    result = complete_job(runtime, source.name, "implementer-1")
+
+    assert result.returncode == 0, result.stderr
+    assert (source / "status").read_text(encoding="utf-8").strip() == "done"
+    assert not (source / "lock").exists()
+    created = {
+        path.name for path in (runtime / "jobs").iterdir()
+    } - jobs_before
+    assert len(created) == 1
+    notification = runtime / "jobs" / created.pop()
+    assert (notification / "role").read_text(encoding="utf-8").strip() == "planner"
+    assert (notification / "task-id").read_text(encoding="utf-8").strip() == "handoff"
+    assert (notification / "status").read_text(encoding="utf-8").strip() == "pending"
+    spec = (notification / "spec.md").read_text(encoding="utf-8")
+    assert "# Notify Planner: handoff-implementation" in spec
+    assert "## Source Job\nhandoff-implementation" in spec
+    assert "## Source Role\nimplementer" in spec
+    assert "before the source job becomes terminal" in spec
+
+
+def test_planner_job_done_does_not_create_recursive_planner_notice(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_copy(tmp_path)
+    make_task(runtime, tmp_path, "planner-only")
+    source = runtime / "jobs" / "planner-only-plan"
+    claimed = subprocess.run(
+        [
+            str(runtime / "bin" / "job-claim"),
+            source.name,
+            "-r",
+            "planner",
+            "--agent-id",
+            "planner-1",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert claimed.returncode == 0, claimed.stderr
+    started = subprocess.run(
+        [
+            str(runtime / "bin" / "job-start"),
+            source.name,
+            "--agent-id",
+            "planner-1",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert started.returncode == 0, started.stderr
+    jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
+
+    result = complete_job(runtime, source.name, "planner-1")
+
+    assert result.returncode == 0, result.stderr
+    assert (source / "status").read_text(encoding="utf-8").strip() == "done"
+    assert {path.name for path in (runtime / "jobs").iterdir()} == jobs_before
+
+
+def test_job_done_reuses_prepublished_planner_notice(tmp_path: Path) -> None:
+    runtime = runtime_copy(tmp_path)
+    source = make_running_job(
+        runtime,
+        tmp_path,
+        task_id="prepublished",
+        job_id="prepublished-work",
+        role="implementer",
+        agent_id="implementer-1",
+    )
+    jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
+    command = [
+        str(runtime / "bin" / "job-notify-planner"),
+        source.name,
+    ]
+
+    first = subprocess.run(
+        command, text=True, capture_output=True, check=False
+    )
+    second = subprocess.run(
+        command, text=True, capture_output=True, check=False
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert first.stdout.strip() == second.stdout.strip()
+    notification_id = first.stdout.strip()
+    assert notification_id
+    jobs_after_publication = {
+        path.name for path in (runtime / "jobs").iterdir()
+    }
+    assert jobs_after_publication - jobs_before == {notification_id}
+    original_spec = (runtime / "jobs" / notification_id / "spec.md").read_text(
+        encoding="utf-8"
+    )
+
+    completed = complete_job(runtime, source.name, "implementer-1")
+
+    assert completed.returncode == 0, completed.stderr
+    assert (source / "status").read_text(encoding="utf-8").strip() == "done"
+    assert {
+        path.name for path in (runtime / "jobs").iterdir()
+    } == jobs_after_publication
+    assert (runtime / "jobs" / notification_id / "spec.md").read_text(
+        encoding="utf-8"
+    ) == original_spec
+
+
+def test_terminal_notice_waits_for_source_terminal_state(tmp_path: Path) -> None:
+    runtime = runtime_copy(tmp_path)
+    make_task(runtime, tmp_path, "gated")
+    plan = runtime / "jobs" / "gated-plan"
+    for command in (
+        [
+            str(runtime / "bin" / "job-claim"),
+            plan.name,
+            "-r",
+            "planner",
+            "--agent-id",
+            "planner-1",
+        ],
+        [
+            str(runtime / "bin" / "job-start"),
+            plan.name,
+            "--agent-id",
+            "planner-1",
+        ],
+        [
+            str(runtime / "bin" / "job-done"),
+            plan.name,
+            "--agent-id",
+            "planner-1",
+            "-m",
+            "initial planning complete",
+        ],
+    ):
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        assert result.returncode == 0, result.stderr
+
+    source = make_running_job(
+        runtime,
+        tmp_path,
+        task_id="gated",
+        job_id="gated-work",
+        role="implementer",
+        agent_id="implementer-1",
+    )
+    prepared = subprocess.run(
+        [str(runtime / "bin" / "job-notify-planner"), source.name],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    notification_id = prepared.stdout.strip()
+    notification = runtime / "jobs" / notification_id
+    assert (
+        notification / ".terminal-notice-source"
+    ).read_text(encoding="utf-8").strip() == source.name
+
+    premature = subprocess.run(
+        [
+            str(runtime / "bin" / "job-claim"),
+            notification_id,
+            "-r",
+            "planner",
+            "--agent-id",
+            "planner-2",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert premature.returncode != 0
+    assert "waiting for source job 'gated-work' to become terminal" in (
+        premature.stderr
+    )
+
+    environment = {**os.environ, "AGENTWS_WAIT_INTERVAL": "1"}
+    waiter = subprocess.Popen(
+        [str(runtime / "bin" / "job-wait"), "-r", "planner"],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(0.2)
+        assert waiter.poll() is None
+        completed = complete_job(runtime, source.name, "implementer-1")
+        assert completed.returncode == 0, completed.stderr
+        assert waiter.wait(timeout=3) == 0
+    finally:
+        if waiter.poll() is None:
+            waiter.terminate()
+            waiter.wait(timeout=3)
+
+    claimed = subprocess.run(
+        [
+            str(runtime / "bin" / "job-claim"),
+            notification_id,
+            "-r",
+            "planner",
+            "--agent-id",
+            "planner-2",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert claimed.returncode == 0, claimed.stderr
+
+
+def test_terminal_planner_notice_cannot_satisfy_source_settlement(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_copy(tmp_path)
+    source = make_running_job(
+        runtime,
+        tmp_path,
+        task_id="terminal-notice",
+        job_id="terminal-notice-work",
+        role="implementer",
+        agent_id="implementer-1",
+    )
+    prepared = subprocess.run(
+        [str(runtime / "bin" / "job-notify-planner"), source.name],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    notification = runtime / "jobs" / prepared.stdout.strip()
+    (notification / "status").write_text("failed\n", encoding="utf-8")
+
+    completed = complete_job(runtime, source.name, "implementer-1")
+
+    assert completed.returncode != 0
+    assert "planner notification collision" in completed.stderr
+    assert (source / "status").read_text(encoding="utf-8").strip() == "running"
+    assert (source / "agent-id").read_text(encoding="utf-8").strip() == (
+        "implementer-1"
+    )
+    assert (source / "lock").is_dir()
+
+
+def test_concurrent_terminal_notice_publication_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_copy(tmp_path)
+    source = make_running_job(
+        runtime,
+        tmp_path,
+        task_id="concurrent-notice",
+        job_id="concurrent-notice-work",
+        role="implementer",
+        agent_id="implementer-1",
+    )
+
+    def publish(_index: int) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(runtime / "bin" / "job-notify-planner"), source.name],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(publish, range(16)))
+
+    assert all(result.returncode == 0 for result in results), [
+        result.stderr for result in results if result.returncode != 0
+    ]
+    notification_ids = {result.stdout.strip() for result in results}
+    assert len(notification_ids) == 1
+    notification = runtime / "jobs" / notification_ids.pop()
+    assert (
+        notification / ".terminal-notice-source"
+    ).read_text(encoding="utf-8").strip() == source.name
+
+
+def test_job_done_notification_collision_leaves_source_running_and_owned(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_copy(tmp_path)
+    source = make_running_job(
+        runtime,
+        tmp_path,
+        task_id="collision",
+        job_id="collision-work",
+        role="implementer",
+        agent_id="implementer-1",
+    )
+    notification_module = runpy.run_path(
+        str(runtime / "tools" / "planner_notification.py")
+    )
+    notification_id = notification_module["planner_notification_id"](
+        "collision", source.name
+    )
+    foreign_spec = tmp_path / "foreign-notice.md"
+    foreign_spec.write_text("# Unrelated planner work\n", encoding="utf-8")
+    foreign = subprocess.run(
+        [
+            str(runtime / "bin" / "job-create"),
+            notification_id,
+            "-r",
+            "planner",
+            "-t",
+            "collision",
+            str(foreign_spec),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert foreign.returncode == 0, foreign.stderr
+    foreign_job = runtime / "jobs" / notification_id
+
+    result = complete_job(runtime, source.name, "implementer-1")
+
+    assert result.returncode != 0
+    assert "planner notification collision" in result.stderr
+    assert "planner notification was not published" in result.stderr
+    assert (source / "status").read_text(encoding="utf-8").strip() == "running"
+    assert (source / "agent-id").read_text(encoding="utf-8").strip() == "implementer-1"
+    assert (source / "lock").is_dir()
+    assert (foreign_job / "spec.md").read_text(encoding="utf-8") == (
+        foreign_spec.read_text(encoding="utf-8")
+    )
 
 
 def test_concurrent_task_comments_remain_complete_records(tmp_path: Path) -> None:
@@ -352,6 +777,8 @@ def test_crashed_job_create_is_invisible_and_same_id_can_be_retried(
         [
             str(runtime / "bin" / "job-claim"),
             abandoned[0].name,
+            "-r",
+            "worker",
             "--agent-id",
             "intruder",
         ],
@@ -391,7 +818,6 @@ def test_crashed_job_create_is_invisible_and_same_id_can_be_retried(
 def test_pending_ownership_is_repaired_by_wait_and_claim(tmp_path: Path) -> None:
     runtime = runtime_copy(tmp_path)
     job = make_job(runtime, "interrupted-release", "pending", owner="old-agent")
-
     waited = subprocess.run(
         [str(runtime / "bin" / "job-wait"), "-r", "worker"],
         text=True,
@@ -410,6 +836,8 @@ def test_pending_ownership_is_repaired_by_wait_and_claim(tmp_path: Path) -> None
         [
             str(runtime / "bin" / "job-claim"),
             "interrupted-release",
+            "-r",
+            "worker",
             "--agent-id",
             "new-agent",
         ],

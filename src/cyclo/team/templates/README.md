@@ -26,6 +26,10 @@ destination. Run `cyclo models` first, then replace the example model with an
 available `provider/model`. After creation, edit individual roster entries if
 agents should use different models or providers.
 
+Each roster line is `NAME ROLE ENGINE PROVIDER/MODEL`. Jobs route by `ROLE`,
+which also selects the corresponding `roles/ROLE.md` behavior. Several agents
+may share one role, and role `planner` owns task coordination.
+
 The templates omit `AGENTS.md` intentionally. Cyclo supplies its embedded
 generic filesystem task/job protocol, while each repository contains only its
 loop-specific roles. No external runtime installation or source checkout is

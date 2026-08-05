@@ -695,6 +695,8 @@ def test_foreign_job_collision_at_commit_boundary_is_never_deleted(
         [
             str(runtime / "bin" / "job-claim"),
             staged_job.name,
+            "-r",
+            "planner",
             "--agent-id",
             "intruder",
         ],

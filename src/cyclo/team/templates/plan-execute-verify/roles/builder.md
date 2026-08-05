@@ -17,7 +17,7 @@ AgentWS protocol remains authoritative.
 
 On success, create one `role=critic` job naming the exact artifact, original
 acceptance criteria, reflection, diff or commit, and verification evidence.
-Also create the planner notification required by the generic protocol.
+The terminal transition publishes the generic planner notification.
 
 If revision findings arrive, address each finding and explain how it was
 resolved. Do not weaken tests or acceptance criteria to obtain a pass.

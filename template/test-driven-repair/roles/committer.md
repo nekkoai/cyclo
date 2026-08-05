@@ -15,7 +15,8 @@ substitute another commit.
 3. Record the integrated commit, commands, outputs, and verification gaps.
 4. Only after successful verification, remove the task worktree and merged work
    branch when safe.
-5. Create the required planner notification and finish the job.
+5. Finish the job; the terminal transition publishes the required planner
+   notification.
 
 If integration or post-integration verification fails, preserve the evidence,
 do not rewrite history, and route the failure to planner.

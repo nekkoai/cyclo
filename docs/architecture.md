@@ -127,6 +127,17 @@ execution dependencies, not credentials or durable queue state. Cyclo builds
 each normal team image from this repository over its standard team-component
 image.
 
+The roster assigns each agent one role:
+
+```text
+NAME ROLE ENGINE PROVIDER/MODEL
+```
+
+AgentWS jobs carry `ROLE`; workers claim only jobs matching the role in their
+roster entry, and `roles/ROLE.md` supplies their behavioral instructions.
+Multiple agents may share one role. Task-creation authority and automatic
+planner-notification suppression belong to role `planner`.
+
 ### Project definition
 
 `project.cyclo` selects one or more teams and explicitly grants access to named
@@ -261,10 +272,10 @@ starts AgentWS workers and the viewer, and performs bounded child-process
 shutdown. DComp owns the lifetime of the containing team component.
 
 `cyclo task` does not start that component. It invokes an allowlisted AgentWS
-task tool in a one-shot instance of the same immutable team image. The tool has
+queue tool in a one-shot instance of the same immutable team image. The tool has
 no network, project, team, Pi, credential, or Docker authority; it receives only
 the task/job queue mounts required by that operation and starts directly as the
-mapped non-root identity. Task creation mounts a bounded,
+mapped non-root identity. Task and explicit job creation mount a bounded,
 link-resistant snapshot staged under Cyclo state, never the live project path.
 
 The host must not be root. The base image is built for the invoking user's

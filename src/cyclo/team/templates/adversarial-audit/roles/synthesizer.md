@@ -23,5 +23,5 @@ Write `jobs/<job-id>/workspace/adversarial-audit.md` containing:
 8. a read-only command log and confirmation that the target was not modified.
 
 A report with no confirmed findings must still explain coverage and limits.
-Create the required planner notification naming the report. Planner owns final
-acceptance and `task-result`.
+Name the report in the task comment; the terminal transition notifies planner.
+The planner role owns final acceptance and `task-result`.
