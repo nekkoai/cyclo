@@ -46,7 +46,7 @@ def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() ->
     nested_brace = f"{pi_path}/node_modules/brace-expansion"
     assert packages[pi_path]["hasShrinkwrap"] is True
     assert packages[nested_brace]["version"] == "5.0.7"
-    assert packages["node_modules/brace-expansion"]["version"] == "5.0.8"
+    assert packages["node_modules/brace-expansion"]["version"] == "5.0.9"
     for dependency in lock["packages"].values():
         resolved = dependency.get("resolved")
         if resolved:
