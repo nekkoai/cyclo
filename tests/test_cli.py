@@ -313,6 +313,7 @@ def test_stop_persists_stopped_intent_before_apply(
 
 def test_refresh_reconciles_provider_system_before_replacement_teams(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     events: list[str] = []
     stale = SimpleNamespace(id="demo", intent="running")
@@ -366,6 +367,19 @@ def test_refresh_reconciles_provider_system_before_replacement_teams(
         "require-ready:demo",
     ]
     assert store.instances == {"demo": replacement}
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "refreshed 1 running instance(s); system operational=true\n"
+    )
+    assert captured.err.splitlines() == [
+        "cyclo refresh: found 1 running instance(s)",
+        "cyclo refresh: rebuild team image for demo...",
+        "cyclo refresh: rebuild team image for demo: done",
+        "cyclo refresh: rebuild and verify provider system...",
+        "cyclo refresh: rebuild and verify provider system: done",
+        "cyclo refresh: apply and verify 1 running instance(s)...",
+        "cyclo refresh: apply and verify 1 running instance(s): done",
+    ]
 
 
 def test_models_automatically_applies_system_before_catalogue(

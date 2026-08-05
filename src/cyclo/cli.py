@@ -6,9 +6,10 @@ import os
 import re
 import secrets
 import sys
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
 
 from . import __version__
 from .authority import validate_project_authority
@@ -55,6 +56,26 @@ DEFAULT_HOST_CONFIG = Path("/etc/cyclo/host.conf")
 DEFAULT_AGENTWS_HOST = "127.0.0.1"
 DEFAULT_DASHBOARD_HOST = "127.0.0.1"
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class _Progress:
+    """Report human-facing CLI work without contaminating command results."""
+
+    def __init__(self, command: str) -> None:
+        self.command = command
+
+    def note(self, message: str) -> None:
+        print(f"cyclo {self.command}: {message}", file=sys.stderr, flush=True)
+
+    @contextmanager
+    def step(self, operation: str) -> Iterator[None]:
+        self.note(f"{operation}...")
+        try:
+            yield
+        except Exception:
+            self.note(f"{operation}: failed")
+            raise
+        self.note(f"{operation}: done")
 
 
 def state_store(args: argparse.Namespace) -> StateStore:
@@ -343,6 +364,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     agentws_root()
     store = state_store(args)
     runtime = cyclo_runtime(args, store)
+    progress = _Progress("run")
     runtime.validate_project_mounts(definition, teams)
     with store.locked():
         current = store.list()
@@ -360,12 +382,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         # The provider system is independent of teams. Bring it to its declared
         # state first so model compatibility can be checked before intent is
         # committed.
-        baseline = runtime.apply(current)
-        catalogue = _catalogue(runtime, baseline.status)
-        for _selected, team in teams:
-            validate_pi_team_models(team, catalogue)
+        with progress.step("prepare and verify provider system"):
+            baseline = runtime.apply(current)
+            catalogue = _catalogue(runtime, baseline.status)
+            for _selected, team in teams:
+                validate_pi_team_models(team, catalogue)
 
-        bindings = _prepare_run_bindings(args, runtime, definition, teams)
+        with progress.step(f"build {len(teams)} team image(s)"):
+            bindings = _prepare_run_bindings(args, runtime, definition, teams)
         _ensure_new_instances(bindings, current)
         for binding in bindings:
             verify_source_identities(binding)
@@ -379,12 +403,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 *(binding.instance for binding in bindings),
             )
         )
-        store.save_many(binding.instance for binding in bindings)
-        applied = runtime.apply(store.list())
-        runtime.require_instances_ready(
-            (binding.instance for binding in bindings),
-            applied.status,
-        )
+        with progress.step(f"start and verify {len(bindings)} team instance(s)"):
+            store.save_many(binding.instance for binding in bindings)
+            applied = runtime.apply(store.list())
+            runtime.require_instances_ready(
+                (binding.instance for binding in bindings),
+                applied.status,
+            )
 
     for binding in bindings:
         _announce_instance(runtime, binding.instance, applied.status)
@@ -454,13 +479,17 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     agentws_root()
     store = state_store(args)
     runtime = cyclo_runtime(args, store)
+    progress = _Progress("refresh")
     with store.locked():
         current = store.list()
-        replacements = {
-            instance.id: _refresh_instance(runtime, instance)
-            for instance in current
-            if instance.intent == "running"
-        }
+        running = tuple(
+            instance for instance in current if instance.intent == "running"
+        )
+        progress.note(f"found {len(running)} running instance(s)")
+        replacements = {}
+        for instance in running:
+            with progress.step(f"rebuild team image for {instance.id}"):
+                replacements[instance.id] = _refresh_instance(runtime, instance)
         refreshed = [
             replacements[instance.id][0]
             if instance.id in replacements
@@ -473,18 +502,21 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         # Refresh must not first compile stale team mounts or pruned team
         # images. Reconcile only the provider system, obtain its catalogue,
         # then publish and apply the complete replacement inventory.
-        baseline = runtime.apply((), rebuild_host=True)
-        catalogue = _catalogue(runtime, baseline.status)
-        for _refreshed, team in replacements.values():
-            validate_pi_team_models(team, catalogue)
-        store.save_many(
-            instance for instance in refreshed if instance.intent == "running"
-        )
-        applied = runtime.apply(store.list())
-        runtime.require_instances_ready(
-            (instance for instance in refreshed if instance.intent == "running"),
-            applied.status,
-        )
+        with progress.step("rebuild and verify provider system"):
+            baseline = runtime.apply((), rebuild_host=True)
+            catalogue = _catalogue(runtime, baseline.status)
+            for _refreshed, team in replacements.values():
+                validate_pi_team_models(team, catalogue)
+        operation = f"apply and verify {len(running)} running instance(s)"
+        with progress.step(operation):
+            store.save_many(
+                instance for instance in refreshed if instance.intent == "running"
+            )
+            applied = runtime.apply(store.list())
+            runtime.require_instances_ready(
+                (instance for instance in refreshed if instance.intent == "running"),
+                applied.status,
+            )
     print(
         f"refreshed {sum(item.intent == 'running' for item in refreshed)} "
         f"running instance(s); system operational={str(applied.status.operational).lower()}"
@@ -495,14 +527,16 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 def cmd_start(args: argparse.Namespace) -> int:
     store = state_store(args)
     runtime = cyclo_runtime(args, store)
+    progress = _Progress("start")
     with store.locked():
         instance = store.load(args.instance)
         if instance.intent == "running":
             raise CycloError(f"Cyclo instance is already desired running: {instance.id}")
         instance.intent = "running"
-        store.save(instance)
-        applied = runtime.apply(store.list())
-        runtime.require_instances_ready((instance,), applied.status)
+        with progress.step(f"start and verify instance {instance.id}"):
+            store.save(instance)
+            applied = runtime.apply(store.list())
+            runtime.require_instances_ready((instance,), applied.status)
     _announce_instance(runtime, instance, applied.status)
     return 0
 
@@ -525,6 +559,7 @@ def _stop_targets(
 def cmd_stop(args: argparse.Namespace) -> int:
     store = state_store(args)
     runtime = cyclo_runtime(args, store)
+    progress = _Progress("stop")
     with store.locked():
         targets = _stop_targets(args.target, store)
         changed = []
@@ -532,8 +567,9 @@ def cmd_stop(args: argparse.Namespace) -> int:
             if instance.intent == "running":
                 instance.intent = "stopped"
                 changed.append(instance)
-        store.save_many(changed)
-        runtime.apply(store.list())
+        with progress.step("apply stopped instance state"):
+            store.save_many(changed)
+            runtime.apply(store.list())
     changed_ids = {instance.id for instance in changed}
     for instance in changed:
         print(f"{instance.id}: stopped")
@@ -885,9 +921,11 @@ def _task_project_summary(instance: Instance) -> tuple[str, ...]:
 def cmd_models(args: argparse.Namespace) -> int:
     store = state_store(args)
     runtime = cyclo_runtime(args, store)
+    progress = _Progress("models")
     with store.locked():
-        applied = runtime.apply(store.list())
-        identifiers = _catalogue_ids(_catalogue(runtime, applied.status))
+        with progress.step("prepare provider system and read catalogue"):
+            applied = runtime.apply(store.list())
+            identifiers = _catalogue_ids(_catalogue(runtime, applied.status))
     if not identifiers:
         raise CycloError(
             "provider system returned no models; run `cyclo gateway providers` "
@@ -901,8 +939,10 @@ def cmd_models(args: argparse.Namespace) -> int:
 def cmd_usage(args: argparse.Namespace) -> int:
     store = state_store(args)
     runtime = cyclo_runtime(args, store)
+    progress = _Progress("usage")
     with store.locked():
-        report = GatewayAdmin(runtime).usage()
+        with progress.step("read gateway usage"):
+            report = GatewayAdmin(runtime).usage()
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
