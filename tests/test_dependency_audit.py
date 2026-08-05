@@ -14,6 +14,15 @@ AUDIT = runpy.run_path(str(TOOL), run_name="cyclo_dependency_audit_test")
 AuditPolicyError = AUDIT["AuditPolicyError"]
 
 
+def advisory(package: str, url: str, severity: str) -> dict[str, str]:
+    return {
+        "name": package,
+        "dependency": package,
+        "severity": severity,
+        "url": url,
+    }
+
+
 def exact_report() -> dict[str, object]:
     return {
         "auditReportVersion": 2,
@@ -22,14 +31,23 @@ def exact_report() -> dict[str, object]:
                 "name": "brace-expansion",
                 "severity": "high",
                 "via": [
-                    {
-                        "name": "brace-expansion",
-                        "dependency": "brace-expansion",
-                        "severity": "high",
-                        "url": AUDIT["WAIVED_ADVISORY"],
-                    }
+                    advisory("brace-expansion", url, severity)
+                    for url, severity in sorted(
+                        AUDIT["WAIVED_ADVISORIES"]["brace-expansion"]
+                    )
                 ],
-                "nodes": [AUDIT["WAIVED_NODE"]],
+                "nodes": [AUDIT["waived_node"]("brace-expansion")],
+            },
+            "undici": {
+                "name": "undici",
+                "severity": "high",
+                "via": [
+                    advisory("undici", url, severity)
+                    for url, severity in sorted(
+                        AUDIT["WAIVED_ADVISORIES"]["undici"]
+                    )
+                ],
+                "nodes": [AUDIT["waived_node"]("undici")],
             },
             "protobufjs": {
                 "name": "protobufjs",
@@ -46,9 +64,9 @@ def exact_report() -> dict[str, object]:
                 "info": 0,
                 "low": 0,
                 "moderate": 1,
-                "high": 1,
+                "high": 2,
                 "critical": 0,
-                "total": 2,
+                "total": 3,
             }
         },
     }
@@ -63,8 +81,10 @@ def exact_package_files(directory: Path) -> tuple[dict[str, object], dict[str, o
                 "version": AUDIT["PI_VERSION"],
                 "hasShrinkwrap": True,
             },
-            AUDIT["WAIVED_NODE"]: {"version": AUDIT["WAIVED_VERSION"]},
-            "node_modules/brace-expansion": {"version": "5.0.8"},
+            AUDIT["waived_node"]("brace-expansion"): {"version": "5.0.7"},
+            AUDIT["waived_node"]("undici"): {"version": "8.5.0"},
+            "node_modules/brace-expansion": {"version": "5.0.9"},
+            "node_modules/undici": {"version": "8.9.0"},
         }
     }
     write_package_files(directory, package, lock)
@@ -89,16 +109,21 @@ def test_exact_pi_shrinkwrap_exception_is_accepted(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "case",
     (
-        "extra-node",
-        "extra-advisory",
+        "brace-extra-node",
+        "undici-extra-node",
+        "brace-extra-advisory",
+        "undici-extra-advisory",
+        "undici-advisory-severity",
         "critical",
-        "clean",
+        "missing-finding",
         "successful-exit",
         "package-pin",
         "lock-pin",
         "no-shrinkwrap",
-        "nested-version",
-        "independent-version",
+        "brace-nested-version",
+        "undici-nested-version",
+        "independent-brace-version",
+        "independent-undici-version",
     ),
 )
 def test_pi_exception_fails_closed_on_policy_drift(
@@ -109,28 +134,32 @@ def test_pi_exception_fails_closed_on_policy_drift(
     report = exact_report()
     returncode = 1
 
-    finding = report["vulnerabilities"]["brace-expansion"]
-    if case == "extra-node":
-        finding["nodes"].append("node_modules/brace-expansion")
-    elif case == "extra-advisory":
-        finding["via"].append(
-            {
-                "name": "brace-expansion",
-                "dependency": "brace-expansion",
-                "severity": "high",
-                "url": "https://example.invalid/another-advisory",
-            }
+    brace = report["vulnerabilities"]["brace-expansion"]
+    undici = report["vulnerabilities"]["undici"]
+    if case == "brace-extra-node":
+        brace["nodes"].append("node_modules/brace-expansion")
+    elif case == "undici-extra-node":
+        undici["nodes"].append("node_modules/undici")
+    elif case == "brace-extra-advisory":
+        brace["via"].append(
+            advisory(
+                "brace-expansion", "https://example.invalid/advisory", "high"
+            )
         )
+    elif case == "undici-extra-advisory":
+        undici["via"].append(
+            advisory("undici", "https://example.invalid/advisory", "moderate")
+        )
+    elif case == "undici-advisory-severity":
+        undici["via"][0]["severity"] = "low"
     elif case == "critical":
-        finding["severity"] = "critical"
-        finding["via"][0]["severity"] = "critical"
-        report["metadata"]["vulnerabilities"]["high"] = 0
+        brace["severity"] = "critical"
+        report["metadata"]["vulnerabilities"]["high"] = 1
         report["metadata"]["vulnerabilities"]["critical"] = 1
-    elif case == "clean":
+    elif case == "missing-finding":
         report["vulnerabilities"].pop("brace-expansion")
-        report["metadata"]["vulnerabilities"]["high"] = 0
-        report["metadata"]["vulnerabilities"]["total"] = 1
-        returncode = 0
+        report["metadata"]["vulnerabilities"]["high"] = 1
+        report["metadata"]["vulnerabilities"]["total"] = 2
     elif case == "successful-exit":
         returncode = 0
     elif case == "package-pin":
@@ -139,17 +168,25 @@ def test_pi_exception_fails_closed_on_policy_drift(
         lock["packages"][""]["dependencies"][AUDIT["PI_PACKAGE"]] = "0.82.1"
     elif case == "no-shrinkwrap":
         lock["packages"][AUDIT["PI_LOCK_PATH"]]["hasShrinkwrap"] = False
-    elif case == "nested-version":
-        lock["packages"][AUDIT["WAIVED_NODE"]]["version"] = "5.0.8"
-    elif case == "independent-version":
-        lock["packages"]["node_modules/brace-expansion"]["version"] = "5.0.7"
+    elif case == "brace-nested-version":
+        lock["packages"][AUDIT["waived_node"]("brace-expansion")][
+            "version"
+        ] = "5.0.8"
+    elif case == "undici-nested-version":
+        lock["packages"][AUDIT["waived_node"]("undici")]["version"] = "8.8.0"
+    elif case == "independent-brace-version":
+        lock["packages"]["node_modules/brace-expansion"]["version"] = "5.0.8"
+    elif case == "independent-undici-version":
+        lock["packages"]["node_modules/undici"]["version"] = "8.8.0"
 
     if case in {
         "package-pin",
         "lock-pin",
         "no-shrinkwrap",
-        "nested-version",
-        "independent-version",
+        "brace-nested-version",
+        "undici-nested-version",
+        "independent-brace-version",
+        "independent-undici-version",
     }:
         for path in package_dir.iterdir():
             path.unlink()
@@ -169,8 +206,8 @@ def test_unexpected_high_finding_is_rejected(tmp_path: Path) -> None:
         "via": [],
         "nodes": ["node_modules/unexpected"],
     }
-    report["metadata"]["vulnerabilities"]["high"] = 2
-    report["metadata"]["vulnerabilities"]["total"] = 3
+    report["metadata"]["vulnerabilities"]["high"] = 3
+    report["metadata"]["vulnerabilities"]["total"] = 4
 
     with pytest.raises(AuditPolicyError):
         AUDIT["validate_team_component"](report, 1, package_dir)
@@ -191,14 +228,29 @@ def test_malformed_or_failed_npm_audit_is_rejected(output: str) -> None:
 
 def test_latest_pi_probe_expires_the_waiver_when_fixed() -> None:
     affected = {
-        "packages": {"node_modules/brace-expansion": {"version": "5.0.7"}}
+        "packages": {
+            "node_modules/brace-expansion": {"version": "5.0.9"},
+            "node_modules/pi/node_modules/brace-expansion": {"version": "5.0.7"},
+            "node_modules/pi/node_modules/undici": {"version": "8.5.0"},
+        }
     }
-    fixed = copy.deepcopy(affected)
-    fixed["packages"]["node_modules/brace-expansion"]["version"] = "5.0.8"
+    result = AUDIT["validate_no_fixed_pi_release"]("0.82.1", affected)
+    assert result == {"brace-expansion": ["5.0.7"], "undici": ["8.5.0"]}
 
-    assert AUDIT["validate_no_fixed_pi_release"]("0.82.1", affected) == ["5.0.7"]
+    brace_fixed = copy.deepcopy(affected)
+    brace_fixed["packages"][
+        "node_modules/pi/node_modules/brace-expansion"
+    ]["version"] = "5.0.9"
     with pytest.raises(AuditPolicyError):
-        AUDIT["validate_no_fixed_pi_release"]("0.83.0", fixed)
+        AUDIT["validate_no_fixed_pi_release"]("0.83.0", brace_fixed)
+
+    undici_fixed = copy.deepcopy(affected)
+    undici_fixed["packages"]["node_modules/pi/node_modules/undici"][
+        "version"
+    ] = "8.9.0"
+    with pytest.raises(AuditPolicyError):
+        AUDIT["validate_no_fixed_pi_release"]("0.83.0", undici_fixed)
+
     with pytest.raises(AuditPolicyError):
         AUDIT["validate_no_fixed_pi_release"]("0.83.0", {"packages": {}})
 
@@ -206,8 +258,11 @@ def test_latest_pi_probe_expires_the_waiver_when_fixed() -> None:
 def test_security_policy_names_the_exact_audit_exception() -> None:
     policy = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
 
-    assert AUDIT["WAIVED_ADVISORY"] in policy
-    assert AUDIT["WAIVED_NODE"] in policy
+    for package in AUDIT["WAIVED_VERSIONS"]:
+        assert AUDIT["waived_node"](package) in policy
+    assert "https://github.com/advisories/GHSA-mh99-v99m-4gvg" in policy
+    assert "https://github.com/advisories/GHSA-rgw5-rvv9-x895" in policy
+    assert "https://github.com/advisories/GHSA-4cwx-7wf7-3272" in policy
     assert "TEMPORARY WAIVER" in (
         ROOT / "docs" / "releasing.md"
     ).read_text(encoding="utf-8")

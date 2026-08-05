@@ -179,25 +179,44 @@ configuration remain trusted installation inputs.
 ## Temporary upstream dependency exception
 
 The 0.2 team runtime includes
-`@earendil-works/pi-coding-agent@0.81.1`. Its published npm shrinkwrap pins a
-nested `brace-expansion@5.0.7` dependency affected by
-[GHSA-mh99-v99m-4gvg](https://github.com/advisories/GHSA-mh99-v99m-4gvg):
-a crafted brace expression can exhaust memory and terminate the team process.
-This is an accepted workload-availability risk, not an expansion of authority.
-It exposes no gateway credentials, Docker control, undeclared mounts, unrelated
-Provider links, or other team state. Cyclo already treats agent-controlled code
-as arbitrary execution inside the team container; deployments requiring
-host-level availability must impose container or VM memory ceilings.
+`@earendil-works/pi-coding-agent@0.81.1`. Its published npm shrinkwrap pins two
+dependencies with high-severity advisories that the parent installation cannot
+override:
 
-No fixed upstream Pi release was available when this exception was accepted on
-2026-07-27. The independently resolvable `pi-lens` copy is fixed at
-`brace-expansion@5.0.8`; the audit exception covers only Pi 0.81.1, advisory
-GHSA-mh99-v99m-4gvg, version 5.0.7, and the exact nested path
-`node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion`.
-It covers no other package, path, version, advisory, or critical finding. CI
-and the release audit inspect the latest published Pi dependency lock and fail
-once a fixed release is available, forcing this exception to be removed and the
-aligned Pi dependencies to be updated.
+- `brace-expansion@5.0.7` at
+  `node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion`,
+  affected by
+  [GHSA-mh99-v99m-4gvg](https://github.com/advisories/GHSA-mh99-v99m-4gvg)
+  and
+  [GHSA-rgw5-rvv9-x895](https://github.com/advisories/GHSA-rgw5-rvv9-x895);
+  crafted brace expressions can exhaust memory and terminate the team process.
+- `undici@8.5.0` at
+  `node_modules/@earendil-works/pi-coding-agent/node_modules/undici`, affected
+  by
+  [GHSA-4cwx-7wf7-3272](https://github.com/advisories/GHSA-4cwx-7wf7-3272)
+  and four moderate advisories attached to the same npm finding; malformed
+  cache directives can disclose cached response data within the team process or
+  crash it.
+
+These are accepted risks inside the team workload, not expansions of authority.
+A team container is one trust domain and already treats agent-controlled code as
+arbitrary execution. The findings expose no gateway credentials, Docker
+control, undeclared mounts, unrelated Provider links, or other team state.
+Deployments requiring host-level availability must impose container or VM
+resource ceilings.
+
+No fixed upstream Pi release was available when this exception was last
+reviewed on 2026-08-05. The independently resolvable `brace-expansion` copy is
+fixed at 5.0.9. Pi's nested `protobufjs@7.6.4` also has a moderate availability
+advisory; moderate findings are reported but are outside the high/critical
+release gate.
+
+The audit exception covers only Pi 0.81.1, the two exact nested paths and
+versions above, and the advisory sets recorded in `tools/dependency-audit`. It
+covers no other package, path, version, advisory, or critical finding. CI and
+the release audit inspect the latest published Pi dependency lock and fail once
+either high-severity dependency is fixed, forcing the exception to be narrowed
+or removed and the aligned Pi dependencies to be updated.
 
 ## Reporting a vulnerability
 

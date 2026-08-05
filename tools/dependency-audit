@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit shipped npm locks, allowing one exact temporary Pi finding."""
+"""Audit shipped npm locks, allowing two exact temporary Pi findings."""
 
 from __future__ import annotations
 
@@ -24,11 +24,31 @@ PACKAGES = (
 PI_PACKAGE = "@earendil-works/pi-coding-agent"
 PI_VERSION = "0.81.1"
 PI_LOCK_PATH = f"node_modules/{PI_PACKAGE}"
-WAIVED_PACKAGE = "brace-expansion"
-WAIVED_VERSION = "5.0.7"
-WAIVED_NODE = f"{PI_LOCK_PATH}/node_modules/{WAIVED_PACKAGE}"
-WAIVED_ADVISORY = "https://github.com/advisories/GHSA-mh99-v99m-4gvg"
-FIXED_BRACE_VERSION = (5, 0, 8)
+WAIVED_VERSIONS = {
+    "brace-expansion": "5.0.7",
+    "undici": "8.5.0",
+}
+FIXED_VERSIONS = {
+    "brace-expansion": (5, 0, 9),
+    "undici": (8, 9, 0),
+}
+WAIVED_ADVISORIES = {
+    "brace-expansion": frozenset(
+        {
+            ("https://github.com/advisories/GHSA-mh99-v99m-4gvg", "high"),
+            ("https://github.com/advisories/GHSA-rgw5-rvv9-x895", "high"),
+        }
+    ),
+    "undici": frozenset(
+        {
+            ("https://github.com/advisories/GHSA-4cwx-7wf7-3272", "high"),
+            ("https://github.com/advisories/GHSA-8xcm-r25x-g524", "moderate"),
+            ("https://github.com/advisories/GHSA-m8rv-5g2x-5cg5", "moderate"),
+            ("https://github.com/advisories/GHSA-jr45-8vmc-qm54", "moderate"),
+            ("https://github.com/advisories/GHSA-v3r7-h72x-cjcm", "moderate"),
+        }
+    ),
+}
 
 
 class AuditPolicyError(RuntimeError):
@@ -109,16 +129,18 @@ def high_findings(report: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     return findings
 
 
-def version_is_fixed(value: object) -> bool:
+def waived_node(package: str) -> str:
+    return f"{PI_LOCK_PATH}/node_modules/{package}"
+
+
+def version_is_fixed(value: object, fixed: tuple[int, int, int]) -> bool:
     if not isinstance(value, str):
         raise AuditPolicyError(f"invalid package version {value!r}")
     match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.*)?", value)
     if match is None:
         raise AuditPolicyError(f"invalid package version {value!r}")
     version = tuple(int(part) for part in match.group(1, 2, 3))
-    return version > FIXED_BRACE_VERSION or (
-        version == FIXED_BRACE_VERSION and match.group(4) is None
-    )
+    return version > fixed or (version == fixed and match.group(4) is None)
 
 
 def validate_waiver_lock(package_dir: Path) -> None:
@@ -128,7 +150,6 @@ def validate_waiver_lock(package_dir: Path) -> None:
         raise AuditPolicyError("team component lock has no package map")
     root = packages.get("")
     pi = packages.get(PI_LOCK_PATH)
-    nested = packages.get(WAIVED_NODE)
     declared = package.get("dependencies")
     locked = root.get("dependencies") if isinstance(root, dict) else None
     if (
@@ -140,50 +161,77 @@ def validate_waiver_lock(package_dir: Path) -> None:
         or not isinstance(pi, dict)
         or pi.get("version") != PI_VERSION
         or pi.get("hasShrinkwrap") is not True
-        or not isinstance(nested, dict)
-        or nested.get("version") != WAIVED_VERSION
     ):
         raise AuditPolicyError(
             f"temporary waiver requires shrinkwrapped {PI_PACKAGE}@{PI_VERSION} "
-            f"with only {WAIVED_NODE}@{WAIVED_VERSION}"
+            "at the exact declared and locked version"
         )
-    independent = packages.get(f"node_modules/{WAIVED_PACKAGE}")
-    if isinstance(independent, dict) and not version_is_fixed(
-        independent.get("version")
-    ):
-        raise AuditPolicyError(f"independent {WAIVED_PACKAGE} copy remains vulnerable")
+
+    for name, expected_version in WAIVED_VERSIONS.items():
+        node = waived_node(name)
+        nested = packages.get(node)
+        if not isinstance(nested, dict) or nested.get("version") != expected_version:
+            raise AuditPolicyError(
+                f"temporary waiver requires {node}@{expected_version}"
+            )
+        independent = packages.get(f"node_modules/{name}")
+        if isinstance(independent, dict) and not version_is_fixed(
+            independent.get("version"), FIXED_VERSIONS[name]
+        ):
+            raise AuditPolicyError(f"independent {name} copy remains vulnerable")
+
+
+def exact_advisories(name: str, finding: dict[str, Any]) -> bool:
+    via = finding.get("via")
+    expected = WAIVED_ADVISORIES[name]
+    if not isinstance(via, list) or len(via) != len(expected):
+        return False
+    actual: set[tuple[str, str]] = set()
+    for advisory in via:
+        if (
+            not isinstance(advisory, dict)
+            or advisory.get("name") != name
+            or advisory.get("dependency") != name
+            or not isinstance(advisory.get("url"), str)
+            or not isinstance(advisory.get("severity"), str)
+        ):
+            return False
+        actual.add((advisory["url"], advisory["severity"]))
+    return actual == expected
 
 
 def validate_team_component(
     report: dict[str, Any], returncode: int, package_dir: Path
 ) -> None:
     findings = high_findings(report)
-    if len(findings) != 1:
+    if len(findings) != len(WAIVED_VERSIONS):
         raise AuditPolicyError(
-            "team component does not have exactly the documented temporary finding"
+            "team component does not have exactly the documented temporary findings"
         )
-    name, finding = findings[0]
-    via = finding.get("via")
-    nodes = finding.get("nodes")
-    exact = (
-        name == WAIVED_PACKAGE
-        and finding.get("name") == WAIVED_PACKAGE
-        and finding.get("severity") == "high"
-        and isinstance(via, list)
-        and len(via) == 1
-        and isinstance(via[0], dict)
-        and via[0].get("name") == WAIVED_PACKAGE
-        and via[0].get("dependency") == WAIVED_PACKAGE
-        and via[0].get("severity") == "high"
-        and via[0].get("url") == WAIVED_ADVISORY
-        and nodes == [WAIVED_NODE]
-        and report["metadata"]["vulnerabilities"]["high"] == 1
-        and report["metadata"]["vulnerabilities"]["critical"] == 0
-        and returncode == 1
-    )
-    if not exact:
+    if (
+        report["metadata"]["vulnerabilities"]["high"] != len(WAIVED_VERSIONS)
+        or report["metadata"]["vulnerabilities"]["critical"] != 0
+        or returncode != 1
+    ):
+        raise AuditPolicyError("team component audit result does not match its waiver")
+
+    seen: set[str] = set()
+    for name, finding in findings:
+        if (
+            name not in WAIVED_VERSIONS
+            or name in seen
+            or finding.get("name") != name
+            or finding.get("severity") != "high"
+            or finding.get("nodes") != [waived_node(name)]
+            or not exact_advisories(name, finding)
+        ):
+            raise AuditPolicyError(
+                "team component findings do not exactly match the documented Pi exception"
+            )
+        seen.add(name)
+    if seen != set(WAIVED_VERSIONS):
         raise AuditPolicyError(
-            "team component finding does not exactly match the documented Pi exception"
+            "team component findings do not exactly match the documented Pi exception"
         )
     validate_waiver_lock(package_dir)
 
@@ -216,26 +264,31 @@ def latest_pi_lock() -> tuple[str, dict[str, Any]]:
         return pi["version"], lock
 
 
-def validate_no_fixed_pi_release(version: str, lock: dict[str, Any]) -> list[str]:
+def validate_no_fixed_pi_release(
+    version: str, lock: dict[str, Any]
+) -> dict[str, list[str]]:
     packages = lock.get("packages")
     if not isinstance(packages, dict):
         raise AuditPolicyError(f"latest {PI_PACKAGE}@{version} has no package map")
-    versions = [
-        value.get("version")
-        for path, value in packages.items()
-        if isinstance(path, str)
-        and (
-            path == f"node_modules/{WAIVED_PACKAGE}"
-            or path.endswith(f"/node_modules/{WAIVED_PACKAGE}")
-        )
-        and isinstance(value, dict)
-    ]
-    affected = [value for value in versions if not version_is_fixed(value)]
-    if not versions or not affected:
-        raise AuditPolicyError(
-            f"latest {PI_PACKAGE}@{version} fixes {WAIVED_PACKAGE}; "
-            "remove the waiver and update Pi"
-        )
+    affected: dict[str, list[str]] = {}
+    for name, fixed in FIXED_VERSIONS.items():
+        versions = [
+            value.get("version")
+            for path, value in packages.items()
+            if isinstance(path, str)
+            and (
+                path == f"node_modules/{name}"
+                or path.endswith(f"/node_modules/{name}")
+            )
+            and isinstance(value, dict)
+        ]
+        vulnerable = [value for value in versions if not version_is_fixed(value, fixed)]
+        if not versions or not vulnerable:
+            raise AuditPolicyError(
+                f"latest {PI_PACKAGE}@{version} fixes {name}; "
+                "remove that waiver and update Pi"
+            )
+        affected[name] = vulnerable
     return affected
 
 
@@ -255,11 +308,17 @@ def audit_repository(root: Path) -> None:
 
     latest_version, latest_lock = latest_pi_lock()
     affected = validate_no_fixed_pi_release(latest_version, latest_lock)
-    versions = ", ".join(sorted({str(value) for value in affected}))
+    waived = "; ".join(
+        f"{name}@{WAIVED_VERSIONS[name]} at {waived_node(name)}"
+        for name in sorted(WAIVED_VERSIONS)
+    )
+    latest = "; ".join(
+        f"{name} {', '.join(sorted({str(value) for value in versions}))}"
+        for name, versions in sorted(affected.items())
+    )
     print(
-        "team component: TEMPORARY WAIVER "
-        f"{WAIVED_ADVISORY} at {WAIVED_NODE}@{WAIVED_VERSION}; "
-        f"latest {PI_PACKAGE}@{latest_version} remains affected ({versions})"
+        f"team component: TEMPORARY WAIVER {waived}; "
+        f"latest {PI_PACKAGE}@{latest_version} remains affected ({latest})"
     )
 
 
