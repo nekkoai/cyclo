@@ -52,17 +52,24 @@ Example:
 ```text
 planner-1   planner   pi   codex-work/MODEL_ID
 builder-1   builder   pi   codex-work/MODEL_ID
+builder-2   builder   pi   claude-work/MODEL_ID
 verifier-1  verifier  pi   claude-work/MODEL_ID
 ```
+
+Each job stores exactly one role, and a worker may claim it only when its roster
+entry declares that role. The same role selects the behavioral prompt at
+`roles/ROLE.md`. Several agents may share one role.
 
 Rules:
 
 - agent names are unique;
+- roles use the same bounded identifier syntax as agent names;
 - each role has a matching `roles/ROLE.md`;
-- at least one agent has the `planner` role;
+- at least one agent has role `planner`;
 - engines are `pi` or `pi-interactive`; and
 - the model is an exact public ID advertised by `cyclo models`.
 
+Role `planner` is reserved for task coordination and permission to create tasks.
 The roster selects model routes. It is not a separate authorization token or
 credential boundary.
 
@@ -77,8 +84,12 @@ Every agent receives these instruction sources:
 5. the assigned AgentWS task and job.
 
 The generic protocol defines queue behavior, planner notifications, project
-discovery, and failure settlement. A team `AGENTS.md` may specialize behavior
-but does not replace those invariants. A role file describes only that role.
+discovery, and failure settlement. In particular, every successful or failed
+terminal transition outside role `planner` durably publishes a
+source-linked planner job before changing status. That job remains unclaimable
+until the source terminal status is visible. A team `AGENTS.md` may specialize
+behavior but does not replace those invariants. A role file describes only that
+role.
 
 Agents must read `/agentws/project.cyclo` before choosing a source directory.
 It tells them which paths below `/workspace` are writable projects and which
@@ -131,12 +142,18 @@ Task operations are available from the host:
 
 ```sh
 cyclo task run INSTANCE TASK_ID SPEC_FILE
+cyclo task add-job INSTANCE TASK_ID JOB_ID ROLE SPEC_FILE
 cyclo task list INSTANCE
 cyclo task show INSTANCE TASK_ID
 cyclo task comment INSTANCE TASK_ID MESSAGE
 cyclo task complete INSTANCE TASK_ID
 cyclo task reopen INSTANCE TASK_ID
 ```
+
+`add-job` routes by `ROLE`. Choose a role handled by the installed team. Cyclo
+validates the identifier syntax but does not treat the mutable repository as
+authority for a running image, so an unserved role is accepted and remains
+visibly pending until a matching worker exists.
 
 At component startup the supervisor resets orphaned active jobs, starts the
 read-only AgentWS viewer and queue runner, and holds a queue lifetime lock.

@@ -17,14 +17,16 @@ from ..state import Instance, StateStore
 _TOOL_LABEL = "io.cyclo.task-tool"
 _TASKS = "/agentws/tasks"
 _JOBS = "/agentws/jobs"
-_SPEC = "/run/cyclo/task-spec.md"
+_SPEC = "/run/cyclo/queue-spec.md"
 _MAX_SPEC_BYTES = 2 * 1024 * 1024
+_SPEC_TOOLS = frozenset({"task-create", "job-create"})
 _TOOL_AUTHORITY = {
     "task-list": (("tasks", True),),
     "task-show": (("tasks", True),),
     "task-comment": (("tasks", False),),
     "task-state": (("tasks", False),),
     "task-create": (("tasks", False), ("jobs", False)),
+    "job-create": (("tasks", True), ("jobs", False)),
 }
 
 
@@ -47,8 +49,10 @@ class TaskAdmin:
             raise CycloError("Cyclo task administration refuses host root")
         if tool not in _TOOL_AUTHORITY:
             raise CycloError(f"invalid AgentWS task tool: {tool!r}")
-        if (specification is not None) != (tool == "task-create"):
-            raise CycloError("a task specification is valid only for task-create")
+        if (specification is not None) != (tool in _SPEC_TOOLS):
+            raise CycloError(
+                "a specification is required exactly for task-create or job-create"
+            )
         self._ensure_queue()
         with self._staged_specification(specification) as staged:
             self._remove_abandoned()
@@ -135,7 +139,7 @@ class TaskAdmin:
             return
         self.store.ensure()
         descriptor, name = tempfile.mkstemp(
-            prefix=".task-spec-",
+            prefix=".queue-spec-",
             dir=self.store.root,
         )
         path = Path(name)

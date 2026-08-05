@@ -19,6 +19,7 @@ from cyclo.cli import (
     cmd_refresh,
     cmd_run,
     cmd_stop,
+    cmd_task_add_job,
     cmd_task_run,
     main,
     state_store,
@@ -152,6 +153,19 @@ def test_cli_surface_has_declarative_provider_and_component_commands() -> None:
     assert parser.parse_args(
         ["component", "logs", "-f", "gateway"]
     ).follow
+    add_job = parser.parse_args(
+        [
+            "task",
+            "add-job",
+            "demo",
+            "pcie",
+            "pcie-rtl-r4",
+            "rtl",
+            "recovery.md",
+        ]
+    )
+    assert add_job.task_action == "add-job"
+    assert add_job.role == "rtl"
 
     with pytest.raises(SystemExit):
         parser.parse_args(["providers", "start"])
@@ -433,6 +447,72 @@ def test_task_run_uses_confined_admin_tool_without_dcomp(
     ) == 0
     assert observed == [
         ("task-create", ("uart",), b"# Build it\n"),
+    ]
+
+
+def test_task_add_job_uses_confined_admin_tool_without_dcomp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    tasks = root / "tasks"
+    jobs = root / "jobs"
+    tasks.mkdir(parents=True)
+    jobs.mkdir()
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Repair the link\n", encoding="utf-8")
+    instance = SimpleNamespace(id="demo", image="sha256:" + "a" * 64)
+    observed: list[tuple[str, tuple[str, ...], bytes | None]] = []
+
+    class Store(MemoryStore):
+        def queue_root(self, _identifier):
+            return root
+
+        def tasks_dir(self, _identifier):
+            return tasks
+
+        def jobs_dir(self, _identifier):
+            return jobs
+
+    store = Store((instance,))
+
+    class Admin:
+        def __init__(self, selected_store, selected_instance):
+            assert selected_store is store
+            assert selected_instance is instance
+
+        def run(self, tool, arguments=(), *, specification=None):
+            observed.append((tool, tuple(arguments), specification))
+            return 0
+
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.TaskAdmin", Admin)
+    monkeypatch.setattr(
+        "cyclo.cli.cyclo_runtime",
+        lambda *_args: pytest.fail("task operations must not require DComp"),
+    )
+
+    assert cmd_task_add_job(
+        namespace(
+            instance="demo",
+            task_id="pcie",
+            job_id="pcie-rtl-r4",
+            role="rtl",
+            spec=str(spec),
+        )
+    ) == 0
+    assert observed == [
+        (
+            "job-create",
+            (
+                "pcie-rtl-r4",
+                "--role",
+                "rtl",
+                "--task-id",
+                "pcie",
+            ),
+            b"# Repair the link\n",
+        ),
     ]
 
 

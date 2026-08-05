@@ -158,10 +158,16 @@ cyclo run ./project.cyclo
 cyclo ps
 cyclo inspect INSTANCE
 cyclo task run INSTANCE uart-ip ./uart-task.md
+cyclo task add-job INSTANCE uart-ip uart-ip-builder-r1 builder ./recovery.md
 cyclo task list INSTANCE
 cyclo logs -f INSTANCE
 cyclo dashboard --host 127.0.0.1
 ```
+
+Jobs are routed by role. A team roster declares
+`NAME ROLE ENGINE PROVIDER/MODEL`; the role selects both the queue work an agent
+may claim and its `roles/ROLE.md` instructions. Several agents may share a role.
+Task coordination authority belongs to role `planner`.
 
 Use `cyclo refresh` to re-read running projects and teams, rebuild their images,
 and apply the resulting installation-wide DComp system. Use `cyclo stop`,

@@ -204,9 +204,10 @@ The roster format is:
 NAME ROLE ENGINE PROVIDER/MODEL
 ```
 
-Cyclo currently supports `pi` and `pi-interactive`. Every role needs a matching
-`roles/ROLE.md`, names must be unique, and at least one agent must have the
-`planner` role.
+`ROLE` is both the queue-routing key written into jobs and the selector for
+`roles/ROLE.md`. Multiple agents may share a role. Cyclo currently supports
+`pi` and `pi-interactive`. Every role needs a matching role file, names must be
+unique, and at least one agent must have role `planner`.
 
 Validate a team:
 
@@ -316,6 +317,21 @@ Create a task from a specification file:
 ```sh
 cyclo task run INSTANCE uart-ip ./uart-task.md
 ```
+
+Add another role-scoped job to an existing task when human recovery or an
+explicit handoff is required:
+
+```sh
+cyclo task add-job INSTANCE uart-ip uart-ip-builder-r1 builder ./recovery.md
+```
+
+The fourth argument is a role. Choose one handled by an agent in the installed
+team roster. Cyclo validates the identifier but does not reject an unserved
+role: the mutable team repository is not authoritative for the already
+installed runtime, and such a job remains visibly pending until a worker for
+that role exists. The job ID must be new. This operation does not require the
+long-running team component; Cyclo runs the team image's queue tool with only
+the existing task, job queue, and bounded specification snapshot available.
 
 Inspect and update it:
 

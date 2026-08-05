@@ -69,14 +69,14 @@ def test_task_tool_runs_with_only_queue_and_spec_authority(
     assert str(tasks.resolve()) in "\n".join(command)
     assert str(jobs.resolve()) in "\n".join(command)
     specification_mount = next(
-        item for item in command if "dst=/run/cyclo/task-spec.md" in item
+        item for item in command if "dst=/run/cyclo/queue-spec.md" in item
     )
     assert str(store.root.resolve()) in specification_mount
     assert str(tmp_path / "task.md") not in "\n".join(command)
     assert command[-3:] == [
         "/agentws/bin/task-create",
         "uart",
-        "/run/cyclo/task-spec.md",
+        "/run/cyclo/queue-spec.md",
     ]
     assert options == {"check": False, "capture": False}
     staged_source = specification_mount.split("src=", 1)[1].split(",", 1)[0]
@@ -139,6 +139,55 @@ def test_task_tool_receives_only_its_required_queue_authority(
     tasks_mount = next(value for value in mounts if "dst=/agentws/tasks" in value)
     assert tasks_mount.endswith(",readonly") is tasks_read_only
     assert any("dst=/agentws/jobs" in value for value in mounts) is has_jobs
+
+
+def test_job_create_receives_read_only_task_and_writable_job_queues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cyclo.state.local_docker_endpoint",
+        lambda: "unix:///var/run/docker.sock",
+    )
+    store = StateStore(tmp_path / "state")
+    store._docker_endpoint = "unix:///var/run/docker.sock"
+    store.tasks_dir("demo").mkdir(parents=True)
+    store.jobs_dir("demo").mkdir()
+    admin = TaskAdmin(
+        store,
+        SimpleNamespace(id="demo", image="sha256:" + "a" * 64),
+    )
+    images = FakeImages()
+    admin.images = images
+
+    assert admin.run(
+        "job-create",
+        ("pcie-rtl-r4", "--role", "rtl", "--task-id", "pcie"),
+        specification=b"Repair the link.\n",
+    ) == 0
+
+    command, _options = images.calls[-1]
+    task_mount = next(
+        command[index + 1]
+        for index, value in enumerate(command)
+        if value == "--mount" and "dst=/agentws/tasks" in command[index + 1]
+    )
+    job_mount = next(
+        command[index + 1]
+        for index, value in enumerate(command)
+        if value == "--mount" and "dst=/agentws/jobs" in command[index + 1]
+    )
+    assert task_mount.endswith(",readonly")
+    assert not job_mount.endswith(",readonly")
+    assert command[-7:] == [
+        "/agentws/bin/job-create",
+        "pcie-rtl-r4",
+        "--role",
+        "rtl",
+        "--task-id",
+        "pcie",
+        "/run/cyclo/queue-spec.md",
+    ]
 
 
 def test_task_tool_rejects_unlisted_agentws_program(

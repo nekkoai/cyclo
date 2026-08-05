@@ -760,6 +760,22 @@ def _validate_task_id(value: str) -> None:
         )
 
 
+def _validate_job_id(value: str) -> None:
+    if not _TASK_ID_RE.fullmatch(value):
+        raise CycloError(
+            "job ID must start with a letter or number and contain only "
+            "letters, numbers, dot, underscore, and hyphen"
+        )
+
+
+def _validate_role(value: str) -> None:
+    if not _TASK_ID_RE.fullmatch(value):
+        raise CycloError(
+            "role must start with a letter or number and contain only "
+            "letters, numbers, dot, underscore, and hyphen"
+        )
+
+
 def _run_task_tool(
     args: argparse.Namespace,
     tool: str,
@@ -802,6 +818,27 @@ def cmd_task_run(args: argparse.Namespace) -> int:
     if result == 0:
         for line in _task_project_summary(instance):
             print(line)
+    return result
+
+
+def cmd_task_add_job(args: argparse.Namespace) -> int:
+    _validate_task_id(args.task_id)
+    _validate_job_id(args.job_id)
+    _validate_role(args.role)
+    requested_spec = Path(args.spec).expanduser()
+    specification = read_task_specification(requested_spec)
+    result, _instance = _run_task_tool(
+        args,
+        "job-create",
+        (
+            args.job_id,
+            "--role",
+            args.role,
+            "--task-id",
+            args.task_id,
+        ),
+        specification=specification,
+    )
     return result
 
 
@@ -1314,11 +1351,21 @@ def build_parser() -> argparse.ArgumentParser:
     task_show.add_argument("instance")
     task_show.add_argument("task_id")
     task_show.set_defaults(func=cmd_task_show)
-    task_run = task_commands.add_parser("run", help="create and enqueue a task")
+    task_run = task_commands.add_parser("run", help="create and start a task")
     task_run.add_argument("instance")
     task_run.add_argument("task_id")
     task_run.add_argument("spec")
     task_run.set_defaults(func=cmd_task_run)
+    task_add_job = task_commands.add_parser(
+        "add-job",
+        help="add a role-routed job to an existing task",
+    )
+    task_add_job.add_argument("instance")
+    task_add_job.add_argument("task_id")
+    task_add_job.add_argument("job_id")
+    task_add_job.add_argument("role")
+    task_add_job.add_argument("spec")
+    task_add_job.set_defaults(func=cmd_task_add_job)
     task_comment = task_commands.add_parser("comment", help="append a task comment")
     task_comment.add_argument("instance")
     task_comment.add_argument("task_id")
