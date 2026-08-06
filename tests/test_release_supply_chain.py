@@ -178,6 +178,12 @@ def test_workflow_actions_are_pinned_to_full_commits() -> None:
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "python -m build --no-isolation" in ci
     assert "python tools/normalize-distributions dist" in ci
+    assert "run: python3 tools/secret-scan" in ci
+    assert "fetch-depth: 0" in ci
+    assert "gitleaks/gitleaks-action" not in ci
+    assert re.search(
+        r"zricethezav/gitleaks:v[0-9.]+@sha256:[0-9a-f]{64}", ci
+    )
 
 
 def test_ci_uses_and_tests_the_current_component_layout() -> None:
