@@ -67,14 +67,34 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
+      - name: Install shipped component dependencies
+        run: |
+          for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
+            npm ci --ignore-scripts --prefix "src/cyclo/$package"
+          done
+          npm ci --force --ignore-scripts --prefix src/cyclo/components/team
       - name: Run Node tests
-        run: node --test tests/*.mjs
-      - name: Audit gateway Node dependencies
-        working-directory: src/cyclo/credential_gateway/gateway_context
-        run: npm audit --omit=dev --package-lock-only --audit-level=high
-      - name: Audit runtime Node dependencies
-        working-directory: src/cyclo/credential_gateway/runtime_context
-        run: npm audit --omit=dev --package-lock-only --audit-level=high
+        run: |
+          node --test tests/*.mjs
+          for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
+            npm test --prefix "src/cyclo/$package"
+          done
+      - name: Confirm generated protocol sources are current
+        run: |
+          generated_paths="
+          src/cyclo/components/protocol/component/gen
+          src/cyclo/components/protocol/provider/gen
+          "
+          git diff --exit-code -- $generated_paths
+          generated_untracked=$(git ls-files --others --exclude-standard -- $generated_paths)
+          if [ -n "$generated_untracked" ]; then
+            printf '%s\n' \
+              "untracked generated protocol files:" \
+              "$generated_untracked" >&2
+            exit 1
+          fi
+      - name: Audit shipped component dependencies
+        run: python3 tools/dependency-audit
       - name: Check POSIX shell syntax
         shell: bash
         run: |
@@ -84,6 +104,7 @@ jobs:
 
   package:
     name: Package and clean-wheel audit
+    needs: node-and-shell
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -103,8 +124,12 @@ jobs:
           python -m build --no-isolation
           python tools/normalize-distributions dist
           python -m twine check dist/*
-      - name: Exercise a clean-copy wheel installation
-        run: tools/release-acceptance
+      - name: Exercise the built wheel installation
+        env:
+          # DComp is released separately and is not downloaded by Cyclo CI.
+          # The local release builder runs the required API-1 integration.
+          CYCLO_RELEASE_REQUIRE_DCOMP: "0"
+        run: tools/release-acceptance "$PWD"/dist/cyclo_agent-*.whl
       - name: Confirm acceptance did not modify tracked files
         run: git diff --exit-code
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -122,24 +147,38 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - name: Build runtime image
+      - name: Build team image
         run: |
           docker build --pull \
-            --tag cyclo-runtime:ci \
-            --file src/cyclo/credential_gateway/runtime_context/Dockerfile \
-            src/cyclo/credential_gateway/runtime_context
+            --build-arg "CYCLO_HOST_UID=$(id -u)" \
+            --build-arg "CYCLO_HOST_GID=$(id -g)" \
+            --tag cyclo-team:ci \
+            --file src/cyclo/components/team/Dockerfile \
+            src/cyclo/components
+      - name: Build a derived team image through Cyclo
+        run: |
+          PYTHONPATH=src python -c 'from pathlib import Path; from cyclo.images import Images; images = Images(); base = images.inspect("cyclo-team:ci"); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); images.build("cyclo-derived-team:ci", dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))'
+          docker run --rm --network none --entrypoint /bin/sh \
+            cyclo-derived-team:ci -ceu \
+            'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
+      - name: Exercise the baked AgentWS team runtime
+        run: PYTHONPATH=src tools/runtime-write-acceptance cyclo-team:ci
       - name: Build gateway image
         run: |
           docker build --pull \
             --tag cyclo-gateway:ci \
-            --file src/cyclo/credential_gateway/gateway_context/Dockerfile \
-            src/cyclo/credential_gateway/gateway_context
+            --file src/cyclo/components/gateway/Dockerfile \
+            src/cyclo/components
+      - name: Build passthrough provider image
+        run: |
+          docker build --pull \
+            --tag cyclo-passthrough:ci \
+            --file src/cyclo/components/passthrough/Dockerfile \
+            src/cyclo/components
       - name: Smoke-test images without credentials
         run: |
           docker run --rm --network none \
-            --env CYCLO_HOST_UID=1000 \
-            --env CYCLO_HOST_GID=1000 \
-            cyclo-runtime:ci sh -ceu '
+            cyclo-team:ci sh -ceu '
               python3 --version
               node --version
               npm --version
@@ -161,24 +200,20 @@ jobs:
               grep -F "Extension CLI Flags" /tmp/pi-help
             '
           docker run --rm --network none \
-            cyclo-gateway:ci supported-providers.mjs > /tmp/cyclo-providers
-          grep -F "$(printf 'PROVIDER\tDESCRIPTION\tAUTH\tLOGIN')" /tmp/cyclo-providers
+            cyclo-gateway:ci providers > /tmp/cyclo-providers
+          grep -F "Supported gateway providers" /tmp/cyclo-providers
+          grep -F "LOGIN COMMAND" /tmp/cyclo-providers
           grep -F "cyclo gateway login anthropic" /tmp/cyclo-providers
           grep -F "cyclo gateway login openai --api-key-stdin" /tmp/cyclo-providers
-          docker run --rm --network none cyclo-gateway:ci providers.mjs
+          docker run --rm --network none cyclo-gateway:ci providers
           if printf 'q\n' | docker run --rm --interactive \
             --security-opt no-new-privileges --cap-drop ALL --pids-limit 256 \
             --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-            --network none cyclo-gateway:ci login.mjs openai-codex \
+            --network none cyclo-gateway:ci login openai-codex \
             > /tmp/cyclo-oauth-login 2>&1; then
             echo "cancelled OAuth login unexpectedly succeeded" >&2
             exit 1
           fi
           grep -F "Select OpenAI Codex login method" /tmp/cyclo-oauth-login
-          grep -F "login failed: Login cancelled" /tmp/cyclo-oauth-login
-          docker run --rm --network none \
-            --env CYCLO_GATEWAY_TOKEN=image-smoke-token \
-            --env CYCLO_GATEWAY_AUTH_JSON=/tmp/cyclo-auth.json \
-            --env CYCLO_GATEWAY_MODELS_JSON=/tmp/cyclo-models.json \
-            --volume "$PWD/tests/fixtures/credential_gateway_image_smoke.mjs:/tmp/smoke.mjs:ro" \
-            cyclo-gateway:ci /tmp/smoke.mjs
+          grep -F "Login cancelled" /tmp/cyclo-oauth-login
+          docker run --rm --network none cyclo-gateway:ci providers

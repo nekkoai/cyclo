@@ -1,0 +1,73 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    echo "Usage: job-fail <job-id> --agent-id <agent-id> -m <message>"
+    exit 1
+}
+
+JOB_ID=""
+MESSAGE=""
+AGENT_ID=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -m)
+            [ "$#" -ge 2 ] || die "-m requires a message"
+            MESSAGE="$2"
+            shift 2
+            ;;
+        --agent-id)
+            [ "$#" -ge 2 ] || die "$1 requires an agent ID"
+            AGENT_ID="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            if [ -z "$JOB_ID" ]; then
+                JOB_ID="$1"
+            else
+                die "unexpected argument '$1'"
+            fi
+            shift
+            ;;
+    esac
+done
+
+[ -n "$JOB_ID" ] || usage
+[ -n "$AGENT_ID" ] || die "--agent-id <agent-id> is required"
+[ -n "$MESSAGE" ] || die "-m <message> is required"
+
+validate_job_id "$JOB_ID"
+validate_agent_id "$AGENT_ID"
+require_jobs_dir
+JOB_DIR="$JOBS_DIR/$JOB_ID"
+
+[ -d "$JOB_DIR" ] || die "job '$JOB_ID' does not exist"
+acquire_job_control_lock "$JOB_DIR"
+current_status="$(read_status "$JOB_DIR")"
+case "$current_status" in
+    claimed|running) ;;
+    *) die "cannot fail job '$JOB_ID' from status '$current_status' (expected: claimed or running)" ;;
+esac
+
+[ -d "$JOB_DIR/lock" ] || die "cannot fail job '$JOB_ID': missing lock directory"
+require_agent_owner "fail" "$JOB_ID" "$JOB_DIR" "$AGENT_ID"
+
+# A failed non-planner job must not disappear from the workflow. Publish the
+# coordination handoff first; failure leaves the source nonterminal on error.
+"$AGENTWS_ROOT/bin/job-notify-planner" "$JOB_ID" >/dev/null \
+    || die "cannot fail job '$JOB_ID': planner notification was not published"
+
+append_log "$JOB_DIR" "Failed" "$MESSAGE"
+write_file_atomic "$JOB_DIR/status" "failed"
+rmdir "$JOB_DIR/lock" 2>/dev/null || die "cannot fail job '$JOB_ID': lock directory is not empty"
+release_job_control_lock
+
+echo "$JOB_ID: $current_status -> failed"

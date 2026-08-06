@@ -1,0 +1,213 @@
+<!-- SPDX-License-Identifier: MIT -->
+
+# AgentWS Tools
+
+This directory contains local helper tools for an installed AgentWS directory.
+
+The shell launchers require `sh` and whichever agent CLI is selected (`pi`,
+`codex`, or `claude`). `tools/agentws` and `tools/agent` use Python 3 stdlib
+only.
+
+## `agentws`
+
+`agentws` is the top-level way to run AgentWS. It starts the configured
+processes and a local, observation-only web interface for the installed AgentWS
+directory. It serves the installed root by default, so from the target project
+root:
+
+```sh
+agentws/tools/agentws
+```
+
+Then open the printed local URL.
+By default, AgentWS starts at `http://127.0.0.1:4137` and increases the port
+until it finds a free one.
+
+Options:
+
+- `--root <path>`: serve a different AgentWS root.
+- `--workspace <path>`: agent process working directory. Defaults to the
+  AgentWS root; task/job/agent state and `bin/` tools remain rooted at `--root`.
+- `--team-manifest <path>`: load a portable `agentws-team.json` bundle. The
+  roster, protocol, and roles paths are resolved inside the manifest directory.
+- `--host <host>`: bind host. Defaults to `127.0.0.1`.
+- `--port <port>`: starting port to bind. AgentWS tries this port and then
+  increasing ports until one is free. Defaults to `4137`.
+- `--verbose`: print agent transcript output in this terminal.
+- `--no-team`: serve the web interface without starting agents.
+- `--no-console`: do not start the built-in console assistant.
+- `--console-model <model>`: pass a model to the built-in console assistant.
+- `--read-only`: deprecated compatibility flag; the web interface is always
+  observation-only.
+- `[team-file]`: team file to run. Defaults to `agentws/default.team`.
+
+## `run_agentws`
+
+`run_agentws` starts a named team from a team file and keeps successful agents
+available for later jobs. A worker that durably releases or fails its job
+restarts with exponential, capped backoff. After five consecutive settled
+retry exits the affected agent is suspended, preventing a bad model or job
+from becoming a tight retry loop.
+
+Each worker is a Linux child subreaper. Before a local retry it terminates and
+reaps the engine's complete adopted process tree, including descendants that
+created new sessions. If that cleanup cannot be proven, the worker exits
+unclean instead of starting beside a leftover engine.
+
+Any other worker exit is unclean: `run_agentws` exits, Cyclo's PID 1 exits, and
+Docker restarts the same container without rebuilding it. Docker teardown is
+the process-tree fence. Before new workers start, the runtime resets persisted
+`claimed` and `running` jobs to `pending` and clears stale agent assignments.
+Recovery requires an inherited capability for the runtime's exclusive queue
+lifetime lock, so a live agent cannot invoke the all-active reset.
+
+Each claimed job receives at most three model-process attempts by default. If a
+process exits while it still owns the job, the per-agent worker releases it
+only while attempts remain. Every `job-done` or `job-fail` outside role
+`planner`, whether agent-driven or automatic, first creates or verifies one
+deterministic planner job for the same task and source. Repeating settlement
+reuses that job, and a planner transition never creates another planner job.
+Notification is published before terminal status but remains mechanically
+unclaimable until the source is `done` or `failed`. If it cannot be published,
+the source stays nonterminal instead of disappearing from the workflow.
+AgentWS does not probe model services or infer why an engine exited. An engine
+failure follows this same bounded settlement path; only an operator-requested
+shutdown restores the previous attempt count.
+Operator-requested SIGINT/SIGTERM shutdown releases the job without consuming
+an attempt. These safe defaults can be adjusted with positive integer
+environment variables:
+
+- `AGENTWS_MAX_JOB_ATTEMPTS` (default `3`, maximum `100`)
+- `AGENTWS_MAX_CONSECUTIVE_FAILURES` (default `5`, maximum `100`)
+- `AGENTWS_RETRY_INITIAL_SECONDS` (default `2`)
+- `AGENTWS_RETRY_MAX_SECONDS` (default `30`, maximum `3600`)
+
+By default agents run headless. Use `--verbose` to print each agent's rendered
+transcript output to the terminal, prefixed by agent name.
+
+```sh
+agentws/tools/run_agentws --verbose
+agentws/tools/run_agentws
+```
+
+Team file format:
+
+```text
+# <name> <role> <agent> [model]
+planner-1 planner pi
+implementer-1 implementer codex
+implementer-2 implementer pi model-id
+reviewer-1 reviewer claude sonnet
+judge-1 judge pi
+```
+
+Role names are project-defined. A job stores a role; an agent may claim only the
+role in its team entry, and `roles/<role>.md` defines how that agent handles the
+work. Multiple agents may share a role. Task coordination authority belongs to
+role `planner`.
+
+Use `pi-interactive` for a Pi agent that keeps the normal AgentWS role and job
+protocol while exposing Pi's RPC input FIFO to external tooling:
+
+```text
+planner-1 planner pi-interactive
+```
+
+The built-in `console` assistant is different: `agentws/tools/agentws` can start
+it as agent `console` with role `console`. The console is not listed in the team
+file and never waits for or claims a queued job. Cyclo starts its AgentWS viewer
+with `--no-console`.
+
+## `agent`
+
+`agent` starts one named agent, claims one pending job for that agent's role,
+records the job in `agents/<agent-name>/current-job`, and renders CLI
+event output to `agents/<agent-name>/transcript.log`.
+By default it also prints the rendered transcript to stdout. Use `--headless`
+to write files only.
+
+From the target project root:
+
+```sh
+# Start a Pi planner agent.
+agentws/tools/agent --pi planner planner-1
+
+# Start a named Codex implementer agent.
+agentws/tools/agent --codex implementer implementer-1
+
+# Start a Claude reviewer agent with a specific model.
+agentws/tools/agent --claude -m sonnet reviewer reviewer-1
+```
+
+Options:
+
+- `--pi`: use Pi. This is the default.
+- `--codex`: use Codex CLI.
+- `--claude`: use Claude Code.
+- `--headless`: do not print the rendered transcript to stdout.
+- `-m <model>`: pass a model name to the selected CLI.
+
+CLI stderr is saved in `error.log`.
+
+The agent name is mandatory. `agent` calls `bin/agent-new` and repeatedly calls
+`bin/job-claim` with a bounded wait between empty-queue checks. The agent itself
+starts and completes the claimed job according to
+`AGENTS.md`. The rendered transcript is stored only in
+`agents/<agent-name>/transcript.log`; the job log points to that file.
+
+Pi runs in its ordinary print/JSON mode. The team image loads the pinned
+`pi-safe-compact` extension, which keeps successful automatic compaction and
+output-length continuation inside Pi. AgentWS only observes the process and the
+job's durable state; it does not implement Pi's context loop. Native endpoints
+surface typed pre-stream exhaustion, and the terminal team Provider adapter
+waits and replays it. Neither behavior belongs to AgentWS or the opaque
+Provider transport itself.
+
+## `agent-pi-interactive`
+
+`agent-pi-interactive` is launched by `run_agentws` for team entries that use
+`pi-interactive`, and by `agentws` itself for the built-in console assistant.
+It uses a local Pi RPC client, writes the rendered transcript to
+`agents/<agent-name>/transcript.log`, and exposes a local
+`input.fifo` for external RPC tooling. The AgentWS web viewer displays
+transcripts and errors but never sends or steers agent input. For a queued
+agent, Pi's `agent_settled` event ends the current attempt after Pi and its
+extensions have exhausted queued work. The queue-less console remains alive for
+later input. A queued interactive agent accepts FIFO steering and follow-ups
+only while its assigned turn is active.
+
+## Task Commands
+
+Task commands operate on local folders under `agentws/tasks/`:
+
+```sh
+agentws/bin/task-create <task-id> <spec-file>
+agentws/bin/task-show <task-id>
+agentws/bin/task-comment <task-id> <message>
+agentws/bin/task-state <task-id> open
+agentws/bin/task-state <task-id> done -m "completed"
+agentws/bin/task-result <task-id> <result-file>
+agentws/bin/task-list
+```
+
+Every task owns a persistent `.control.lock`. Creation publishes the complete
+task atomically, and each result/state file replacement is atomic. Commands
+that update multiple task files hold the task mutex for the full operation, so
+concurrent mutations cannot interleave. The mutex serializes writers; it does
+not turn a multi-file update into a crash transaction.
+
+## `bin/agent-new`
+
+`bin/agent-new <agent-id> <role>` creates a named agent directory when needed
+and prints its path. The role is both its queue route and prompt name. If the
+agent already has a claimed or running job, it exits with an error instead.
+
+Create a role-scoped job with a complete specification:
+
+```sh
+agentws/bin/job-create <job-id> --role <role> --task-id <task-id> <spec-file>
+```
+
+The worker supervisor passes the roster role to `job-wait --role <role>` and
+`job-claim [job-id] --role <role> --agent-id <agent-id>`. The claim records the
+named agent as owner only after selecting a pending job with that role.

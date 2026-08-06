@@ -1,21 +1,51 @@
 from __future__ import annotations
 
+import json
 import os
 import runpy
 import shutil
 import signal
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
+from typing import Any
 
-from cyclo.agentws_bundle import packaged_agentws_template
+import pytest
+
+from cyclo.team.resources import packaged_agentws_runtime
 
 
 RETRYABLE_AGENT_EXIT = 75
 
 
+def test_standard_pi_agent_uses_print_json_mode() -> None:
+    agent_script = packaged_agentws_runtime() / "tools" / "agent"
+    build_command = runpy.run_path(str(agent_script))["build_command"]
+
+    command = build_command(
+        "pi",
+        "provider/model",
+        Path("/agentws/agents/planner"),
+        "Do the job.",
+    )
+
+    assert command == [
+        "pi",
+        "-p",
+        "--mode",
+        "json",
+        "--model",
+        "provider/model",
+        "--session-dir",
+        "/agentws/agents/planner/pi-session",
+        "Do the job.",
+    ]
+
+
 def test_agent_prompt_treats_workspace_as_an_internal_project_root() -> None:
-    agent_script = packaged_agentws_template() / "tools" / "agent"
+    agent_script = packaged_agentws_runtime() / "tools" / "agent"
     build_initial_prompt = runpy.run_path(str(agent_script))["build_initial_prompt"]
 
     prompt = build_initial_prompt(
@@ -30,11 +60,303 @@ def test_agent_prompt_treats_workspace_as_an_internal_project_root() -> None:
     )
 
     normalized = " ".join(prompt.split())
-    assert "Project root (current working directory): /workspace" in normalized
-    assert "Interpret relative paths in user tasks from" in normalized
-    assert "container mount name is an internal runtime detail" in normalized
-    assert "do not require the task author to name it" in normalized
+    assert (
+        "Workspace namespace (current working directory): /workspace"
+        in normalized
+    )
+    assert "Interpret task paths using `project.cyclo`" in normalized
+    assert "Writable named projects are under `/workspace/<name>`" in normalized
+    assert "read-only inputs are under `/readonly/<name>`" in normalized
     assert "Agent workspace:" not in normalized
+
+
+def test_agent_prompt_references_project_config_without_copying_it() -> None:
+    agent_script = packaged_agentws_runtime() / "tools" / "agent"
+    build_initial_prompt = runpy.run_path(str(agent_script))["build_initial_prompt"]
+    project_config = (
+        "name uart\n"
+        "description UART implementation.\n"
+        "team /team ro\n"
+        "mount core /workspace/core rw\n"
+        "mount specifications /readonly/specifications ro\n"
+    )
+
+    prompt = build_initial_prompt(
+        "designer-1",
+        "designer",
+        Path("/agentws"),
+        Path("/workspace"),
+        Path("/team/AGENTS.md"),
+        Path("/team/roles/designer.md"),
+        "Custom team protocol that does not mention mounts.",
+        "Design RTL.",
+    )
+
+    assert "Cyclo project definition: /agentws/project.cyclo" in prompt
+    assert "mount core /workspace/core rw" not in prompt
+    assert "mount specifications /readonly/specifications ro" not in prompt
+    assert "Custom team protocol that does not mention mounts." in prompt
+    assert project_config.strip() not in prompt
+    assert "PROJECT.md" not in prompt
+
+
+def test_team_protocol_is_layered_after_system_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, _workspace = copy_runtime(tmp_path)
+    team = tmp_path / "team"
+    roles = team / "roles"
+    roles.mkdir(parents=True)
+    (roles / "designer.md").write_text("Design RTL.\n", encoding="utf-8")
+    team_protocol = team / "AGENTS.md"
+    team_protocol.write_text("Use the team lint rules.\n", encoding="utf-8")
+    monkeypatch.setenv("AGENTWS_SYSTEM_PROTOCOL", str(runtime / "AGENTS.md"))
+    monkeypatch.setenv("AGENTWS_TEAM_PROTOCOL", str(team_protocol))
+    monkeypatch.setenv("AGENTWS_TEAM_ROLES_DIR", str(roles))
+
+    agent_script = runtime / "tools" / "agent"
+    load_team_context = runpy.run_path(str(agent_script))["load_team_context"]
+    protocol_file, _role_file, protocol_text, _role_text = load_team_context(
+        runtime, "designer"
+    )
+
+    assert protocol_file == runtime / "AGENTS.md"
+    assert "You are an AgentWS role agent" in protocol_text
+    assert "# Team-specific additions" in protocol_text
+    assert f"Source: {team_protocol}" in protocol_text
+    assert "Use the team lint rules." in protocol_text
+    assert protocol_text.index("You are an AgentWS role agent") < protocol_text.index(
+        "Use the team lint rules."
+    )
+
+
+def test_interactive_agent_prompt_references_instance_project_config(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    create_planner_job(runtime, tmp_path, "interactive-project-context")
+    project_config = runtime / "project.cyclo"
+    project_config.write_text(
+        "name interactive\n"
+        "description Interactive project.\n"
+        "team /team ro\n"
+        "mount core /workspace/core rw\n",
+        encoding="utf-8",
+    )
+    environment = agent_environment(tmp_path, workspace, "#!/bin/sh\nexit 23\n")
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent-pi-interactive"),
+            "--headless",
+            "planner",
+            "planner-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    prompt = (runtime / "agents" / "planner-1" / "prompt.md").read_text(
+        encoding="utf-8"
+    )
+    assert f"Cyclo project definition: {project_config}" in prompt
+    assert "mount core /workspace/core rw" not in prompt
+    assert "PROJECT.md" not in prompt
+
+
+def test_interactive_initial_rpc_failure_settles_the_claimed_job(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_planner_job(runtime, tmp_path, "interactive-rpc-failure")
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        r"""#!/usr/bin/env python3
+import json
+import sys
+import time
+
+request = json.loads(sys.stdin.readline())
+assert request["id"] == "initial"
+print(json.dumps({
+    "id": "web-early",
+    "type": "response",
+    "success": True,
+}), flush=True)
+print(json.dumps({
+    "id": "initial",
+    "type": "response",
+    "success": False,
+    "error": "model request rejected",
+}), flush=True)
+time.sleep(30)
+""",
+    )
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent-pi-interactive"),
+            "--headless",
+            "planner",
+            "planner-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
+    assert not (job / "lock").exists()
+    assert (job / ".agent-attempts").read_text(encoding="utf-8").strip() == "1"
+    transcript = (runtime / "agents" / "planner-1" / "transcript.log").read_text(
+        encoding="utf-8"
+    )
+    assert "pi rpc error" in transcript
+    assert "model request rejected" in transcript
+
+
+def test_interactive_noninitial_rpc_failure_does_not_settle_the_job(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_planner_job(runtime, tmp_path, "interactive-rpc-order")
+    continued = tmp_path / "pi-continued"
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        r"""#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+request = json.loads(sys.stdin.readline())
+assert request["id"] == "initial"
+print(json.dumps({
+    "id": "web-early",
+    "type": "response",
+    "success": False,
+    "error": "unrelated external input failed",
+}), flush=True)
+time.sleep(0.5)
+with open(os.environ["FAKE_PI_CONTINUED"], "w", encoding="utf-8") as stream:
+    stream.write("yes\n")
+print(json.dumps({
+    "id": "initial",
+    "type": "response",
+    "success": False,
+    "error": "initial model request rejected",
+}), flush=True)
+time.sleep(30)
+""",
+    )
+    environment["FAKE_PI_CONTINUED"] = str(continued)
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent-pi-interactive"),
+            "--headless",
+            "planner",
+            "planner-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    assert continued.is_file()
+    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
+    assert not (job / "lock").exists()
+    assert (job / ".agent-attempts").read_text(encoding="utf-8").strip() == "1"
+
+
+def test_interactive_agent_settled_ends_the_claimed_attempt(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_planner_job(runtime, tmp_path, "interactive-agent-settled")
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        r"""#!/usr/bin/env python3
+import json
+import sys
+import time
+
+request = json.loads(sys.stdin.readline())
+assert request["id"] == "initial"
+print(json.dumps({
+    "id": "initial",
+    "type": "response",
+    "command": "prompt",
+    "success": True,
+}), flush=True)
+print(json.dumps({
+    "type": "message",
+    "message": {
+        "role": "assistant",
+        "stopReason": "error",
+        "errorMessage": "upstream request failed",
+    },
+}), flush=True)
+print(json.dumps({"type": "agent_settled"}), flush=True)
+time.sleep(30)
+""",
+    )
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent-pi-interactive"),
+            "--headless",
+            "planner",
+            "planner-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
+    assert not (job / "lock").exists()
+    assert (job / ".agent-attempts").read_text(encoding="utf-8").strip() == "1"
+    log = (job / "log.md").read_text(encoding="utf-8")
+    assert "exited with status 0 without finishing the job" in log
+
+
+def test_python_agent_worker_rejects_hidden_agent_id(tmp_path: Path) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    environment = agent_environment(tmp_path, workspace, "#!/bin/sh\nexit 0\n")
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            ".hidden",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "must start with an alphanumeric" in result.stderr
+    assert not (runtime / "agents" / ".hidden").exists()
 
 
 def write_executable(path: Path, text: str) -> None:
@@ -44,7 +366,7 @@ def write_executable(path: Path, text: str) -> None:
 
 def copy_runtime(tmp_path: Path) -> tuple[Path, Path]:
     runtime = tmp_path / "agentws"
-    shutil.copytree(packaged_agentws_template(), runtime)
+    shutil.copytree(packaged_agentws_runtime(), runtime)
     subprocess.run([str(runtime / "bin" / "job-init")], check=True, capture_output=True)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -61,6 +383,38 @@ def create_planner_job(runtime: Path, tmp_path: Path, task_id: str = "retry") ->
         text=True,
     )
     return runtime / "jobs" / f"{task_id}-plan"
+
+
+def create_role_job(
+    runtime: Path,
+    tmp_path: Path,
+    *,
+    task_id: str,
+    job_id: str,
+    role: str,
+) -> Path:
+    create_planner_job(runtime, tmp_path, task_id)
+    spec = tmp_path / f"{job_id}.md"
+    spec.write_text(f"# Work for {role}\n", encoding="utf-8")
+    subprocess.run(
+        [
+            str(runtime / "bin" / "job-create"),
+            job_id,
+            "-r",
+            role,
+            "-t",
+            task_id,
+            str(spec),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return runtime / "jobs" / job_id
+
+
+def planner_notification_module(runtime: Path) -> dict[str, Any]:
+    return runpy.run_path(str(runtime / "tools" / "planner_notification.py"))
 
 
 def agent_environment(
@@ -134,7 +488,12 @@ printf '%s\n' "$count" > "$FAKE_PI_COUNT"
 exit 23
 """,
     )
-    command = [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"]
+    command = [
+        str(runtime / "tools" / "agent"),
+        "--pi",
+        "planner",
+        "planner-1",
+    ]
 
     first = subprocess.run(
         command,
@@ -168,6 +527,520 @@ exit 23
         encoding="utf-8"
     )
     assert (tmp_path / "pi-count").read_text(encoding="utf-8").strip() == "2"
+    assert sorted(path.name for path in (runtime / "jobs").iterdir()) == [
+        "retry-plan"
+    ]
+
+
+def test_stored_retry_exhaustion_fails_job_without_launching_engine(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_planner_job(runtime, tmp_path, "stored-planner")
+    (job / ".agent-attempts").write_text("1\n", encoding="utf-8")
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        "#!/bin/sh\n: > \"$FAKE_PI_STARTED\"\nexit 99\n",
+        max_attempts=1,
+    )
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT
+    assert (job / "status").read_text(encoding="utf-8").strip() == "failed"
+    assert not (tmp_path / "pi-started").exists()
+    assert sorted(path.name for path in (runtime / "jobs").iterdir()) == [
+        "stored-planner-plan"
+    ]
+
+
+def test_terminal_engine_crash_notifies_planner_before_failing_job(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_role_job(
+        runtime,
+        tmp_path,
+        task_id="uart",
+        job_id="uart-implementation",
+        role="implementer",
+    )
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        "#!/bin/sh\nexit 23\n",
+        max_attempts=1,
+    )
+    jobs_before = sorted(path.name for path in (runtime / "jobs").iterdir())
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "implementer",
+            "impl-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT
+    assert (job / "status").read_text(encoding="utf-8").strip() == "failed"
+    jobs_after = {path.name for path in (runtime / "jobs").iterdir()}
+    created = jobs_after - set(jobs_before)
+    assert len(created) == 1
+    notification = runtime / "jobs" / created.pop()
+    assert (notification / "role").read_text(encoding="utf-8").strip() == "planner"
+    assert (notification / "task-id").read_text(encoding="utf-8").strip() == "uart"
+    spec = (notification / "spec.md").read_text(encoding="utf-8")
+    assert "# Notify Planner: uart-implementation" in spec
+    assert "## Source Job\nuart-implementation" in spec
+    assert "## Source Role\nimplementer" in spec
+    assert "source job terminal transition" in spec
+    source_log = (job / "log.md").read_text(encoding="utf-8")
+    assert "process exited with status 23" in source_log
+    assert "retry safety budget exhausted (1/1)" in source_log
+
+
+def test_existing_planner_notification_is_reused_after_crash_boundary(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_role_job(
+        runtime,
+        tmp_path,
+        task_id="crash-boundary",
+        job_id="crash-boundary-work",
+        role="implementer",
+    )
+    agent_module = runpy.run_path(str(runtime / "tools" / "agent"))
+    notification_module = planner_notification_module(runtime)
+    (job / ".agent-attempts").write_text("7\n", encoding="utf-8")
+    subprocess.run(
+        [
+            str(runtime / "bin" / "job-claim"),
+            job.name,
+            "-r",
+            "implementer",
+            "--agent-id",
+            "impl-before-crash",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert agent_module["ensure_planner_visibility"](
+        runtime,
+        job,
+        job.name,
+    )
+    notification_id = notification_module["planner_notification_id"](
+        "crash-boundary",
+        job.name,
+    )
+    notification = runtime / "jobs" / notification_id
+    original_spec = (notification / "spec.md").read_text(encoding="utf-8")
+    assert (job / "status").read_text(encoding="utf-8").strip() == "claimed"
+    assert "queue keeps it unclaimable" in original_spec
+    assert (
+        notification / ".terminal-notice-source"
+    ).read_text(encoding="utf-8").strip() == job.name
+    premature_claim = subprocess.run(
+        [
+            str(runtime / "bin" / "job-claim"),
+            notification_id,
+            "-r",
+            "planner",
+            "--agent-id",
+            "planner-before-terminal",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert premature_claim.returncode != 0
+    assert "waiting for source job" in premature_claim.stderr
+    assert (notification / "status").read_text(encoding="utf-8").strip() == "pending"
+    subprocess.run(
+        [str(runtime / "bin" / "job-reset-orphans")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        "#!/bin/sh\n: > \"$FAKE_PI_STARTED\"\nexit 99\n",
+        max_attempts=7,
+    )
+    jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "implementer",
+            "impl-after-crash",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    assert (job / "status").read_text(encoding="utf-8").strip() == "failed"
+    assert not (tmp_path / "pi-started").exists()
+    assert {path.name for path in (runtime / "jobs").iterdir()} == jobs_before
+    assert (notification / "spec.md").read_text(encoding="utf-8") == original_spec
+    terminal_claim = subprocess.run(
+        [
+            str(runtime / "bin" / "job-claim"),
+            notification_id,
+            "-r",
+            "planner",
+            "--agent-id",
+            "planner-after-terminal",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert terminal_claim.returncode == 0, terminal_claim.stderr
+
+
+def test_mismatched_planner_notification_collision_is_container_fatal(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_role_job(
+        runtime,
+        tmp_path,
+        task_id="notice-collision",
+        job_id="notice-collision-work",
+        role="implementer",
+    )
+    notification_module = planner_notification_module(runtime)
+    notification_id = notification_module["planner_notification_id"](
+        "notice-collision",
+        job.name,
+    )
+    foreign_spec = tmp_path / "foreign-notification.md"
+    canonical_spec = notification_module["planner_notification_spec"](
+        "notice-collision",
+        job.name,
+        "implementer",
+    )
+    foreign_spec.write_text(
+        canonical_spec.replace("terminal transition", "terminal replacement", 1),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            str(runtime / "bin" / "job-create"),
+            notification_id,
+            "-r",
+            "planner",
+            "-t",
+            "notice-collision",
+            str(foreign_spec),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        "#!/bin/sh\nexit 23\n",
+        max_attempts=1,
+    )
+    jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "implementer",
+            "impl-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 70
+    assert (job / "status").read_text(encoding="utf-8").strip() == "claimed"
+    assert (job / "lock").is_dir()
+    assert "planner notification collision" in result.stderr
+    assert {path.name for path in (runtime / "jobs").iterdir()} == jobs_before
+
+
+def test_notification_metadata_checks_reject_fifo_without_blocking(
+    tmp_path: Path,
+) -> None:
+    runtime, _workspace = copy_runtime(tmp_path)
+    notification_module = planner_notification_module(runtime)
+    fifo = tmp_path / "metadata-fifo"
+    os.mkfifo(fifo)
+
+    assert notification_module["_read_regular_text"](fifo, 1024) is None
+    assert notification_module["_is_regular_file"](fifo) is False
+
+
+def test_planner_notification_creation_failure_leaves_source_claimed(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_role_job(
+        runtime,
+        tmp_path,
+        task_id="notice-create-failure",
+        job_id="notice-create-failure-work",
+        role="implementer",
+    )
+    write_executable(runtime / "bin" / "job-create", "#!/bin/sh\nexit 99\n")
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        "#!/bin/sh\nexit 23\n",
+        max_attempts=1,
+    )
+    jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "implementer",
+            "impl-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 70
+    assert (job / "status").read_text(encoding="utf-8").strip() == "claimed"
+    assert (job / "lock").is_dir()
+    assert "planner notification creation failed" in result.stderr
+    assert {path.name for path in (runtime / "jobs").iterdir()} == jobs_before
+
+
+def test_public_nonplanner_job_fail_publishes_planner_notice(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_role_job(
+        runtime,
+        tmp_path,
+        task_id="public-fail",
+        job_id="public-fail-work",
+        role="implementer",
+    )
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        """#!/bin/sh
+set -eu
+"$FAKE_JOB_FAIL" "$FAKE_JOB_ID" --agent-id impl-1 -m "private direct failure detail"
+exit 23
+""",
+        max_attempts=3,
+    )
+    environment.update(
+        {
+            "FAKE_JOB_FAIL": str(runtime / "bin" / "job-fail"),
+            "FAKE_JOB_ID": job.name,
+        }
+    )
+    jobs_before = {path.name for path in (runtime / "jobs").iterdir()}
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "implementer",
+            "impl-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (job / "status").read_text(encoding="utf-8").strip() == "failed"
+    assert "private direct failure detail" in (job / "log.md").read_text(
+        encoding="utf-8"
+    )
+    created = {
+        path.name for path in (runtime / "jobs").iterdir()
+    } - jobs_before
+    assert len(created) == 1
+    notification = runtime / "jobs" / created.pop()
+    assert (notification / "role").read_text(encoding="utf-8").strip() == "planner"
+    assert (notification / "task-id").read_text(encoding="utf-8").strip() == (
+        "public-fail"
+    )
+    spec = (notification / "spec.md").read_text(encoding="utf-8")
+    assert "# Notify Planner: public-fail-work" in spec
+    assert "## Source Job\npublic-fail-work" in spec
+
+
+def test_public_planner_job_fail_remains_terminal_when_engine_exits(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_planner_job(runtime, tmp_path, "public-planner-fail")
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        """#!/bin/sh
+set -eu
+"$FAKE_JOB_FAIL" "$FAKE_JOB_ID" --agent-id planner-1 -m "planner direct failure"
+exit 23
+""",
+        max_attempts=3,
+    )
+    environment.update(
+        {
+            "FAKE_JOB_FAIL": str(runtime / "bin" / "job-fail"),
+            "FAKE_JOB_ID": job.name,
+        }
+    )
+    jobs_before = sorted(path.name for path in (runtime / "jobs").iterdir())
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert (job / "status").read_text(encoding="utf-8").strip() == "failed"
+    assert sorted(path.name for path in (runtime / "jobs").iterdir()) == jobs_before
+
+
+@pytest.mark.parametrize(
+    ("role", "agent_name", "task_id", "job_id"),
+    [
+        (
+            "implementer",
+            "impl-1",
+            "release-fallback",
+            "release-fallback-work",
+        ),
+        (
+            "planner",
+            "planner-1",
+            "planner-release-fallback",
+            "planner-release-fallback-plan",
+        ),
+    ],
+)
+def test_job_release_failure_fails_owned_job_closed(
+    tmp_path: Path,
+    role: str,
+    agent_name: str,
+    task_id: str,
+    job_id: str,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    if role == "planner":
+        job = create_planner_job(runtime, tmp_path, task_id)
+        assert job.name == job_id
+    else:
+        job = create_role_job(
+            runtime,
+            tmp_path,
+            task_id=task_id,
+            job_id=job_id,
+            role=role,
+        )
+    write_executable(runtime / "bin" / "job-release", "#!/bin/sh\nexit 99\n")
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        "#!/bin/sh\nexit 23\n",
+        max_attempts=3,
+    )
+    jobs_before = sorted(path.name for path in (runtime / "jobs").iterdir())
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            role,
+            agent_name,
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == 70
+    assert (job / "status").read_text(encoding="utf-8").strip() == "failed"
+    jobs_after = {path.name for path in (runtime / "jobs").iterdir()}
+    created = jobs_after - set(jobs_before)
+    if role == "planner":
+        assert not created
+    else:
+        assert len(created) == 1
+        notification = runtime / "jobs" / created.pop()
+        assert (notification / "role").read_text(encoding="utf-8").strip() == (
+            "planner"
+        )
+        assert (
+            notification / ".terminal-notice-source"
+        ).read_text(encoding="utf-8").strip() == job.name
+        claimed = subprocess.run(
+            [
+                str(runtime / "bin" / "job-claim"),
+                notification.name,
+                "-r",
+                "planner",
+                "--agent-id",
+                "planner-after-fallback",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert claimed.returncode == 0, claimed.stderr
 
 
 def test_signal_shutdown_releases_job_without_consuming_attempt(tmp_path: Path) -> None:
@@ -183,7 +1056,12 @@ exec sleep 30
 """,
     )
     process = subprocess.Popen(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         stdout=subprocess.PIPE,
@@ -206,7 +1084,7 @@ exec sleep 30
     )
 
 
-def test_crashed_engine_cannot_hold_output_pipe_or_leave_descendant(
+def test_detached_engine_descendant_is_reaped_before_local_retry(
     tmp_path: Path,
 ) -> None:
     runtime, workspace = copy_runtime(tmp_path)
@@ -215,19 +1093,32 @@ def test_crashed_engine_cannot_hold_output_pipe_or_leave_descendant(
     environment = agent_environment(
         tmp_path,
         workspace,
-        """#!/bin/sh
-set -eu
-sleep 30 &
-child=$!
-printf '%s\n' "$child" > "$FAKE_PI_CHILD"
-exit 23
+        r"""#!/usr/bin/env python3
+import os
+import subprocess
+
+child = subprocess.Popen(
+    ["sleep", "30"],
+    start_new_session=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+with open(os.environ["FAKE_PI_CHILD"], "w", encoding="utf-8") as stream:
+    stream.write(f"{child.pid}\n")
+os._exit(23)
 """,
     )
     environment["FAKE_PI_CHILD"] = str(child_file)
 
     started = time.monotonic()
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -236,9 +1127,49 @@ exit 23
     )
 
     assert time.monotonic() - started < 7
-    assert result.returncode == RETRYABLE_AGENT_EXIT
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    child_pid = int(child_file.read_text(encoding="utf-8").strip())
+    wait_for_process_exit(child_pid)
     assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
-    wait_for_process_exit(int(child_file.read_text(encoding="utf-8").strip()))
+    assert not (job / "lock").exists()
+
+
+def test_exited_engine_cli_still_cleans_its_process_group(tmp_path: Path) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    job = create_planner_job(runtime, tmp_path, "same-group-descendant")
+    child_file = tmp_path / "same-group-pi-child"
+    environment = agent_environment(
+        tmp_path,
+        workspace,
+        """#!/bin/sh
+set -eu
+sleep 30 </dev/null >/dev/null 2>&1 &
+child=$!
+printf '%s\n' "$child" > "$FAKE_PI_CHILD"
+exit 23
+""",
+    )
+    environment["FAKE_PI_CHILD"] = str(child_file)
+
+    result = subprocess.run(
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    child_pid = int(child_file.read_text(encoding="utf-8").strip())
+    wait_for_process_exit(child_pid)
+    assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
+    assert not (job / "lock").exists()
 
 
 def test_prelaunch_failure_still_settles_claimed_job(tmp_path: Path) -> None:
@@ -255,7 +1186,12 @@ def test_prelaunch_failure_still_settles_claimed_job(tmp_path: Path) -> None:
     )
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -282,7 +1218,12 @@ def test_transition_failure_fails_closed_and_returns_fatal_status(
     )
 
     result = subprocess.run(
-        [str(runtime / "tools" / "agent"), "--pi", "planner", "planner-1"],
+        [
+            str(runtime / "tools" / "agent"),
+            "--pi",
+            "planner",
+            "planner-1",
+        ],
         env=environment,
         text=True,
         capture_output=True,
@@ -298,7 +1239,57 @@ def test_transition_failure_fails_closed_and_returns_fatal_status(
     )
 
 
-def test_interactive_agent_cleans_descendants_and_settles_job(
+def test_fallback_rechecks_ownership_before_failing_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, _workspace = copy_runtime(tmp_path)
+    job = create_role_job(
+        runtime,
+        tmp_path,
+        task_id="fallback-owner-race",
+        job_id="fallback-owner-race-work",
+        role="implementer",
+    )
+    subprocess.run(
+        [
+            str(runtime / "bin" / "job-claim"),
+            job.name,
+            "-r",
+            "implementer",
+            "--agent-id",
+            "impl-1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    agent_module = runpy.run_path(str(runtime / "tools" / "agent"))
+
+    def lose_ownership(*_args, **_kwargs) -> bool:
+        with agent_module["job_control_lock"](job):
+            (job / "agent-id").write_text("impl-2\n", encoding="utf-8")
+        return False
+
+    function_globals = agent_module["transition_or_fail_closed"].__globals__
+    monkeypatch.setitem(function_globals, "run_job_transition", lose_ownership)
+
+    settled, used_fallback = agent_module["transition_or_fail_closed"](
+        runtime,
+        job,
+        job.name,
+        "impl-1",
+        "job-release",
+        "simulated transition failure",
+    )
+
+    assert not settled
+    assert used_fallback
+    assert (job / "status").read_text(encoding="utf-8").strip() == "claimed"
+    assert (job / "agent-id").read_text(encoding="utf-8").strip() == "impl-2"
+    assert (job / "lock").is_dir()
+
+
+def test_interactive_reaps_detached_descendant_before_local_retry(
     tmp_path: Path,
 ) -> None:
     runtime, workspace = copy_runtime(tmp_path)
@@ -307,12 +1298,20 @@ def test_interactive_agent_cleans_descendants_and_settles_job(
     environment = agent_environment(
         tmp_path,
         workspace,
-        """#!/bin/sh
-set -eu
-sleep 30 &
-child=$!
-printf '%s\n' "$child" > "$FAKE_PI_CHILD"
-exit 23
+        r"""#!/usr/bin/env python3
+import os
+import subprocess
+
+child = subprocess.Popen(
+    ["sleep", "30"],
+    start_new_session=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+with open(os.environ["FAKE_PI_CHILD"], "w", encoding="utf-8") as stream:
+    stream.write(f"{child.pid}\n")
+os._exit(23)
 """,
     )
     environment["FAKE_PI_CHILD"] = str(child_file)
@@ -331,9 +1330,11 @@ exit 23
         check=False,
     )
 
-    assert result.returncode == RETRYABLE_AGENT_EXIT
+    assert result.returncode == RETRYABLE_AGENT_EXIT, result.stderr
+    child_pid = int(child_file.read_text(encoding="utf-8").strip())
+    wait_for_process_exit(child_pid)
     assert (job / "status").read_text(encoding="utf-8").strip() == "pending"
-    wait_for_process_exit(int(child_file.read_text(encoding="utf-8").strip()))
+    assert not (job / "lock").exists()
 
 
 def supervisor_environment(
@@ -352,7 +1353,9 @@ def supervisor_environment(
     protocol = team_root / "AGENTS.md"
     protocol.write_text("Use the queue.\n", encoding="utf-8")
     roster = team_root / "team"
-    roster.write_text("planner-1 planner pi test/model\n", encoding="utf-8")
+    roster.write_text(
+        "planner-1 planner pi test/model\n", encoding="utf-8"
+    )
     environment = os.environ.copy()
     environment.update(
         {
@@ -385,6 +1388,171 @@ def start_supervisor(
     )
 
 
+def test_supervisor_validates_the_complete_roster_before_starting_any_agent(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    started = tmp_path / "agent-started"
+    write_executable(
+        runtime / "tools" / "agent",
+        "#!/bin/sh\n: > \"$FAKE_AGENT_STARTED\"\nexec sleep 30\n",
+    )
+    environment = supervisor_environment(
+        tmp_path, runtime, workspace, max_failures=3
+    )
+    environment["FAKE_AGENT_STARTED"] = str(started)
+    roster = Path(environment["AGENTWS_TEAM_ROSTER"])
+    roster.write_text(
+        "planner-1 planner pi test/model\n"
+        "planner-1 planner pi test/other\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(runtime / "tools" / "run_agentws")],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "duplicate agent name 'planner-1'" in result.stderr
+    assert not started.exists()
+    assert not (runtime / "agents" / ".team-runs" / "supervisor.ready").exists()
+
+
+def test_supervisor_refuses_unremovable_stale_suspension_state(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    started = tmp_path / "agent-started"
+    write_executable(
+        runtime / "tools" / "agent",
+        "#!/bin/sh\n: > \"$FAKE_AGENT_STARTED\"\nexec sleep 30\n",
+    )
+    environment = supervisor_environment(
+        tmp_path, runtime, workspace, max_failures=3
+    )
+    environment["FAKE_AGENT_STARTED"] = str(started)
+    stale = runtime / "agents" / ".team-runs" / "planner-1.suspended"
+    stale.mkdir(parents=True)
+
+    result = subprocess.run(
+        [str(runtime / "tools" / "run_agentws")],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "cannot clear stale agent suspension markers" in result.stderr
+    assert not started.exists()
+    assert not (runtime / "agents" / ".team-runs" / "supervisor.ready").exists()
+
+
+def test_supervisor_refreshes_readiness_and_removes_it_on_shutdown(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    write_executable(runtime / "tools" / "agent", "#!/bin/sh\nexec sleep 30\n")
+    environment = supervisor_environment(
+        tmp_path, runtime, workspace, max_failures=3
+    )
+    ready = runtime / "agents" / ".team-runs" / "supervisor.ready"
+    process = start_supervisor(runtime, environment)
+    try:
+        wait_for(ready)
+        first_mtime = ready.stat().st_mtime_ns
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and ready.stat().st_mtime_ns == first_mtime:
+            time.sleep(0.05)
+        assert ready.stat().st_mtime_ns > first_mtime
+    finally:
+        stop_process_group(process)
+
+    assert not ready.exists()
+
+
+def test_normally_exited_supervisor_stops_sibling_worker_and_engine(
+    tmp_path: Path,
+) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    sibling_worker = tmp_path / "sibling-worker"
+    sibling_engine = tmp_path / "sibling-engine"
+    exiting_supervisor = tmp_path / "exiting-supervisor"
+    fake_bin = tmp_path / "supervisor-bin"
+    fake_bin.mkdir()
+    write_executable(
+        fake_bin / "sleep",
+        """#!/bin/sh
+set -eu
+if [ -f "$EXITING_SUPERVISOR" ] \
+    && [ "$(cat "$EXITING_SUPERVISOR")" = "$PPID" ]; then
+    exit 99
+fi
+exec /bin/sleep "$@"
+""",
+    )
+    write_executable(
+        runtime / "tools" / "agent",
+        """#!/bin/sh
+set -eu
+last=""
+for argument in "$@"; do last="$argument"; done
+if [ "$last" = "planner-1" ]; then
+    while [ ! -f "$SIBLING_ENGINE" ]; do sleep 0.02; done
+    printf '%s\n' "$PPID" > "$EXITING_SUPERVISOR"
+    exit 0
+fi
+printf '%s\n' "$$" > "$SIBLING_WORKER"
+sleep 30 &
+engine=$!
+printf '%s\n' "$engine" > "$SIBLING_ENGINE"
+stop() {
+    kill "$engine" 2>/dev/null || true
+    wait "$engine" 2>/dev/null || true
+    exit 0
+}
+trap stop INT TERM
+wait "$engine"
+""",
+    )
+    environment = supervisor_environment(
+        tmp_path, runtime, workspace, max_failures=3
+    )
+    roles = Path(environment["AGENTWS_TEAM_ROLES_DIR"])
+    (roles / "worker.md").write_text("Work.\n", encoding="utf-8")
+    Path(environment["AGENTWS_TEAM_ROSTER"]).write_text(
+        "planner-1 planner pi test/model\n"
+        "worker-1 worker pi test/model\n",
+        encoding="utf-8",
+    )
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment.get('PATH', '')}",
+            "SIBLING_WORKER": str(sibling_worker),
+            "SIBLING_ENGINE": str(sibling_engine),
+            "EXITING_SUPERVISOR": str(exiting_supervisor),
+        }
+    )
+
+    process = start_supervisor(runtime, environment)
+    stdout, stderr = process.communicate(timeout=8)
+
+    assert process.returncode != 0
+    assert "agent supervisor planner-1 exited with status 99" in stderr
+    assert "started worker-1" in stdout
+    worker_pid = int(sibling_worker.read_text(encoding="utf-8").strip())
+    engine_pid = int(sibling_engine.read_text(encoding="utf-8").strip())
+    wait_for_process_exit(worker_pid)
+    wait_for_process_exit(engine_pid)
+    assert not (runtime / "agents" / ".team-runs" / "supervisor.ready").exists()
+
+
 def test_supervisor_uses_capped_backoff_then_suspends(tmp_path: Path) -> None:
     runtime, workspace = copy_runtime(tmp_path)
     write_executable(
@@ -395,7 +1563,7 @@ count=0
 [ ! -f "$FAKE_AGENT_COUNT" ] || count=$(cat "$FAKE_AGENT_COUNT")
 count=$((count + 1))
 printf '%s\n' "$count" > "$FAKE_AGENT_COUNT"
-exit 9
+exit 75
 """,
     )
     environment = supervisor_environment(
@@ -417,28 +1585,62 @@ exit 9
     assert "started planner-1" in stdout
 
 
-def test_supervisor_suspends_immediately_on_fatal_agent_status(
-    tmp_path: Path,
+@pytest.mark.parametrize("status", [1, 70, 137])
+def test_supervisor_propagates_unclean_agent_status(
+    tmp_path: Path, status: int
 ) -> None:
     runtime, workspace = copy_runtime(tmp_path)
     write_executable(
         runtime / "tools" / "agent",
-        "#!/bin/sh\nprintf '1\\n' > \"$FAKE_AGENT_COUNT\"\nexit 70\n",
+        f"#!/bin/sh\nprintf '1\\n' > \"$FAKE_AGENT_COUNT\"\nexit {status}\n",
     )
     environment = supervisor_environment(
         tmp_path, runtime, workspace, max_failures=5
     )
-    suspended = runtime / "agents" / ".team-runs" / "planner-1.suspended"
+    process = start_supervisor(runtime, environment)
+    _stdout, stderr = process.communicate(timeout=8)
+
+    assert process.returncode != 0
+    assert (tmp_path / "agent-count").read_text(encoding="utf-8").strip() == "1"
+    assert f"without a clean settlement (status {status})" in stderr
+    assert "restarting the Cyclo container" in stderr
+    assert not (
+        runtime / "agents" / ".team-runs" / "planner-1.suspended"
+    ).exists()
+
+
+def test_sigkill_worker_exits_team_without_local_replacement(tmp_path: Path) -> None:
+    runtime, workspace = copy_runtime(tmp_path)
+    worker_pid = tmp_path / "worker-pid"
+    write_executable(
+        runtime / "tools" / "agent",
+        """#!/bin/sh
+set -eu
+count=0
+[ ! -f "$FAKE_AGENT_COUNT" ] || count=$(cat "$FAKE_AGENT_COUNT")
+count=$((count + 1))
+printf '%s\n' "$count" > "$FAKE_AGENT_COUNT"
+printf '%s\n' "$$" > "$FAKE_WORKER_PID"
+exec sleep 30
+""",
+    )
+    environment = supervisor_environment(
+        tmp_path, runtime, workspace, max_failures=5
+    )
+    environment["FAKE_WORKER_PID"] = str(worker_pid)
     process = start_supervisor(runtime, environment)
     try:
-        wait_for(suspended)
-        _stdout, stderr = stop_process_group(process)
+        wait_for(worker_pid)
+        os.kill(int(worker_pid.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+        _stdout, stderr = process.communicate(timeout=8)
     finally:
         if process.poll() is None:
             stop_process_group(process)
 
+    assert process.returncode != 0
     assert (tmp_path / "agent-count").read_text(encoding="utf-8").strip() == "1"
-    assert "suspended immediately after fatal safety status 70" in stderr
+    assert "without a clean settlement" in stderr
+    assert "restarting the Cyclo container" in stderr
 
 
 def test_successful_agent_exit_resets_consecutive_failure_count(tmp_path: Path) -> None:
@@ -452,7 +1654,7 @@ count=0
 count=$((count + 1))
 printf '%s\n' "$count" > "$FAKE_AGENT_COUNT"
 case "$count" in
-    1|3) exit 9 ;;
+    1|3) exit 75 ;;
     2|4) exit 0 ;;
     *) : > "$FAKE_AGENT_FIFTH"; exec sleep 30 ;;
 esac
@@ -465,10 +1667,16 @@ esac
         max_failures=2,
         maximum_delay=1,
     )
+    stale_suspension = (
+        runtime / "agents" / ".team-runs" / "removed-agent.suspended"
+    )
+    stale_suspension.parent.mkdir(parents=True)
+    stale_suspension.write_text("last_status=70\n", encoding="utf-8")
     suspended = runtime / "agents" / ".team-runs" / "planner-1.suspended"
     process = start_supervisor(runtime, environment)
     try:
         wait_for(tmp_path / "agent-fifth")
+        assert not stale_suspension.exists()
         assert not suspended.exists()
     finally:
         stop_process_group(process)

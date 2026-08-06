@@ -1,0 +1,21 @@
+{
+  "name": "@cyclo/passthrough",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cyclo identity provider component",
+  "bin": {
+    "cyclo-passthrough-component": "src/main.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@connectrpc/connect": "2.1.2",
+    "@cyclo/component": "file:../protocol/component",
+    "@cyclo/provider": "file:../protocol/provider"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

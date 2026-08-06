@@ -1,0 +1,179 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    echo "Usage: job-reset-orphans [--all-active]" >&2
+    echo "" >&2
+    echo "Reset active jobs whose owner agent no longer exists." >&2
+    echo "--all-active is reserved for fresh runtime startup, after the old" >&2
+    echo "container process namespace has been destroyed." >&2
+    exit "${1:-1}"
+}
+
+ALL_ACTIVE=0
+case "${1:-}" in
+    "") ;;
+    --all-active) ALL_ACTIVE=1 ;;
+    -h|--help) usage 0 ;;
+    *) usage ;;
+esac
+
+require_runtime_lock() {
+    runtime_lock="$AGENTWS_ROOT"
+    runtime_lock_fd="${CYCLO_RUNTIME_LOCK_FD:-}"
+    case "$runtime_lock_fd" in
+        ""|*[!0-9]*)
+            die "--all-active requires Cyclo's inherited runtime-lock capability"
+            ;;
+    esac
+    [ "$runtime_lock_fd" -gt 2 ] \
+        || die "invalid inherited runtime-lock descriptor"
+    [ -d "$runtime_lock" ] && [ ! -L "$runtime_lock" ] \
+        || die "runtime root is not a directory: $runtime_lock"
+    [ "$runtime_lock" -ef "/proc/self/fd/$runtime_lock_fd" ] \
+        || die "inherited descriptor does not identify Cyclo's runtime lock"
+    flock -n -x "$runtime_lock_fd" \
+        || die "inherited runtime-lock capability is not held"
+}
+
+validate_empty_ownership_lock() {
+    selected_job="$1"
+    selected_name="$(basename "$selected_job")"
+    ownership_lock="$selected_job/lock"
+    if [ ! -e "$ownership_lock" ] && [ ! -L "$ownership_lock" ]; then
+        return 0
+    fi
+    if [ ! -d "$ownership_lock" ] || [ -L "$ownership_lock" ]; then
+        echo "error: cannot reset job '$selected_name': invalid ownership lock" >&2
+        return 1
+    fi
+    first_entry="$(
+        find "$ownership_lock" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null \
+            || printf '%s\n' '<unreadable>'
+    )"
+    if [ -n "$first_entry" ]; then
+        echo "error: cannot reset job '$selected_name': lock directory is not empty" >&2
+        return 1
+    fi
+    return 0
+}
+
+[ "$ALL_ACTIVE" -eq 0 ] || require_runtime_lock
+require_jobs_dir
+require_tasks_dir
+
+count=0
+errors=0
+
+for job_dir in "$JOBS_DIR"/*; do
+    if [ -L "$job_dir" ]; then
+        echo "error: refusing symbolic-link queue entry: $job_dir" >&2
+        errors=1
+        continue
+    fi
+    [ -d "$job_dir" ] || continue
+    if [ -L "$job_dir/status" ]; then
+        echo "error: refusing symbolic-link job status: $job_dir/status" >&2
+        errors=1
+        continue
+    fi
+    [ -f "$job_dir/status" ] || continue
+    if [ -L "$job_dir/log.md" ]; then
+        echo "error: refusing symbolic-link job log: $job_dir/log.md" >&2
+        errors=1
+        continue
+    fi
+
+    status="$(read_status "$job_dir")"
+    if [ "$ALL_ACTIVE" -eq 1 ] && [ "$status" = "pending" ]; then
+        acquire_job_control_lock "$job_dir"
+        if [ "$(read_status "$job_dir")" = "pending" ]; then
+            if validate_empty_ownership_lock "$job_dir"; then
+                finalize_pending_task_creation_locked "$job_dir"
+                repair_pending_ownership_locked "$job_dir"
+            else
+                errors=1
+            fi
+        fi
+        release_job_control_lock
+        continue
+    fi
+    case "$status" in
+        claimed|running) ;;
+        *) continue ;;
+    esac
+
+    job_name="$(basename "$job_dir")"
+    acquire_job_control_lock "$job_dir"
+
+    # A claimant or transition may have completed while this command waited
+    # for the control mutex. Make the orphan decision again under that mutex.
+    status="$(read_status "$job_dir")"
+    case "$status" in
+        claimed|running) ;;
+        *)
+            release_job_control_lock
+            continue
+            ;;
+    esac
+    if [ "$ALL_ACTIVE" -eq 1 ]; then
+        reset_reason="fresh runtime startup proved that no prior team process remains"
+    else
+        reset_reason="$(job_orphan_reason "$job_dir" || true)"
+    fi
+    if [ -z "$reset_reason" ]; then
+        release_job_control_lock
+        continue
+    fi
+    if ! validate_empty_ownership_lock "$job_dir"; then
+        errors=1
+        release_job_control_lock
+        continue
+    fi
+
+    echo "Resetting orphaned job: $job_name ($reset_reason)"
+    append_log "$job_dir" "Reset by job-reset-orphans" "$reset_reason."
+    write_file_atomic "$job_dir/status" "pending"
+    rm -f "$job_dir/agent-id"
+    if [ -e "$job_dir/lock" ] || [ -L "$job_dir/lock" ]; then
+        if ! rmdir "$job_dir/lock" 2>/dev/null; then
+            echo "error: cannot reset orphaned job '$job_name': lock directory is not empty" >&2
+            errors=1
+            release_job_control_lock
+            continue
+        fi
+    fi
+    release_job_control_lock
+    count=$((count + 1))
+done
+
+if [ "$ALL_ACTIVE" -eq 1 ]; then
+    for agent_dir in "$AGENTWS_ROOT"/agents/*; do
+        if [ -L "$agent_dir" ]; then
+            echo "error: refusing symbolic-link agent entry: $agent_dir" >&2
+            errors=1
+            continue
+        fi
+        [ -d "$agent_dir" ] || continue
+        current_job="$agent_dir/current-job"
+        if [ -L "$current_job" ]; then
+            echo "error: refusing symbolic-link current-job: $current_job" >&2
+            errors=1
+            continue
+        fi
+        [ -f "$current_job" ] || continue
+        write_file_atomic "$current_job" ""
+    done
+fi
+
+if [ "$count" -eq 0 ]; then
+    echo "No orphaned jobs found"
+else
+    echo "Reset $count orphaned jobs"
+fi
+
+[ "$errors" -eq 0 ] || exit 1

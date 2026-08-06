@@ -20,6 +20,15 @@ from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent.parent
 
+NODE_LOCK_PATHS = (
+    Path("src/cyclo/components/protocol/component/package-lock.json"),
+    Path("src/cyclo/components/gateway/package-lock.json"),
+    Path("src/cyclo/components/passthrough/package-lock.json"),
+    Path("src/cyclo/components/team/pi/package-lock.json"),
+    Path("src/cyclo/components/protocol/provider/package-lock.json"),
+    Path("src/cyclo/components/team/package-lock.json"),
+)
+
 
 def fail(message: str) -> "NoReturn":
     raise SystemExit(f"release manifest: {message}")
@@ -131,8 +140,8 @@ def npm_purl(name: str, version: str) -> str:
 
 def locked_node_packages() -> list[dict[str, object]]:
     packages: list[dict[str, object]] = []
-    lock_paths = sorted((ROOT / "src" / "cyclo" / "credential_gateway").glob("*_context/package-lock.json"))
-    for lock_path in lock_paths:
+    for relative_lock_path in NODE_LOCK_PATHS:
+        lock_path = ROOT / relative_lock_path
         context = lock_path.parent.name
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
         for package_path, entry in sorted(lock.get("packages", {}).items()):
@@ -147,6 +156,7 @@ def locked_node_packages() -> list[dict[str, object]]:
             packages.append(
                 {
                     "context": context,
+                    "lockfile": relative_lock_path.as_posix(),
                     "name": name,
                     "version": version,
                     "license": entry.get("license", "NOASSERTION"),
@@ -204,7 +214,7 @@ def make_spdx(
             "licenseDeclared": dependency["license"],
             "copyrightText": "NOASSERTION",
             "primaryPackagePurpose": "LIBRARY",
-            "comment": f"Locked dependency in {dependency['context']}",
+            "comment": f"Locked dependency in {dependency['lockfile']}",
             "externalRefs": [
                 {
                     "referenceCategory": "PACKAGE-MANAGER",

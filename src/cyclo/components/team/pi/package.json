@@ -1,0 +1,37 @@
+{
+  "name": "@cyclo/pi-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi adapter for Cyclo's Provider interface",
+  "files": [
+    "src"
+  ],
+  "exports": {
+    ".": "./src/extension.mjs",
+    "./adapter": "./src/adapter.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.mjs"
+    ]
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@connectrpc/connect": "2.1.2",
+    "@cyclo/component": "file:../../protocol/component",
+    "@cyclo/provider": "file:../../protocol/provider"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "0.81.1"
+  },
+  "devDependencies": {
+    "@connectrpc/connect-node": "2.1.2",
+    "@earendil-works/pi-ai": "0.81.1"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

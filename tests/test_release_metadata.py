@@ -25,7 +25,7 @@ def test_distribution_keeps_the_cyclo_runtime_identity() -> None:
     project = project_metadata()
 
     assert project["name"] == "cyclo-agent"
-    assert project["version"] == cyclo.__version__ == "0.1.0"
+    assert project["version"] == cyclo.__version__ == "0.2.1"
     assert cyclo.__name__ == "cyclo"
     assert project["scripts"] == {"cyclo": "cyclo.cli:main"}
 
@@ -36,7 +36,7 @@ def test_distribution_keeps_the_cyclo_runtime_identity() -> None:
         text=True,
         env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
     )
-    assert result.stdout.strip() == "cyclo 0.1.0"
+    assert result.stdout.strip() == "cyclo 0.2.1"
 
 
 def test_release_metadata_is_stable() -> None:
@@ -66,12 +66,16 @@ def test_release_documents_and_sdist_manifest_match_the_version() -> None:
         "include README.md",
         "include SECURITY.md",
         "include tools/build-release",
+        "include tools/dependency-audit",
         "include tools/normalize-distributions",
+        "include tools/publish-release",
         "include tools/release-acceptance",
         "include tools/release-manifest",
         "include tools/runtime-write-acceptance",
         "include tools/secret-scan",
         "recursive-include docs *.md",
         "recursive-include requirements *.in *.txt",
+        "recursive-include template README.md team Dockerfile *.md",
         "recursive-include tests *.py *.mjs",
+        "include tests/fixtures/derived-team/Dockerfile",
     } <= manifest_entries

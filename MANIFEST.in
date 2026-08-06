@@ -5,6 +5,8 @@ include SECURITY.md
 include pyproject.toml
 include tools/release-acceptance
 include tools/build-release
+include tools/publish-release
+include tools/dependency-audit
 include tools/runtime-write-acceptance
 include tools/normalize-distributions
 include tools/release-manifest
@@ -12,7 +14,24 @@ include tools/secret-scan
 
 recursive-include .github *.yml
 recursive-include docs *.md
-include docs/assets/cyclo-hero.jpg
+include docs/styleguide.pdf
+recursive-include docs/assets *.svg
 recursive-include requirements *.in *.txt
-recursive-include template README.md team *.md
+recursive-include template README.md team Dockerfile *.md
 recursive-include tests *.py *.mjs
+include tests/fixtures/derived-team/Dockerfile
+
+include src/cyclo/components/__init__.py
+include src/cyclo/components/README.md
+graft src/cyclo/components/protocol/component
+graft src/cyclo/components/protocol/provider
+graft src/cyclo/components/gateway
+graft src/cyclo/components/passthrough
+graft src/cyclo/components/team
+prune src/cyclo/components/protocol/component/node_modules
+prune src/cyclo/components/protocol/provider/node_modules
+prune src/cyclo/components/gateway/node_modules
+prune src/cyclo/components/passthrough/node_modules
+prune src/cyclo/components/team/node_modules
+prune src/cyclo/components/team/pi/node_modules
+global-exclude __pycache__ *.py[cod]

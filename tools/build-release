@@ -18,6 +18,46 @@ command -v npm >/dev/null 2>&1 || fail "npm is required"
 command -v docker >/dev/null 2>&1 || fail "Docker is required"
 docker info >/dev/null 2>&1 || fail "the Docker daemon is unavailable"
 
+if [ "${CYCLO_DCOMP+x}" = x ]; then
+    [ -n "$CYCLO_DCOMP" ] || fail "CYCLO_DCOMP is empty"
+    dcomp_request=$CYCLO_DCOMP
+else
+    dcomp_request=dcomp
+fi
+command -v "$dcomp_request" >/dev/null 2>&1 \
+    || fail "DComp is required; install machine API 1 or set CYCLO_DCOMP"
+dcomp=$(command -v "$dcomp_request")
+dcomp=$(CDPATH= cd -- "$(dirname -- "$dcomp")" && pwd)/$(basename -- "$dcomp")
+"$python" - "$dcomp" <<'PY'
+import json
+import subprocess
+import sys
+
+completed = subprocess.run(
+    [sys.argv[1], "version", "--json"],
+    check=False,
+    capture_output=True,
+    text=True,
+)
+if completed.returncode:
+    detail = " ".join((completed.stderr or completed.stdout).split())
+    raise SystemExit(
+        f"DComp version check failed ({completed.returncode})"
+        + (f": {detail}" if detail else "")
+    )
+try:
+    document = json.loads(completed.stdout)
+except json.JSONDecodeError as exc:
+    raise SystemExit("DComp version did not return JSON") from exc
+if (
+    not isinstance(document, dict)
+    or document.get("api_version") != 1
+    or not isinstance(document.get("version"), str)
+    or not document["version"]
+):
+    raise SystemExit(f"DComp machine API 1 is required, found: {document!r}")
+PY
+
 cd "$repo_root"
 [ -z "$(git status --porcelain --untracked-files=normal)" ] \
     || fail "the release must be built from a clean committed tree"
@@ -32,12 +72,17 @@ case $output in
     /*) ;;
     *) output=$repo_root/$output ;;
 esac
-[ ! -e "$output" ] || fail "output already exists: $output"
+[ ! -e "$output" ] && [ ! -L "$output" ] \
+    || fail "output already exists: $output"
 
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/cyclo-build-release.XXXXXX")
+publication_stage=
 cleanup() {
     status=$?
     trap - 0
+    if [ -n "$publication_stage" ]; then
+        rm -rf -- "$publication_stage"
+    fi
     rm -rf -- "$work_root"
     exit "$status"
 }
@@ -62,6 +107,12 @@ git archive --format=tar HEAD | tar -xf - -C "$source_tree"
 printf '%s\n' '==> source tests'
 (
     cd "$source_tree"
+    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
+        npm ci --ignore-scripts --prefix "src/cyclo/$package"
+    done
+    # This is the same intentional, lockfile-bounded peer override used by the
+    # team Dockerfile for pi-simplify 0.2.2 against Pi 0.81.
+    npm ci --force --ignore-scripts --prefix src/cyclo/components/team
     "$venv/bin/python" -m pytest -q \
         --ignore=tests/test_release_manifest.py \
         --ignore=tests/test_secret_scan.py
@@ -69,6 +120,24 @@ printf '%s\n' '==> source tests'
         "$venv/bin/python" -m pytest -q \
         tests/test_release_manifest.py tests/test_secret_scan.py
     node --test tests/*.mjs
+    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
+        npm test --prefix "src/cyclo/$package"
+    done
+    # Tests regenerate the checked-in protocol bindings. Refuse to package a
+    # source tree that is no longer byte-for-byte equivalent to the release
+    # commit, including newly generated files that were never added to Git.
+    GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree \
+        git diff --exit-code
+    source_untracked=$(
+        GIT_DIR=$git_dir GIT_WORK_TREE=$source_tree \
+            git ls-files --others --exclude-standard
+    )
+    [ -z "$source_untracked" ] || {
+        printf '%s\n' \
+            "build release: source tests created untracked release files:" \
+            "$source_untracked" >&2
+        exit 1
+    }
     find . -type f -exec sh -c '
         for script do
             first=
@@ -81,16 +150,7 @@ printf '%s\n' '==> source tests'
 )
 
 printf '%s\n' '==> dependency audits'
-npm audit --package-lock-only --omit=dev --audit-level=high \
-    --prefix "$source_tree/src/cyclo/credential_gateway/gateway_context"
-npm audit --package-lock-only --omit=dev --audit-level=high \
-    --prefix "$source_tree/src/cyclo/credential_gateway/runtime_context"
-
-printf '%s\n' '==> wheel-only acceptance'
-CYCLO_RELEASE_BUILD_PYTHON="$venv/bin/python" \
-    PYTHON="$venv/bin/python" \
-    SOURCE_DATE_EPOCH=$source_date_epoch \
-    "$repo_root/tools/release-acceptance"
+"$venv/bin/python" "$source_tree/tools/dependency-audit" "$source_tree"
 
 printf '%s\n' '==> distributions and release metadata'
 (
@@ -108,42 +168,55 @@ SOURCE_DATE_EPOCH=$source_date_epoch CYCLO_RELEASE_COMMIT=$commit \
 
 wheel=$dist/cyclo_agent-$version-py3-none-any.whl
 [ -f "$wheel" ] || fail "expected wheel was not built: $wheel"
+
+printf '%s\n' '==> exact-wheel acceptance'
+CYCLO_DCOMP="$dcomp" \
+CYCLO_RELEASE_REQUIRE_DCOMP=1 \
+PYTHON="$venv/bin/python" \
+    "$source_tree/tools/release-acceptance" "$wheel"
+
 "$venv/bin/python" -m pip install \
     --disable-pip-version-check --no-deps --force-reinstall "$wheel"
 
 printf '%s\n' '==> packaged example teams'
 for template in adversarial-audit plan-execute-verify test-driven-repair; do
     team=$work_root/team-$template
-    project=$work_root/project-$template
-    state=$work_root/state-$template
-    mkdir -p "$project"
     HOME=$home XDG_STATE_HOME=$home/.local/state \
-        "$venv/bin/cyclo" init "$team" \
+        "$venv/bin/cyclo" team init "$team" \
         --template "$template" \
         --model openai-codex/release-verification
     HOME=$home XDG_STATE_HOME=$home/.local/state \
         "$venv/bin/cyclo" validate "$team"
-    HOME=$home XDG_STATE_HOME=$home/.local/state \
-        "$venv/bin/cyclo" --state-root "$state" run \
-        --name "release-$template" --dry-run "$team" "$project" >/dev/null
 done
 
 printf '%s\n' '==> credential-free Docker images'
 docker build --pull \
-    --tag "cyclo-runtime:release-$short_commit" \
-    --file "$source_tree/src/cyclo/credential_gateway/runtime_context/Dockerfile" \
-    "$source_tree/src/cyclo/credential_gateway/runtime_context"
+    --build-arg "CYCLO_HOST_UID=$(id -u)" \
+    --build-arg "CYCLO_HOST_GID=$(id -g)" \
+    --tag "cyclo-team:release-$short_commit" \
+    --file "$source_tree/src/cyclo/components/team/Dockerfile" \
+    "$source_tree/src/cyclo/components"
+"$venv/bin/python" -c \
+    'import pathlib, sys; from cyclo.images import Images; images = Images(); base = images.inspect(sys.argv[1]); assert base is not None; root = pathlib.Path(sys.argv[2]).resolve(); images.build(sys.argv[3], dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))' \
+    "cyclo-team:release-$short_commit" \
+    "$source_tree/tests/fixtures/derived-team" \
+    "cyclo-derived-team:release-$short_commit"
+docker run --rm --network none --entrypoint /bin/sh \
+    "cyclo-derived-team:release-$short_commit" -ceu \
+    'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
 PYTHON="$venv/bin/python" \
     "$source_tree/tools/runtime-write-acceptance" \
-    "cyclo-runtime:release-$short_commit"
+    "cyclo-team:release-$short_commit"
 docker build --pull \
     --tag "cyclo-gateway:release-$short_commit" \
-    --file "$source_tree/src/cyclo/credential_gateway/gateway_context/Dockerfile" \
-    "$source_tree/src/cyclo/credential_gateway/gateway_context"
-docker run --rm --network none \
-    --env CYCLO_HOST_UID=1000 \
-    --env CYCLO_HOST_GID=1000 \
-    "cyclo-runtime:release-$short_commit" sh -ceu '
+    --file "$source_tree/src/cyclo/components/gateway/Dockerfile" \
+    "$source_tree/src/cyclo/components"
+docker build --pull \
+    --tag "cyclo-passthrough:release-$short_commit" \
+    --file "$source_tree/src/cyclo/components/passthrough/Dockerfile" \
+    "$source_tree/src/cyclo/components"
+docker run --rm --network none --entrypoint /bin/sh \
+    "cyclo-team:release-$short_commit" -ceu '
         python3 --version
         node --version
         npm --version
@@ -153,41 +226,35 @@ docker run --rm --network none \
         test "$(npm root -g)" = /opt/cyclo-agent-tools/lib/node_modules
         mkdir -p "$HOME/.pi/agent"
         printf "%s\n" \
-          "{\"packages\":[\"npm:pi-web-access\",\"npm:pi-lens\",\"npm:pi-simplify\"]}" \
+          "{\"packages\":[\"npm:pi-web-access\",\"npm:pi-lens\",\"npm:pi-simplify\",\"/opt/cyclo-agent-tools/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/pi-safe-compact\"]}" \
           > "$HOME/.pi/agent/settings.json"
         PI_OFFLINE=1 pi list > /tmp/pi-packages
         grep -F "npm:pi-web-access" /tmp/pi-packages
         grep -F "npm:pi-lens" /tmp/pi-packages
         grep -F "npm:pi-simplify" /tmp/pi-packages
+        grep -F "pi-safe-compact" /tmp/pi-packages
         pi --offline --help > /tmp/pi-help
         grep -F "Extension CLI Flags" /tmp/pi-help
     '
-providers_output=$work_root/gateway-providers
-HOME=$home XDG_STATE_HOME=$home/.local/state \
-    "$venv/bin/cyclo" \
-    --gateway-image "cyclo-gateway:release-$short_commit" \
-    gateway providers > "$providers_output"
-grep -F "$(printf 'PROVIDER\tDESCRIPTION\tAUTH\tLOGIN')" \
-    "$providers_output" >/dev/null
-grep -F "cyclo gateway login anthropic" "$providers_output" >/dev/null
-grep -F "cyclo gateway login openai --api-key-stdin" \
-    "$providers_output" >/dev/null
-docker run --rm --network none \
-    "cyclo-gateway:release-$short_commit" providers.mjs >/dev/null
-oauth_output=$work_root/oauth-login
-if printf 'q\n' | docker run --rm --interactive \
-    --security-opt no-new-privileges --cap-drop ALL --pids-limit 256 \
-    --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-    --network none "cyclo-gateway:release-$short_commit" \
-    login.mjs openai-codex > "$oauth_output" 2>&1; then
-    fail "cancelled OAuth login unexpectedly succeeded"
-fi
-grep -F "Select OpenAI Codex login method" "$oauth_output" >/dev/null
-grep -F "login failed: Login cancelled" "$oauth_output" >/dev/null
+docker run --rm --network none "cyclo-gateway:release-$short_commit" providers >/dev/null
 
 [ -z "$(git status --porcelain --untracked-files=normal)" ] \
     || fail "release verification modified the committed tree"
-mkdir -p "$(dirname -- "$output")"
-mv "$dist" "$output"
+output_parent=$(dirname -- "$output")
+mkdir -p "$output_parent"
+output_name=$(basename -- "$output")
+[ ! -e "$output" ] && [ ! -L "$output" ] \
+    || fail "output already exists: $output"
+publication_stage=$(
+    mktemp -d "$output_parent/.$output_name.publish.XXXXXX"
+)
+cp -a "$dist"/. "$publication_stage"/
+# A same-filesystem no-replace rename is the publication commit. Ignore
+# catchable termination across the commit and success report so a complete
+# output is never reported as an interrupted, retryable pre-commit operation.
+trap '' HUP INT TERM
+"$venv/bin/python" "$source_tree/tools/publish-release" \
+    "$publication_stage" "$output"
+publication_stage=
 printf '%s\n' "build release: PASS"
 printf '%s\n' "artifacts: $output"

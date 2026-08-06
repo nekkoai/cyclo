@@ -1,121 +1,370 @@
-# Cyclo architecture
+# Architecture
 
-Cyclo separates four things that often get mixed together in agent runners:
-the team definition, the project being changed, the filesystem work queue, and
-provider credentials. Each has an independent owner and lifecycle.
+## Purpose
+
+Cyclo turns four kinds of operator-owned input into a running agentic system:
+
+- gateway credentials;
+- a host provider configuration;
+- Git-defined teams; and
+- project definitions with explicit filesystem authority.
+
+Cyclo is a host CLI and compiler. It is not a daemon, proxy, scheduler, or
+container lifecycle engine. DComp is the sole lifecycle engine. It validates
+and reconciles the Docker components, direct interface links, networks,
+volumes, and interrupted operations described by Cyclo.
+
+After startup, inference travels directly between components. Neither the Cyclo
+CLI nor DComp is in that data path.
 
 ## Components
 
+One Cyclo installation contains these runtime component classes:
+
+| Component | Responsibility | Persistent authority |
+| --- | --- | --- |
+| Gateway | Provider login, credential refresh, native upstream calls, model catalogue, usage ledger | Gateway credential volume |
+| Intermediate Provider | Transform, route, filter, pool, or observe Provider traffic | Only its declared volumes, if any |
+| Team | AgentWS workers, Pi, project tools, read-only AgentWS viewer | Its queue and Pi directories |
+
+The host also runs two short-lived programs:
+
+| Program | Responsibility |
+| --- | --- |
+| `cyclo` | Parse domain configuration, build images, persist instance intent, compile the global DComp system, invoke administrative tools |
+| `dcomp` | Validate and apply that system, own Docker lifecycle state, report component/network status, recover interrupted operations |
+
+DComp is an external executable. Cyclo discovers it through `CYCLO_DCOMP` or
+`PATH`, requires machine API version 1, and gives it
+`STATE_ROOT/dcomp` as its private state directory.
+Docker resource names owned by DComp are opaque to Cyclo. Administrative code
+resolves the gateway's declared `credentials` volume through
+`dcomp volume --json`; it does not reproduce DComp's naming rules.
+
+## One installation-wide system
+
+The canonical Cyclo state root produces a stable installation identifier and a
+single DComp system named `cyclo-<installation-id>`. Every apply compiles:
+
+1. the fixed gateway;
+2. every Provider component declared by the selected `host.conf`; and
+3. every persisted team instance whose intent is `running`.
+
+All active teams therefore share one declared provider stack but retain
+independent component containers, queues, Pi state, project mounts, and
+dashboard ports.
+
 ```text
-team Git repository                 project Git repository
-team + roles/*.md                   source and tests
-        | read-only by default             | writable by default
-        +-------------------+---------------+
-                            v
-                 cyclo-runtime container
-             bundled queue + agent processes
-                            |
-                 scoped private capability
-                            |
-                            v
-                 cyclo-gateway container
-            model catalogue + policy + proxy
-                            |
-                 cyclo-gateway-store volume
-       credentials + subscriptions + usage ledger
+                           host loopback
+                                │
+                         model discovery
+                                │
+                                v
+┌─────────────┐   private   ┌──────────┐   private   ┌──────────┐
+│   gateway   │────────────>│ provider │────────────>│ provider │
+│ credentials │    link     │    A     │    link     │ outer    │
+└─────────────┘              └──────────┘              └────┬─────┘
+                                                           │
+                                    one private link/team   │
+                                  ┌─────────────────────────┼─────┐
+                                  v                         v     v
+                              ┌────────┐                ┌────────┐
+                              │ team 1 │                │ team 2 │
+                              └────────┘                └────────┘
 ```
 
-The host-side `cyclo` command validates definitions and mount boundaries,
-builds packaged Docker contexts, creates isolated instance state, reconciles
-Docker resources, and issues a capability scoped to the providers and models
-declared by that team generation.
+Arrows represent interface address bindings, not lifecycle dependencies.
+DComp permits fan-out and cycles. Cyclo does not infer a startup order or route
+from graph shape.
 
-The host controller is Python. The reused Pi agent engine and `pi-ai` provider
-and subscription support are JavaScript, but they are installed and executed
-inside the runtime and gateway images. Running Cyclo therefore does not require
-Node.js or npm on the host; those tools are host prerequisites only for the
-complete maintainer test and release workflow.
+## Configuration layers
 
-The runtime image contains Cyclo's owned filesystem loop, Pi agent engines, and
-supporting command-line tools. It receives the team, project, and per-instance
-queue state as explicit mounts. It never receives the Docker socket, gateway
-administrator token, credential store, host home directory, or another team's
-state.
+No file is a universal configuration database.
 
-The gateway image is the only component that mounts `cyclo-gateway-store`.
-Interactive subscription logins and API-key provisioning run inside that
-image. The long-running proxy projects only allowed models to each runtime and
-records provider-reported token accounting by instance and team generation.
+### Host configuration
 
-## Definitions and generations
+`host.conf` installs intermediate Provider components:
 
-A team is an ordinary Git repository containing a `team` roster and role files.
-The roster binds every named agent to a role, engine, and proxy model. Cyclo
-identifies a generation with the repository commit plus a digest of the live
-roster, roles, and optional protocol, so experiments remain attributable even
-when the team has uncommitted edits.
+```text
+provider NAME SOURCE [context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...]
+```
 
-The default team mount is read-only. `--team-write` deliberately permits a team
-to modify its own definition; those changes are ordinary Git working-tree
-changes and apply on the next run. Project writability is controlled
-independently with `--project-read-only`.
+The implicit installation reads `/etc/cyclo/host.conf`; an explicit
+`--state-root` or `CYCLO_STATE_ROOT` reads `STATE_ROOT/host.conf`. This scope is
+recorded when the installation is initialized and cannot later be changed for
+the same state root.
 
-## Queue and controller state
+The gateway is implicit and always exposes `gateway.provider`. An empty file
+uses it directly. Every provider input must be bound exactly once. All
+declarations are collected before bindings are resolved, so a target may be
+declared earlier or later. The last provider declaration is the outer Provider.
 
-Each instance has durable host state below the selected Cyclo state root. The
-runtime sees a materialized, read-only copy of the bundled queue implementation
-and a writable instance queue. Tasks, jobs, comments, transcripts, and results
-survive container replacement. Atomic publication, locking, bounded retries,
-and interrupted-write recovery are implemented by the bundled loop.
+### Component descriptor
 
-Controller state contains paths, lifecycle metadata, scoped client records,
-and a writable per-instance Pi tree containing projected model configuration,
-the scoped gateway token, locks, and local runtime metadata. It does not contain
-host or provider credentials; those remain in the gateway store. Stopping an
-instance removes its container and private network, revokes its capability, and
-preserves its queue history.
+Each provider source contains `component.dcomp`:
 
-## Networks and model traffic
+```text
+docker example/provider:1
+input cyclo.provider.v1.Provider upstream
+output cyclo.provider.v1.Provider provider
+```
 
-Each instance receives a private Docker network. In normal mode the runtime can
-also use direct outbound networking. `--offline` makes its network internal;
-the gateway is attached to that network, so allowed model calls still work but
-direct web egress and the per-team viewer do not.
+The descriptor declares nominal protobuf service identities and local endpoint
+names. Cyclo requires each provider to expose exactly one
+`cyclo.provider.v1.Provider` output. DComp validates the generated system
+against the same endpoint contract.
 
-The scoped gateway capability is provider-and-model authorization plus usage
-attribution. It is not a confidentiality boundary between the mounted project
-and an allowed model provider: an agent can send readable project content in a
-model request. Use read-only mounts and offline mode to reduce privileges, and
-use separate Git worktrees for concurrent writers.
+If the source contains a `Dockerfile`, Cyclo builds it. `context=PATH` may
+select a containing build context; otherwise the source directory is the
+context. Without a Dockerfile, the image named by `docker` must already exist
+and define an OCI health check.
 
-## Persistent gateway data
+### Team repository
 
-`cyclo-gateway-store` contains credentials, subscription sessions, and an
-append-only JSONL usage ledger. Usage records contain accounting and
-attribution metadata, not prompts or responses. `cyclo usage` aggregates the
-retained ledger for experiments. Version 0.1.0 does not impose automatic
-retention; operators should monitor the Docker volume.
+A team repository supplies a roster, `roles/*.md`, optional `AGENTS.md`, and a
+required Dockerfile derived from `CYCLO_TEAM_BASE`. It contains behavior and
+execution dependencies, not credentials or durable queue state. Cyclo builds
+each normal team image from this repository over its standard team-component
+image.
 
-`cyclo gateway destroy-store` is intentionally fail-closed and confirmation
-gated. It deletes the entire volume, including credentials, subscriptions, and
-usage history, only after verifying every mounting Cyclo container by immutable
-identity. A foreign, unverifiable, racing, or still-running mount causes refusal
-or lets Docker's final in-use check preserve the volume.
+The roster assigns each agent one role:
 
-## Observation boundary
+```text
+NAME ROLE ENGINE PROVIDER/MODEL
+```
 
-The fleet dashboard and per-team viewer are read-only. Both bind to loopback by
-default and have no application authentication in 0.1.0. An operator can
-explicitly select a non-loopback host for either interface, in which case Cyclo
-prints an exposure warning. Queue scans are bounded, queue content is treated
-as data, and the dashboard never starts the gateway or executes queue files. A
-team cannot read another team's private queue through Cyclo; cross-team
-supervision requires a future explicit, read-only observation interface.
+AgentWS jobs carry `ROLE`; workers claim only jobs matching the role in their
+roster entry, and `roles/ROLE.md` supplies their behavioral instructions.
+Multiple agents may share one role. Task-creation authority and automatic
+planner-notification suppression belong to role `planner`.
 
-## Docker-host trust
+### Project definition
 
-Cyclo treats team containers and writable Git trees as untrusted, but trusts
-the host kernel, Docker daemon, Cyclo installation, gateway image, and
-administrator account. Compromise of the Docker host or access to the Docker
-socket is outside the isolation guarantee. The detailed reporting and support
-policy is in [`../SECURITY.md`](../SECURITY.md).
+`project.cyclo` selects one or more teams and explicitly grants access to named
+host directories. It also supplies a name, description, and optional literal
+context describing the mounted projects.
+
+## Builds and image identity
+
+Cyclo owns image construction; DComp deliberately does not build or pull
+images. Cyclo uses stable tags scoped by installation, component kind, Cyclo
+version, and—where necessary—Provider or team identity.
+
+Whenever an operation needs a built host or team image, Cyclo invokes
+`docker build` with that stable tag. It does not hash source trees, pre-judge
+whether a tag is current, emulate `.dockerignore`, or maintain build history.
+Docker receives the real context and owns file selection and layer-cache reuse.
+Build output is captured rather than streamed and surfaced on failure.
+
+Cyclo asks Docker to write the built image ID, inspects the completed stable
+tag, verifies both identities agree, and passes only the immutable `sha256:`
+image ID to the generated DComp definition. A single CLI operation may retain
+that inspected result in memory to avoid asking for the same shared base twice;
+there is no persistent Cyclo image cache.
+
+Team images must preserve:
+
+- Cyclo's fixed entrypoint;
+- the OCI health check; and
+- a root final image user so the entrypoint can assume the host UID/GID and
+  then drop privileges.
+
+Cyclo writes the current components as content-addressed descriptor directories
+below `STATE_ROOT/system/descriptors/`, atomically replaces
+`STATE_ROOT/system/system.dcomp`, and removes descriptors that the selected
+file no longer references. It keeps no history of generated systems. Cyclo
+validates the selected file with `dcomp check`, resumes an unfinished DComp
+operation when necessary, and invokes `dcomp up`.
+
+DComp retains unchanged component instances and replaces only components whose
+resolved definition changed.
+
+## Interfaces and networking
+
+Every Cyclo application interface is identified by a fully qualified protobuf
+service name. DComp checks nominal equality between linked input and output
+declarations. It does not inspect protobuf descriptors or application payloads.
+
+Cyclo's built-in components use ConnectRPC over HTTP/1.1 TCP and listen on
+`0.0.0.0:50051`. For a link such as:
+
+```text
+link policy.upstream trace.provider
+```
+
+DComp creates a private internal Docker network containing those two
+components and injects:
+
+```text
+DCOMP_LINK_UPSTREAM=dns:///trace:50051
+```
+
+Each direct link has its own network. A consumer receives only targets for its
+declared inputs. No service registry, proxy, sidecar, bearer token, credential
+file, or Docker socket is needed.
+
+External routing is explicit:
+
+- the gateway has egress for native provider calls;
+- the outer Provider has an externally routed base network because Cyclo
+  publishes its Provider port on a dynamic loopback port for host-side calls;
+- a normal team has egress and may publish its AgentWS viewer;
+- `--offline` removes team egress and viewer publication while preserving its
+  private Provider link; and
+- non-outer intermediate providers have no external base network unless the
+  generated system explicitly grants one.
+
+The host-side Provider client accepts only `127.0.0.1` and obtains the current
+dynamic port from DComp status.
+
+## Provider data plane
+
+`cyclo.provider.v1.Provider` has two RPCs:
+
+- `ListModels`, a typed catalogue control plane; and
+- `Infer`, a streaming opaque data plane.
+
+`InferRequest` contains an exact public model ID and one string payload.
+`InferResponse` contains one string payload. For the current Pi integration,
+those strings contain Pi JSON frames and events. Relays forward them without
+interpreting, validating, or reserializing them. A policy component may
+deliberately inspect them, but transparency is the base transport contract.
+
+The gateway is the only component that receives physical credentials.
+Intermediate providers can observe the inference data explicitly routed
+through them, but not credential files or unrelated links.
+
+## Team runtime
+
+The common team image contains:
+
+- AgentWS code and generic `AGENTS.md`;
+- the Cyclo team supervisor;
+- Pi and the Cyclo Provider adapter;
+- the read-only AgentWS viewer; and
+- the standard command-line tools.
+
+The source tree follows that runtime boundary. `cyclo.components.team` owns
+everything copied into or executed by the team image: its Dockerfile,
+entrypoint, supervisor, AgentWS tree, Pi adapter, and JavaScript dependencies.
+`cyclo.team` is the separate host-side library for team definitions, packaged
+templates, image construction, DComp component compilation, queue inspection,
+compatibility checks, and confined task administration. Shared Component and
+Provider interface packages remain under `cyclo.components.protocol`; the Pi
+adapter is not an independent runtime component.
+
+AgentWS code is image content, not a host bind mount. A running team receives:
+
+```text
+/agentws/tasks             durable writable task state
+/agentws/jobs              durable writable job state
+/agentws/agents            durable writable agent state
+/agentws/project.cyclo     generated read-only project view
+/opt/cyclo/pi-settings.json generated read-only Pi settings template
+/home/cyclo/.pi            private writable Pi state
+/team                      team repository, ro or rw
+/workspace/<name>          each rw project mount
+/readonly/<name>           each ro supporting mount
+```
+
+The supervisor reads `/agentws/project.cyclo`, recovers orphaned queue work,
+starts AgentWS workers and the viewer, and performs bounded child-process
+shutdown. DComp owns the lifetime of the containing team component.
+
+`cyclo task` does not start that component. It invokes an allowlisted AgentWS
+queue tool in a one-shot instance of the same immutable team image. The tool has
+no network, project, team, Pi, credential, or Docker authority; it receives only
+the task/job queue mounts required by that operation and starts directly as the
+mapped non-root identity. Task and explicit job creation mount a bounded,
+link-resistant snapshot staged under Cyclo state, never the live project path.
+
+The host must not be root. The base image is built for the invoking user's
+UID/GID; the entrypoint starts with image root only to select that identity.
+After dropping privilege it copies the immutable Pi settings template into the
+team's writable Pi state and executes the runtime.
+
+## State ownership
+
+The state split is intentional:
+
+| Owner | Durable state |
+| --- | --- |
+| Cyclo | `host.conf` selection, instance `run.json`, desired running/stopped intent, AgentWS queues, Pi state, generated project views, generated DComp definitions, Docker endpoint binding |
+| DComp | Applied-system record, immutable Docker object identities, network and component reconciliation state, interrupted operation journal |
+| Gateway | Credential/account store, refreshed OAuth sessions, model catalogue snapshot, usage ledger in its named Docker volume |
+| Docker | Images, containers, networks, volumes, health and current published-port allocations |
+
+DComp state lives below `STATE_ROOT/dcomp`, but its schema and lifecycle belong
+to DComp. Cyclo accesses it only through DComp's machine API. Conversely, DComp
+does not parse Cyclo instance records or project/team definitions.
+
+Cyclo instance records contain domain intent and immutable image IDs. They do
+not contain container IDs, network IDs, or a second lifecycle state machine.
+
+## Operations
+
+Mutating Cyclo commands serialize through one installation lock. The important
+operations are:
+
+- `run`: validate current project/team sources, ensure the provider system,
+  validate models, build team images, persist running intent, and apply the
+  complete system;
+- `start`: change a persisted instance to running and apply;
+- `stop`: change selected instances to stopped and apply;
+- `forget`: require stopped intent, apply to prove absence, then delete the
+  instance and AgentWS state;
+- `refresh`: re-read and build all running project/team replacements, validate
+  them against the current Provider catalogue, publish the replacement cohort,
+  apply it, and require the refreshed teams to become ready;
+- `repair`: apply the current host configuration and persisted instance intent,
+  running the required host Docker builds and resuming interrupted DComp work;
+- `models`: apply the system and query the outer Provider catalogue; and
+- `gateway login`: prepare only the fixed gateway/store boundary, update the
+  private store, and restart the gateway. It does not reconcile unrelated
+  Provider or team components.
+
+`ps`, `inspect`, `logs`, generic component inspection/restart,
+`providers status`, `gateway status`, `doctor`, and the fleet dashboard inspect
+persisted state and DComp facts. Generic component restart controls an
+already-applied component directly; it does not reconcile provider or instance
+configuration. These commands do not create an alternative lifecycle model.
+
+The outer Provider selected by `host.conf` is the only authoritative route. A
+failed component is reported as not ready and the DComp system is
+non-operational until the configuration or component is fixed.
+
+## Security architecture
+
+The trusted administrative domain is the host OS, Cyclo CLI, DComp executable
+and state, Docker daemon, operator-approved configuration, and image build
+inputs. The primary hostile workload is arbitrary code inside a team container.
+
+Cyclo enforces these boundaries before emitting DComp binds:
+
+- team and project source trees must be canonical, distinct, and non-overlapping;
+- no declared mount may overlap Cyclo state, installed Cyclo sources,
+  `host.conf`, the DComp executable, the host Pi directory, `/proc`, `/sys`,
+  `/dev`, `/run`, or a known Docker socket;
+- initial launch rechecks bind-source device/inode identity after validation;
+- every later apply revalidates persisted mount authority;
+- team containers receive no Docker socket or gateway volume;
+- provider links are private networks with only their two endpoints; and
+- credentials remain in the gateway volume.
+
+Team Dockerfiles and provider Dockerfiles execute through the trusted Docker
+daemon. Approving either source is a host-administration action; runtime
+isolation cannot make an untrusted Docker build safe.
+
+Normal teams have outbound network access, so an agent may exfiltrate data from
+its declared readable mounts. `--offline` removes direct external routing, but
+does not make the model Provider confidential: data sent for inference reaches
+the selected provider chain and external model service. Additional policy,
+quota, audit, or filtering components can be interposed when required.
+
+The fleet and AgentWS dashboards are unauthenticated. Their default bind is
+loopback. A non-loopback deployment must use a trusted network boundary or
+authenticated reverse proxy.
+
+Separate state roots prevent accidental resource adoption and name collisions;
+they are not a security boundary against the trusted host or Docker
+administrator. Stronger tenant isolation requires separate OS or VM domains.

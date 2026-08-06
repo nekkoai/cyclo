@@ -1,0 +1,39 @@
+{
+  "name": "@cyclo/provider",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cyclo's typed provider control plane and opaque Pi transport",
+  "files": [
+    "gen",
+    "proto",
+    "src"
+  ],
+  "exports": {
+    "./contract": {
+      "types": "./gen/cyclo/provider/v1/provider_pb.d.ts",
+      "default": "./gen/cyclo/provider/v1/provider_pb.js"
+    },
+    "./errors": "./src/errors.mjs",
+    "./protocol": "./src/protocol.mjs",
+    "./schema.json": "./gen/schema.json"
+  },
+  "scripts": {
+    "generate": "buf lint && buf generate && buf build --as-file-descriptor-set --exclude-source-info -o gen/schema.json",
+    "prepack": "npm run generate",
+    "test": "npm run generate && node --test"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.12.1",
+    "@connectrpc/connect": "2.1.2"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "1.72.0",
+    "@bufbuild/protoc-gen-es": "2.12.1",
+    "@connectrpc/connect-node": "2.1.2",
+    "@cyclo/component": "file:../component"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

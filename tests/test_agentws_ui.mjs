@@ -3,14 +3,14 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
-const asset = (name) => new URL(`../src/cyclo/_agentws/template/tools/agentws-public/${name}`, import.meta.url);
-const viewer = new URL("../src/cyclo/_agentws/template/tools/agentws", import.meta.url);
+const asset = (name) => new URL(`../src/cyclo/components/team/agentws/tools/agentws-public/${name}`, import.meta.url);
+const viewer = new URL("../src/cyclo/components/team/agentws/tools/agentws", import.meta.url);
 
 test("AgentWS exposes an accessible Cyclo operations dashboard without chat", async () => {
   const html = await readFile(asset("index.html"), "utf8");
 
   assert.match(html, /<html lang="en">/);
-  assert.match(html, /<meta name="color-scheme" content="dark">/);
+  assert.match(html, /<meta name="color-scheme" content="light">/);
   assert.match(html, /<main id="main-content"/);
   assert.match(html, /class="brand-name">cyclo</);
   assert.match(html, /class="brand-context">agentws</);
@@ -38,9 +38,9 @@ test("AgentWS application is observation-only and defaults to tasks", async () =
 test("AgentWS styles share Cyclo tokens and responsive accessibility", async () => {
   const css = await readFile(asset("styles.css"), "utf8");
 
-  assert.match(css, /--bg:\s*#0b0e11/);
-  assert.match(css, /--green:\s*#b8f24a/);
-  assert.match(css, /--cyan:\s*#66d9d2/);
+  assert.match(css, /--carta:\s*#EFE7D6/);
+  assert.match(css, /--ink:\s*#201A12/);
+  assert.match(css, /--rosso:\s*#D8402E/);
   assert.match(css, /:focus-visible/);
   assert.match(css, /prefers-reduced-motion/);
   assert.match(css, /@media \(max-width: 760px\)/);

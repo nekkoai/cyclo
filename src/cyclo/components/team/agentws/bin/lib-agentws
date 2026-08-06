@@ -1,0 +1,445 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+
+JOBS_DIR="${JOBS_DIR:-$AGENTWS_ROOT/jobs}"
+TASKS_DIR="${TASKS_DIR:-$AGENTWS_ROOT/tasks}"
+VALID_STATUSES="${VALID_STATUSES:-pending claimed running done failed}"
+VALID_TASK_STATES="${VALID_TASK_STATES:-open done}"
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+timestamp() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+agent_host() {
+    hostname 2>/dev/null || uname -n
+}
+
+validate_name() {
+    label="$1"
+    value="${2:-}"
+
+    case "$value" in
+        ""|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+            die "invalid $label '$value' - must start with an alphanumeric character and contain only alphanumeric, dot, underscore, and hyphen"
+            ;;
+    esac
+}
+
+validate_job_id() {
+    validate_name "job ID" "${1:-}"
+}
+
+validate_task_id() {
+    validate_name "task ID" "${1:-}"
+}
+
+validate_role() {
+    validate_name "role" "${1:-}"
+}
+
+validate_agent_id() {
+    validate_name "agent ID" "${1:-}"
+}
+
+is_valid_status() {
+    candidate="${1:-}"
+
+    for status in $VALID_STATUSES; do
+        [ "$status" = "$candidate" ] && return 0
+    done
+
+    return 1
+}
+
+require_valid_status() {
+    status="${1:-}"
+
+    if ! is_valid_status "$status"; then
+        echo "error: invalid status '$status'" >&2
+        echo "valid statuses: $VALID_STATUSES" >&2
+        exit 1
+    fi
+}
+
+is_valid_task_state() {
+    candidate="${1:-}"
+
+    for state in $VALID_TASK_STATES; do
+        [ "$state" = "$candidate" ] && return 0
+    done
+
+    return 1
+}
+
+require_valid_task_state() {
+    state="${1:-}"
+
+    if ! is_valid_task_state "$state"; then
+        echo "error: invalid task state '$state'" >&2
+        echo "valid task states: $VALID_TASK_STATES" >&2
+        exit 1
+    fi
+}
+
+require_jobs_dir() {
+    [ -d "$JOBS_DIR" ] || die "jobs directory '$JOBS_DIR' does not exist; run bin/job-init first"
+}
+
+require_tasks_dir() {
+    [ -d "$TASKS_DIR" ] || die "tasks directory '$TASKS_DIR' does not exist; run bin/job-init first"
+}
+
+require_positive_integer() {
+    name="$1"
+    value="${2:-}"
+
+    case "$value" in
+        ""|*[!0-9]*)
+            die "$name must be a positive integer"
+            ;;
+    esac
+
+    [ "$value" -gt 0 ] || die "$name must be greater than zero"
+}
+
+read_status() {
+    job_dir="$1"
+    cat "$job_dir/status" 2>/dev/null || echo "unknown"
+}
+
+write_file_atomic() {
+    path="$1"
+    content="$2"
+    tmp="$path.tmp.$$"
+
+    printf '%s\n' "$content" > "$tmp" || die "cannot write temporary file '$tmp'"
+    mv -f "$tmp" "$path" || {
+        rm -f "$tmp"
+        die "cannot replace '$path'"
+    }
+}
+
+# Queue ownership uses the job's lock/ directory.  This separate, persistent
+# file is an advisory mutex for changing that ownership and the job status.
+# Keeping the inode for the lifetime of the job avoids the remove-and-recreate
+# race that occurs when lock/ itself is used as both ownership and mutex.
+acquire_job_control_lock() {
+    job_dir="$1"
+    control_lock="$job_dir/.control.lock"
+
+    command -v flock >/dev/null 2>&1 \
+        || die "required command not found: flock"
+    [ ! -L "$control_lock" ] \
+        || die "job control lock is a symbolic link: $control_lock"
+
+    # Opening with append creates the control file for queues made by older
+    # AgentWS versions without truncating an existing persistent inode.
+    exec 8>>"$control_lock" \
+        || die "cannot open job control lock: $control_lock"
+    [ -f "$control_lock" ] && [ ! -L "$control_lock" ] || {
+        exec 8>&-
+        die "job control lock is not a regular file: $control_lock"
+    }
+    flock -x 8 || {
+        exec 8>&-
+        die "cannot acquire job control lock: $control_lock"
+    }
+}
+
+release_job_control_lock() {
+    exec 8>&-
+}
+
+# A deterministic terminal notice is published before its source becomes
+# terminal, but it must not run before the terminal status is visible. Source
+# terminal states are monotonic and status writes are atomic, so reading the
+# source status while holding the notice lock is sufficient to open this gate.
+terminal_notice_ready_locked() {
+    _notice_dir="$1"
+    _notice_marker="$_notice_dir/.terminal-notice-source"
+    TERMINAL_NOTICE_SOURCE=""
+
+    if [ ! -e "$_notice_marker" ] && [ ! -L "$_notice_marker" ]; then
+        return 0
+    fi
+    [ -f "$_notice_marker" ] && [ ! -L "$_notice_marker" ] \
+        || die "terminal notice '$(basename "$_notice_dir")' has an invalid source marker"
+
+    TERMINAL_NOTICE_SOURCE="$(cat "$_notice_marker" 2>/dev/null || true)"
+    validate_job_id "$TERMINAL_NOTICE_SOURCE"
+    _notice_source_dir="$JOBS_DIR/$TERMINAL_NOTICE_SOURCE"
+    [ -d "$_notice_source_dir" ] && [ ! -L "$_notice_source_dir" ] \
+        || die "terminal notice '$(basename "$_notice_dir")' has no valid source job '$TERMINAL_NOTICE_SOURCE'"
+    for _notice_source_name in role task-id status; do
+        [ -f "$_notice_source_dir/$_notice_source_name" ] \
+            && [ ! -L "$_notice_source_dir/$_notice_source_name" ] \
+            || die "source job '$TERMINAL_NOTICE_SOURCE' has invalid $_notice_source_name"
+    done
+
+    _notice_role="$(cat "$_notice_dir/role" 2>/dev/null || true)"
+    _notice_task="$(cat "$_notice_dir/task-id" 2>/dev/null || true)"
+    _notice_source_role="$(cat "$_notice_source_dir/role" 2>/dev/null || true)"
+    _notice_source_task="$(cat "$_notice_source_dir/task-id" 2>/dev/null || true)"
+    [ "$_notice_role" = "planner" ] \
+        || die "terminal notice '$(basename "$_notice_dir")' does not have role planner"
+    [ "$_notice_source_role" != "planner" ] \
+        || die "terminal notice source '$TERMINAL_NOTICE_SOURCE' is a planner job"
+    [ "$_notice_task" = "$_notice_source_task" ] \
+        || die "terminal notice '$(basename "$_notice_dir")' and source '$TERMINAL_NOTICE_SOURCE' belong to different tasks"
+
+    _notice_source_status="$(read_status "$_notice_source_dir")"
+    case "$_notice_source_status" in
+        done|failed) return 0 ;;
+        pending|claimed|running) return 1 ;;
+        *) die "source job '$TERMINAL_NOTICE_SOURCE' has invalid status '$_notice_source_status'" ;;
+    esac
+}
+
+# Task comments, state, and results are shared by every role working on the
+# task. Keep one persistent inode per task and hold it across each complete
+# logical mutation so records and finalization cannot interleave.
+acquire_task_control_lock() {
+    _task_lock_dir="$1"
+    _task_control_lock="$_task_lock_dir/.control.lock"
+
+    command -v flock >/dev/null 2>&1 \
+        || die "required command not found: flock"
+    [ -d "$_task_lock_dir" ] && [ ! -L "$_task_lock_dir" ] \
+        || die "task directory is symlinked or is not a directory: $_task_lock_dir"
+    if [ -e "$_task_control_lock" ] || [ -L "$_task_control_lock" ]; then
+        [ -f "$_task_control_lock" ] && [ ! -L "$_task_control_lock" ] \
+            || die "task control lock is symlinked or is not a regular file: $_task_control_lock"
+    fi
+
+    # Opening with append safely creates the persistent lock for tasks made by
+    # older AgentWS versions without truncating an existing inode.
+    exec 7>>"$_task_control_lock" \
+        || die "cannot open task control lock: $_task_control_lock"
+    [ -f "$_task_control_lock" ] && [ ! -L "$_task_control_lock" ] || {
+        exec 7>&-
+        die "task control lock is symlinked or is not a regular file: $_task_control_lock"
+    }
+    flock -x 7 || {
+        exec 7>&-
+        die "cannot acquire task control lock: $_task_control_lock"
+    }
+    [ -d "$_task_lock_dir" ] && [ ! -L "$_task_lock_dir" ] \
+        || die "task directory changed while acquiring its control lock: $_task_lock_dir"
+    [ -f "$_task_control_lock" ] && [ ! -L "$_task_control_lock" ] \
+        || die "task control lock changed while it was being acquired: $_task_control_lock"
+}
+
+release_task_control_lock() {
+    exec 7>&-
+}
+
+require_task_record_locked() {
+    _task_record_dir="$1"
+
+    if [ -e "$_task_record_dir/.creating" ] || [ -L "$_task_record_dir/.creating" ]; then
+        die "task '$(basename "$_task_record_dir")' has an incomplete creation marker"
+    fi
+    for _task_record_name in spec.md state log.md; do
+        _task_record_path="$_task_record_dir/$_task_record_name"
+        [ -f "$_task_record_path" ] && [ ! -L "$_task_record_path" ] \
+            || die "task '$(basename "$_task_record_dir")' has an invalid $_task_record_name"
+    done
+    [ -s "$_task_record_dir/spec.md" ] \
+        || die "task '$(basename "$_task_record_dir")' has an empty spec.md"
+    _task_record_state="$(cat "$_task_record_dir/state" 2>/dev/null || true)"
+    is_valid_task_state "$_task_record_state" \
+        || die "task '$(basename "$_task_record_dir")' has invalid state '$_task_record_state'"
+}
+
+# `task-create` holds the initial planner job's control lock from publishing
+# status=pending until removing the task's .creating marker. SIGKILL releases
+# that lock. The next startup, waiter, or claimant finishes the same transaction
+# only after proving that the task and planner job carry the same token.
+finalize_pending_task_creation_locked() {
+    _creation_job_dir="$1"
+    _creation_job_marker="$_creation_job_dir/.task-create-transaction"
+
+    if [ ! -e "$_creation_job_marker" ] && [ ! -L "$_creation_job_marker" ]; then
+        return 0
+    fi
+    [ -f "$_creation_job_marker" ] && [ ! -L "$_creation_job_marker" ] \
+        && [ -s "$_creation_job_marker" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid task-create transaction"
+    [ "$(read_status "$_creation_job_dir")" = "pending" ] || return 0
+
+    _creation_task_id_file="$_creation_job_dir/task-id"
+    [ -f "$_creation_task_id_file" ] && [ ! -L "$_creation_task_id_file" ] \
+        && [ -s "$_creation_task_id_file" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid task-id"
+    _creation_task_id="$(cat "$_creation_task_id_file" 2>/dev/null || true)"
+    validate_task_id "$_creation_task_id"
+    [ "$(basename "$_creation_job_dir")" = "$_creation_task_id-plan" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' does not match task '$_creation_task_id'"
+    [ -f "$_creation_job_dir/role" ] && [ ! -L "$_creation_job_dir/role" ] \
+        && [ "$(cat "$_creation_job_dir/role" 2>/dev/null || true)" = "planner" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid role"
+    [ -f "$_creation_job_dir/spec.md" ] && [ ! -L "$_creation_job_dir/spec.md" ] \
+        && [ -s "$_creation_job_dir/spec.md" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid spec.md"
+    [ -f "$_creation_job_dir/log.md" ] && [ ! -L "$_creation_job_dir/log.md" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid log.md"
+    [ -d "$_creation_job_dir/workspace" ] && [ ! -L "$_creation_job_dir/workspace" ] \
+        || die "initial planner job '$(basename "$_creation_job_dir")' has an invalid workspace"
+
+    _creation_task_dir="$TASKS_DIR/$_creation_task_id"
+    _creation_task_marker="$_creation_task_dir/.creating"
+    acquire_task_control_lock "$_creation_task_dir"
+    if [ ! -e "$_creation_task_marker" ] && [ ! -L "$_creation_task_marker" ]; then
+        release_task_control_lock
+        return 0
+    fi
+    [ -f "$_creation_task_marker" ] && [ ! -L "$_creation_task_marker" ] \
+        && [ -s "$_creation_task_marker" ] \
+        || die "task '$_creation_task_id' has an invalid creation marker"
+    for _creation_name in spec.md state log.md; do
+        _creation_path="$_creation_task_dir/$_creation_name"
+        [ -f "$_creation_path" ] && [ ! -L "$_creation_path" ] \
+            || die "task '$_creation_task_id' has an invalid $_creation_name"
+    done
+    [ -s "$_creation_task_dir/spec.md" ] \
+        || die "task '$_creation_task_id' has an empty spec.md"
+    [ "$(cat "$_creation_task_dir/state" 2>/dev/null || true)" = "open" ] \
+        || die "task '$_creation_task_id' has invalid state during creation recovery"
+    [ "$(cat "$_creation_task_marker" 2>/dev/null || true)" = \
+        "$(cat "$_creation_job_marker" 2>/dev/null || true)" ] \
+        || die "task '$_creation_task_id' does not match its initial planner transaction"
+
+    rm -f -- "$_creation_task_marker" \
+        || die "cannot recover task '$_creation_task_id' creation"
+    [ ! -e "$_creation_task_marker" ] && [ ! -L "$_creation_task_marker" ] \
+        || die "cannot recover task '$_creation_task_id' creation"
+    release_task_control_lock
+    append_log "$_creation_job_dir" "Recovered interrupted task creation" \
+        "Finalized task '$_creation_task_id' before exposing its planner job."
+}
+
+# A pending job cannot have a committed owner.  If a claimant or releaser died
+# between its atomic status write and removing lock/, finish that interrupted
+# transition while the caller holds .control.lock.  A non-empty lock is treated
+# as corruption and left untouched.
+repair_pending_ownership_locked() {
+    job_dir="$1"
+
+    [ "$(read_status "$job_dir")" = "pending" ] || return 1
+    if [ -e "$job_dir/lock" ] || [ -L "$job_dir/lock" ]; then
+        [ -d "$job_dir/lock" ] && [ ! -L "$job_dir/lock" ] \
+            || die "pending job '$(basename "$job_dir")' has an invalid ownership lock"
+        rmdir "$job_dir/lock" 2>/dev/null \
+            || die "pending job '$(basename "$job_dir")' has a non-empty ownership lock"
+        rm -f "$job_dir/agent-id"
+        append_log "$job_dir" "Recovered interrupted transition" \
+            "Removed stale ownership from a pending job."
+    else
+        rm -f "$job_dir/agent-id"
+    fi
+    return 0
+}
+
+# Print why a claimed/running job is demonstrably orphaned.  No output and a
+# non-zero result mean that its named agent directory still exists; callers
+# must not infer death merely from elapsed time in that case.
+job_orphan_reason() {
+    job_dir="$1"
+
+    if [ ! -f "$job_dir/agent-id" ]; then
+        echo "missing agent-id"
+        return 0
+    fi
+
+    orphan_agent_id="$(cat "$job_dir/agent-id" 2>/dev/null || true)"
+    case "$orphan_agent_id" in
+        "")
+            echo "empty agent-id"
+            return 0
+            ;;
+        [!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+            echo "invalid agent-id '$orphan_agent_id'"
+            return 0
+            ;;
+    esac
+    if [ ! -d "$AGENTWS_ROOT/agents/$orphan_agent_id" ]; then
+        echo "agent '$orphan_agent_id' has no agents/$orphan_agent_id directory"
+        return 0
+    fi
+    return 1
+}
+
+require_agent_owner() {
+    action="$1"
+    job_id="$2"
+    job_dir="$3"
+    agent_id="$4"
+
+    validate_agent_id "$agent_id"
+    [ -f "$job_dir/agent-id" ] || die "cannot $action job '$job_id': missing agent-id"
+    expected="$(cat "$job_dir/agent-id" 2>/dev/null || true)"
+
+    if [ "$expected" != "$agent_id" ]; then
+        die "cannot $action job '$job_id': owned by '$expected', not '$agent_id'"
+    fi
+}
+
+append_log() {
+    job_dir="$1"
+    summary="$2"
+    detail="${3:-}"
+
+    {
+        printf '## %s - %s\n\n' "$(timestamp)" "$summary"
+        if [ -n "$detail" ]; then
+            printf '%s\n\n' "$detail"
+        fi
+    } >> "$job_dir/log.md"
+}
+
+append_task_log() {
+    task_dir="$1"
+    summary="$2"
+    detail="${3:-}"
+
+    [ -f "$task_dir/log.md" ] && [ ! -L "$task_dir/log.md" ] \
+        || die "task '$(basename "$task_dir")' has an invalid log.md"
+
+    {
+        printf '## %s - %s\n\n' "$(timestamp)" "$summary"
+        if [ -n "$detail" ]; then
+            printf '%s\n\n' "$detail"
+        fi
+    } >> "$task_dir/log.md"
+}
+
+copy_file_atomic() {
+    source="$1"
+    destination="$2"
+
+    [ -f "$source" ] && [ ! -L "$source" ] \
+        || die "source file is symlinked or is not a regular file: $source"
+    if [ -e "$destination" ] || [ -L "$destination" ]; then
+        [ -f "$destination" ] && [ ! -L "$destination" ] \
+            || die "destination is symlinked or is not a regular file: $destination"
+    fi
+    temporary="$(mktemp "$destination.tmp.XXXXXX")" \
+        || die "cannot create temporary file for '$destination'"
+    if ! cp -- "$source" "$temporary"; then
+        rm -f -- "$temporary"
+        die "cannot copy '$source' to '$destination'"
+    fi
+    [ -f "$temporary" ] && [ ! -L "$temporary" ] || {
+        rm -f -- "$temporary"
+        die "temporary destination changed while copying '$destination'"
+    }
+    mv -f -- "$temporary" "$destination" || {
+        rm -f -- "$temporary"
+        die "cannot replace '$destination'"
+    }
+}

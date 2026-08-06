@@ -1,5 +1,6 @@
 #!/bin/sh
-# Exercise Cyclo as a wheel-installed application in an otherwise empty home.
+# Audit a Cyclo wheel as an installed application. DComp/Docker integration is
+# opt-in because DComp is a separately installed release prerequisite.
 set -eu
 
 fail() {
@@ -11,6 +12,15 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 python=${PYTHON:-python3}
 build_python=${CYCLO_RELEASE_BUILD_PYTHON:-}
+provided_wheel=${1:-}
+require_dcomp=${CYCLO_RELEASE_REQUIRE_DCOMP:-0}
+
+[ "$#" -le 1 ] \
+    || fail "usage: tools/release-acceptance [WHEEL]"
+case $require_dcomp in
+    0|1) ;;
+    *) fail "CYCLO_RELEASE_REQUIRE_DCOMP must be 0 or 1" ;;
+esac
 
 command -v "$python" >/dev/null 2>&1 || fail "Python not found: $python"
 command -v git >/dev/null 2>&1 || fail "Git is required"
@@ -21,10 +31,89 @@ if sys.version_info < (3, 10):
     raise SystemExit("Cyclo requires Python 3.10 or newer")
 '
 
+dcomp=
+if [ "${CYCLO_DCOMP+x}" = x ]; then
+    [ -n "$CYCLO_DCOMP" ] || fail "CYCLO_DCOMP is empty"
+    dcomp=$(command -v "$CYCLO_DCOMP" 2>/dev/null) \
+        || fail "DComp executable not found: $CYCLO_DCOMP"
+elif [ "$require_dcomp" -eq 1 ] && command -v dcomp >/dev/null 2>&1; then
+    dcomp=$(command -v dcomp)
+fi
+if [ "$require_dcomp" -eq 1 ] && [ -z "$dcomp" ]; then
+    fail "DComp is required; install machine API 1 or set CYCLO_DCOMP"
+fi
+if [ -n "$dcomp" ]; then
+    dcomp=$(CDPATH= cd -- "$(dirname -- "$dcomp")" && pwd)/$(basename -- "$dcomp")
+    "$python" - "$dcomp" <<'PY'
+import json
+import subprocess
+import sys
+
+executable = sys.argv[1]
+completed = subprocess.run(
+    [executable, "version", "--json"],
+    check=False,
+    capture_output=True,
+    text=True,
+)
+if completed.returncode:
+    detail = " ".join((completed.stderr or completed.stdout).split())
+    raise SystemExit(
+        f"DComp version check failed ({completed.returncode})"
+        + (f": {detail}" if detail else "")
+    )
+try:
+    document = json.loads(completed.stdout)
+except json.JSONDecodeError as exc:
+    raise SystemExit("DComp version did not return JSON") from exc
+if (
+    not isinstance(document, dict)
+    or document.get("api_version") != 1
+    or not isinstance(document.get("version"), str)
+    or not document["version"]
+):
+    raise SystemExit(f"DComp machine API 1 is required, found: {document!r}")
+PY
+    export CYCLO_DCOMP=$dcomp
+else
+    unset CYCLO_DCOMP
+fi
+
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/cyclo-release-acceptance.XXXXXX")
+runtime_system=
+runtime_volume=
+resolve_runtime_volume() {
+    "$venv/bin/python" - "$state_root" "$runtime_system" <<'PY'
+from pathlib import Path
+import sys
+
+from cyclo.dcomp import DCompClient
+from cyclo.state import StateStore
+
+state_root, system = sys.argv[1:]
+print(
+    DCompClient(StateStore(Path(state_root))).volume(
+        system,
+        "gateway",
+        "credentials",
+    )
+)
+PY
+}
 cleanup() {
     status=$?
     trap - 0
+    if [ -z "$runtime_volume" ] && [ -n "$runtime_system" ] \
+        && [ -n "$dcomp" ]; then
+        runtime_volume=$(resolve_runtime_volume 2>/dev/null) || runtime_volume=
+    fi
+    if [ -n "$runtime_system" ] && [ -n "$dcomp" ]; then
+        "$dcomp" --state-root "$state_root/dcomp" \
+            down "$runtime_system" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$runtime_volume" ] && command -v docker >/dev/null 2>&1; then
+        docker volume rm "$runtime_volume" >/dev/null 2>&1 || true
+    fi
     rm -rf -- "$work_root"
     exit "$status"
 }
@@ -41,41 +130,57 @@ empty_home=$work_root/home
 state_root=$work_root/state
 team=$work_root/team
 project=$work_root/project
-doctor_log=$work_root/doctor.log
+documentation=$work_root/documentation
+project_file=$work_root/project.cyclo
+project_context=$work_root/project-context.md
 
-mkdir -p "$dist" "$source_tree" "$empty_home" "$project"
+mkdir -p "$dist" "$source_tree" "$empty_home" "$project" "$documentation"
 
-# Build from exactly the files that could enter a source publication. This
-# prevents setuptools from reusing ignored build/lib files deleted from source.
-(
-    cd "$repo_root"
-    git ls-files --cached --others --exclude-standard |
-        while IFS= read -r path; do
-            [ -e "$path" ] || continue
-            cp -a --parents -- "$path" "$source_tree"
-        done
-)
+if [ -z "$provided_wheel" ]; then
+    # Build from exactly the files eligible for source publication. This
+    # prevents setuptools from reusing ignored build output.
+    (
+        cd "$repo_root"
+        git ls-files --cached --others --exclude-standard |
+            while IFS= read -r path; do
+                [ -e "$path" ] || continue
+                cp -a --parents -- "$path" "$source_tree"
+            done
+    )
+fi
+
 export HOME=$empty_home
 export XDG_STATE_HOME=$empty_home/.local/state
 unset PYTHONHOME PYTHONPATH \
-    CYCLO_RUNTIME_IMAGE CYCLO_GATEWAY_IMAGE CYCLO_GATEWAY_STORE CYCLO_STATE_ROOT \
+    CYCLO_TEAM_IMAGE CYCLO_STATE_ROOT \
     PI_CODING_AGENT_DIR \
     AGENTWS_MAX_JOB_ATTEMPTS AGENTWS_MAX_CONSECUTIVE_FAILURES \
     AGENTWS_RETRY_INITIAL_SECONDS AGENTWS_RETRY_MAX_SECONDS
 "$python" -m venv "$venv"
 
-if [ -z "$build_python" ]; then
-    printf '%s\n' '==> installing hash-locked build backend'
-    "$python" -m venv "$build_venv"
-    "$build_venv/bin/python" -m pip install \
-        --disable-pip-version-check \
-        --require-hashes \
-        --requirement "$repo_root/requirements/release.txt"
-    build_python=$build_venv/bin/python
-fi
-command -v "$build_python" >/dev/null 2>&1 \
-    || fail "build Python not found: $build_python"
-"$build_python" - "$repo_root/pyproject.toml" <<'PY'
+if [ -n "$provided_wheel" ]; then
+    wheel_directory=$(CDPATH= cd -- "$(dirname -- "$provided_wheel")" && pwd) \
+        || fail "wheel directory does not exist: $(dirname -- "$provided_wheel")"
+    wheel=$wheel_directory/$(basename -- "$provided_wheel")
+    [ -f "$wheel" ] || fail "wheel does not exist: $wheel"
+    case $(basename -- "$wheel") in
+        cyclo_agent-*.whl) ;;
+        *) fail "unexpected Cyclo wheel filename: $wheel" ;;
+    esac
+    printf '%s\n' "==> using supplied release wheel: $wheel"
+else
+    if [ -z "$build_python" ]; then
+        printf '%s\n' '==> installing hash-locked build backend'
+        "$python" -m venv "$build_venv"
+        "$build_venv/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --require-hashes \
+            --requirement "$repo_root/requirements/release.txt"
+        build_python=$build_venv/bin/python
+    fi
+    command -v "$build_python" >/dev/null 2>&1 \
+        || fail "build Python not found: $build_python"
+    "$build_python" - "$repo_root/pyproject.toml" <<'PY'
 from importlib.metadata import version
 from pathlib import Path
 import sys
@@ -98,41 +203,37 @@ if actual != expected:
     raise SystemExit(f"release build backend mismatch: expected {expected}, found {actual}")
 PY
 
-printf '%s\n' '==> building release wheel'
-"$build_python" -m pip wheel \
-    --disable-pip-version-check \
-    --no-build-isolation \
-    --no-deps \
-    --wheel-dir "$dist" \
-    "$source_tree"
+    printf '%s\n' '==> building release wheel'
+    "$build_python" -m pip wheel \
+        --disable-pip-version-check \
+        --no-build-isolation \
+        --no-deps \
+        --wheel-dir "$dist" \
+        "$source_tree"
 
-set -- "$dist"/cyclo_agent-*.whl
-[ "$#" -eq 1 ] && [ -f "$1" ] || fail "expected exactly one Cyclo wheel in $dist"
-wheel=$1
+    set -- "$dist"/cyclo_agent-*.whl
+    [ "$#" -eq 1 ] && [ -f "$1" ] \
+        || fail "expected exactly one Cyclo wheel in $dist"
+    wheel=$1
+fi
 
 printf '%s\n' '==> auditing wheel contents'
-"$venv/bin/python" - "$wheel" <<'PY'
+"$venv/bin/python" - "$wheel" "$repo_root" <<'PY'
 import sys
 import zipfile
+from pathlib import Path
 
 wheel = sys.argv[1]
-forbidden_names = {
-    "cyclo/provenance.py",
-    "cyclo/runtime.lock.json",
-    "cyclo/_agentws/LICENSE",
-    "cyclo/_agentws/UPSTREAM.json",
-    "cyclo/credential_gateway/LICENSE",
-    "cyclo/credential_gateway/ORIGIN.md",
-    "cyclo/credential_gateway/UPSTREAM.json",
-}
+package_root = Path(sys.argv[2]) / "src" / "cyclo"
 required_names = {
-    "cyclo/credential_gateway/gateway_context/Dockerfile",
-    "cyclo/credential_gateway/gateway_context/model-metadata.mjs",
-    "cyclo/credential_gateway/gateway_context/safe-model-fields.json",
-    "cyclo/credential_gateway/gateway_context/safe-model-fields.mjs",
-    "cyclo/credential_gateway/runtime_context/Dockerfile",
+    (Path("cyclo") / path.relative_to(package_root)).as_posix()
+    for path in package_root.rglob("*")
+    if path.is_file()
+    and "node_modules" not in path.parts
+    and "__pycache__" not in path.parts
+    and path.suffix not in {".pyc", ".pyo"}
 }
-legacy_package_prefix = "cyclo/" + "vendor" + "_gateway/"
+
 upstream_https = b"github" + b".com/glguida/"
 upstream_ssh = b"git@" + b"github.com:glguida/"
 private_home = b"/home/" + b"glguida"
@@ -149,15 +250,20 @@ forbidden_content = (
 problems = []
 with zipfile.ZipFile(wheel) as archive:
     names = set(archive.namelist())
-    problems.extend(sorted(names & forbidden_names))
     problems.extend(
         f"missing required wheel resource: {name}"
         for name in sorted(required_names - names)
     )
     problems.extend(
-        f"legacy package path remains: {name}"
+        f"installed dependency tree leaked into wheel: {name}"
         for name in sorted(names)
-        if name.startswith(legacy_package_prefix)
+        if "node_modules" in Path(name).parts
+    )
+    problems.extend(
+        f"Python bytecode cache leaked into wheel: {name}"
+        for name in sorted(names)
+        if "__pycache__" in Path(name).parts
+        or Path(name).suffix in {".pyc", ".pyo"}
     )
     for name in sorted(names):
         data = archive.read(name)
@@ -178,9 +284,8 @@ printf '%s\n' '==> installing wheel into isolated environment'
     --force-reinstall \
     "$wheel"
 
-# From here on, neither the source checkout nor user-local executables are on
-# Python's or the shell's search path. Git and Docker remain available from
-# ordinary system locations.
+# The source checkout and user-local Python commands are deliberately absent.
+# An explicitly selected DComp remains usable by absolute path.
 export PATH=$venv/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
 cd "$work_root"
 
@@ -194,51 +299,51 @@ case $installed_root in
 esac
 
 printf '%s\n' '==> checking wheel-only commands and package resources'
-[ "$("$cyclo" --version)" = "cyclo 0.1.0" ] \
+[ "$("$cyclo" --version)" = "cyclo 0.2.1" ] \
     || fail "installed command reports an unexpected release version"
 "$venv/bin/python" -c '
 from importlib.metadata import distribution
 dist = distribution("cyclo-agent")
 assert dist.metadata["Name"] == "cyclo-agent"
-assert dist.version == "0.1.0"
+assert dist.version == "0.2.1"
 import cyclo
 assert cyclo.__version__ == dist.version
 '
 
-gateway_help=$("$cyclo" gateway --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
-case $gateway_help in
-    *destroy-store*) ;;
-    *) fail "installed gateway help is incomplete" ;;
-esac
-case $gateway_help in
-    *providers*) ;;
-    *) fail "installed gateway help omits pre-login provider discovery" ;;
-esac
-case $gateway_help in
-    *"credentials, subscriptions, and retained usage history"*) ;;
-    *) fail "installed gateway help does not disclose all retained store data" ;;
-esac
-providers_help=$("$cyclo" gateway providers --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
-case $providers_help in
-    *"Providers are upstream AI services"*"does not read or mount the gateway credential store"*) ;;
-    *) fail "installed provider-discovery help omits its credential-free guarantee" ;;
-esac
-models_help=$("$cyclo" models --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
-case $models_help in
-    *"cyclo gateway providers"*) ;;
-    *) fail "installed models help omits pre-login provider discovery" ;;
-esac
-destroy_help=$("$cyclo" gateway destroy-store --help | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
-case $destroy_help in
-    *"--confirm VOLUME"*) ;;
-    *) fail "installed store-destruction confirmation help is incomplete" ;;
-esac
-case $destroy_help in
-    *"credentials, subscriptions, and retained usage history"*irreversib*|*irreversib*"credentials, subscriptions, and retained usage history"*) ;;
-    *) fail "installed store-destruction help does not disclose irreversible data loss" ;;
-esac
+gateway_help=$("$cyclo" gateway --help)
+printf '%s\n' "$gateway_help" | grep -F 'providers' >/dev/null \
+    || fail "installed gateway help omits provider discovery"
+printf '%s\n' "$gateway_help" | grep -F 'destroy-store' >/dev/null \
+    || fail "installed gateway help omits store destruction"
+printf '%s\n' "$gateway_help" | grep -F 'build' >/dev/null \
+    || fail "installed gateway help omits build-and-apply"
 
-templates=$("$cyclo" templates)
+component_help=$("$cyclo" component --help)
+for action in list status logs restart; do
+    printf '%s\n' "$component_help" | grep -F "$action" >/dev/null \
+        || fail "installed component help omits $action"
+done
+component_words=$(
+    printf '%s\n' "$component_help" | tr ' ,{}()' '\n'
+)
+for obsolete in build start stop; do
+    if printf '%s\n' "$component_words" | grep -Fx "$obsolete" >/dev/null; then
+        fail "installed component help exposes obsolete $obsolete lifecycle"
+    fi
+done
+
+run_help=$("$cyclo" run --help)
+if printf '%s\n' "$run_help" | grep -F -- '--dry-run' >/dev/null; then
+    fail "installed run help exposes obsolete --dry-run"
+fi
+
+providers_help=$("$cyclo" providers --help)
+for action in check status restart; do
+    printf '%s\n' "$providers_help" | grep -F "$action" >/dev/null \
+        || fail "installed providers help omits $action"
+done
+
+templates=$("$cyclo" team templates)
 expected_templates=$(printf '%s\n' \
     adversarial-audit \
     plan-execute-verify \
@@ -248,62 +353,87 @@ expected_templates=$(printf '%s\n' \
     fail "packaged templates are incomplete"
 }
 
-"$cyclo" init "$team" \
+"$cyclo" team init "$team" \
     --template test-driven-repair \
     --model openai-codex/release-acceptance
+printf '%s\n' \
+    'ARG CYCLO_TEAM_BASE' \
+    'FROM ${CYCLO_TEAM_BASE}' \
+    | cmp - "$team/Dockerfile" >/dev/null \
+    || fail "generated team omits the standard image derivation"
 "$cyclo" validate "$team"
 
-dry_run=$(
-    "$cyclo" --state-root "$state_root" run \
-        --name release-acceptance \
-        --dry-run \
-        "$team" \
-        "$project"
-)
-printf '%s\n' "$dry_run"
-case $dry_run in
-    *"cyclo-runtime:"*) ;;
-    *) fail "dry-run did not use the packaged Cyclo runtime image" ;;
-esac
-case $dry_run in
-    *"type=bind,src=$team,dst=/team"*) ;;
-    *) fail "dry-run did not isolate the team mount" ;;
-esac
-case $dry_run in
-    *"type=bind,src=$project,dst=/workspace"*) ;;
-    *) fail "dry-run did not isolate the project mount" ;;
-esac
-case $dry_run in
-    *multiagent*|*"$HOME/agentws"*|*"$HOME/multiagent"*)
-        fail "dry-run referenced an external upstream checkout"
-        ;;
-esac
+printf '%s\n' \
+    'release-acceptance-context-marker' \
+    'Use `/workspace/source` for implementation work.' \
+    > "$project_context"
+"$cyclo" project init "$project_file" \
+    --name release-acceptance \
+    --description 'Exercise packaged multi-mount project definitions.' \
+    --context "$project_context" \
+    --team "$team" ro \
+    --mount source "$project" rw \
+    --mount documentation "$documentation" ro
+"$venv/bin/python" - "$project_file" <<'PY'
+from pathlib import Path
+import sys
 
-printf '%s\n' '==> checking installed runtime'
-doctor_status=0
-"$cyclo" --state-root "$state_root" doctor >"$doctor_log" 2>&1 || doctor_status=$?
-cat "$doctor_log"
+from cyclo.project import load_project
+from cyclo.project_run import load_project_teams
 
-grep -F 'ok  bundled job-loop ABI:' "$doctor_log" >/dev/null \
-    || fail "doctor did not find the packaged job-loop runtime"
-grep -F 'ok  Cyclo credential gateway API:' "$doctor_log" >/dev/null \
-    || fail "doctor did not load Cyclo's packaged gateway"
+definition = load_project(Path(sys.argv[1]))
+teams = load_project_teams(definition)
+assert definition.name == "release-acceptance"
+assert len(teams) == 1
+assert [mount.name for mount in definition.mounts] == [
+    "source",
+    "documentation",
+]
+PY
+grep -F 'release-acceptance-context-marker' "$project_file" >/dev/null \
+    || fail "project init omitted its embedded context"
 
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    [ "$doctor_status" -eq 0 ] || fail "doctor failed with an accessible Docker daemon"
-    grep -F 'ok  Docker daemon:' "$doctor_log" >/dev/null \
-        || fail "doctor did not accept the Docker daemon"
+if [ "$require_dcomp" -eq 1 ]; then
+    printf '%s\n' '==> checking installed DComp/Docker integration'
+    command -v docker >/dev/null 2>&1 || fail "Docker is required"
+    docker info >/dev/null 2>&1 || fail "the Docker daemon is unavailable"
+    mkdir -p "$state_root"
+    : > "$state_root/host.conf"
+    "$cyclo" --state-root "$state_root" validate "$project_file"
+    system=$(
+        "$venv/bin/python" - "$state_root" <<'PY'
+from pathlib import Path
+import sys
+from cyclo.state import StateStore
+
+print(StateStore(Path(sys.argv[1])).system)
+PY
+    )
+    runtime_system=cyclo-$system
+
+    "$cyclo" --state-root "$state_root" gateway build
+    runtime_volume=$(resolve_runtime_volume)
+    component_status=$(
+        "$cyclo" --state-root "$state_root" component status gateway
+    )
+    printf '%s\n' "$component_status"
+    printf '%s\n' "$component_status" | grep -F 'gateway' >/dev/null \
+        || fail "DComp status omitted the gateway component"
+    doctor_log=$work_root/doctor.log
+    "$cyclo" --state-root "$state_root" doctor >"$doctor_log"
+    cat "$doctor_log"
+    grep -F 'ok  dcomp ' "$doctor_log" >/dev/null \
+        || fail "doctor did not report DComp"
+    grep -F 'ok  component gateway' "$doctor_log" >/dev/null \
+        || fail "doctor did not report a healthy gateway"
+
+    "$cyclo" --state-root "$state_root" gateway destroy-store \
+        --confirm "$runtime_volume"
+    runtime_system=
+    runtime_volume=
 else
-    [ "$doctor_status" -eq 1 ] \
-        || fail "doctor returned $doctor_status when Docker was unavailable"
-    if grep -F 'no  Docker daemon:' "$doctor_log" >/dev/null; then
-        :
-    elif grep -F 'error: Docker is not installed or not on PATH' "$doctor_log" >/dev/null; then
-        :
-    else
-        fail "doctor did not report the unavailable Docker dependency"
-    fi
-    printf '%s\n' 'SKIP: Docker daemon is unavailable; wheel integrity checks passed.'
+    printf '%s\n' \
+        'SKIP: DComp/Docker integration (set CYCLO_RELEASE_REQUIRE_DCOMP=1).'
 fi
 
 printf '%s\n' 'release acceptance: PASS'

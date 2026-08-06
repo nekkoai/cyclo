@@ -1,0 +1,134 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    echo "Usage: job-claim [job-id] [-r <role>] --agent-id <agent-id>"
+    echo ""
+    echo "Claim a pending job for a named agent."
+    echo "If no job-id is given, claims the oldest pending job."
+    echo "Returns 'CLAIMED: <job-id>' or 'NO_JOBS'."
+    echo ""
+    echo "Options:"
+    echo "  -r <role>    Only claim jobs assigned to this role"
+    echo "  --agent-id   Named agent that will own the job"
+    exit 1
+}
+
+JOB_ID=""
+JOB_ROLE=""
+AGENT_ID=""
+CLAIM_WAITING_SOURCE=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -r|--role)
+            [ "$#" -ge 2 ] || die "$1 requires a role"
+            JOB_ROLE="$2"
+            shift 2
+            ;;
+        --agent-id)
+            [ "$#" -ge 2 ] || die "$1 requires an agent ID"
+            AGENT_ID="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            if [ -z "$JOB_ID" ]; then
+                JOB_ID="$1"
+            else
+                die "unexpected argument '$1'"
+            fi
+            shift
+            ;;
+    esac
+done
+
+[ -n "$JOB_ROLE" ] && validate_role "$JOB_ROLE"
+[ -n "$AGENT_ID" ] || die "--agent-id <agent-id> is required"
+validate_agent_id "$AGENT_ID"
+require_jobs_dir
+require_tasks_dir
+
+claim_job() {
+    job_id="$1"
+    job_dir="$JOBS_DIR/$job_id"
+
+    [ -d "$job_dir" ] || return 1
+    [ -f "$job_dir/status" ] || return 1
+    [ -f "$job_dir/role" ] || return 1
+
+    acquire_job_control_lock "$job_dir"
+
+    status="$(cat "$job_dir/status" 2>/dev/null || true)"
+    if [ "$status" != "pending" ]; then
+        release_job_control_lock
+        return 1
+    fi
+
+    role="$(cat "$job_dir/role" 2>/dev/null || true)"
+    if [ -z "$role" ]; then
+        release_job_control_lock
+        return 1
+    fi
+
+    if [ -n "$JOB_ROLE" ] && [ "$role" != "$JOB_ROLE" ]; then
+        release_job_control_lock
+        return 1
+    fi
+
+    if ! terminal_notice_ready_locked "$job_dir"; then
+        CLAIM_WAITING_SOURCE="$TERMINAL_NOTICE_SOURCE"
+        release_job_control_lock
+        return 1
+    fi
+
+    finalize_pending_task_creation_locked "$job_dir"
+
+    if ! repair_pending_ownership_locked "$job_dir"; then
+        release_job_control_lock
+        return 1
+    fi
+
+    if ! mkdir "$job_dir/lock" 2>/dev/null; then
+        release_job_control_lock
+        return 1
+    fi
+
+    write_file_atomic "$job_dir/agent-id" "$AGENT_ID"
+    write_file_atomic "$job_dir/status" "claimed"
+    release_job_control_lock
+    echo "CLAIMED: $job_id"
+    return 0
+}
+
+if [ -n "$JOB_ID" ]; then
+    validate_job_id "$JOB_ID"
+    [ -d "$JOBS_DIR/$JOB_ID" ] || die "job '$JOB_ID' does not exist"
+
+    if claim_job "$JOB_ID"; then
+        exit 0
+    fi
+
+    status="$(cat "$JOBS_DIR/$JOB_ID/status" 2>/dev/null || echo "unknown")"
+    [ "$status" = "pending" ] || die "cannot claim job '$JOB_ID' from status '$status' (expected: pending)"
+    if [ -n "$CLAIM_WAITING_SOURCE" ]; then
+        die "cannot claim job '$JOB_ID': waiting for source job '$CLAIM_WAITING_SOURCE' to become terminal"
+    fi
+    [ ! -d "$JOBS_DIR/$JOB_ID/lock" ] || die "cannot claim job '$JOB_ID': lock directory already exists"
+    die "could not claim job '$JOB_ID' due to a concurrent claim race"
+fi
+
+for job_name in $(ls -1tr "$JOBS_DIR" 2>/dev/null || true); do
+    validate_job_id "$job_name"
+    if claim_job "$job_name"; then
+        exit 0
+    fi
+done
+
+echo "NO_JOBS"

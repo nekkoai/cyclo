@@ -1,259 +1,231 @@
-<p align="center">
-  <img src="docs/assets/cyclo-hero.jpg" alt="A protected credential gateway connecting isolated agent teams in a continuous loop" width="100%">
-</p>
+<img src="docs/assets/banner.svg" alt="cyclo — Agentic systems, in a Git loop. A local-first agent runtime. V0.2.1, MIT, Linux, Python 3.10+, DComp." width="100%">
 
-<h1 align="center">Cyclo</h1>
+Cyclo runs Git-defined agent teams against explicitly mounted projects. A
+credential gateway owns provider logins, optional provider components transform
+or route model traffic, and each team runs as an isolated component with its
+own durable AgentWS queue.
 
-<p align="center">
-  <strong>Agentic systems, in a Git loop.</strong><br>
-  Define teams as repositories, run them against real projects, and observe
-  their work without putting provider credentials inside team containers.
-</p>
+Cyclo uses [DComp](https://github.com/glguida/dcomp) for Docker lifecycle and
+component links. Cyclo builds images and compiles one installation-wide DComp
+system; DComp reconciles its containers, networks, volumes, and crash-recovery
+state. Neither program is in the inference data path after startup.
 
-<p align="center">
-  <a href="#quick-start">Quick start</a> ·
-  <a href="#how-it-works">How it works</a> ·
-  <a href="#define-a-team">Define a team</a> ·
-  <a href="#security-boundary">Security</a> ·
-  <a href="#documentation">Documentation</a>
-</p>
+## 01 · Requirements
 
-<p align="center">
-  <code>v0.1.0</code> &nbsp; <code>stable</code> &nbsp;
-  <code>Linux</code> &nbsp; <code>Python 3.10+</code> &nbsp; <code>MIT</code>
-</p>
+- Linux;
+- Python 3.10 or newer;
+- Git;
+- a local Docker Engine reachable through a Unix socket; and
+- a `dcomp` executable with machine API version 1.
 
-Cyclo is a local-first runtime for experimenting with multi-agent systems. A
-team is ordinary Git content: a roster, role prompts, and an optional shared
-protocol. Attach that team to any project directory, submit a task, and Cyclo
-runs a durable filesystem job loop inside its own Docker container.
-
-Model traffic crosses a separate credential gateway. API keys and subscription
-sessions remain in a Docker-managed volume that team containers never mount;
-each running team receives only a provider-and-model-scoped capability.
-
-Cyclo is standalone. The queue runtime, agent launcher, read-only viewer,
-credential gateway, Docker build contexts, templates, and fleet dashboard all
-ship in this repository—there are no sibling checkouts or external agent
-runtime to install.
-
-## Why Cyclo
-
-| Teams are software | Credentials stay outside |
-|---|---|
-| Version roles and model choices in a normal Git repository. Fork a team, compare generations, or deliberately let it self-modify. | Provider keys and OAuth subscriptions live only in the gateway store, never in a team repository, project, or team container. |
-| **Work survives processes** | **The loop is visible** |
-| Tasks, jobs, comments, results, and transcripts persist across container replacement and bounded agent retries. | A read-only dashboard shows fleet state, queue activity, attention items, and provider-reported token usage. |
-
-## Quick start
-
-Cyclo requires Linux, Python 3.10 or newer, Git, and a Docker daemon available
-to the current user. From a Cyclo source checkout:
+Install DComp on `PATH`, or set `CYCLO_DCOMP` to its executable. Verify the
+machine interface before using Cyclo:
 
 ```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install .
-cyclo doctor
+"${CYCLO_DCOMP:-dcomp}" version --json
 ```
 
-The host does not need Node.js or npm. The Pi agent engine and provider
-libraries run inside Cyclo's images; Node.js is needed only for the full
-maintainer test suite.
+Cyclo refuses to build or run team workloads as host root. Run it as the user
+who owns the project files and may access Docker.
 
-### 1. Connect a model provider
+Cyclo 0.2 is a fresh-install boundary. It does not import Cyclo 0.1 state or
+Docker resources.
 
-Provider discovery works before login:
+## 02 · First installation
+
+Install the Python package on the host and select a state root:
+
+```sh
+python3 -m pip install .
+export CYCLO_STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cyclo-work"
+mkdir -p "$CYCLO_STATE_ROOT"
+```
+
+An explicit state root uses `$CYCLO_STATE_ROOT/host.conf`. An implicit default
+state root uses `/etc/cyclo/host.conf`. The file may be absent or empty, which
+routes teams directly to the gateway.
+
+Inspect login providers, authenticate, and list the resulting models:
 
 ```sh
 cyclo gateway providers
-cyclo gateway login openai-codex
+cyclo gateway login openai-codex --as codex-work
 cyclo models
+cyclo doctor
 ```
 
-The example uses a ChatGPT subscription through interactive OAuth. Cyclo also
-supports Anthropic subscription login and API-key providers; the live
-`cyclo gateway providers` output explains the available login routes, and
-`cyclo models` is authoritative for roster model names.
+Login stores credentials in the gateway's private Docker volume and restarts
+the gateway so the new catalogue is visible. On a fresh installation Cyclo
+creates only that fixed gateway/store boundary first; unrelated Provider or
+team failures cannot block login. API keys and OAuth sessions are never mounted
+into provider or team components.
 
-### 2. Create a team
+## 03 · Provider composition
 
-```sh
-cyclo templates
-cyclo init ~/teams/my-team \
-  --template plan-execute-verify \
-  --model PROVIDER/MODEL_ID
-cyclo validate ~/teams/my-team
-```
-
-Replace `PROVIDER/MODEL_ID` with an exact value printed by `cyclo models`.
-`cyclo init` creates an independent Git repository; edit and commit it like any
-other source project.
-
-### 3. Attach the team to a project
-
-```sh
-cyclo run --name my-team \
-  ~/teams/my-team \
-  ~/src/my-project
-```
-
-The team definition is read-only by default. The project is writable by
-default, so agents can change its source and tests. Cyclo prints the instance
-name, project root, persistent queue path, and per-team viewer URL.
-
-### 4. Give it work
-
-```sh
-$EDITOR /tmp/task.md
-cyclo task my-team task-001 /tmp/task.md
-cyclo logs -f my-team
-```
-
-The task specification describes the desired outcome in the attached project;
-it does not need to mention an internal container path. Open the fleet view in
-another terminal:
-
-```sh
-cyclo dashboard
-```
-
-## How it works
-
-```mermaid
-flowchart LR
-    T["Team Git repository<br/>team + roles/*.md"]
-    P["Project directory<br/>source + tests"]
-    R["cyclo-runtime<br/>agents + filesystem loop"]
-    S[("Host state<br/>tasks + jobs + transcripts")]
-    G["cyclo-gateway<br/>policy + proxy + usage"]
-    V[("Gateway volume<br/>credentials + subscriptions")]
-    M["Allowed model provider"]
-
-    T -->|/team · read-only| R
-    P -->|/workspace · writable| R
-    R <-->|durable queue| S
-    R -->|scoped capability| G
-    V <-->|gateway only| G
-    G --> M
-```
-
-Each instance has its own runtime container, private Docker network, persistent
-queue state, and scoped gateway capability. The gateway is the only component
-that mounts the credential volume, and it attributes provider-reported usage
-to the team/project binding and team generation.
-
-A submitted task begins with a planner job. Agents claim jobs matching their
-roles, write evidence and results to the filesystem queue, and create follow-up
-jobs for the next role. The wrapper keeps every agent available for later work;
-the team stops only when you stop the instance.
-
-## Define a team
-
-A minimal team repository looks like this:
+The gateway is always the root Provider. Each non-gateway provider is an
+ordinary source directory containing `component.dcomp` and, when Cyclo should
+build it, a `Dockerfile`:
 
 ```text
-my-team/
-  team
-  roles/
-    planner.md
-    builder.md
-    verifier.md
-  AGENTS.md              # optional shared protocol
+# providers/passthrough/component.dcomp
+docker cyclo-passthrough:dev
+input cyclo.provider.v1.Provider upstream
+output cyclo.provider.v1.Provider provider
 ```
 
-The `team` roster assigns every agent a role, engine, and gateway model:
+Install component instances in `host.conf`:
 
 ```text
-# <name>       <role>    <engine>        <provider/model>
-planner-1      planner   pi              openai-codex/MODEL_ID
-builder-1      builder   pi              openai-codex/MODEL_ID
-verifier-1     verifier  pi-interactive  anthropic/MODEL_ID
+provider trace ./providers/passthrough upstream=gateway.provider -- label=trace
+provider policy ./providers/policy upstream=trace.provider
 ```
 
-Every role needs a matching `roles/<role>.md`, and at least one agent must have
-the `planner` role. A team can mix models or providers. When `AGENTS.md` is
-absent, Cyclo supplies its bundled filesystem-loop protocol.
+The grammar is:
 
-Use `--team-write` only when a team should edit its own roster or roles; those
-ordinary Git working-tree changes take effect on the next run.
+```text
+provider NAME SOURCE [context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...]
+```
 
-## Included loops
+Relative `SOURCE` paths resolve beside `host.conf`. `context=PATH` selects a
+larger Docker build context containing the source. Every declared input must be
+bound exactly once to an output with the same protobuf service name. All
+declarations are resolved together, so links may refer to components written
+later in the file. The last provider declaration is the outer Provider used by
+teams and host-side catalogue calls; with no declarations, `gateway.provider`
+is outer.
 
-| Template | Flow |
-|---|---|
-| `plan-execute-verify` | Planner → builder → critic/revision → independent verifier |
-| `test-driven-repair` | Reproduce and test → repair → judge → integrate |
-| `adversarial-audit` | Threat model → parallel inspection → challenge → evidence synthesis |
+Cyclo uses stable installation/version tags for built gateway, Provider, and
+team images. Whenever an operation needs one, Cyclo invokes `docker build` with
+the real source context and lets Docker apply `.dockerignore` and its native
+layer cache. Cyclo captures the build output, inspects the resulting immutable
+image ID, and gives only that ID to DComp. It keeps no source-digest cache or
+build history.
 
-List them with `cyclo templates`. A created team is a normal, independent Git
-repository with no runtime link back to Cyclo's template copy.
+DComp gives each direct interface link a private internal TCP network.
+Components receive only the targets for their declared inputs, such as
+`DCOMP_LINK_UPSTREAM=dns:///trace:50051`.
 
-## Observe and operate
+## 04 · Teams and projects
+
+Create a team repository and a project definition:
 
 ```sh
+cyclo team init ./teams/jon-rtl --template plan-execute-verify --model codex-work/MODEL
+cyclo project init ./project.cyclo --context ./project-context.md --team ./teams/jon-rtl ro --mount core-et /home/user/openhw/core-et rw --mount specifications ./specifications ro
+```
+
+A project is a small line-oriented file:
+
+```text
+name rtl-work
+description Integrate a reusable UART IP into CORE-ET.
+context <<PROJECT_CONTEXT
+`core-et` is the writable implementation repository.
+`specifications` contains normative read-only interface documentation.
+PROJECT_CONTEXT
+team ./teams/jon-rtl ro
+mount core-et /home/user/openhw/core-et rw
+mount specifications ./specifications ro
+```
+
+Every `team` line creates one durable Cyclo instance and one generated DComp
+team component. Writable mounts appear at `/workspace/<name>`; read-only inputs
+appear at `/readonly/<name>`. Several writable mounts represent several
+projects. The team repository is mounted at `/team` with its declared mode.
+
+Cyclo bakes AgentWS, Pi, the provider adapter, and the generic agent protocol
+into the common team image. At runtime it mounts only durable queue directories,
+Pi state, the team repository, the generated read-only
+`/agentws/project.cyclo`, and declared project paths. Every team repository
+contains a Dockerfile derived from Cyclo's standard team-component image:
+
+```dockerfile
+ARG CYCLO_TEAM_BASE
+FROM ${CYCLO_TEAM_BASE}
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends verilator
+```
+
+The two-line `ARG`/`FROM` form is sufficient when no extra packages are needed.
+Edit it to install the team's tools. Cyclo supplies `CYCLO_TEAM_BASE`; the final
+stage must inherit it and preserve Cyclo's entrypoint and health check.
+
+Run and inspect the project:
+
+```sh
+cyclo validate ./project.cyclo
+cyclo run ./project.cyclo
 cyclo ps
-cyclo dashboard
-cyclo usage
-cyclo path my-team
-cyclo stop my-team
+cyclo inspect INSTANCE
+cyclo task run INSTANCE uart-ip ./uart-task.md
+cyclo task add-job INSTANCE uart-ip uart-ip-builder-r1 builder ./recovery.md
+cyclo task list INSTANCE
+cyclo logs -f INSTANCE
+cyclo dashboard --host 127.0.0.1
 ```
 
-The dashboard combines lifecycle state, bounded queue summaries, recent
-task/job activity, and gateway usage across all instances. It and the per-team
-AgentWS viewer are read-only and bind to loopback by default.
+Jobs are routed by role. A team roster declares
+`NAME ROLE ENGINE PROVIDER/MODEL`; the role selects both the queue work an agent
+may claim and its `roles/ROLE.md` instructions. Several agents may share a role.
+Task coordination authority belongs to role `planner`.
 
-To expose the dashboard on a trusted network, bind it explicitly and browse to
-the machine's real hostname or IP—not to the bind address `0.0.0.0`:
+Use `cyclo refresh` to re-read running projects and teams, rebuild their images,
+and apply the resulting installation-wide DComp system. Use `cyclo stop`,
+`cyclo start`, and `cyclo forget` for durable instance intent. `cyclo repair`
+runs the required host Docker builds, reapplies the current host configuration
+and persisted instance intent, and resumes an interrupted DComp operation.
+
+## 05 · Runtime model
+
+One canonical state root defines one Cyclo installation and one DComp system:
+
+```text
+Cyclo CLI
+  ├── runs Docker builds and validates immutable image IDs
+  ├── stores project/team intent and AgentWS queues
+  └── compiles gateway + providers + running teams
+                         │
+                         v
+                       DComp
+  └── owns containers, link networks, volumes, and operation recovery
+```
+
+The gateway and outer Provider have explicitly published loopback endpoints for
+host administration and model discovery. Team dashboards are published on the
+address requested by `cyclo run`; the default is `127.0.0.1`. Normal teams have
+external network access. `--offline` removes that access and the dashboard
+publication while retaining the private Provider link.
+
+The configured outer Provider is the only route. A failed component remains
+inspectable through `cyclo component status` and makes the system
+non-operational until it is fixed or removed from `host.conf`.
+
+## 06 · Multiple installations
+
+Use a different state root for each installation:
 
 ```sh
-cyclo dashboard --host 0.0.0.0 --port 4173
-# browse to http://<machine-host>:4173/
+CYCLO_STATE_ROOT="$HOME/.local/state/cyclo-work" cyclo doctor
+CYCLO_STATE_ROOT="$HOME/.local/state/cyclo-lab" cyclo doctor
 ```
 
-Version 0.1.0 has no application authentication. Keep the default loopback bind
-unless network access is already controlled.
+The canonical state-root path determines the DComp system name, Docker resource
+namespace, image names, gateway volume, queues, and generated configuration.
+Each installation binds itself to the selected local Docker Unix socket on its
+first operation that needs a Docker endpoint and rejects later attempts to
+retarget it.
 
-## Security boundary
+## 07 · Documentation
 
-The team container receives its team mount, project mount, durable job state,
-and a writable Pi state tree containing its scoped gateway capability. It does
-**not** receive provider credentials, subscription files, the credential
-volume, gateway administrator token, host home directory, Docker socket, or
-another team's state.
+- [Architecture](docs/architecture.md)
+- [Operations guide](docs/guide.md)
+- [Provider protocol](docs/provider-protocol.md)
+- [Project format](docs/project-format.md)
+- [Team repository contract](docs/team-repositories.md)
+- [Security policy](SECURITY.md)
 
-This isolates credentials; it is not a general-purpose sandbox or data-loss
-prevention system. An agent can send readable project content to an allowed
-model provider. `--offline` blocks direct outbound networking while preserving
-gateway access, and `--project-read-only` removes project write access. See the
-[architecture](docs/architecture.md) and [security policy](SECURITY.md) for the
-full trust model.
+Cyclo ships its gateway, provider protocol, team runtime, AgentWS runtime,
+dashboard, and team templates. DComp is a separate required executable;
+external `agentws` and `multiagent` checkouts are not runtime dependencies.
 
-## Documentation
-
-| Document | What it covers |
-|---|---|
-| [User guide](docs/guide.md) | Complete installation, provider, runtime, retry, operation, mount, and persistent-state reference |
-| [Architecture](docs/architecture.md) | Components, generations, networks, state, and trust boundaries |
-| [Team templates](template/README.md) | The bundled loops and how to customize them |
-| [Security policy](SECURITY.md) | Supported versions, reporting, and explicit guarantees |
-| [Release guide](docs/releasing.md) | Reproducible local build and verification procedure |
-| [Changelog](CHANGELOG.md) | Version history |
-
-Run `cyclo --help` for the command index and `cyclo COMMAND --help` for exact
-options.
-
-## Development
-
-```sh
-python3 -m pip install -e .
-python3 -m pytest -q
-node --test tests/*.mjs
-```
-
-Cyclo 0.1.0 is a stable release. It is distributed as `cyclo-agent`; the
-command, Python package, repository, and product remain `cyclo` and Cyclo.
-
-## License
-
-Cyclo is released under the [MIT License](LICENSE).
+<img src="docs/assets/fregio.svg" alt="cyclo · MIT licence" width="100%">

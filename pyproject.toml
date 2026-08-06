@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cyclo-agent"
-version = "0.1.0"
+version = "0.2.1"
 description = "Run Git-defined agent teams through an isolated credential proxy"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,27 +53,58 @@ include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["cyclo", "cyclo.*"]
+namespaces = false
 
 [tool.setuptools.package-data]
-cyclo = [
-  "team_templates/*",
-  "team_templates/*/*",
-  "team_templates/*/roles/*",
-]
-"cyclo._agentws" = [
-  "template/*",
-  "template/bin/*",
-  "template/roles/*",
-  "template/tools/*",
-  "template/tools/agentws-public/*",
-]
-"cyclo.credential_gateway" = [
-  "runtime_context/*",
-  "runtime_context/.dockerignore",
-  "gateway_context/*",
-  "gateway_context/.dockerignore",
+"cyclo.team.templates" = [
+  "README.md",
+  "*/*",
+  "*/roles/*",
 ]
 "cyclo.dashboard_static" = ["*.html", "*.css", "*.js"]
+"cyclo.components" = [
+  "README.md",
+  "protocol/component/*",
+  "protocol/component/gen/**/*",
+  "protocol/component/proto/**/*",
+  "protocol/component/src/*",
+  "protocol/component/test/*",
+  "protocol/component/test/fixtures/*",
+  "protocol/provider/*",
+  "protocol/provider/gen/**/*",
+  "protocol/provider/proto/**/*",
+  "protocol/provider/src/*",
+  "protocol/provider/test/*",
+  "protocol/provider/test/fixtures/*",
+  "gateway/*",
+  "gateway/src/*",
+  "gateway/test/*",
+  "passthrough/*",
+  "passthrough/src/*",
+  "passthrough/test/*",
+]
+"cyclo.components.team" = [
+  "README.md",
+  "Dockerfile",
+  "Dockerfile.dockerignore",
+  "entrypoint.sh",
+  "package.json",
+  "package-lock.json",
+  "agentws/*",
+  "agentws/bin/*",
+  "agentws/roles/*",
+  "agentws/tools/*",
+  "agentws/tools/agentws-public/*",
+  "pi/*",
+  "pi/src/*",
+  "pi/test/*",
+]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo"]
+"cyclo.components" = ["**/node_modules/**"]
+"cyclo.components.team" = ["**/node_modules/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

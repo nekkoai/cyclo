@@ -1,0 +1,1410 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Run one named AgentWS agent and render JSON events to transcript logs."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from planner_notification import ensure_planner_notification
+
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+DEFAULT_MAX_JOB_ATTEMPTS = 3
+RETRYABLE_AGENT_EXIT = 75
+FATAL_AGENT_EXIT = 70
+JOB_ATTEMPTS_FILE = ".agent-attempts"
+ENGINE_STOP_SECONDS = 2.0
+PR_SET_CHILD_SUBREAPER = 36
+_SUBREAPER_ENABLED = False
+
+
+def timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+class ShutdownRequested(Exception):
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"signal {signum}")
+        self.signum = signum
+
+
+class StoredRetryBudgetExhausted(Exception):
+    """Skip the engine and settle an already-exhausted claimed job."""
+
+
+def validate_name(label: str, value: str) -> None:
+    if not value or not NAME_RE.fullmatch(value):
+        die(
+            f"invalid {label} '{value}' - must start with an alphanumeric "
+            "character and contain only alphanumeric, dot, underscore, and hyphen"
+        )
+
+
+def configured_team_path(root: Path, env_name: str, default: Path) -> Path:
+    value = os.environ.get(env_name)
+    path = Path(value).expanduser() if value else default
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+def configured_workspace(root: Path) -> Path:
+    workspace = configured_team_path(root, "AGENTWS_WORKSPACE", root)
+    if not workspace.is_dir():
+        die(f"agent workspace directory not found: {workspace}")
+    return workspace
+
+
+def load_team_context(root: Path, role: str):
+    protocol_file = configured_team_path(
+        root, "AGENTWS_SYSTEM_PROTOCOL", root / "AGENTS.md"
+    )
+    team_protocol_value = os.environ.get("AGENTWS_TEAM_PROTOCOL")
+    team_protocol_file = (
+        configured_team_path(root, "AGENTWS_TEAM_PROTOCOL", root / "AGENTS.md")
+        if team_protocol_value
+        else None
+    )
+    roles_dir = configured_team_path(root, "AGENTWS_TEAM_ROLES_DIR", root / "roles")
+    role_file = (roles_dir / f"{role}.md").resolve()
+    if not protocol_file.is_file():
+        die(f"system protocol not found: {protocol_file}")
+    if team_protocol_file is not None and not team_protocol_file.is_file():
+        die(f"team protocol not found: {team_protocol_file}")
+    if not roles_dir.is_dir():
+        die(f"team roles directory not found: {roles_dir}")
+    if not role_file.is_file():
+        die(f"role file not found: {role_file}")
+    protocol_text = protocol_file.read_text(encoding="utf-8", errors="replace")
+    if team_protocol_file is not None and team_protocol_file != protocol_file:
+        team_protocol_text = team_protocol_file.read_text(
+            encoding="utf-8", errors="replace"
+        )
+        protocol_text = (
+            protocol_text.rstrip()
+            + f"\n\n# Team-specific additions\n\n"
+            + f"Source: {team_protocol_file}\n\n"
+            + team_protocol_text.lstrip()
+        )
+    role_text = role_file.read_text(encoding="utf-8", errors="replace")
+    return protocol_file, role_file, protocol_text, role_text
+
+
+def build_initial_prompt(
+    agent_name: str,
+    role: str,
+    runtime_root: Path,
+    workspace: Path,
+    protocol_file: Path,
+    role_file: Path,
+    protocol_text: str,
+    role_text: str,
+    console: bool = False,
+) -> str:
+    mode_text = """
+You are the AgentWS console assistant. You are not assigned a queued job and do
+not have a current-job. The queued-job lifecycle portions of the generic
+protocol do not apply to this console session. Use the local AgentWS bin/ tools
+to inspect and manage tasks, jobs, and agents, and dispatch work when asked.
+""" if console else ""
+    project_source = runtime_root / "project.cyclo"
+    return f"""You are agent {agent_name} with role {role}.
+
+AgentWS runtime root: {runtime_root}
+Workspace namespace (current working directory): {workspace}
+Cyclo project definition: {project_source}
+System protocol source: {protocol_file}
+Role instruction source: {role_file}
+{mode_text}
+Run AgentWS queue and state commands from the runtime root above. Use the
+project layout as the default location for inspection and work unless the task
+or job names a more specific worktree. Interpret task paths using
+`project.cyclo`. Writable named projects are under `/workspace/<name>`;
+read-only inputs are under `/readonly/<name>`. In a direct compatibility run,
+project paths are relative to `/workspace`. Report changed artifacts using
+their actual mounted paths.
+
+The Cyclo project definition is independent of the team protocol. It defines the
+actual writable workspaces and read-only inputs. Read it before touching project
+files, including when the team supplies its own AGENTS.md.
+
+The complete protocol and role instructions are included below. The
+container-facing project definition remains an instance-wide file; read it
+from the path above rather than expecting it to be copied into every job
+prompt. Treat the included protocol and role content as authoritative.
+When the protocol tells you to read roles/<role>.md, use the role instructions
+included here or their explicit source path above.
+
+<agentws-protocol>
+{protocol_text.strip()}
+</agentws-protocol>
+
+<agentws-role role="{role}">
+{role_text.strip()}
+</agentws-role>
+"""
+
+
+def write_file(path: Path, text: str) -> None:
+    path.write_text(text + "\n", encoding="utf-8")
+
+
+def positive_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        die(f"{name} must be a positive integer")
+    if value <= 0 or value > 100:
+        die(f"{name} must be an integer from 1 to 100")
+    return value
+
+
+def read_job_status(job_dir: Path) -> str:
+    try:
+        return (job_dir / "status").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def read_job_owner(job_dir: Path) -> str:
+    try:
+        return (job_dir / "agent-id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def job_owned_by(job_dir: Path, agent_name: str) -> bool:
+    return (
+        read_job_status(job_dir) in {"claimed", "running"}
+        and read_job_owner(job_dir) == agent_name
+        and (job_dir / "lock").is_dir()
+    )
+
+
+@contextmanager
+def job_control_lock(job_dir: Path) -> Iterable[None]:
+    control_path = job_dir / ".control.lock"
+    open_flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    open_flags |= (
+        getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(control_path, open_flags, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as control_file:
+        if not stat.S_ISREG(os.fstat(control_file.fileno()).st_mode):
+            raise OSError(f"invalid job control lock: {control_path}")
+        fcntl.flock(control_file.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def write_job_status_atomic(job_dir: Path, status_text: str) -> None:
+    status_path = job_dir / "status"
+    temporary = status_path.with_name(
+        f".{status_path.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}"
+    )
+    try:
+        temporary.write_text(status_text + "\n", encoding="utf-8")
+        os.replace(temporary, status_path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _attempt_path(job_dir: Path) -> Path:
+    return job_dir / JOB_ATTEMPTS_FILE
+
+
+def _read_job_attempts(job_dir: Path, maximum: int) -> int:
+    path = _attempt_path(job_dir)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return maximum
+    if not stat.S_ISREG(info.st_mode):
+        return maximum
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        value = int(raw, 10)
+    except (OSError, ValueError):
+        return maximum
+    if value < 0:
+        return maximum
+    return min(value, maximum)
+
+
+def _write_job_attempts(job_dir: Path, value: int) -> None:
+    path = _attempt_path(job_dir)
+    temporary = path.with_name(
+        f".{path.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}"
+    )
+    try:
+        temporary.write_text(f"{value}\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def record_job_attempt(job_dir: Path, maximum: int) -> tuple[int, int]:
+    """Record one model-process launch while the caller owns the job lock."""
+
+    previous = _read_job_attempts(job_dir, maximum)
+    current = min(previous + 1, maximum)
+    _write_job_attempts(job_dir, current)
+    return previous, current
+
+
+def restore_job_attempt(job_dir: Path, previous: int) -> None:
+    """Do not charge an operator-requested shutdown against the retry budget."""
+
+    path = _attempt_path(job_dir)
+    if previous <= 0:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    _write_job_attempts(job_dir, previous)
+
+
+def clear_job_attempts(job_dir: Path) -> None:
+    try:
+        _attempt_path(job_dir).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def run_job_transition(
+    root: Path,
+    command: str,
+    job_id: str,
+    agent_name: str,
+    message: str,
+) -> bool:
+    try:
+        proc = subprocess.run(
+            [
+                str(root / "bin" / command),
+                job_id,
+                "--agent-id",
+                agent_name,
+                "-m",
+                message,
+            ],
+            cwd=root,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"warning: {command} failed for {job_id}: {exc}", file=sys.stderr)
+        return False
+    if proc.returncode == 0:
+        return True
+    detail = (proc.stderr or "").strip() or f"exit status {proc.returncode}"
+    print(f"warning: {command} failed for {job_id}: {detail}", file=sys.stderr)
+    return False
+
+
+def force_fail_owned_job(
+    root: Path,
+    job_dir: Path,
+    job_id: str,
+    agent_name: str,
+    message: str,
+) -> bool:
+    """Fail closed when the normal transition command is unavailable.
+
+    This is deliberately a narrow last resort. The caller must still own the
+    job lock; otherwise this function leaves state untouched.
+    """
+
+    try:
+        with job_control_lock(job_dir):
+            if not job_owned_by(job_dir, agent_name):
+                print(
+                    f"warning: cannot fail job {job_id} safely: ownership was lost",
+                    file=sys.stderr,
+                )
+                return False
+
+            if not ensure_planner_visibility(root, job_dir, job_id):
+                return False
+
+            append_job_log(job_dir, "Failed by agent safety fallback", message)
+            write_job_status_atomic(job_dir, "failed")
+            try:
+                (job_dir / "lock").rmdir()
+            except OSError as exc:
+                # The terminal status is already atomically published and prevents another
+                # launch. Leave the lock for job-reap and report the damage.
+                print(
+                    f"warning: job {job_id} failed closed but its lock remains: {exc}",
+                    file=sys.stderr,
+                )
+            return True
+    except OSError as exc:
+        print(f"warning: cannot fail job {job_id} safely: {exc}", file=sys.stderr)
+        return False
+
+
+def transition_or_fail_closed(
+    root: Path,
+    job_dir: Path,
+    job_id: str,
+    agent_name: str,
+    command: str,
+    message: str,
+) -> tuple[bool, bool]:
+    """Return (settled, used_fallback) for an owned job transition."""
+
+    if run_job_transition(root, command, job_id, agent_name, message):
+        return True, False
+    fallback_message = (
+        f"The normal {command} transition failed. The worker failed this job "
+        "closed to prevent an unbounded retry or a stranded owned job."
+    )
+    return (
+        force_fail_owned_job(
+            root,
+            job_dir,
+            job_id,
+            agent_name,
+            fallback_message,
+        ),
+        True,
+    )
+
+
+def ensure_planner_visibility(
+    root: Path,
+    job_dir: Path,
+    job_id: str,
+) -> bool:
+    try:
+        ensure_planner_notification(root, job_dir, job_id)
+    except RuntimeError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def settle_stored_retry_budget_exhaustion(
+    root: Path,
+    job_dir: Path,
+    job_id: str,
+    agent_name: str,
+    *,
+    maximum: int,
+) -> int:
+    """Fail a job whose retry budget was exhausted before engine launch."""
+
+    failure_message = (
+        f"Agent retry safety budget exhausted after {maximum} unsuccessful "
+        "process attempts; refusing another model launch."
+    )
+    settled, used_fallback = transition_or_fail_closed(
+        root,
+        job_dir,
+        job_id,
+        agent_name,
+        "job-fail",
+        failure_message,
+    )
+    if not settled or used_fallback:
+        return FATAL_AGENT_EXIT
+    return RETRYABLE_AGENT_EXIT
+
+
+def settle_job_after_process(
+    root: Path,
+    job_dir: Path,
+    job_id: str,
+    agent_name: str,
+    *,
+    process_status: int,
+    previous_attempts: int,
+    attempt: int,
+    maximum: int,
+    interrupted: bool,
+    label: str = "Agent",
+) -> int:
+    """Settle the claimed job and return the supervisor-visible process status."""
+
+    status = read_job_status(job_dir)
+    if status in {"done", "failed"}:
+        clear_job_attempts(job_dir)
+        return 0
+
+    if interrupted:
+        if job_owned_by(job_dir, agent_name):
+            try:
+                restore_job_attempt(job_dir, previous_attempts)
+            except OSError as exc:
+                print(
+                    f"warning: cannot restore retry counter for {job_id}: {exc}",
+                    file=sys.stderr,
+                )
+            settled, used_fallback = transition_or_fail_closed(
+                root,
+                job_dir,
+                job_id,
+                agent_name,
+                "job-release",
+                f"{label} process was stopped by the operator; releasing without "
+                "consuming a retry attempt.",
+            )
+            if not settled or used_fallback:
+                return FATAL_AGENT_EXIT
+        return process_status
+
+    if job_owned_by(job_dir, agent_name):
+        terminal_failure = attempt <= 0 or attempt >= maximum
+        if terminal_failure:
+            failure_message = (
+                f"{label} process exited with status {process_status} without "
+                f"finishing the job; retry safety budget exhausted "
+                f"({attempt}/{maximum})."
+            )
+            settled, used_fallback = transition_or_fail_closed(
+                root,
+                job_dir,
+                job_id,
+                agent_name,
+                "job-fail",
+                failure_message,
+            )
+        else:
+            settled, used_fallback = transition_or_fail_closed(
+                root,
+                job_dir,
+                job_id,
+                agent_name,
+                "job-release",
+                f"{label} process exited with status {process_status} without "
+                f"finishing the job; released for bounded retry ({attempt}/{maximum}).",
+            )
+        if not settled or used_fallback:
+            return FATAL_AGENT_EXIT
+        return RETRYABLE_AGENT_EXIT
+
+    # A deliberate job-release leaves the job pending. Preserve its attempt
+    # counter and make the supervisor back off before this worker can reclaim it.
+    if status == "pending":
+        return RETRYABLE_AGENT_EXIT
+
+    # Another agent may have claimed the released job before this process
+    # finished. It now owns settlement, so this process completed normally.
+    if status in {"claimed", "running"} and read_job_owner(job_dir) != agent_name:
+        return 0
+    print(
+        f"warning: cannot settle job {job_id}: unexpected status {status or 'missing'}",
+        file=sys.stderr,
+    )
+    return FATAL_AGENT_EXIT
+
+
+def append_job_log(job_dir: Path, summary: str, detail: str) -> None:
+    with (job_dir / "log.md").open("a", encoding="utf-8") as f:
+        f.write(f"## {timestamp()} - {summary}\n\n")
+        f.write(detail.rstrip() + "\n\n")
+
+
+def run_bin(
+    root: Path,
+    *args: str,
+    capture: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        [str(root / "bin" / args[0]), *args[1:]],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        detail = stderr or stdout or f"exit status {proc.returncode}"
+        die(f"{args[0]} failed: {detail}", proc.returncode)
+    return proc
+
+
+class Transcript:
+    def __init__(self, paths: Iterable[Path], mirror_stdout: bool = False, mirror_prefix: str = "") -> None:
+        self.files = [path.open("a", encoding="utf-8", buffering=1) for path in paths]
+        self.section: str | None = None
+        self.mirror_stdout = mirror_stdout
+        self.mirror_prefix = mirror_prefix
+        self.mirror_line_start = True
+        self.lock = threading.RLock()
+
+    def close(self) -> None:
+        with self.lock:
+            for f in self.files:
+                f.close()
+
+    def write(self, text: str) -> None:
+        with self.lock:
+            self._write(text)
+
+    def _write(self, text: str) -> None:
+        if not text:
+            return
+        for f in self.files:
+            f.write(text)
+            f.flush()
+        if self.mirror_stdout:
+            sys.stdout.write(self.prefix_mirror_text(text))
+            sys.stdout.flush()
+
+    def prefix_mirror_text(self, text: str) -> str:
+        if not self.mirror_prefix:
+            return text
+        out: list[str] = []
+        for ch in text:
+            if self.mirror_line_start and ch != "\n":
+                out.append(self.mirror_prefix)
+                self.mirror_line_start = False
+            out.append(ch)
+            if ch == "\n":
+                self.mirror_line_start = True
+        return "".join(out)
+
+    def line(self, text: str = "") -> None:
+        with self.lock:
+            self._write(text + "\n")
+
+    def heading(self, title: str, force: bool = False) -> None:
+        with self.lock:
+            self._heading(title, force=force)
+
+    def _heading(self, title: str, force: bool = False) -> None:
+        if force or self.section != title:
+            self._write(f"\n### {title}\n\n")
+            self.section = title
+
+    def text_block(self, title: str, text: str, force_heading: bool = False) -> None:
+        if not text:
+            return
+        with self.lock:
+            self._heading(title, force=force_heading)
+            self._write(text)
+
+    def event(self, title: str, detail: str | None = None) -> None:
+        with self.lock:
+            self.section = None
+            self._write("\n")
+            self._write(f"[{timestamp()}] {title}\n")
+            if detail:
+                self._write(detail.rstrip() + "\n")
+
+
+class Renderer:
+    def __init__(self, transcript: Transcript, engine: str) -> None:
+        self.t = transcript
+        self.engine = engine
+        self.saw_assistant_text = False
+
+    def render_line(self, raw: str) -> None:
+        raw = raw.rstrip("\n")
+        if not raw:
+            return
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            if raw.lstrip().startswith("{"):
+                return
+            else:
+                self.t.event("output", raw)
+            return
+        if not isinstance(event, dict):
+            return
+
+        if self.engine == "claude":
+            self.render_claude(event)
+        elif self.engine == "codex":
+            self.render_codex(event)
+        elif self.engine == "pi":
+            self.render_pi(event)
+
+    def text_block(self, title: str, text: str) -> None:
+        if not text:
+            return
+        self.t.text_block(title, text)
+        if title == "Assistant":
+            self.saw_assistant_text = True
+
+    def render_claude(self, event: dict[str, Any]) -> None:
+        typ = event.get("type")
+        subtype = event.get("subtype")
+
+        if typ == "stream_event":
+            inner = event.get("event")
+            if isinstance(inner, dict):
+                delta = inner.get("delta")
+                if isinstance(delta, dict):
+                    delta_type = delta.get("type")
+                    if delta_type == "text_delta":
+                        self.text_block("Assistant", str(delta.get("text", "")))
+                        return
+                    if delta_type in ("thinking_delta", "reasoning_delta"):
+                        self.text_block("Thinking", str(delta.get("thinking") or delta.get("text") or ""))
+                        return
+                inner_type = inner.get("type")
+                if inner_type:
+                    return
+
+        if typ == "system":
+            if subtype == "init":
+                model = event.get("model")
+                session_id = event.get("session_id")
+                detail = "\n".join(str(x) for x in (f"model: {model}" if model else "", f"session: {session_id}" if session_id else "") if x)
+                self.t.event("claude session initialized", detail)
+                return
+            if subtype == "api_retry":
+                attempt = event.get("attempt")
+                max_retries = event.get("max_retries")
+                error = event.get("error")
+                self.t.event("claude api retry", f"attempt: {attempt}/{max_retries}\nerror: {error}")
+                return
+            if subtype:
+                return
+
+        if typ == "assistant":
+            if not self.saw_assistant_text:
+                text = self.extract_claude_message_text(event.get("message"))
+                if text:
+                    self.text_block("Assistant", text)
+                    return
+
+        if typ == "result":
+            result = event.get("result")
+            if result and not self.saw_assistant_text:
+                self.text_block("Assistant", str(result))
+            self.t.event("claude result", self.scalar_metadata(event, skip={"result"}))
+            return
+
+        self.render_generic(event)
+
+    def extract_claude_message_text(self, message: Any) -> str:
+        if not isinstance(message, dict):
+            return ""
+        parts: list[str] = []
+        content = message.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+        return "".join(parts)
+
+    def render_codex(self, event: dict[str, Any]) -> None:
+        typ = event.get("type")
+        if typ == "thread.started":
+            self.t.event("codex thread started", f"thread: {event.get('thread_id')}")
+            return
+        if typ == "turn.started":
+            self.t.event("codex turn started")
+            return
+        if typ == "turn.completed":
+            usage = event.get("usage")
+            self.t.event("codex turn completed", self.usage_summary(usage))
+            return
+        if typ == "turn.failed":
+            self.t.event("codex turn failed", self.scalar_metadata(event, skip={"type"}))
+            return
+        if typ == "error":
+            self.t.event("codex error", self.scalar_metadata(event, skip={"type"}))
+            return
+
+        if typ in ("item.started", "item.updated", "item.completed"):
+            item = event.get("item")
+            if isinstance(item, dict):
+                self.render_codex_item(typ, item)
+                return
+
+        self.render_generic(event)
+
+    def render_codex_item(self, event_type: str, item: dict[str, Any]) -> None:
+        item_type = str(item.get("type", "item"))
+        status = item.get("status")
+        prefix = event_type.replace("item.", "")
+
+        if item_type == "agent_message":
+            text = item.get("text")
+            if text:
+                self.text_block("Assistant", str(text).rstrip() + "\n")
+                return
+
+        if item_type == "reasoning":
+            text = item.get("text") or item.get("summary") or item.get("content")
+            if text:
+                self.text_block("Reasoning", self.plain_text(text).rstrip() + "\n")
+                return
+
+        if item_type == "command_execution":
+            command = self.command_text(item.get("command"))
+            title = f"command {prefix}"
+            detail_parts = []
+            if command:
+                detail_parts.append(command)
+            if status:
+                detail_parts.append(f"status: {status}")
+            for key in ("exit_code", "duration_ms"):
+                if key in item:
+                    detail_parts.append(f"{key}: {item[key]}")
+            output = item.get("output") or item.get("stdout") or item.get("stderr")
+            if output:
+                detail_parts.append(self.limit_text(self.plain_text(output)))
+            self.t.event(title, "\n".join(detail_parts))
+            return
+
+        if item_type in ("file_change", "patch", "plan_update", "web_search", "mcp_tool_call"):
+            self.t.event(f"{item_type} {prefix}", self.scalar_metadata(item, skip={"id", "type"}))
+            return
+
+        self.t.event(f"{item_type} {prefix}", self.scalar_metadata(item, skip={"id", "type"}))
+
+    def render_pi(self, event: dict[str, Any]) -> None:
+        typ = event.get("type")
+        if typ == "session":
+            return
+        if typ == "message":
+            message = event.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                if message.get("stopReason") == "error":
+                    error = message.get("errorMessage") or message.get("error")
+                    if error:
+                        self.text_block("Assistant", f"Error: {error}\n")
+                        return
+                return
+        if typ in ("agent_start", "agent_end", "turn_start", "turn_end", "message_start", "message_end"):
+            return
+        if typ == "message_update":
+            msg_event = event.get("assistantMessageEvent")
+            if isinstance(msg_event, dict):
+                msg_type = msg_event.get("type")
+                delta = msg_event.get("delta")
+                if msg_type == "text_delta":
+                    self.text_block("Assistant", str(delta or ""))
+                    return
+                if msg_type == "thinking_delta":
+                    self.text_block("Thinking", str(delta or ""))
+                    return
+                if msg_type in (
+                    "thinking_start",
+                    "thinking_end",
+                    "text_start",
+                    "text_end",
+                    "toolcall_start",
+                    "toolcall_delta",
+                    "toolcall_end",
+                ):
+                    return
+            self.render_generic(event)
+            return
+        if typ == "tool_execution_start":
+            detail = self.command_text(event.get("args"))
+            self.tool_block(str(event.get("toolName") or "tool"), detail)
+            return
+        if typ == "tool_execution_update":
+            return
+        if typ == "tool_execution_end":
+            title = str(event.get("toolName") or "tool")
+            if event.get("isError"):
+                title += " (error)"
+            self.tool_block(title, self.limit_text(self.result_text(event.get("result"))))
+            return
+        if typ in ("queue_update", "compaction_start", "compaction_end", "auto_retry_start", "auto_retry_end"):
+            self.t.event(f"pi {typ}", self.scalar_metadata(event, skip={"type"}))
+            return
+
+        self.render_generic(event)
+
+    def render_generic(self, event: dict[str, Any]) -> None:
+        return
+
+    def tool_block(self, name: str, detail: str | None = None) -> None:
+        lines = [name]
+        if detail:
+            lines.append(detail.rstrip())
+        self.t.text_block("Tool Call", "\n".join(lines) + "\n\n")
+
+    def scalar_metadata(self, value: dict[str, Any], skip: set[str] | None = None) -> str:
+        skip = skip or set()
+        lines: list[str] = []
+        for key, item in value.items():
+            if key in skip:
+                continue
+            if item in (None, "", [], {}):
+                continue
+            if isinstance(item, (dict, list, tuple)):
+                continue
+            lines.append(f"{key}: {self.limit_text(str(item))}")
+        return "\n".join(lines)
+
+    def plain_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, dict):
+            return self.result_text(value)
+        if isinstance(value, (list, tuple)):
+            parts = [self.plain_text(item) for item in value]
+            return "\n".join(part for part in parts if part)
+        return str(value)
+
+    def command_text(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            command = value.get("command") or value.get("cmd")
+            if command:
+                return str(command)
+            parts = []
+            for key in ("path", "file", "pattern", "query"):
+                if key in value and not isinstance(value[key], (dict, list, tuple)):
+                    parts.append(f"{key}: {value[key]}")
+            return "\n".join(parts)
+        return self.plain_text(value)
+
+    def result_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, (list, tuple)):
+            parts = [self.result_text(item) for item in value]
+            return "\n".join(part for part in parts if part)
+        if isinstance(value, dict):
+            for key in ("text", "output", "stdout", "stderr", "error", "message", "delta"):
+                if key in value:
+                    text = self.result_text(value[key])
+                    if text:
+                        return text
+            content = value.get("content")
+            if isinstance(content, (list, tuple)):
+                parts = []
+                for item in content:
+                    text = self.result_text(item)
+                    if text:
+                        parts.append(text)
+                return "\n".join(parts)
+            return self.scalar_metadata(value)
+        return str(value)
+
+    def usage_summary(self, value: Any) -> str:
+        if not isinstance(value, dict):
+            return ""
+        parts = []
+        for key in ("input_tokens", "output_tokens", "total_tokens", "input", "output", "totalTokens"):
+            if key in value and not isinstance(value[key], (dict, list, tuple)):
+                parts.append(f"{key}: {value[key]}")
+        return "\n".join(parts)
+
+    def limit_text(self, text: str, limit: int = 4000) -> str:
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + f"\n... truncated {len(text) - limit} chars"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run one named AgentWS agent and render JSON output to transcript.log."
+    )
+    engine = parser.add_mutually_exclusive_group()
+    engine.add_argument("--pi", action="store_const", const="pi", dest="engine")
+    engine.add_argument("--codex", action="store_const", const="codex", dest="engine")
+    engine.add_argument("--claude", action="store_const", const="claude", dest="engine")
+    parser.set_defaults(engine="pi")
+    parser.add_argument("--headless", action="store_true", help="Do not mirror rendered transcript output to stdout")
+    parser.add_argument("-m", "--model")
+    parser.add_argument("role")
+    parser.add_argument("agent_name")
+    return parser.parse_args()
+
+
+def build_command(engine: str, model: str | None, agent_dir: Path, prompt: str) -> list[str]:
+    if engine == "pi":
+        cmd = ["pi", "-p", "--mode", "json"]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.extend(["--session-dir", str(agent_dir / "pi-session"), prompt])
+        return cmd
+    if engine == "codex":
+        cmd = ["codex", "exec", "--json", "--output-last-message", str(agent_dir / "last-message.md")]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append(prompt)
+        return cmd
+    if engine == "claude":
+        cmd = ["claude", "-p"]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.extend(["--output-format", "stream-json", "--verbose", "--include-partial-messages", prompt])
+        return cmd
+    raise AssertionError(engine)
+
+
+def enable_child_subreaper() -> None:
+    """Make this worker the adoption point for daemonized engine descendants."""
+
+    global _SUBREAPER_ENABLED
+    if _SUBREAPER_ENABLED:
+        return
+    if sys.platform != "linux":
+        raise OSError("AgentWS process fencing requires Linux child-subreaper support")
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    prctl.restype = ctypes.c_int
+    if prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    _SUBREAPER_ENABLED = True
+
+
+def launch_engine(command: list[str], workspace: Path, **kwargs):
+    enable_child_subreaper()
+    kwargs.setdefault("start_new_session", True)
+    return subprocess.Popen(command, cwd=workspace, **kwargs)
+
+
+def _engine_group_exists(process: subprocess.Popen[str]) -> bool:
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _direct_child_pids() -> list[int] | None:
+    children = Path(
+        f"/proc/{os.getpid()}/task/{threading.get_native_id()}/children"
+    )
+    try:
+        values = children.read_text(encoding="ascii").split()
+        return [int(value) for value in values]
+    except (OSError, ValueError):
+        return None
+
+
+def _reap_adopted_children() -> None:
+    while True:
+        try:
+            child, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except InterruptedError:
+            continue
+        if child == 0:
+            return
+
+
+def _stop_adopted_children(*, timeout: float = ENGINE_STOP_SECONDS) -> bool:
+    """Stop every child adopted from the engine, including new sessions."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _reap_adopted_children()
+        children = _direct_child_pids()
+        if children is None:
+            return False
+        if not children:
+            return True
+        for child in children:
+            try:
+                os.kill(child, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return False
+        time.sleep(0.02)
+
+    kill_deadline = time.monotonic() + 1.0
+    while time.monotonic() < kill_deadline:
+        _reap_adopted_children()
+        children = _direct_child_pids()
+        if children is None:
+            return False
+        if not children:
+            return True
+        for child in children:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return False
+        time.sleep(0.02)
+    _reap_adopted_children()
+    return _direct_child_pids() == []
+
+
+def stop_engine_process_group(
+    process: subprocess.Popen[str] | None,
+    *,
+    timeout: float = ENGINE_STOP_SECONDS,
+) -> bool:
+    """Best-effort cleanup for controlled exits.
+
+    An abruptly killed worker cannot execute this function. In that case the
+    team supervisor exits and Docker tears down the complete container cgroup.
+    """
+
+    if process is None:
+        return True
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    deadline = time.monotonic() + timeout
+    try:
+        process.wait(timeout=max(0.05, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        pass
+    while _engine_group_exists(process) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if _engine_group_exists(process):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            return False
+    adopted_stopped = _stop_adopted_children()
+    group_stopped = not _engine_group_exists(process)
+    return group_stopped and adopted_stopped
+
+
+def join_reader_threads(
+    threads: Iterable[threading.Thread],
+    *,
+    timeout: float = ENGINE_STOP_SECONDS,
+) -> bool:
+    """Drain engine pipes without blocking cleanup on a stuck reader."""
+
+    thread_list = list(threads)
+    deadline = time.monotonic() + timeout
+    for thread in thread_list:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    # Closing a TextIOWrapper can block on a reader thread's internal lock.
+    # Report failure instead; exit status 70 makes the supervisor restart the
+    # container, whose cgroup teardown closes every remaining pipe holder.
+    return not any(thread.is_alive() for thread in thread_list)
+
+
+def main() -> int:
+    args = parse_args()
+    validate_name("role", args.role)
+    validate_name("agent ID", args.agent_name)
+
+    script_dir = Path(__file__).resolve().parent
+    root = script_dir.parent
+    workspace = configured_workspace(root)
+
+    if shutil.which(args.engine) is None:
+        die(f"required command not found: {args.engine}")
+    try:
+        enable_child_subreaper()
+    except OSError as exc:
+        die(f"cannot establish the agent process fence: {exc}")
+
+    protocol_file, role_file, protocol_text, role_text = load_team_context(root, args.role)
+    max_job_attempts = positive_env_int(
+        "AGENTWS_MAX_JOB_ATTEMPTS", DEFAULT_MAX_JOB_ATTEMPTS
+    )
+
+    agent_dir_out = run_bin(
+        root,
+        "agent-new",
+        args.agent_name,
+        args.role,
+    ).stdout.strip()
+    if not agent_dir_out:
+        die("agent-new returned no agent directory")
+    agent_dir = Path(agent_dir_out)
+
+    write_file(agent_dir / "engine", args.engine)
+    if args.model:
+        write_file(agent_dir / "model", args.model)
+    write_file(agent_dir / "last_started_at", timestamp())
+
+    job_id = ""
+    job_dir: Path | None = None
+    previous_attempts = 0
+    attempt = 0
+    settlement_needed = False
+    transcript: Transcript | None = None
+    error_files: list[Any] = []
+    proc: subprocess.Popen[str] | None = None
+    reader_threads: list[threading.Thread] = []
+    renderer: Renderer | None = None
+    shutdown_signals = (signal.SIGTERM, signal.SIGINT)
+    previous_handlers = {signum: signal.getsignal(signum) for signum in shutdown_signals}
+    process_status = 1
+    interrupted = False
+    stored_retry_budget_exhausted = False
+    defer_shutdown = False
+    deferred_shutdown_signum = 0
+
+    def request_shutdown(signum: int, _frame: Any) -> None:
+        nonlocal deferred_shutdown_signum
+        if defer_shutdown:
+            deferred_shutdown_signum = signum
+            return
+        raise ShutdownRequested(signum)
+
+    try:
+        for signum in shutdown_signals:
+            signal.signal(signum, request_shutdown)
+
+        while True:
+            run_bin(
+                root,
+                "job-wait",
+                "-r",
+                args.role,
+                capture=True,
+            )
+            defer_shutdown = True
+            try:
+                claim = run_bin(
+                    root,
+                    "job-claim",
+                    "-r",
+                    args.role,
+                    "--agent-id",
+                    args.agent_name,
+                ).stdout.strip()
+                if claim.startswith("CLAIMED: "):
+                    job_id = claim.removeprefix("CLAIMED: ").strip()
+                    job_dir = root / "jobs" / job_id
+                    settlement_needed = True
+                elif claim != "NO_JOBS":
+                    die(f"unexpected job-claim output: {claim}")
+            finally:
+                defer_shutdown = False
+            if deferred_shutdown_signum:
+                raise ShutdownRequested(deferred_shutdown_signum)
+            if settlement_needed:
+                break
+
+        write_file(agent_dir / "current-job", job_id)
+        assert job_dir is not None
+        previous_attempts, attempt = record_job_attempt(job_dir, max_job_attempts)
+        if previous_attempts >= max_job_attempts:
+            stored_retry_budget_exhausted = True
+            raise StoredRetryBudgetExhausted
+
+        prompt = build_initial_prompt(
+            args.agent_name,
+            args.role,
+            root,
+            workspace,
+            protocol_file,
+            role_file,
+            protocol_text,
+            role_text,
+        )
+        write_file(agent_dir / "prompt.md", prompt)
+
+        agent_transcript = agent_dir / "transcript.log"
+        agent_error = agent_dir / "error.log"
+        for path in (agent_transcript, agent_error):
+            path.touch()
+
+        append_job_log(
+            job_dir,
+            "Transcript",
+            f"Agent transcript: agents/{args.agent_name}/transcript.log",
+        )
+
+        transcript = Transcript(
+            [agent_transcript],
+            mirror_stdout=not args.headless,
+            mirror_prefix=f"{args.agent_name}: ",
+        )
+        error_files = [agent_error.open("a", encoding="utf-8", buffering=1)]
+
+        transcript.event(
+            "run start",
+            "\n".join(
+                part
+                for part in (
+                    f"agent: {args.agent_name}",
+                    f"role: {args.role}",
+                    f"job: {job_id}",
+                    f"engine: {args.engine}",
+                    f"model: {args.model}" if args.model else "",
+                )
+                if part
+            ),
+        )
+
+        cmd = build_command(args.engine, args.model, agent_dir, prompt)
+        proc = launch_engine(
+            cmd,
+            workspace,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+        def copy_stderr() -> None:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                for f in error_files:
+                    f.write(line)
+                    f.flush()
+                if sys.stderr.isatty():
+                    sys.stderr.write(f"\033[31m{args.agent_name}: {line}\033[0m")
+                else:
+                    sys.stderr.write(f"{args.agent_name}: {line}")
+                sys.stderr.flush()
+
+        renderer = Renderer(transcript, args.engine)
+
+        def copy_stdout() -> None:
+            assert proc is not None and proc.stdout is not None
+            assert renderer is not None
+            for line in proc.stdout:
+                renderer.render_line(line)
+
+        reader_threads = [
+            threading.Thread(target=copy_stdout, daemon=True),
+            threading.Thread(target=copy_stderr, daemon=True),
+        ]
+        for thread in reader_threads:
+            thread.start()
+        process_status = proc.wait()
+    except StoredRetryBudgetExhausted:
+        process_status = RETRYABLE_AGENT_EXIT
+    except ShutdownRequested as exc:
+        if transcript is not None:
+            transcript.event("run interrupted", f"signal: {exc.signum}")
+        process_status = 128 + exc.signum
+        interrupted = True
+    except Exception as exc:
+        print(f"error: agent worker failed: {exc}", file=sys.stderr)
+        traceback.print_exc()
+        if transcript is not None:
+            transcript.event("run failed", f"{type(exc).__name__}: {exc}")
+        process_status = 1
+    finally:
+        # Once cleanup begins, a repeated stop request must not interrupt a
+        # durable job transition.
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, signal.SIG_IGN)
+        cleanup_clean = stop_engine_process_group(proc)
+        readers_stopped = join_reader_threads(reader_threads)
+        cleanup_clean = cleanup_clean and readers_stopped
+        if not cleanup_clean:
+            print(
+                "error: engine cleanup did not complete; restarting the team container",
+                file=sys.stderr,
+            )
+            process_status = FATAL_AGENT_EXIT
+        if transcript is not None and proc is not None and not interrupted:
+            last_message = agent_dir / "last-message.md"
+            if (
+                renderer is not None
+                and args.engine == "codex"
+                and last_message.is_file()
+                and last_message.stat().st_size > 0
+            ):
+                text = last_message.read_text(encoding="utf-8", errors="replace")
+                if text and not renderer.saw_assistant_text:
+                    transcript.text_block("Assistant", text.rstrip() + "\n")
+            transcript.event("run end", f"exit: {process_status}")
+        if cleanup_clean and settlement_needed and job_dir is not None:
+            if stored_retry_budget_exhausted and not interrupted:
+                process_status = settle_stored_retry_budget_exhaustion(
+                    root,
+                    job_dir,
+                    job_id,
+                    args.agent_name,
+                    maximum=max_job_attempts,
+                )
+            else:
+                process_status = settle_job_after_process(
+                    root,
+                    job_dir,
+                    job_id,
+                    args.agent_name,
+                    process_status=process_status,
+                    previous_attempts=previous_attempts,
+                    attempt=attempt,
+                    maximum=max_job_attempts,
+                    interrupted=interrupted,
+                )
+        if transcript is not None:
+            transcript.close()
+        for f in error_files:
+            f.close()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+    return process_status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

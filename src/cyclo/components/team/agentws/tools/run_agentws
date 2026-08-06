@@ -1,0 +1,403 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+AGENTWS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUN_DIR="$AGENTWS_ROOT/agents/.team-runs"
+
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    cat <<'EOF'
+Usage: tools/run_agentws [--verbose] [team-file]
+
+Run the named AgentWS team. Team file format:
+
+  <name> <role> <agent> [model]
+
+If team-file is omitted, AGENTWS_TEAM_ROSTER is used when set, otherwise
+agentws/default.team. Portable team paths are passed through AGENTWS_TEAM_*
+environment variables. Blank lines and # comments are ignored. Agent is one
+of: pi, pi-interactive, codex, claude.
+
+Options:
+  --verbose   Print each agent's rendered transcript output to this terminal.
+
+Retry safety is configured with AGENTWS_MAX_JOB_ATTEMPTS,
+AGENTWS_MAX_CONSECUTIVE_FAILURES, AGENTWS_RETRY_INITIAL_SECONDS, and
+AGENTWS_RETRY_MAX_SECONDS.
+EOF
+}
+
+agent_flag() {
+    case "$1" in
+        pi) echo "--pi" ;;
+        codex) echo "--codex" ;;
+        claude) echo "--claude" ;;
+        *) die "invalid agent '$1' in team file; expected pi, pi-interactive, codex, or claude" ;;
+    esac
+}
+
+run_agent_once() {
+    headless_arg="$1"
+    agent="$2"
+    model="$3"
+    role="$4"
+    name="$5"
+
+    if [ "$agent" = "pi-interactive" ]; then
+        if [ -n "$model" ]; then
+            exec "$SCRIPT_DIR/agent-pi-interactive" $headless_arg -m "$model" "$role" "$name"
+        else
+            exec "$SCRIPT_DIR/agent-pi-interactive" $headless_arg "$role" "$name"
+        fi
+    fi
+
+    flag="$(agent_flag "$agent")"
+    if [ -n "$model" ]; then
+        exec "$SCRIPT_DIR/agent" $headless_arg "$flag" -m "$model" "$role" "$name"
+    else
+        exec "$SCRIPT_DIR/agent" $headless_arg "$flag" "$role" "$name"
+    fi
+}
+
+VERBOSE=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --verbose)
+            VERBOSE=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            usage >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+[ "$#" -le 1 ] || {
+    usage >&2
+    exit 1
+}
+
+TEAM_ROOT="${AGENTWS_TEAM_ROOT:-$AGENTWS_ROOT}"
+TEAM_FILE="${1:-${AGENTWS_TEAM_ROSTER:-$TEAM_ROOT/default.team}}"
+SYSTEM_PROTOCOL_FILE="${AGENTWS_SYSTEM_PROTOCOL:-$AGENTWS_ROOT/AGENTS.md}"
+TEAM_PROTOCOL_FILE="${AGENTWS_TEAM_PROTOCOL:-}"
+ROLES_DIR="${AGENTWS_TEAM_ROLES_DIR:-$TEAM_ROOT/roles}"
+CONSOLE_ROLE="${AGENTWS_TEAM_CONSOLE_ROLE:-console}"
+WORKSPACE="${AGENTWS_WORKSPACE:-$AGENTWS_ROOT}"
+MAX_JOB_ATTEMPTS="${AGENTWS_MAX_JOB_ATTEMPTS:-3}"
+MAX_CONSECUTIVE_FAILURES="${AGENTWS_MAX_CONSECUTIVE_FAILURES:-5}"
+RETRY_INITIAL_SECONDS="${AGENTWS_RETRY_INITIAL_SECONDS:-2}"
+RETRY_MAX_SECONDS="${AGENTWS_RETRY_MAX_SECONDS:-30}"
+RETRYABLE_AGENT_EXIT=75
+case "$TEAM_FILE" in
+    */*) ;;
+    *) TEAM_FILE="$AGENTWS_ROOT/$TEAM_FILE" ;;
+esac
+
+[ -f "$TEAM_FILE" ] || die "team file not found: $TEAM_FILE"
+[ -f "$SYSTEM_PROTOCOL_FILE" ] || die "system protocol not found: $SYSTEM_PROTOCOL_FILE"
+if [ -n "$TEAM_PROTOCOL_FILE" ]; then
+    [ -f "$TEAM_PROTOCOL_FILE" ] || die "team protocol not found: $TEAM_PROTOCOL_FILE"
+fi
+[ -d "$ROLES_DIR" ] || die "team roles directory not found: $ROLES_DIR"
+[ -d "$WORKSPACE" ] || die "agent workspace directory not found: $WORKSPACE"
+command -v ps >/dev/null 2>&1 || die "required command not found: ps"
+require_positive_integer "AGENTWS_MAX_JOB_ATTEMPTS" "$MAX_JOB_ATTEMPTS"
+require_positive_integer "AGENTWS_MAX_CONSECUTIVE_FAILURES" "$MAX_CONSECUTIVE_FAILURES"
+require_positive_integer "AGENTWS_RETRY_INITIAL_SECONDS" "$RETRY_INITIAL_SECONDS"
+require_positive_integer "AGENTWS_RETRY_MAX_SECONDS" "$RETRY_MAX_SECONDS"
+[ "$MAX_JOB_ATTEMPTS" -le 100 ] \
+    || die "AGENTWS_MAX_JOB_ATTEMPTS must not exceed 100"
+[ "$MAX_CONSECUTIVE_FAILURES" -le 100 ] \
+    || die "AGENTWS_MAX_CONSECUTIVE_FAILURES must not exceed 100"
+[ "$RETRY_INITIAL_SECONDS" -le "$RETRY_MAX_SECONDS" ] \
+    || die "AGENTWS_RETRY_INITIAL_SECONDS must not exceed AGENTWS_RETRY_MAX_SECONDS"
+[ "$RETRY_MAX_SECONDS" -le 3600 ] \
+    || die "AGENTWS_RETRY_MAX_SECONDS must not exceed 3600"
+
+export AGENTWS_TEAM_ROOT="$TEAM_ROOT"
+export AGENTWS_TEAM_ROSTER="$TEAM_FILE"
+export AGENTWS_SYSTEM_PROTOCOL="$SYSTEM_PROTOCOL_FILE"
+if [ -n "$TEAM_PROTOCOL_FILE" ]; then
+    export AGENTWS_TEAM_PROTOCOL="$TEAM_PROTOCOL_FILE"
+else
+    unset AGENTWS_TEAM_PROTOCOL
+fi
+export AGENTWS_TEAM_ROLES_DIR="$ROLES_DIR"
+export AGENTWS_TEAM_CONSOLE_ROLE="$CONSOLE_ROLE"
+export AGENTWS_WORKSPACE="$WORKSPACE"
+export AGENTWS_MAX_JOB_ATTEMPTS="$MAX_JOB_ATTEMPTS"
+
+mkdir -p "$RUN_DIR"
+READY_FILE="$RUN_DIR/supervisor.ready"
+# Suspension markers describe this supervisor process, not historical runs.
+# Clear all of them so removed or renamed roster entries cannot keep a newly
+# started team in agents-suspended health forever.
+rm -f "$READY_FILE" || die "cannot clear stale supervisor readiness marker: $READY_FILE"
+rm -f "$RUN_DIR"/*.suspended \
+    || die "cannot clear stale agent suspension markers in $RUN_DIR"
+rm -f "$RUN_DIR"/*.worker-pid \
+    || die "cannot clear stale agent worker state in $RUN_DIR"
+
+# Validate the complete roster before starting its first process. In particular,
+# a bad later row must not leave an apparently live partial team behind.
+validate_roster() (
+    validated_line_no=0
+    validated_count=0
+    seen_names=" "
+    while IFS= read -r validated_line || [ -n "$validated_line" ]; do
+        validated_line_no=$((validated_line_no + 1))
+        validated_line="${validated_line#"${validated_line%%[![:space:]]*}"}"
+        case "$validated_line" in
+            ""|\#*) continue ;;
+        esac
+
+        set -- $validated_line
+        [ "$#" -ge 3 ] \
+            || die "$TEAM_FILE:$validated_line_no: expected <name> <role> <agent> [model]"
+        [ "$#" -le 4 ] \
+            || die "$TEAM_FILE:$validated_line_no: too many fields"
+
+        validated_name="$1"
+        validated_role="$2"
+        validated_agent="$3"
+        validate_agent_id "$validated_name"
+        validate_role "$validated_role"
+        [ -f "$ROLES_DIR/$validated_role.md" ] \
+            || die "$TEAM_FILE:$validated_line_no: role file not found: $ROLES_DIR/$validated_role.md"
+        if [ "$validated_agent" != "pi-interactive" ]; then
+            agent_flag "$validated_agent" >/dev/null
+        fi
+        case "$seen_names" in
+            *" $validated_name "*)
+                die "$TEAM_FILE:$validated_line_no: duplicate agent name '$validated_name'"
+                ;;
+        esac
+        seen_names="$seen_names$validated_name "
+        validated_count=$((validated_count + 1))
+    done < "$TEAM_FILE"
+    [ "$validated_count" -gt 0 ] || die "team file has no agents: $TEAM_FILE"
+)
+
+validate_roster
+
+line_no=0
+pids=""
+supervisors=""
+
+cleanup_team() {
+    rm -f "$READY_FILE" \
+        || echo "warning: cannot remove supervisor readiness marker: $READY_FILE" >&2
+    worker_pids=""
+    for supervisor in $supervisors; do
+        name="${supervisor#*:}"
+        worker_file="$RUN_DIR/$name.worker-pid"
+        worker_pid=""
+        if [ -f "$worker_file" ]; then
+            IFS= read -r worker_pid < "$worker_file" || worker_pid=""
+        fi
+        case "$worker_pid" in
+            ""|*[!0-9]*) ;;
+            *) worker_pids="$worker_pids $worker_pid" ;;
+        esac
+    done
+    for pid in $pids; do
+        kill "$pid" 2>/dev/null || true
+    done
+    # A supervisor killed while waiting cannot forward TERM. Its worker PID is
+    # recorded before every wait so the parent can still settle the active job.
+    for pid in $worker_pids; do
+        kill "$pid" 2>/dev/null || true
+    done
+
+    attempts=0
+    while [ "$attempts" -lt 100 ]; do
+        alive=0
+        for pid in $pids $worker_pids; do
+            if supervisor_alive "$pid"; then
+                alive=1
+                break
+            fi
+        done
+        [ "$alive" -eq 1 ] || break
+        sleep 0.1
+        attempts=$((attempts + 1))
+    done
+    for pid in $pids $worker_pids; do
+        if supervisor_alive "$pid"; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+    wait 2>/dev/null || true
+    rm -f "$RUN_DIR"/*.worker-pid \
+        || echo "warning: cannot remove agent worker state in $RUN_DIR" >&2
+    pids=""
+}
+
+cleanup_on_exit() {
+    status="$?"
+    trap - 0 INT TERM
+    cleanup_team
+    exit "$status"
+}
+
+stop_team() {
+    echo "stopping AgentWS team" >&2
+    exit 130
+}
+
+supervisor_alive() {
+    selected_pid="$1"
+    selected_state="$(ps -o stat= -p "$selected_pid" 2>/dev/null || true)"
+    selected_state="${selected_state#"${selected_state%%[![:space:]]*}"}"
+    case "$selected_state" in
+        ""|Z*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+trap cleanup_on_exit 0
+trap stop_team INT TERM
+
+while IFS= read -r line || [ -n "$line" ]; do
+    line_no=$((line_no + 1))
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+        ""|\#*) continue ;;
+    esac
+
+    set -- $line
+    [ "$#" -ge 3 ] || die "$TEAM_FILE:$line_no: expected <name> <role> <agent> [model]"
+    [ "$#" -le 4 ] || die "$TEAM_FILE:$line_no: too many fields"
+
+    name="$1"
+    role="$2"
+    agent="$3"
+    model="${4:-}"
+
+    (
+        # The parent owns team cleanup; an agent supervisor must not inherit its
+        # EXIT handler and terminate healthy siblings when this child exits.
+        trap - 0 INT TERM
+        consecutive_failures=0
+        retry_delay="$RETRY_INITIAL_SECONDS"
+        suspended_file="$RUN_DIR/$name.suspended"
+        worker_file="$RUN_DIR/$name.worker-pid"
+        worker_pid=""
+
+        cleanup_supervisor() {
+            status="$?"
+            trap - 0 INT TERM
+            if [ -n "$worker_pid" ]; then
+                kill "$worker_pid" 2>/dev/null || true
+                wait "$worker_pid" 2>/dev/null || true
+            fi
+            rm -f "$worker_file" \
+                || echo "warning: cannot remove worker state: $worker_file" >&2
+            exit "$status"
+        }
+
+        stop_supervisor() {
+            exit 130
+        }
+
+        trap cleanup_supervisor 0
+        trap stop_supervisor INT TERM
+        rm -f "$suspended_file" \
+            || die "cannot clear stale suspension marker: $suspended_file"
+        while :; do
+            headless_arg="--headless"
+            [ "$VERBOSE" -eq 1 ] && headless_arg=""
+            run_agent_once "$headless_arg" "$agent" "$model" "$role" "$name" &
+            worker_pid="$!"
+            write_file_atomic "$worker_file" "$worker_pid"
+            if wait "$worker_pid"; then
+                rc=0
+            else
+                rc="$?"
+            fi
+            worker_pid=""
+            rm -f "$worker_file" \
+                || die "cannot remove worker state: $worker_file"
+            printf '%s\n' "$rc" > "$RUN_DIR/$name.last-status" 2>/dev/null || true
+            printf '%s\n' "$(timestamp)" > "$RUN_DIR/$name.last-exit" 2>/dev/null || true
+            if [ "$rc" -eq 0 ]; then
+                consecutive_failures=0
+                retry_delay="$RETRY_INITIAL_SECONDS"
+                sleep 1
+                continue
+            fi
+            if [ "$rc" -ne "$RETRYABLE_AGENT_EXIT" ]; then
+                echo "agent $name exited without a clean settlement (status $rc); restarting the Cyclo container" >&2
+                exit "$rc"
+            fi
+
+            consecutive_failures=$((consecutive_failures + 1))
+            if [ "$consecutive_failures" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
+                echo "agent $name suspended after $consecutive_failures consecutive failures; restart the Cyclo container after correcting the cause" >&2
+                {
+                    printf 'failures=%s\n' "$consecutive_failures"
+                    printf 'last_status=%s\n' "$rc"
+                    printf 'suspended_at=%s\n' "$(timestamp)"
+                } > "$suspended_file"
+                # Keep the team supervisor alive so Docker's restart policy cannot
+                # reset this in-memory circuit breaker into another crash loop.
+                while :; do
+                    sleep 3600
+                done
+            fi
+
+            echo "agent $name exited with status $rc; retry $consecutive_failures/$MAX_CONSECUTIVE_FAILURES in ${retry_delay}s" >&2
+            sleep "$retry_delay"
+            if [ "$retry_delay" -lt "$RETRY_MAX_SECONDS" ]; then
+                retry_delay=$((retry_delay * 2))
+                if [ "$retry_delay" -gt "$RETRY_MAX_SECONDS" ]; then
+                    retry_delay="$RETRY_MAX_SECONDS"
+                fi
+            fi
+        done
+    ) &
+    pid="$!"
+    pids="$pids $pid"
+    supervisors="$supervisors $pid:$name"
+    printf '%s\n' "$pid" > "$RUN_DIR/$name.pid"
+    echo "started $name ($role, $agent${model:+, $model}) pid=$pid"
+done < "$TEAM_FILE"
+
+[ -n "$pids" ] || die "validated team produced no agent supervisors: $TEAM_FILE"
+
+# POSIX sh has no portable wait -n. Poll every known supervisor so one dead role
+# cannot be hidden indefinitely by healthy siblings that keep the parent alive.
+while :; do
+    for supervisor in $supervisors; do
+        pid="${supervisor%%:*}"
+        name="${supervisor#*:}"
+        if supervisor_alive "$pid"; then
+            continue
+        fi
+        if wait "$pid"; then
+            child_status=0
+        else
+            child_status="$?"
+        fi
+        [ "$child_status" -ne 0 ] || child_status=1
+        echo "agent supervisor $name exited with status $child_status; restarting the Cyclo container" >&2
+        exit "$child_status"
+    done
+    # Replacing the marker gives the host a heartbeat that cannot remain
+    # apparently ready after SIGKILL, SIGSTOP, or a host crash.
+    write_file_atomic "$READY_FILE" "pid=$$"
+    sleep 1
+done

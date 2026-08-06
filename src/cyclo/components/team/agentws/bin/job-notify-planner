@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Ensure that one source job has a durable terminal planner notification."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+AGENTWS_ROOT = Path(__file__).resolve().parents[1]
+TOOLS_DIR = AGENTWS_ROOT / "tools"
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from planner_notification import ensure_planner_notification
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="job-notify-planner",
+        description="prepare the source job's deterministic terminal planner notice",
+    )
+    parser.add_argument("job_id")
+    args = parser.parse_args()
+
+    job_dir = AGENTWS_ROOT / "jobs" / args.job_id
+    try:
+        notification_id = ensure_planner_notification(
+            AGENTWS_ROOT,
+            job_dir,
+            args.job_id,
+        )
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if notification_id is not None:
+        print(notification_id)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

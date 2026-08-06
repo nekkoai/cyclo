@@ -1,118 +1,200 @@
 # Releasing Cyclo
 
-Cyclo uses stable semantic versions. `0.1.0` is a stable release; version
-numbers below `1.0.0` do not imply an alpha or preview build. The Python
-distribution is `cyclo-agent`, while the command, import package, repository,
-and Docker images retain the `cyclo` name.
+Cyclo uses semantic versions. `0.2.1` is a stable release; a version below
+`1.0.0` does not imply an alpha or preview build. The Python distribution is `cyclo-agent`,
+while the command, import package, repository, and image names retain `cyclo`.
+
+Version 0.2 is a fresh-install boundary. Release verification does not migrate
+0.1 state or Docker resources. Test 0.2 with a new state root.
+
+## Release boundary
+
+Cyclo and DComp are separate projects:
+
+- the Cyclo wheel contains project, team, provider, gateway, and AgentWS domain
+  logic;
+- DComp owns container, network, volume, and component lifecycle; and
+- Cyclo invokes the separately installed `dcomp` executable through machine API
+  version 1.
+
+Cyclo does not vendor or download DComp. Set `CYCLO_DCOMP` to an absolute DComp
+executable when it is not on `PATH`. An empty override, a missing executable,
+non-JSON version output, or any machine API other than 1 is a release failure.
+
+The release wheel must not contain the superseded Python Docker lifecycle
+modules. `tools/release-acceptance` audits both the required DComp-facing
+modules and the forbidden legacy paths.
+
+## What CI verifies
+
+Ordinary CI is self-contained and does not fetch an unpublished DComp build. It
+performs:
+
+- the complete Python test matrix;
+- Node protocol, gateway, provider, and UI tests;
+- generated-protocol drift checks;
+- dependency and secret scans;
+- reproducible wheel and source-distribution checks;
+- installed-wheel command, template, project-format, and package-content
+  acceptance; and
+- credential-free Docker builds for the team, gateway, and pass-through images,
+  including the baked AgentWS runtime and a derived-team fixture.
+
+The package job runs `tools/release-acceptance` with
+`CYCLO_RELEASE_REQUIRE_DCOMP=0`. This is not an end-to-end runtime claim. The
+authoritative local release build requires DComp and runs the API-1/Docker
+integration gate.
 
 ## Prepare the release commit
 
-Update the version in `pyproject.toml` and `src/cyclo/__init__.py`, image tags
-and examples in `README.md`, the installed-version expectations in
-`tools/release-acceptance` and `tests/test_release_*.py`, and the top entry in
-`CHANGELOG.md`. Then run:
+Update the version in `pyproject.toml` and `src/cyclo/__init__.py`, the top
+entry in `CHANGELOG.md`, and installed-version assertions in release tests.
+Then run:
 
 ```sh
 python3 -m pytest -q
 node --test tests/*.mjs
+tools/dependency-audit
 while IFS= read -r script; do sh -n "$script"; done < <(git grep -l '^#!/bin/sh$')
 git diff --check
 tools/release-acceptance
 ```
 
-Build from a clean committed tree and validate both distributions:
+The last command is the wheel-only acceptance path unless
+`CYCLO_RELEASE_REQUIRE_DCOMP=1` is explicitly set.
+
+Build and inspect both Python distributions:
 
 ```sh
 rm -rf build dist
 python3 -m pip install --require-hashes -r requirements/release.txt
-SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
-  python3 -m build --no-isolation
-SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
-  python3 tools/normalize-distributions dist
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python3 -m build --no-isolation
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python3 tools/normalize-distributions dist
 python3 -m twine check dist/*
+tools/release-acceptance "$PWD"/dist/cyclo_agent-*.whl
 tools/release-manifest dist
 git status --short
 ```
 
-Build and smoke-test both credential-free image contexts:
+## Image acceptance
+
+Every component image uses `src/cyclo/components` as its build context. The
+`team/` component owns its supervisor, AgentWS tree, Pi adapter, dependency
+locks, entrypoint, and Dockerfile; shared protocol packages remain beside it.
 
 ```sh
-docker build --pull -t cyclo-runtime:0.1.0 \
-  -f src/cyclo/credential_gateway/runtime_context/Dockerfile \
-  src/cyclo/credential_gateway/runtime_context
-docker build --pull -t cyclo-gateway:0.1.0 \
-  -f src/cyclo/credential_gateway/gateway_context/Dockerfile \
-  src/cyclo/credential_gateway/gateway_context
-docker run --rm --network none \
-  -e CYCLO_HOST_UID=1000 -e CYCLO_HOST_GID=1000 \
-  cyclo-runtime:0.1.0 python3 --version
-docker run --rm --network none cyclo-gateway:0.1.0 supported-providers.mjs
-docker run --rm --network none cyclo-gateway:0.1.0 providers.mjs
+docker build --pull --build-arg "CYCLO_HOST_UID=$(id -u)" --build-arg "CYCLO_HOST_GID=$(id -g)" -t cyclo-team:0.2.1 -f src/cyclo/components/team/Dockerfile src/cyclo/components
+docker build --pull -t cyclo-gateway:0.2.1 -f src/cyclo/components/gateway/Dockerfile src/cyclo/components
+docker build --pull -t cyclo-passthrough:0.2.1 -f src/cyclo/components/passthrough/Dockerfile src/cyclo/components
+PYTHONPATH=src python3 -c 'from pathlib import Path; from cyclo.images import Images; images = Images(); base = images.inspect("cyclo-team:0.2.1"); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); images.build("cyclo-derived-team:0.2.1", dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))'
+docker run --rm --network none --entrypoint /bin/sh cyclo-derived-team:0.2.1 -ceu 'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
+PYTHONPATH=src tools/runtime-write-acceptance cyclo-team:0.2.1
+docker run --rm --network none cyclo-gateway:0.2.1 providers
 ```
 
-The worktree must be clean and tests must pass on the exact commit before a
-release is built.
+`tools/runtime-write-acceptance` uses the image-baked AgentWS tools and
+`/usr/local/bin/cyclo-team-runtime`; it never mounts a second runtime tree from
+the host. It exercises the generated project/settings mounts, writable and
+read-only project authority, worker cleanup, and the queue-only one-shot task
+administration path.
+
+## Required DComp integration
+
+Install a compatible DComp locally and verify its machine API before building a
+release:
+
+```sh
+export CYCLO_DCOMP=/absolute/path/to/dcomp
+"$CYCLO_DCOMP" version --json
+CYCLO_RELEASE_REQUIRE_DCOMP=1 tools/release-acceptance "$PWD"/dist/cyclo_agent-*.whl
+```
+
+The acceptance script requires API 1, creates a disposable empty `host.conf`,
+builds and applies the credential gateway through Cyclo and DComp, reads
+component status through DComp's JSON machine API, runs `cyclo doctor`, and
+destroys the disposable gateway store. Its trap also attempts DComp shutdown
+after an interrupted or failed run.
 
 ## Build the release bundle
 
-The authoritative release operation is local and does not use a Git hosting
-service or publish anything:
+The authoritative release operation is:
 
 ```sh
-tools/build-release
+CYCLO_DCOMP=/absolute/path/to/dcomp tools/build-release
 ```
 
-It requires Git, Python 3.10 or newer with `venv`/`ensurepip`, Node.js and npm,
-Docker with a running daemon, and network access to the configured Python and
-npm package indexes and Docker registry. It never reads or changes a Git
-remote. Registry access is used only to install the locked verification tools,
-run dependency audits, and fetch pinned Docker image/package layers.
+It requires:
 
-The script refuses a dirty tree, archives the exact local commit, installs the
-hash-locked release tools into a temporary environment, and disables PEP 517
-build isolation so the backend cannot be replaced by an implicit download. It
-runs the Python, Node, shell, dependency, clean-wheel, and three-template
-acceptance suites, builds and smoke-tests both credential-free Docker images,
-and writes this bundle:
+- a clean committed worktree;
+- Git and Python 3.10 or newer with `venv`;
+- Node.js 22 and npm;
+- Docker with a running daemon;
+- DComp machine API 1; and
+- network access to the configured Python/npm indexes and Docker registry for
+  pinned release dependencies and image layers.
+
+The builder archives the exact local commit, installs the hash-locked release
+toolchain, runs Python, Node, shell, dependency, secret, package, Docker, baked
+runtime, and DComp integration acceptance, and writes:
 
 ```text
-release/cyclo-agent-0.1.0/
-  cyclo_agent-0.1.0-py3-none-any.whl
-  cyclo_agent-0.1.0.tar.gz
+release/cyclo-agent-0.2.1/
+  cyclo_agent-0.2.1-py3-none-any.whl
+  cyclo_agent-0.2.1.tar.gz
   SHA256SUMS
   release-manifest.json
-  cyclo-agent-0.1.0.spdx.json
+  cyclo-agent-0.2.1.spdx.json
 ```
 
-The wheel and source archive are normalized before their checksums and SBOM are
-created. Rebuilding the same commit with the same Python version, locked
-toolchain, and commit-derived `SOURCE_DATE_EPOCH` produces byte-identical
-distribution files. Docker base images and npm tarballs are pinned, but the
-runtime image also installs packages from the live Debian index and is not
-claimed to be byte-identical across rebuild dates.
+The wheel and source archive are normalized before checksums and the SBOM are
+created. Protocol generation must leave the archived commit byte-for-byte
+unchanged. The SPDX SBOM enumerates every shipped Node lockfile.
 
-`tools/build-release` does not inspect, contact, mutate, tag, push to, or
-publish through any Git remote or hosting service. Publication is deliberately
-separate from the build and is not performed by Cyclo's release tooling. Never
-replace an artifact for an existing version; publish a new patch version
-instead.
+The high-severity dependency gate is implemented once in
+`tools/dependency-audit` and is shared by CI and the local builder. The exact
+`TEMPORARY WAIVER` for Pi's published shrinkwrap is documented in `SECURITY.md`.
+It fails closed if any allowed package, version, nested path, or advisory in the
+shipped lock changes, and expires when upstream fixes either dependency.
 
-## Verify from a clean machine
+The completed bundle is copied to a private sibling staging directory and
+published with Linux `renameat2(RENAME_NOREPLACE)`. An interrupted build cannot
+expose a partial destination or replace an existing release.
 
-On a disposable Linux host with Git, Python 3.10 or newer, and Docker, copy the
-wheel from the release bundle and run:
+The release tools do not inspect, contact, mutate, tag, push to, or publish
+through a Git remote or hosting service. Publication is a separate operator
+action. Never replace artifacts for an existing version; release a new patch
+version.
+
+## Verify on a clean machine
+
+Copy the complete release bundle and a separately obtained DComp executable to
+a disposable Linux host:
 
 ```sh
+cd ./cyclo-agent-0.2.1
+sha256sum --check SHA256SUMS
 python3 -m venv /tmp/cyclo-release
 . /tmp/cyclo-release/bin/activate
-python -m pip install ./cyclo_agent-0.1.0-py3-none-any.whl
+python -m pip install ./cyclo_agent-0.2.1-py3-none-any.whl
+export CYCLO_DCOMP=/absolute/path/to/dcomp
+"$CYCLO_DCOMP" version --json
 cyclo --version
-cyclo doctor
-cyclo templates
-cyclo gateway providers
+cyclo team templates
 ```
 
-Initialize one packaged team, run `cyclo validate`, and perform a `run
---dry-run` against a disposable project. Compare the copied wheel against
-`SHA256SUMS`; if it differs or installation fails, discard the bundle and build
-a corrected patch version.
+Use a fresh Cyclo installation root:
+
+```sh
+export CYCLO_STATE_ROOT=/tmp/cyclo-0.2-state
+mkdir -p "$CYCLO_STATE_ROOT"
+: > "$CYCLO_STATE_ROOT/host.conf"
+cyclo gateway providers
+cyclo gateway login PROVIDER
+cyclo models
+cyclo component list
+cyclo doctor
+```
+
+Then initialize a team and project, validate them, and run the project. Cyclo
+0.2 has no `run --dry-run`; configuration-only checks are `cyclo validate` and
+`cyclo providers check`.
