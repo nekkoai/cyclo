@@ -294,6 +294,9 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     lock = (ROOT / "requirements" / "release.txt").read_text(encoding="utf-8")
     release = (ROOT / "tools" / "build-release").read_text(encoding="utf-8")
     acceptance = (ROOT / "tools" / "release-acceptance").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
 
     assert "--hash=sha256:" in lock
     assert "--require-hashes" in release
@@ -313,11 +316,14 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     ).read_text(encoding="utf-8")
     assert "CYCLO_RELEASE_REQUIRE_DCOMP=1" in release
     assert "DComp machine API 1 is required" in release
-    assert 'CYCLO_RELEASE_REQUIRE_DCOMP: "0"' in (
-        ROOT / ".github" / "workflows" / "ci.yml"
-    ).read_text(encoding="utf-8")
+    assert 'CYCLO_RELEASE_REQUIRE_DCOMP: "0"' in workflow
     assert "node --test tests/*.mjs" in release
-    assert "npm ci --force --ignore-scripts --prefix src/cyclo/components/team" in release
+    team_install = (
+        "npm ci --legacy-peer-deps --ignore-scripts "
+        "--prefix src/cyclo/components/team"
+    )
+    assert team_install in release
+    assert team_install in workflow
     assert "docker build --pull" in release
     assert "src/cyclo/components/team" in release
     assert (

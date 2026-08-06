@@ -72,7 +72,7 @@ jobs:
           for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
             npm ci --ignore-scripts --prefix "src/cyclo/$package"
           done
-          npm ci --force --ignore-scripts --prefix src/cyclo/components/team
+          npm ci --legacy-peer-deps --ignore-scripts --prefix src/cyclo/components/team
       - name: Run Node tests
         run: |
           node --test tests/*.mjs
