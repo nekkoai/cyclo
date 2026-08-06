@@ -112,7 +112,7 @@ printf '%s\n' '==> source tests'
     done
     # This is the same intentional, lockfile-bounded peer override used by the
     # team Dockerfile for pi-simplify 0.2.2 against Pi 0.81.
-    npm ci --force --ignore-scripts --prefix src/cyclo/components/team
+    npm ci --legacy-peer-deps --ignore-scripts --prefix src/cyclo/components/team
     "$venv/bin/python" -m pytest -q \
         --ignore=tests/test_release_manifest.py \
         --ignore=tests/test_secret_scan.py

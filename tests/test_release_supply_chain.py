@@ -178,6 +178,12 @@ def test_workflow_actions_are_pinned_to_full_commits() -> None:
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "python -m build --no-isolation" in ci
     assert "python tools/normalize-distributions dist" in ci
+    assert "run: python3 tools/secret-scan" in ci
+    assert "fetch-depth: 0" in ci
+    assert "gitleaks/gitleaks-action" not in ci
+    assert re.search(
+        r"zricethezav/gitleaks:v[0-9.]+@sha256:[0-9a-f]{64}", ci
+    )
 
 
 def test_ci_uses_and_tests_the_current_component_layout() -> None:
@@ -294,6 +300,9 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     lock = (ROOT / "requirements" / "release.txt").read_text(encoding="utf-8")
     release = (ROOT / "tools" / "build-release").read_text(encoding="utf-8")
     acceptance = (ROOT / "tools" / "release-acceptance").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
 
     assert "--hash=sha256:" in lock
     assert "--require-hashes" in release
@@ -313,11 +322,14 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     ).read_text(encoding="utf-8")
     assert "CYCLO_RELEASE_REQUIRE_DCOMP=1" in release
     assert "DComp machine API 1 is required" in release
-    assert 'CYCLO_RELEASE_REQUIRE_DCOMP: "0"' in (
-        ROOT / ".github" / "workflows" / "ci.yml"
-    ).read_text(encoding="utf-8")
+    assert 'CYCLO_RELEASE_REQUIRE_DCOMP: "0"' in workflow
     assert "node --test tests/*.mjs" in release
-    assert "npm ci --force --ignore-scripts --prefix src/cyclo/components/team" in release
+    team_install = (
+        "npm ci --legacy-peer-deps --ignore-scripts "
+        "--prefix src/cyclo/components/team"
+    )
+    assert team_install in release
+    assert team_install in workflow
     assert "docker build --pull" in release
     assert "src/cyclo/components/team" in release
     assert (
