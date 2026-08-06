@@ -367,6 +367,11 @@ def test_release_tooling_is_hash_locked_and_git_remote_free() -> None:
     assert "docker build --pull" in release
     assert "src/cyclo/components/team" in release
     assert (
+        "docker run --rm --network none --entrypoint /bin/sh \\\n"
+        "            cyclo-team:ci -ceu"
+    ) in workflow
+    assert "pi-safe-compact" in workflow
+    assert (
         'docker run --rm --network none --entrypoint /bin/sh \\\n'
         '    "cyclo-team:release-$short_commit" -ceu'
     ) in release
