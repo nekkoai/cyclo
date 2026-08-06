@@ -3,7 +3,7 @@ FROM node:22-trixie-slim@sha256:e6d9a389d34ff9678438af985c9913fbd1eb6ed36e80fea5
 WORKDIR /opt/cyclo-agent-tools/lib
 COPY team/package.json team/package-lock.json ./
 # pi-simplify 0.2.2 declares Pi 0.75 peers. The lock keeps those peer libraries
-# alongside the security-fixed Pi 0.81 CLI. Ignore peer-range resolution and
+# alongside the security-fixed Pi 0.84 CLI. Ignore peer-range resolution and
 # install exactly that side-by-side lockfile layout.
 # A second pi-safe-compact package location beside Pi makes both use the same
 # pi-ai provider registry; the locked npm installation remains intact.
@@ -38,7 +38,7 @@ COPY team/pi/src ./team/pi/src
 
 # Pi and its extension must share the pi-ai instance nested under the pinned Pi
 # CLI. The top-level pi-ai is intentionally older: npm keeps it there for
-# plugins whose peer range predates Pi 0.81.
+# plugins whose peer range predates Pi 0.84.
 RUN rm -rf /opt/cyclo/team/pi/node_modules/@earendil-works/pi-ai \
     && mkdir -p /opt/cyclo/team/pi/node_modules/@earendil-works \
     && ln -s /opt/cyclo-agent-tools/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai \

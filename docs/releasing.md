@@ -150,11 +150,11 @@ The wheel and source archive are normalized before checksums and the SBOM are
 created. Protocol generation must leave the archived commit byte-for-byte
 unchanged. The SPDX SBOM enumerates every shipped Node lockfile.
 
-The high-severity dependency gate is implemented once in
-`tools/dependency-audit` and is shared by CI and the local builder. The exact
-`TEMPORARY WAIVER` for Pi's published shrinkwrap is documented in `SECURITY.md`.
-It fails closed if any allowed package, version, nested path, or advisory in the
-shipped lock changes, and expires when upstream fixes either dependency.
+The dependency gate is implemented once in `tools/dependency-audit` and is
+shared by CI and the local builder. Every shipped Node component must have zero
+high- or critical-severity findings in its production dependency audit; there
+are no component-specific waivers. Moderate findings remain outside the
+release-blocking gate.
 
 The completed bundle is copied to a private sibling staging directory and
 published with Linux `renameat2(RENAME_NOREPLACE)`. An interrupted build cannot

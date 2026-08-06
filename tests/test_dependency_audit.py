@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import copy
 import json
 import runpy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,205 +12,43 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools" / "dependency-audit"
 AUDIT = runpy.run_path(str(TOOL), run_name="cyclo_dependency_audit_test")
 AuditPolicyError = AUDIT["AuditPolicyError"]
+TOOL_GLOBALS = AUDIT["audit_repository"].__globals__
+EXPECTED_PACKAGES = (
+    "components/protocol/component",
+    "components/protocol/provider",
+    "components/gateway",
+    "components/passthrough",
+    "components/team/pi",
+    "components/team",
+)
 
 
-def advisory(package: str, url: str, severity: str) -> dict[str, str]:
-    return {
-        "name": package,
-        "dependency": package,
-        "severity": severity,
-        "url": url,
+def audit_report(
+    finding_name: str | None = None, severity: str = "high"
+) -> dict[str, object]:
+    vulnerabilities: dict[str, object] = {}
+    counts = {
+        "info": 0,
+        "low": 0,
+        "moderate": 0,
+        "high": 0,
+        "critical": 0,
+        "total": 0,
     }
-
-
-def exact_report() -> dict[str, object]:
+    if finding_name is not None:
+        vulnerabilities[finding_name] = {
+            "name": finding_name,
+            "severity": severity,
+            "via": [],
+            "nodes": [f"node_modules/{finding_name}"],
+        }
+        counts[severity] = 1
+        counts["total"] = 1
     return {
         "auditReportVersion": 2,
-        "vulnerabilities": {
-            "brace-expansion": {
-                "name": "brace-expansion",
-                "severity": "high",
-                "via": [
-                    advisory("brace-expansion", url, severity)
-                    for url, severity in sorted(
-                        AUDIT["WAIVED_ADVISORIES"]["brace-expansion"]
-                    )
-                ],
-                "nodes": [AUDIT["waived_node"]("brace-expansion")],
-            },
-            "undici": {
-                "name": "undici",
-                "severity": "high",
-                "via": [
-                    advisory("undici", url, severity)
-                    for url, severity in sorted(
-                        AUDIT["WAIVED_ADVISORIES"]["undici"]
-                    )
-                ],
-                "nodes": [AUDIT["waived_node"]("undici")],
-            },
-            "protobufjs": {
-                "name": "protobufjs",
-                "severity": "moderate",
-                "via": [],
-                "nodes": [
-                    "node_modules/@earendil-works/"
-                    "pi-coding-agent/node_modules/protobufjs"
-                ],
-            },
-        },
-        "metadata": {
-            "vulnerabilities": {
-                "info": 0,
-                "low": 0,
-                "moderate": 1,
-                "high": 2,
-                "critical": 0,
-                "total": 3,
-            }
-        },
+        "vulnerabilities": vulnerabilities,
+        "metadata": {"vulnerabilities": counts},
     }
-
-
-def exact_package_files(directory: Path) -> tuple[dict[str, object], dict[str, object]]:
-    package = {"dependencies": {AUDIT["PI_PACKAGE"]: AUDIT["PI_VERSION"]}}
-    lock = {
-        "packages": {
-            "": {"dependencies": {AUDIT["PI_PACKAGE"]: AUDIT["PI_VERSION"]}},
-            AUDIT["PI_LOCK_PATH"]: {
-                "version": AUDIT["PI_VERSION"],
-                "hasShrinkwrap": True,
-            },
-            AUDIT["waived_node"]("brace-expansion"): {"version": "5.0.7"},
-            AUDIT["waived_node"]("undici"): {"version": "8.5.0"},
-            "node_modules/brace-expansion": {"version": "5.0.9"},
-            "node_modules/undici": {"version": "8.9.0"},
-        }
-    }
-    write_package_files(directory, package, lock)
-    return package, lock
-
-
-def write_package_files(
-    directory: Path, package: dict[str, object], lock: dict[str, object]
-) -> None:
-    directory.mkdir(exist_ok=True)
-    (directory / "package.json").write_text(json.dumps(package), encoding="utf-8")
-    (directory / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
-
-
-def test_exact_pi_shrinkwrap_exception_is_accepted(tmp_path: Path) -> None:
-    package_dir = tmp_path / "team"
-    exact_package_files(package_dir)
-
-    AUDIT["validate_team_component"](exact_report(), 1, package_dir)
-
-
-@pytest.mark.parametrize(
-    "case",
-    (
-        "brace-extra-node",
-        "undici-extra-node",
-        "brace-extra-advisory",
-        "undici-extra-advisory",
-        "undici-advisory-severity",
-        "critical",
-        "missing-finding",
-        "successful-exit",
-        "package-pin",
-        "lock-pin",
-        "no-shrinkwrap",
-        "brace-nested-version",
-        "undici-nested-version",
-        "independent-brace-version",
-        "independent-undici-version",
-    ),
-)
-def test_pi_exception_fails_closed_on_policy_drift(
-    tmp_path: Path, case: str
-) -> None:
-    package_dir = tmp_path / "team"
-    package, lock = exact_package_files(package_dir)
-    report = exact_report()
-    returncode = 1
-
-    brace = report["vulnerabilities"]["brace-expansion"]
-    undici = report["vulnerabilities"]["undici"]
-    if case == "brace-extra-node":
-        brace["nodes"].append("node_modules/brace-expansion")
-    elif case == "undici-extra-node":
-        undici["nodes"].append("node_modules/undici")
-    elif case == "brace-extra-advisory":
-        brace["via"].append(
-            advisory(
-                "brace-expansion", "https://example.invalid/advisory", "high"
-            )
-        )
-    elif case == "undici-extra-advisory":
-        undici["via"].append(
-            advisory("undici", "https://example.invalid/advisory", "moderate")
-        )
-    elif case == "undici-advisory-severity":
-        undici["via"][0]["severity"] = "low"
-    elif case == "critical":
-        brace["severity"] = "critical"
-        report["metadata"]["vulnerabilities"]["high"] = 1
-        report["metadata"]["vulnerabilities"]["critical"] = 1
-    elif case == "missing-finding":
-        report["vulnerabilities"].pop("brace-expansion")
-        report["metadata"]["vulnerabilities"]["high"] = 1
-        report["metadata"]["vulnerabilities"]["total"] = 2
-    elif case == "successful-exit":
-        returncode = 0
-    elif case == "package-pin":
-        package["dependencies"][AUDIT["PI_PACKAGE"]] = "0.82.1"
-    elif case == "lock-pin":
-        lock["packages"][""]["dependencies"][AUDIT["PI_PACKAGE"]] = "0.82.1"
-    elif case == "no-shrinkwrap":
-        lock["packages"][AUDIT["PI_LOCK_PATH"]]["hasShrinkwrap"] = False
-    elif case == "brace-nested-version":
-        lock["packages"][AUDIT["waived_node"]("brace-expansion")][
-            "version"
-        ] = "5.0.8"
-    elif case == "undici-nested-version":
-        lock["packages"][AUDIT["waived_node"]("undici")]["version"] = "8.8.0"
-    elif case == "independent-brace-version":
-        lock["packages"]["node_modules/brace-expansion"]["version"] = "5.0.8"
-    elif case == "independent-undici-version":
-        lock["packages"]["node_modules/undici"]["version"] = "8.8.0"
-
-    if case in {
-        "package-pin",
-        "lock-pin",
-        "no-shrinkwrap",
-        "brace-nested-version",
-        "undici-nested-version",
-        "independent-brace-version",
-        "independent-undici-version",
-    }:
-        for path in package_dir.iterdir():
-            path.unlink()
-        write_package_files(package_dir, package, lock)
-
-    with pytest.raises(AuditPolicyError):
-        AUDIT["validate_team_component"](report, returncode, package_dir)
-
-
-def test_unexpected_high_finding_is_rejected(tmp_path: Path) -> None:
-    package_dir = tmp_path / "team"
-    exact_package_files(package_dir)
-    report = exact_report()
-    report["vulnerabilities"]["unexpected"] = {
-        "name": "unexpected",
-        "severity": "high",
-        "via": [],
-        "nodes": ["node_modules/unexpected"],
-    }
-    report["metadata"]["vulnerabilities"]["high"] = 3
-    report["metadata"]["vulnerabilities"]["total"] = 4
-
-    with pytest.raises(AuditPolicyError):
-        AUDIT["validate_team_component"](report, 1, package_dir)
 
 
 @pytest.mark.parametrize(
@@ -219,50 +57,166 @@ def test_unexpected_high_finding_is_rejected(tmp_path: Path) -> None:
         "not JSON",
         '{"error":{"summary":"registry unavailable","detail":""}}',
         '{"auditReportVersion":1,"vulnerabilities":{},"metadata":{}}',
+        '{"auditReportVersion":2,"vulnerabilities":[],"metadata":{}}',
+        '{"auditReportVersion":2,"vulnerabilities":{},"metadata":[]}',
+        '{"auditReportVersion":2,"vulnerabilities":{},"metadata":'
+        '{"vulnerabilities":[]}}',
     ),
 )
 def test_malformed_or_failed_npm_audit_is_rejected(output: str) -> None:
-    with pytest.raises(AuditPolicyError):
+    with pytest.raises(AuditPolicyError, match="fixture returned"):
         AUDIT["parse_audit_output"](output, source="fixture")
 
 
-def test_latest_pi_probe_expires_the_waiver_when_fixed() -> None:
-    affected = {
-        "packages": {
-            "node_modules/brace-expansion": {"version": "5.0.9"},
-            "node_modules/pi/node_modules/brace-expansion": {"version": "5.0.7"},
-            "node_modules/pi/node_modules/undici": {"version": "8.5.0"},
-        }
+def test_high_findings_accepts_a_clean_report() -> None:
+    assert AUDIT["high_findings"](audit_report()) == []
+
+
+@pytest.mark.parametrize("severity", ("high", "critical"))
+def test_high_findings_returns_blocking_severities(severity: str) -> None:
+    report = audit_report("unsafe-package", severity)
+
+    assert AUDIT["high_findings"](report) == [
+        ("unsafe-package", report["vulnerabilities"]["unsafe-package"])
+    ]
+
+
+def test_high_findings_allows_moderate_findings() -> None:
+    assert AUDIT["high_findings"](audit_report("known-package", "moderate")) == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("finding-shape", "invalid finding"),
+        ("finding-name", "invalid finding for package"),
+        ("severity", "invalid severity for package"),
+        ("high-type", "findings disagree with its metadata"),
+        ("high-bool", "findings disagree with its metadata"),
+        ("critical-negative", "findings disagree with its metadata"),
+        ("count-mismatch", "findings disagree with its metadata"),
+    ),
+)
+def test_high_findings_rejects_invalid_findings_and_metadata(
+    mutation: str, message: str
+) -> None:
+    report = audit_report("package", "high")
+    finding = report["vulnerabilities"]["package"]
+    counts = report["metadata"]["vulnerabilities"]
+
+    if mutation == "finding-shape":
+        report["vulnerabilities"]["package"] = []
+    elif mutation == "finding-name":
+        finding["name"] = "different-package"
+    elif mutation == "severity":
+        finding["severity"] = "unknown"
+    elif mutation == "high-type":
+        counts["high"] = "1"
+    elif mutation == "high-bool":
+        counts["high"] = True
+    elif mutation == "critical-negative":
+        counts["critical"] = -1
+    elif mutation == "count-mismatch":
+        counts["high"] = 0
+
+    with pytest.raises(AuditPolicyError, match=message):
+        AUDIT["high_findings"](report)
+
+
+def package_name(package_dir: Path, root: Path) -> str:
+    return package_dir.relative_to(root / "src" / "cyclo").as_posix()
+
+
+def test_policy_covers_every_shipped_component_lock() -> None:
+    component_root = ROOT / "src" / "cyclo" / "components"
+    shipped_locks = {
+        path.parent.relative_to(ROOT / "src" / "cyclo").as_posix()
+        for path in component_root.glob("**/package-lock.json")
+        if "node_modules" not in path.parts
     }
-    result = AUDIT["validate_no_fixed_pi_release"]("0.82.1", affected)
-    assert result == {"brace-expansion": ["5.0.7"], "undici": ["8.5.0"]}
 
-    brace_fixed = copy.deepcopy(affected)
-    brace_fixed["packages"][
-        "node_modules/pi/node_modules/brace-expansion"
-    ]["version"] = "5.0.9"
-    with pytest.raises(AuditPolicyError):
-        AUDIT["validate_no_fixed_pi_release"]("0.83.0", brace_fixed)
-
-    undici_fixed = copy.deepcopy(affected)
-    undici_fixed["packages"]["node_modules/pi/node_modules/undici"][
-        "version"
-    ] = "8.9.0"
-    with pytest.raises(AuditPolicyError):
-        AUDIT["validate_no_fixed_pi_release"]("0.83.0", undici_fixed)
-
-    with pytest.raises(AuditPolicyError):
-        AUDIT["validate_no_fixed_pi_release"]("0.83.0", {"packages": {}})
+    assert tuple(AUDIT["PACKAGES"]) == EXPECTED_PACKAGES
+    assert shipped_locks == set(EXPECTED_PACKAGES)
 
 
-def test_security_policy_names_the_exact_audit_exception() -> None:
-    policy = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+def test_every_shipped_lock_uses_the_same_clean_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    audited: list[str] = []
 
-    for package in AUDIT["WAIVED_VERSIONS"]:
-        assert AUDIT["waived_node"](package) in policy
-    assert "https://github.com/advisories/GHSA-mh99-v99m-4gvg" in policy
-    assert "https://github.com/advisories/GHSA-rgw5-rvv9-x895" in policy
-    assert "https://github.com/advisories/GHSA-4cwx-7wf7-3272" in policy
-    assert "TEMPORARY WAIVER" in (
-        ROOT / "docs" / "releasing.md"
-    ).read_text(encoding="utf-8")
+    def clean_audit(package_dir: Path) -> tuple[dict[str, object], int]:
+        audited.append(package_name(package_dir, tmp_path))
+        return audit_report(), 0
+
+    monkeypatch.setitem(TOOL_GLOBALS, "run_audit", clean_audit)
+
+    AUDIT["audit_repository"](tmp_path)
+
+    assert audited == list(EXPECTED_PACKAGES)
+    assert capsys.readouterr().out.splitlines() == [
+        f"{name}: no high or critical vulnerabilities"
+        for name in EXPECTED_PACKAGES
+    ]
+
+
+@pytest.mark.parametrize("failing_package", EXPECTED_PACKAGES)
+@pytest.mark.parametrize("severity", ("high", "critical"))
+def test_every_shipped_lock_rejects_high_and_critical_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_package: str,
+    severity: str,
+) -> None:
+    def audit_with_finding(
+        package_dir: Path,
+    ) -> tuple[dict[str, object], int]:
+        name = package_name(package_dir, tmp_path)
+        if name == failing_package:
+            return audit_report("unsafe-package", severity), 1
+        return audit_report(), 0
+
+    monkeypatch.setitem(TOOL_GLOBALS, "run_audit", audit_with_finding)
+
+    with pytest.raises(AuditPolicyError) as raised:
+        AUDIT["audit_repository"](tmp_path)
+
+    assert str(raised.value) == (
+        f"{failing_package}: high/critical findings: unsafe-package"
+    )
+
+
+@pytest.mark.parametrize("failing_package", EXPECTED_PACKAGES)
+def test_every_shipped_lock_rejects_an_unexpected_audit_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_package: str,
+) -> None:
+    def audit_with_failure(
+        package_dir: Path,
+    ) -> tuple[dict[str, object], int]:
+        name = package_name(package_dir, tmp_path)
+        return audit_report(), 1 if name == failing_package else 0
+
+    monkeypatch.setitem(TOOL_GLOBALS, "run_audit", audit_with_failure)
+
+    with pytest.raises(AuditPolicyError) as raised:
+        AUDIT["audit_repository"](tmp_path)
+
+    assert str(raised.value) == (
+        f"{failing_package}: npm audit exited with status 1 "
+        "without high/critical findings"
+    )
+
+
+def test_run_audit_rejects_an_unexpected_process_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    completed = SimpleNamespace(stdout=json.dumps(audit_report()), returncode=2)
+    monkeypatch.setattr(AUDIT["subprocess"], "run", lambda *args, **kwargs: completed)
+
+    with pytest.raises(AuditPolicyError) as raised:
+        AUDIT["run_audit"](tmp_path / "component")
+
+    assert str(raised.value) == (
+        f"npm audit ({tmp_path / 'component'}) failed with status 2"
+    )

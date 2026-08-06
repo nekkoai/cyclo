@@ -37,12 +37,12 @@ coordination while preserving the 0.2 component architecture and state format.
 
 ### Supply-chain policy
 
-- Update the independently resolved `brace-expansion` runtime dependency to
-  5.0.9.
-- Refresh the fail-closed temporary exception for the exact high-severity
-  dependencies in Pi's published shrinkwrap. The release gate continues to
-  reject unknown findings and expires the exception when upstream fixes either
-  dependency.
+- Align the team runtime, gateway, adapter, and Provider payload ABI on Pi
+  0.84.0. Its published lock fixes the nested `brace-expansion` and `undici`
+  findings; update the independently resolved `js-yaml` dependency to 4.3.1.
+- Remove the expired Pi exception. Every shipped Node component now follows the
+  same release gate with no high- or critical-severity findings and no
+  component-specific waivers.
 
 ## [0.2.0] - 2026-07-31
 

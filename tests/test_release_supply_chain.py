@@ -17,6 +17,29 @@ RUNTIME = ROOT / "src" / "cyclo" / "components" / "team"
 GATEWAY = ROOT / "src" / "cyclo" / "components" / "gateway"
 COMPONENTS = ROOT / "src" / "cyclo" / "components"
 PI_ADAPTER = RUNTIME / "pi"
+PI_RUNTIME_VERSION = "0.84.0"
+SHIPPED_NODE_PACKAGES = (
+    "protocol/component",
+    "protocol/provider",
+    "gateway",
+    "passthrough",
+    "team/pi",
+    "team",
+)
+
+
+def assert_registry_artifacts_are_integrity_pinned(
+    lock_path: Path, lock: dict[str, object]
+) -> None:
+    for name, dependency in lock["packages"].items():
+        if not name or name.startswith("../") or dependency.get("link"):
+            continue
+        resolved = dependency.get("resolved")
+        assert isinstance(resolved, str), f"{lock_path}: {name} has no source"
+        assert resolved.startswith("https://registry.npmjs.org/"), (
+            f"{lock_path}: {name} has a non-registry source"
+        )
+        assert dependency.get("integrity"), f"{lock_path}: {name} has no integrity"
 
 
 def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() -> None:
@@ -31,7 +54,7 @@ def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() ->
     assert re.search(r"^FROM python:3\.12-[^@\s]+@sha256:[0-9a-f]{64}", dockerfile, re.M)
 
     expected = {
-        "@earendil-works/pi-coding-agent": "0.81.1",
+        "@earendil-works/pi-coding-agent": PI_RUNTIME_VERSION,
         "pi-lens": "3.8.68",
         "pi-safe-compact": "0.4.0",
         "pi-simplify": "0.2.2",
@@ -44,18 +67,15 @@ def test_runtime_node_install_is_locked_and_avoids_remote_installer_scripts() ->
     packages = lock["packages"]
     pi_path = "node_modules/@earendil-works/pi-coding-agent"
     nested_brace = f"{pi_path}/node_modules/brace-expansion"
+    nested_undici = f"{pi_path}/node_modules/undici"
     assert packages[pi_path]["hasShrinkwrap"] is True
-    assert packages[nested_brace]["version"] == "5.0.7"
+    assert packages[nested_brace]["version"] == "5.0.9"
+    assert packages[nested_undici]["version"] == "8.9.0"
     assert packages["node_modules/brace-expansion"]["version"] == "5.0.9"
-    for dependency in lock["packages"].values():
-        resolved = dependency.get("resolved")
-        if resolved:
-            if not resolved.startswith("file:"):
-                assert resolved.startswith("https://registry.npmjs.org/")
-                assert dependency.get("integrity")
+    assert packages["node_modules/js-yaml"]["version"] == "4.3.1"
 
 
-def test_pi_extension_shares_the_cli_pi_ai_without_replacing_legacy_peers() -> None:
+def test_pi_transport_packages_and_abi_share_the_cli_generation() -> None:
     dockerfile = (RUNTIME / "Dockerfile").read_text(encoding="utf-8")
     runtime_lock = json.loads(
         (RUNTIME / "package-lock.json").read_text(encoding="utf-8")
@@ -63,14 +83,38 @@ def test_pi_extension_shares_the_cli_pi_ai_without_replacing_legacy_peers() -> N
     extension = json.loads(
         (PI_ADAPTER / "package.json").read_text(encoding="utf-8")
     )
+    extension_lock = json.loads(
+        (PI_ADAPTER / "package-lock.json").read_text(encoding="utf-8")
+    )
+    provider_abi = json.loads(
+        (COMPONENTS / "protocol" / "provider" / "src" / "abi.json").read_text(
+            encoding="utf-8"
+        )
+    )
     packages = runtime_lock["packages"]
     cli_path = "node_modules/@earendil-works/pi-coding-agent"
     cli_pi_path = f"{cli_path}/node_modules/@earendil-works/pi-ai"
     legacy_pi_path = "node_modules/@earendil-works/pi-ai"
     cli_version = packages[cli_path]["version"]
 
-    assert packages[cli_pi_path]["version"] == cli_version == "0.81.1"
+    assert packages[cli_pi_path]["version"] == cli_version == PI_RUNTIME_VERSION
+    for name in (
+        "pi-agent-core",
+        "pi-ai",
+        "pi-client",
+        "pi-protocol",
+        "pi-telemetry",
+        "pi-tui",
+    ):
+        path = f"{cli_path}/node_modules/@earendil-works/{name}"
+        assert packages[path]["version"] == cli_version
     assert extension["peerDependencies"]["@earendil-works/pi-ai"] == cli_version
+    assert extension["devDependencies"]["@earendil-works/pi-ai"] == cli_version
+    assert (
+        extension_lock["packages"]["node_modules/@earendil-works/pi-ai"]["version"]
+        == cli_version
+    )
+    assert provider_abi["piInferenceFormat"] == f"pi-ai@{cli_version}"
     assert packages[legacy_pi_path]["version"] != cli_version
     assert (
         "/opt/cyclo-agent-tools/lib/node_modules/@earendil-works/"
@@ -96,39 +140,29 @@ def test_gateway_node_install_is_locked_to_the_runtime_pi_generation() -> None:
     assert "command -v flock" in dockerfile
     assert re.search(r"^FROM node:22-[^@\s]+@sha256:[0-9a-f]{64}", dockerfile)
     assert package["private"] is True
-    assert package["dependencies"]["@earendil-works/pi-ai"] == "0.81.1"
+    assert package["dependencies"]["@earendil-works/pi-ai"] == PI_RUNTIME_VERSION
+    assert (
+        lock["packages"]["node_modules/@earendil-works/pi-ai"]["version"]
+        == PI_RUNTIME_VERSION
+    )
     assert "@cyclo/component" in package["dependencies"]
     assert "@cyclo/provider" in package["dependencies"]
     assert lock["lockfileVersion"] == 3
     assert lock["packages"][""]["dependencies"] == package["dependencies"]
-    for dependency in lock["packages"].values():
-        resolved = dependency.get("resolved")
-        if resolved:
-            assert resolved.startswith(("https://registry.npmjs.org/", "file:")) or resolved.startswith("../")
-            if not dependency.get("link"):
-                assert dependency.get("integrity")
 
 
 def test_every_shipped_component_has_a_pinned_lock_and_declaration() -> None:
-    for name in (
-        "protocol/component",
-        "protocol/provider",
-        "gateway",
-        "passthrough",
-        "team",
-    ):
+    for name in SHIPPED_NODE_PACKAGES:
         package = COMPONENTS / name
-        lock = json.loads((package / "package-lock.json").read_text(encoding="utf-8"))
+        lock_path = package / "package-lock.json"
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
         assert lock["lockfileVersion"] == 3
         assert (package / "package.json").is_file()
+        assert_registry_artifacts_are_integrity_pinned(lock_path, lock)
         if name in {"gateway", "passthrough", "team"}:
             assert (package / "Dockerfile").is_file()
         if name in {"gateway", "passthrough"}:
             assert (package / "component.conf").is_file()
-    assert (PI_ADAPTER / "package.json").is_file()
-    assert json.loads(
-        (PI_ADAPTER / "package-lock.json").read_text(encoding="utf-8")
-    )["lockfileVersion"] == 3
 
 
 def test_local_protocol_dependencies_match_source_and_image_layouts() -> None:
