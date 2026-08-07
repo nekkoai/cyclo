@@ -178,8 +178,8 @@ jobs:
             src/cyclo/components
       - name: Smoke-test images without credentials
         run: |
-          docker run --rm --network none \
-            cyclo-team:ci sh -ceu '
+          docker run --rm --network none --entrypoint /bin/sh \
+            cyclo-team:ci -ceu '
               python3 --version
               node --version
               npm --version
@@ -191,12 +191,13 @@ jobs:
               npm ls --prefix /opt/cyclo-agent-tools/lib --depth=0
               mkdir -p "$HOME/.pi/agent"
               printf "%s\n" \
-                "{\"packages\":[\"npm:pi-web-access\",\"npm:pi-lens\",\"npm:pi-simplify\"]}" \
+                "{\"packages\":[\"npm:pi-web-access\",\"npm:pi-lens\",\"npm:pi-simplify\",\"/opt/cyclo-agent-tools/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/pi-safe-compact\"]}" \
                 > "$HOME/.pi/agent/settings.json"
               PI_OFFLINE=1 pi list > /tmp/pi-packages
               grep -F "npm:pi-web-access" /tmp/pi-packages
               grep -F "npm:pi-lens" /tmp/pi-packages
               grep -F "npm:pi-simplify" /tmp/pi-packages
+              grep -F "pi-safe-compact" /tmp/pi-packages
               pi --offline --help > /tmp/pi-help
               grep -F "Extension CLI Flags" /tmp/pi-help
             '

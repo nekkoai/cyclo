@@ -176,47 +176,14 @@ An extension receives exactly the Provider traffic and links assigned to it.
 Its existence is not itself a security guarantee; its implementation and
 configuration remain trusted installation inputs.
 
-## Temporary upstream dependency exception
+## Dependency audit policy
 
-The 0.2 team runtime includes
-`@earendil-works/pi-coding-agent@0.81.1`. Its published npm shrinkwrap pins two
-dependencies with high-severity advisories that the parent installation cannot
-override:
+Every shipped Node component must have zero high- or critical-severity findings
+in its production dependency audit. `tools/dependency-audit` enforces this gate
+for each component lock in CI and during release builds; there are no
+component-specific waivers.
 
-- `brace-expansion@5.0.7` at
-  `node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion`,
-  affected by
-  [GHSA-mh99-v99m-4gvg](https://github.com/advisories/GHSA-mh99-v99m-4gvg)
-  and
-  [GHSA-rgw5-rvv9-x895](https://github.com/advisories/GHSA-rgw5-rvv9-x895);
-  crafted brace expressions can exhaust memory and terminate the team process.
-- `undici@8.5.0` at
-  `node_modules/@earendil-works/pi-coding-agent/node_modules/undici`, affected
-  by
-  [GHSA-4cwx-7wf7-3272](https://github.com/advisories/GHSA-4cwx-7wf7-3272)
-  and four moderate advisories attached to the same npm finding; malformed
-  cache directives can disclose cached response data within the team process or
-  crash it.
-
-These are accepted risks inside the team workload, not expansions of authority.
-A team container is one trust domain and already treats agent-controlled code as
-arbitrary execution. The findings expose no gateway credentials, Docker
-control, undeclared mounts, unrelated Provider links, or other team state.
-Deployments requiring host-level availability must impose container or VM
-resource ceilings.
-
-No fixed upstream Pi release was available when this exception was last
-reviewed on 2026-08-05. The independently resolvable `brace-expansion` copy is
-fixed at 5.0.9. Pi's nested `protobufjs@7.6.4` also has a moderate availability
-advisory; moderate findings are reported but are outside the high/critical
-release gate.
-
-The audit exception covers only Pi 0.81.1, the two exact nested paths and
-versions above, and the advisory sets recorded in `tools/dependency-audit`. It
-covers no other package, path, version, advisory, or critical finding. CI and
-the release audit inspect the latest published Pi dependency lock and fail once
-either high-severity dependency is fixed, forcing the exception to be narrowed
-or removed and the aligned Pi dependencies to be updated.
+Moderate findings remain outside the high/critical release gate.
 
 ## Reporting a vulnerability
 

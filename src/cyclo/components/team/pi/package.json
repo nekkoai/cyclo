@@ -25,11 +25,11 @@
     "@cyclo/provider": "file:../../protocol/provider"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "0.81.1"
+    "@earendil-works/pi-ai": "0.84.0"
   },
   "devDependencies": {
     "@connectrpc/connect-node": "2.1.2",
-    "@earendil-works/pi-ai": "0.81.1"
+    "@earendil-works/pi-ai": "0.84.0"
   },
   "engines": {
     "node": ">=22.19.0"

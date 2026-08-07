@@ -14,7 +14,7 @@
     "@connectrpc/connect": "2.1.2",
     "@cyclo/component": "file:../protocol/component",
     "@cyclo/provider": "file:../protocol/provider",
-    "@earendil-works/pi-ai": "0.81.1"
+    "@earendil-works/pi-ai": "0.84.0"
   },
   "engines": {
     "node": ">=22.19.0"
