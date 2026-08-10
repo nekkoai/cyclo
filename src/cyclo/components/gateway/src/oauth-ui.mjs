@@ -1,11 +1,16 @@
 const CONTROL = /[\u0000-\u001f\u007f]/u;
 
-export function createAuthInteraction({ ask, askSecret = ask, write = console.log, signal }) {
+export function createAuthInteraction({
+  ask,
+  askSecret = ask,
+  write = console.log,
+  signal = new AbortController().signal,
+}) {
   if (typeof ask !== "function" || typeof askSecret !== "function" || typeof write !== "function") {
     throw new TypeError("OAuth interaction requires ask, askSecret, and write functions");
   }
   return Object.freeze({
-    ...(signal === undefined ? {} : { signal }),
+    signal,
     async prompt(prompt) {
       if (!prompt || typeof prompt !== "object") {
         throw new Error("OAuth provider emitted an invalid prompt");
