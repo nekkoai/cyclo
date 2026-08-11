@@ -205,6 +205,7 @@ commands instead:
 ```sh
 cyclo stop INSTANCE
 cyclo start INSTANCE
+cyclo shutdown
 cyclo refresh
 cyclo forget INSTANCE --confirm INSTANCE
 ```
@@ -219,6 +220,11 @@ project file for every running instance, validates current team sources, runs
 the required image builds, updates instance records, and applies the new global
 system.
 Stopped instances are not refreshed.
+
+`cyclo shutdown` is realm-wide rather than instance intent: it removes all
+runtime containers and transient networks in the selected realm while
+preserving every instance record and persistent volume. A later
+`cyclo repair` restores components with running intent.
 
 `cyclo stop /path/to/project.cyclo` stops the instances selected by the current
 definition. If an instance's team line was removed, stop that persisted

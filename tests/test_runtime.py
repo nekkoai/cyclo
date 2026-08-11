@@ -45,6 +45,9 @@ class AppliedDComp:
     def up(self, _path: Path) -> None:
         self.calls.append("up")
 
+    def down(self, name: str) -> None:
+        self.calls.append(f"down:{name}")
+
 
 def runtime(tmp_path: Path, host_text: str = "") -> CycloRuntime:
     config = tmp_path / "host.conf"
@@ -207,6 +210,46 @@ def test_apply_delegates_pending_operation_recovery_to_dcomp_up(
 
     assert selected.apply_gateway().status is observed
     assert dcomp.calls == ["check", "up", "status"]
+
+
+def test_shutdown_delegates_realm_name_and_verifies_complete_absence(
+    tmp_path: Path,
+) -> None:
+    absent = DCompStatus(
+        api_version=1,
+        name="cyclo-test",
+        desired=False,
+        operational=False,
+        digest="",
+        operation="",
+        phase="",
+        networks=(),
+        components=(),
+    )
+    dcomp = AppliedDComp(absent)
+    selected = CycloRuntime(
+        StateStore(tmp_path / "state"),
+        tmp_path / "missing-host.conf",
+        dcomp=dcomp,  # type: ignore[arg-type]
+        images=NoImages(),  # type: ignore[arg-type]
+    )
+
+    assert selected.shutdown() is absent
+    assert dcomp.calls == [f"down:{selected.name}", "status"]
+
+
+def test_shutdown_rejects_remaining_runtime_resources(tmp_path: Path) -> None:
+    remaining = status(component_status("gateway"))
+    dcomp = AppliedDComp(remaining)
+    selected = CycloRuntime(
+        StateStore(tmp_path / "state"),
+        tmp_path / "host.conf",
+        dcomp=dcomp,  # type: ignore[arg-type]
+        images=NoImages(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(CycloError, match="runtime resources remain"):
+        selected.shutdown()
 
 
 def test_provider_graph_and_openai_edge_compile_direct_interface_links(

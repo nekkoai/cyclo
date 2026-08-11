@@ -593,6 +593,17 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_shutdown(args: argparse.Namespace) -> int:
+    store = state_store(args)
+    runtime = cyclo_runtime(args, store)
+    progress = _Progress("shutdown")
+    with store.locked(bind_host_config=False):
+        with progress.step("remove all realm runtime components"):
+            runtime.shutdown()
+    print(f"shut down Cyclo realm: {store.root}")
+    return 0
+
+
 def cmd_forget(args: argparse.Namespace) -> int:
     if args.confirm != args.instance:
         raise CycloError("confirmation must exactly match the instance ID")
@@ -1282,7 +1293,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cyclo",
         description="Run Git-defined agent teams through composable model providers",
         epilog=(
-            "Everyday:  validate, run, start, stop, ps, inspect, logs, task\n"
+            "Everyday:  validate, run, start, stop, shutdown, ps, inspect, "
+            "logs, task\n"
             "Authoring: team, project\n"
             "System:    models, usage, component, gateway, providers, doctor"
         ),
@@ -1397,6 +1409,11 @@ def build_parser() -> argparse.ArgumentParser:
     stop = commands.add_parser("stop", help="stop an instance or project")
     stop.add_argument("target", help="instance ID or project.cyclo")
     stop.set_defaults(func=cmd_stop)
+    shutdown = commands.add_parser(
+        "shutdown",
+        help="remove every runtime component in the selected realm",
+    )
+    shutdown.set_defaults(func=cmd_shutdown)
     forget = commands.add_parser(
         "forget",
         help="delete a stopped instance and its durable AgentWS state",

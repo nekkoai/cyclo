@@ -243,6 +243,17 @@ runs the required host Docker builds and reapplies current host configuration
 plus persisted instance intent. DComp resumes an interrupted matching target
 or safely supersedes a stale target as part of `up`.
 
+`cyclo shutdown` removes every container and transient network in the selected
+realm while preserving its instance intent and persistent volumes. Select a
+private realm directly, without supplying its internal DComp system name:
+
+```sh
+cyclo shutdown --state-root ~/.local/state/cyclo-work
+```
+
+The command verifies that no realm components remain. A later `cyclo repair`
+recreates the runtime from the preserved configuration and intent.
+
 ## 05 · Runtime model
 
 One canonical state root defines one Cyclo realm and one DComp system:

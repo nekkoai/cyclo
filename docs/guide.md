@@ -510,6 +510,20 @@ Start a stopped instance from its persisted definition:
 cyclo start INSTANCE
 ```
 
+Shut down every runtime component in one realm without changing instance
+intent or deleting persistent volumes:
+
+```sh
+cyclo shutdown
+cyclo shutdown --local
+cyclo shutdown --state-root ~/.local/state/cyclo-work
+```
+
+Cyclo derives the DComp system from the selected state root and verifies that
+no component or transient network remains after shutdown. `cyclo repair` later
+recreates the runtime from the preserved host configuration and instance
+intent.
+
 Adopt current project/team sources and rebuild every running instance:
 
 ```sh

@@ -351,6 +351,23 @@ class CycloRuntime:
     def status(self) -> DCompStatus:
         return self.dcomp.status(self.name)
 
+    def shutdown(self) -> DCompStatus:
+        """Remove every runtime resource for this realm and verify absence."""
+
+        self.dcomp.down(self.name)
+        observed = self.status()
+        if (
+            observed.desired
+            or observed.operation
+            or observed.components
+            or observed.networks
+        ):
+            raise CycloError(
+                "DComp shutdown completed but runtime resources remain "
+                f"recorded for {self.name}"
+            )
+        return observed
+
     def wait_status(self, timeout: float = 30.0) -> DCompStatus:
         """Wait only for Docker health checks to settle; do not repair or reroute."""
 

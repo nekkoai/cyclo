@@ -881,7 +881,18 @@ Stopping a project path applies to teams selected by the currently parsed
 project file. Instances removed from that file remain individually addressable
 by ID.
 
-### 14.4 Refresh
+### 14.4 Shutdown
+
+`cyclo shutdown` MUST derive the DComp system name from the selected Cyclo
+state root. It MUST remove every managed component container and transient
+network in that realm, then observe DComp status and fail unless no runtime
+component or network remains recorded.
+
+Shutdown MUST preserve Cyclo instance intent, AgentWS state, gateway credential
+and usage state, and all other declared persistent volumes. A later repair MAY
+recreate the runtime from that preserved intent.
+
+### 14.5 Refresh
 
 Refresh MUST:
 
@@ -897,7 +908,7 @@ Refresh MUST:
 
 Stopped instances MUST retain their prior persisted configuration and intent.
 
-### 14.5 Repair
+### 14.6 Repair
 
 Repair MUST run the required host Docker builds and apply current `host.conf`
 plus persisted instance intent. DComp `up` MUST resume an incomplete matching
@@ -906,7 +917,7 @@ target or safely supersede it when current intent resolves differently.
 Repair MUST NOT reparse mutable team/project definitions to rewrite persisted
 instances. Refresh owns that adoption boundary.
 
-### 14.6 Forget
+### 14.7 Forget
 
 Forget MUST require:
 
@@ -917,7 +928,7 @@ Cyclo MUST first apply the system and verify that stopped teams are absent from
 the desired composition. It may then atomically remove the instance directory
 and its AgentWS/Pi state.
 
-### 14.7 Component restart
+### 14.8 Component restart
 
 Provider restart MUST first apply the current global composition, verify the
 configured Provider components, then ask DComp to restart those committed

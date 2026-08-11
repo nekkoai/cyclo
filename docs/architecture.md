@@ -349,6 +349,9 @@ operations are:
   complete system;
 - `start`: change a persisted instance to running and apply;
 - `stop`: change selected instances to stopped and apply;
+- `shutdown`: remove every runtime container and transient network for the
+  selected realm, verify their absence, and preserve instance intent and
+  persistent volumes;
 - `forget`: require stopped intent, apply to prove absence, then delete the
   instance and AgentWS state;
 - `refresh`: re-read and build all running project/team replacements, validate

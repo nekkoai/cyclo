@@ -18,6 +18,7 @@ from cyclo.cli import (
     cmd_ps,
     cmd_refresh,
     cmd_run,
+    cmd_shutdown,
     cmd_stop,
     cmd_task_add_job,
     cmd_task_run,
@@ -174,6 +175,7 @@ def test_cli_surface_has_declarative_provider_and_component_commands() -> None:
     assert rename.gateway_action == "rename"
     assert rename.account == "work"
     assert rename.new_account == "personal"
+    assert parser.parse_args(["shutdown"]).func is cmd_shutdown
 
     with pytest.raises(SystemExit):
         parser.parse_args(["providers", "start"])
@@ -371,6 +373,39 @@ def test_stop_persists_stopped_intent_before_apply(
 
     assert cmd_stop(namespace(target="demo")) == 0
     assert events == ["save:demo=stopped", "apply:demo=stopped"]
+
+
+def test_shutdown_removes_selected_realm_without_changing_instance_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[str] = []
+    instance = SimpleNamespace(id="demo", intent="running")
+
+    class Store(MemoryStore):
+        root = Path("/selected/realm")
+
+        def locked(self, **options):
+            events.append(f"lock:{options}")
+            return nullcontext()
+
+    class Runtime:
+        def shutdown(self):
+            events.append("shutdown")
+
+    store = Store((instance,))
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr(
+        "cyclo.cli.cyclo_runtime",
+        lambda _args, _store: Runtime(),
+    )
+
+    assert cmd_shutdown(namespace()) == 0
+    assert events == ["lock:{'bind_host_config': False}", "shutdown"]
+    assert store.load("demo").intent == "running"
+    assert capsys.readouterr().out == (
+        "shut down Cyclo realm: /selected/realm\n"
+    )
 
 
 def test_refresh_reconciles_provider_system_before_replacement_teams(
