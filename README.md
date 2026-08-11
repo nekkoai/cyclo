@@ -1,9 +1,9 @@
-<img src="docs/assets/banner.svg" alt="cyclo — Agentic systems, in a Git loop. A local-first agent runtime. V0.2.1, MIT, Linux, Python 3.10+, DComp." width="100%">
+<img src="docs/assets/banner.svg" alt="cyclo — Agentic systems, in a Git loop. A local-first agent runtime. V0.2.3, MIT, Linux, Python 3.10+, DComp." width="100%">
 
 Cyclo runs Git-defined agent teams against explicitly mounted projects. A
 credential gateway owns provider logins, optional provider components transform
-or route model traffic, and each team runs as an isolated component with its
-own durable AgentWS queue.
+or route model traffic, optional host edge components expose terminal APIs, and
+each team runs as an isolated component with its own durable AgentWS queue.
 
 Cyclo uses [DComp](https://github.com/glguida/dcomp) for Docker lifecycle and
 component links. Cyclo builds images and compiles one installation-wide DComp
@@ -56,9 +56,9 @@ cyclo doctor
 
 Login stores credentials in the gateway's private Docker volume and restarts
 the gateway so the new catalogue is visible. On a fresh installation Cyclo
-creates only that fixed gateway/store boundary first; unrelated Provider or
-team failures cannot block login. API keys and OAuth sessions are never mounted
-into provider or team components.
+creates only that fixed gateway/store boundary first; unrelated host-component
+or team failures cannot block login. API keys and OAuth sessions are never
+mounted into provider or team components.
 
 ## 03 · Provider composition
 
@@ -94,6 +94,23 @@ later in the file. The last provider declaration is the outer Provider used by
 teams and host-side catalogue calls; with no declarations, `gateway.provider`
 is outer.
 
+Cyclo ships a quota-aware Provider pooler as a bundled component source. Pool
+every model shared by two gateway accounts with:
+
+```text
+provider pool pooler upstream=gateway.provider -- account-a account-b
+```
+
+This preserves the upstream catalogue and adds `pool/MODEL` for each shared
+provider-local model ID. To pool only exact IDs under a chosen name:
+
+```text
+provider pool pooler upstream=gateway.provider -- account-a/model account-b/model model=balanced
+```
+
+The latter adds `pool/balanced`. Failover occurs only for typed pre-stream
+resource exhaustion; the pooler never replays after emitting a response.
+
 Cyclo uses stable installation/version tags for built gateway, Provider, and
 team images. Whenever an operation needs one, Cyclo invokes `docker build` with
 the real source context and lets Docker apply `.dockerignore` and its native
@@ -104,6 +121,25 @@ build history.
 DComp gives each direct interface link a private internal TCP network.
 Components receive only the targets for their declared inputs, such as
 `DCOMP_LINK_UPSTREAM=dns:///trace:50051`.
+
+Enable the bundled OpenAI HTTP edge independently of the Provider chain:
+
+```text
+component openai
+```
+
+This is a terminal component, not another Provider. Cyclo links its required
+`provider` input to the final Provider selected above and publishes its OpenAI
+Responses API at `http://127.0.0.1:8080/v1`. Select another literal IPv4 bind
+address or host port with:
+
+```text
+component openai bind=0.0.0.0 port=18080
+```
+
+The bind address defaults to `127.0.0.1`. An explicit `0.0.0.0` exposes the
+API on every host IPv4 interface, so use it only behind an appropriate trusted
+network boundary. Apply changes with `cyclo repair`.
 
 ## 04 · Teams and projects
 
@@ -132,6 +168,9 @@ Every `team` line creates one durable Cyclo instance and one generated DComp
 team component. Writable mounts appear at `/workspace/<name>`; read-only inputs
 appear at `/readonly/<name>`. Several writable mounts represent several
 projects. The team repository is mounted at `/team` with its declared mode.
+`cyclo run` persists each instance under
+`STATE_ROOT/instances/INSTANCE/run.json`; teams are deliberately not copied
+into `host.conf`.
 
 Cyclo bakes AgentWS, Pi, the provider adapter, and the generic agent protocol
 into the common team image. At runtime it mounts only durable queue directories,
@@ -172,8 +211,9 @@ Task coordination authority belongs to role `planner`.
 Use `cyclo refresh` to re-read running projects and teams, rebuild their images,
 and apply the resulting installation-wide DComp system. Use `cyclo stop`,
 `cyclo start`, and `cyclo forget` for durable instance intent. `cyclo repair`
-runs the required host Docker builds, reapplies the current host configuration
-and persisted instance intent, and resumes an interrupted DComp operation.
+runs the required host Docker builds and reapplies current host configuration
+plus persisted instance intent. DComp resumes an interrupted matching target
+or safely supersedes a stale target as part of `up`.
 
 ## 05 · Runtime model
 
@@ -183,7 +223,7 @@ One canonical state root defines one Cyclo installation and one DComp system:
 Cyclo CLI
   ├── runs Docker builds and validates immutable image IDs
   ├── stores project/team intent and AgentWS queues
-  └── compiles gateway + providers + running teams
+  └── compiles gateway + host.conf components + running teams
                          │
                          v
                        DComp
@@ -224,8 +264,9 @@ retarget it.
 - [Team repository contract](docs/team-repositories.md)
 - [Security policy](SECURITY.md)
 
-Cyclo ships its gateway, provider protocol, team runtime, AgentWS runtime,
-dashboard, and team templates. DComp is a separate required executable;
-external `agentws` and `multiagent` checkouts are not runtime dependencies.
+Cyclo ships its gateway, provider protocol, OpenAI edge, team runtime, AgentWS
+runtime, dashboard, and team templates. DComp is a separate required
+executable; external `agentws` and `multiagent` checkouts are not runtime
+dependencies.
 
 <img src="docs/assets/fregio.svg" alt="cyclo · MIT licence" width="100%">

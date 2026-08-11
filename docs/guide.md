@@ -84,7 +84,8 @@ cyclo gateway login openai --as openai-work --api-key-env OPENAI_API_KEY
 `--as` chooses the public account/provider prefix used in model IDs. A
 successful login writes the gateway's private Docker volume and restarts the
 gateway. On a fresh installation Cyclo first creates only that fixed
-gateway/store boundary; unrelated Provider or team failures do not block login.
+gateway/store boundary; unrelated host-component or team failures do not block
+login.
 A separate build or restart command is not required.
 
 Inspect the result:
@@ -110,7 +111,7 @@ destructive: first copy the exact volume name reported by
 `cyclo gateway status`. Cyclo obtains that opaque Docker name from DComp's
 verified volume lookup rather than constructing it itself.
 
-## 4. Configure Provider components
+## 4. Configure host components
 
 The gateway is always present and exposes `gateway.provider`. If `host.conf` is
 absent or empty, it is also the outer Provider.
@@ -131,6 +132,8 @@ Rules:
 
 - `NAME` is a lower-case DComp component name.
 - Relative `SOURCE` paths resolve beside `host.conf`; `~` is not expanded.
+- `pooler` selects Cyclo's packaged pooler and does not accept
+  `context=PATH`.
 - `SOURCE` must contain `component.dcomp`.
 - `context=PATH` optionally selects a containing Docker build context.
 - Every input declared by `component.dcomp` must be bound exactly once.
@@ -169,6 +172,54 @@ cyclo component restart trace
 
 Provider status is literal. A broken component is not bypassed. Fix or remove
 it, then apply the system again.
+
+### Pool gateway accounts
+
+The bundled pooler is an intermediate Provider component. To expose one
+virtual model for every provider-local model shared by selected gateway
+accounts:
+
+```text
+provider pool pooler upstream=gateway.provider -- account-a account-b
+```
+
+Two accounts are the minimum; additional account prefixes may be appended to
+the same line.
+
+If both accounts advertise `model`, the outer catalogue contains `pool/model`
+as well as every original upstream model. To choose exact members and an output
+name instead:
+
+```text
+provider pool pooler upstream=gateway.provider -- account-a/model account-b/model model=balanced
+```
+
+That instance adds `pool/balanced`. The instance name supplies the public model
+prefix. The pooler tries another member only after typed resource exhaustion
+arrives before any response; it never replays a partially emitted request.
+Run `cyclo repair`, then `cyclo models`, after changing the declaration.
+
+Enable the bundled OpenAI HTTP edge with a separate directive:
+
+```text
+component openai
+```
+
+The edge is not a Provider and does not change which Provider is outer. Cyclo
+links `openai.provider` to that outer Provider and publishes the HTTP API on
+host loopback at `http://127.0.0.1:8080/v1` by default. A different literal
+IPv4 bind address or fixed host port may be selected explicitly:
+
+```text
+component openai bind=0.0.0.0 port=18080
+```
+
+`bind=0.0.0.0` exposes the API on every host IPv4 interface. Use that setting
+only when the surrounding container or host network provides the intended
+access boundary.
+
+Only one bundled OpenAI edge may be declared per installation. Run
+`cyclo repair` after changing `host.conf`.
 
 ## 5. Create a team
 
@@ -266,6 +317,9 @@ the mode on its `team` line.
 Cyclo also creates a read-only `/agentws/project.cyclo` for each team. It keeps
 the name, description, and context but replaces host paths with the actual
 container paths. Agents are required to read it before choosing a workspace.
+The team declaration remains in the project file; `cyclo run` records its
+runtime instance and desired state in
+`STATE_ROOT/instances/INSTANCE/run.json`, not in `host.conf`.
 
 Validate without starting anything:
 
@@ -298,10 +352,11 @@ Common options are:
 `run` performs one global apply:
 
 1. validate project, team, model, mount, and Docker authority;
-2. build the gateway and configured source-built providers through Docker;
+2. build the gateway and configured host components through Docker;
 3. build team images, allowing Docker to reuse cached layers;
 4. persist each new instance with `running` intent; and
-5. compile and apply gateway, providers, and every running team through DComp.
+5. compile and apply gateway, host components, and every running team through
+   DComp.
 
 If apply fails after intent is persisted, the instances remain visible and
 repairable. Fix the reported component or configuration, then run:
@@ -423,9 +478,10 @@ Reapply current `host.conf` and persisted instance intent:
 cyclo repair
 ```
 
-`repair` runs the required host Docker builds and resumes an interrupted DComp
-operation before applying. It does not re-read team/project definitions for
-persisted instances; use `refresh` for that.
+`repair` runs the required host Docker builds and submits current persisted
+intent to DComp. DComp resumes an interrupted matching target or supersedes a
+stale target before applying. Repair does not re-read team/project definitions
+for persisted instances; use `refresh` for that.
 
 Delete a stopped instance and its durable AgentWS/Pi state:
 
@@ -508,7 +564,9 @@ cyclo component status
 ```
 
 If DComp reports an interrupted operation, ordinary mutating Cyclo commands and
-`cyclo repair` attempt `dcomp resume` before applying the desired system.
+`cyclo repair` submit the current desired system through `dcomp up`. DComp
+resumes a matching target or safely supersedes a stale target before applying
+the current one.
 
 If one provider is unhealthy:
 

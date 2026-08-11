@@ -18,6 +18,8 @@ EXPECTED_PACKAGES = (
     "components/protocol/provider",
     "components/gateway",
     "components/passthrough",
+    "components/pooler",
+    "components/openai",
     "components/team/pi",
     "components/team",
 )

@@ -107,7 +107,7 @@ git archive --format=tar HEAD | tar -xf - -C "$source_tree"
 printf '%s\n' '==> source tests'
 (
     cd "$source_tree"
-    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
+    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/pooler components/openai components/team/pi; do
         npm ci --ignore-scripts --prefix "src/cyclo/$package"
     done
     # This is the same intentional, lockfile-bounded peer override used by the
@@ -120,7 +120,7 @@ printf '%s\n' '==> source tests'
         "$venv/bin/python" -m pytest -q \
         tests/test_release_manifest.py tests/test_secret_scan.py
     node --test tests/*.mjs
-    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/team/pi; do
+    for package in components/protocol/component components/protocol/provider components/gateway components/passthrough components/pooler components/openai components/team/pi; do
         npm test --prefix "src/cyclo/$package"
     done
     # Tests regenerate the checked-in protocol bindings. Refuse to package a
@@ -214,6 +214,14 @@ docker build --pull \
 docker build --pull \
     --tag "cyclo-passthrough:release-$short_commit" \
     --file "$source_tree/src/cyclo/components/passthrough/Dockerfile" \
+    "$source_tree/src/cyclo/components"
+docker build --pull \
+    --tag "cyclo-pooler:release-$short_commit" \
+    --file "$source_tree/src/cyclo/components/pooler/Dockerfile" \
+    "$source_tree/src/cyclo/components"
+docker build --pull \
+    --tag "cyclo-openai:release-$short_commit" \
+    --file "$source_tree/src/cyclo/components/openai/Dockerfile" \
     "$source_tree/src/cyclo/components"
 docker run --rm --network none --entrypoint /bin/sh \
     "cyclo-team:release-$short_commit" -ceu '

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cyclo-agent"
-version = "0.2.1"
+version = "0.2.3"
 description = "Run Git-defined agent teams through an isolated credential proxy"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -83,6 +83,12 @@ namespaces = false
   "passthrough/*",
   "passthrough/src/*",
   "passthrough/test/*",
+  "pooler/*",
+  "pooler/src/*",
+  "pooler/test/*",
+  "openai/*",
+  "openai/src/*",
+  "openai/test/*",
 ]
 "cyclo.components.team" = [
   "README.md",

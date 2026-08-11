@@ -2,6 +2,29 @@
 
 All notable changes to Cyclo are documented in this file.
 
+## [0.2.3] - 2026-08-11
+
+Cyclo 0.2.3 adds composable account pooling and a standalone OpenAI Responses
+edge while simplifying interrupted DComp recovery.
+
+### Provider composition
+
+- Ship the quota-aware `pooler` as a bundled intermediate Provider. A
+  `host.conf` declaration can pool two or more accounts or exact model routes
+  without requiring a separate source checkout.
+- Ship the `openai` terminal component, which consumes the final Provider and
+  exposes stateless OpenAI-compatible Models and Responses HTTP endpoints with
+  streaming, reasoning, function calls, images, usage, errors, and cancellation.
+- Add `component openai [bind=IPV4] [port=PORT]` to `host.conf`, defaulting to
+  loopback publication on port 8080 and keeping it outside the Provider chain.
+
+### Lifecycle and release
+
+- Delegate interrupted-operation recovery and safe target supersession directly
+  to `dcomp up`, removing Cyclo's redundant pre-apply resume decision.
+- Include the pooler and OpenAI packages and images in CI, distribution
+  manifests, dependency auditing, release acceptance, and architecture tests.
+
 ## [0.2.1] - 2026-08-05
 
 Cyclo 0.2.1 strengthens long-running provider requests and durable team

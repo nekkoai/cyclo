@@ -94,5 +94,5 @@
   <text x="114" y="200" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="13" font-weight="700" letter-spacing="3.5" fill="#201A12">A LOCAL-FIRST AGENT RUNTIME</text>
   <text x="52" y="328" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="132" font-weight="700" letter-spacing="-8" fill="#201A12">cyclo</text>
   <text x="56" y="370" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="27" font-weight="500" fill="#201A12">Agentic systems, <tspan fill="#D8402E">in a Git loop.</tspan></text>
-  <text x="56" y="403" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" letter-spacing="2.5" fill="#201A12">V0.2.1 · MIT · LINUX · PYTHON 3.10+ · DCOMP</text>
+  <text x="56" y="403" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" letter-spacing="2.5" fill="#201A12">V0.2.3 · MIT · LINUX · PYTHON 3.10+ · DCOMP</text>
 </svg>

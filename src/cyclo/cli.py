@@ -1143,14 +1143,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             providers = tuple(
                 provider.name for provider in runtime.host.providers
             )
+            host_components = tuple(
+                component.name for component in runtime.host.components
+            )
             host_available = True
         except CycloError as exc:
             providers = ()
+            host_components = ()
             host_available = False
             failures.append(f"host configuration unavailable: {exc}")
         expected = {
             "gateway",
             *providers,
+            *host_components,
             *(
                 runtime.component_for_instance(instance.id)
                 for instance in instances

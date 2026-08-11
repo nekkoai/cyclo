@@ -27,11 +27,15 @@ graft src/cyclo/components/protocol/component
 graft src/cyclo/components/protocol/provider
 graft src/cyclo/components/gateway
 graft src/cyclo/components/passthrough
+graft src/cyclo/components/pooler
+graft src/cyclo/components/openai
 graft src/cyclo/components/team
 prune src/cyclo/components/protocol/component/node_modules
 prune src/cyclo/components/protocol/provider/node_modules
 prune src/cyclo/components/gateway/node_modules
 prune src/cyclo/components/passthrough/node_modules
+prune src/cyclo/components/pooler/node_modules
+prune src/cyclo/components/openai/node_modules
 prune src/cyclo/components/team/node_modules
 prune src/cyclo/components/team/pi/node_modules
 global-exclude __pycache__ *.py[cod]

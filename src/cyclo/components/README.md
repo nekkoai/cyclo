@@ -9,18 +9,20 @@ protocol/
   provider/       model catalogue and opaque inference transport contract
 gateway/          credential-owning root provider component
 passthrough/      example intermediate provider component
+pooler/           quota-aware intermediate provider component
+openai/           terminal OpenAI HTTP-to-Provider edge component
 team/             per-team component implementation
   agentws/        job loop, tools, roles, and read-only viewer
   pi/             in-process Provider adapter for Pi
   runtime.py      component supervisor
 ```
 
-`gateway` and `passthrough` are independently runnable components. Each has a
-`component.conf`, implementation, tests, and—where runnable as a container—a
-Dockerfile. The packages below `protocol/` are shared interface definitions,
-not running services. Cyclo creates one DComp component from `team/` for every
-configured team instance. Its Pi bridge runs in that component's process and
-is not an independent DComp component.
+`gateway`, `passthrough`, `pooler`, and `openai` are independently runnable
+components. Each has a `component.conf`, implementation, tests, and—where
+runnable as a container—a Dockerfile. The packages below `protocol/` are shared
+interface definitions, not running services. Cyclo creates one DComp component
+from `team/` for every configured team instance. Its Pi bridge runs in that
+component's process and is not an independent DComp component.
 
 All Dockerfiles use this directory as their build context. They copy only the
 protocol and implementation sources they require; their adjacent

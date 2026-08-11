@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -21,7 +21,7 @@ from .dcomp_system import (
     provider_endpoint,
 )
 from .errors import CycloError
-from .host import Host, Provider, load_host
+from .host import Host, HostComponent, Provider, load_host
 from .images import Image, Images
 from .mounts import (
     validate_mount_authority,
@@ -42,12 +42,14 @@ from .team.image import TeamImageBuilder, require_non_root_team_host
 
 
 GATEWAY_STORE = "/var/lib/cyclo-gateway"
+OPENAI_HTTP_PORT = 8080
 
 
 @dataclass(frozen=True)
 class HostImages:
     gateway: Image
     providers: Mapping[str, Image]
+    components: Mapping[str, Image] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,7 @@ class CycloRuntime:
         self.team_images = TeamImageBuilder(self.images, store.system)
         self._gateway_image_cache: Image | None = None
         self._provider_image_cache: dict[str, Image] = {}
+        self._component_image_cache: dict[str, Image] = {}
 
     @property
     def host(self) -> Host:
@@ -101,7 +104,14 @@ class CycloRuntime:
                     provider
                 )
             providers[provider.name] = self._provider_image_cache[provider.name]
-        return HostImages(gateway, providers)
+        components: dict[str, Image] = {}
+        for component in self.host.components:
+            if rebuild or component.name not in self._component_image_cache:
+                self._component_image_cache[component.name] = (
+                    self._host_component_image(component)
+                )
+            components[component.name] = self._component_image_cache[component.name]
+        return HostImages(gateway, providers, components)
 
     def build_gateway(self, *, rebuild: bool = False) -> Image:
         """Ask Docker to build the gateway, using its native build cache."""
@@ -174,6 +184,36 @@ class CycloRuntime:
                     binding.output,
                 )
                 for binding in provider.bindings
+            )
+
+        for configured in self.host.components:
+            image = host_images.components.get(configured.name)
+            if image is None:
+                raise CycloError(
+                    f"missing built image for component {configured.name!r}"
+                )
+            components.append(
+                Component(
+                    configured.name,
+                    image.id,
+                    inputs=(provider_endpoint(),),
+                    ports=(
+                        PublishedPort(
+                            configured.bind,
+                            configured.port,
+                            OPENAI_HTTP_PORT,
+                        ),
+                    ),
+                    egress=True,
+                )
+            )
+            links.append(
+                Link(
+                    configured.name,
+                    "provider",
+                    self.host.outer_component,
+                    self.host.outer_output,
+                )
             )
 
         for instance in active:
@@ -296,9 +336,6 @@ class CycloRuntime:
         wait: bool = True,
     ) -> AppliedSystem:
         self.dcomp.check(definition.path)
-        status = self.dcomp.status(self.name)
-        if status.operation:
-            self.dcomp.resume(self.name)
         self.dcomp.up(definition.path)
         observed = self.wait_status() if wait else self.status()
         return AppliedSystem(definition, observed)
@@ -454,6 +491,18 @@ class CycloRuntime:
             reference,
             dockerfile=dockerfile,
             context=provider.context,
+        )
+
+    def _host_component_image(self, component: HostComponent) -> Image:
+        root = components_root()
+        reference = (
+            f"cyclo-{self.store.system}-component-{component.name}:"
+            f"{__version__}"
+        )
+        return self.images.build(
+            reference,
+            dockerfile=root / component.name / "Dockerfile",
+            context=root,
         )
 
     @staticmethod

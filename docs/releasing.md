@@ -1,6 +1,6 @@
 # Releasing Cyclo
 
-Cyclo uses semantic versions. `0.2.1` is a stable release; a version below
+Cyclo uses semantic versions. `0.2.3` is a stable release; a version below
 `1.0.0` does not imply an alpha or preview build. The Python distribution is `cyclo-agent`,
 while the command, import package, repository, and image names retain `cyclo`.
 
@@ -31,14 +31,15 @@ Ordinary CI is self-contained and does not fetch an unpublished DComp build. It
 performs:
 
 - the complete Python test matrix;
-- Node protocol, gateway, provider, and UI tests;
+- Node protocol, gateway, provider-component, and UI tests;
 - generated-protocol drift checks;
 - dependency and secret scans;
 - reproducible wheel and source-distribution checks;
 - installed-wheel command, template, project-format, and package-content
   acceptance; and
-- credential-free Docker builds for the team, gateway, and pass-through images,
-  including the baked AgentWS runtime and a derived-team fixture.
+- credential-free Docker builds for the team, gateway, pass-through, pooler,
+  and OpenAI edge images, including the baked AgentWS runtime and a derived-team
+  fixture.
 
 The package job runs `tools/release-acceptance` with
 `CYCLO_RELEASE_REQUIRE_DCOMP=0`. This is not an end-to-end runtime claim. The
@@ -83,13 +84,15 @@ Every component image uses `src/cyclo/components` as its build context. The
 locks, entrypoint, and Dockerfile; shared protocol packages remain beside it.
 
 ```sh
-docker build --pull --build-arg "CYCLO_HOST_UID=$(id -u)" --build-arg "CYCLO_HOST_GID=$(id -g)" -t cyclo-team:0.2.1 -f src/cyclo/components/team/Dockerfile src/cyclo/components
-docker build --pull -t cyclo-gateway:0.2.1 -f src/cyclo/components/gateway/Dockerfile src/cyclo/components
-docker build --pull -t cyclo-passthrough:0.2.1 -f src/cyclo/components/passthrough/Dockerfile src/cyclo/components
-PYTHONPATH=src python3 -c 'from pathlib import Path; from cyclo.images import Images; images = Images(); base = images.inspect("cyclo-team:0.2.1"); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); images.build("cyclo-derived-team:0.2.1", dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))'
-docker run --rm --network none --entrypoint /bin/sh cyclo-derived-team:0.2.1 -ceu 'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
-PYTHONPATH=src tools/runtime-write-acceptance cyclo-team:0.2.1
-docker run --rm --network none cyclo-gateway:0.2.1 providers
+docker build --pull --build-arg "CYCLO_HOST_UID=$(id -u)" --build-arg "CYCLO_HOST_GID=$(id -g)" -t cyclo-team:0.2.3 -f src/cyclo/components/team/Dockerfile src/cyclo/components
+docker build --pull -t cyclo-gateway:0.2.3 -f src/cyclo/components/gateway/Dockerfile src/cyclo/components
+docker build --pull -t cyclo-passthrough:0.2.3 -f src/cyclo/components/passthrough/Dockerfile src/cyclo/components
+docker build --pull -t cyclo-pooler:0.2.3 -f src/cyclo/components/pooler/Dockerfile src/cyclo/components
+docker build --pull -t cyclo-openai:0.2.3 -f src/cyclo/components/openai/Dockerfile src/cyclo/components
+PYTHONPATH=src python3 -c 'from pathlib import Path; from cyclo.images import Images; images = Images(); base = images.inspect("cyclo-team:0.2.3"); assert base is not None; root = Path("tests/fixtures/derived-team").resolve(); images.build("cyclo-derived-team:0.2.3", dockerfile=root / "Dockerfile", context=root, build_args=(("CYCLO_TEAM_BASE", base.reference),), labels=(("io.cyclo.team-base", base.id),))'
+docker run --rm --network none --entrypoint /bin/sh cyclo-derived-team:0.2.3 -ceu 'test "$(cat /opt/cyclo-derived-team-smoke)" = cyclo-derived-team-ok'
+PYTHONPATH=src tools/runtime-write-acceptance cyclo-team:0.2.3
+docker run --rm --network none cyclo-gateway:0.2.3 providers
 ```
 
 `tools/runtime-write-acceptance` uses the image-baked AgentWS tools and
@@ -138,12 +141,12 @@ toolchain, runs Python, Node, shell, dependency, secret, package, Docker, baked
 runtime, and DComp integration acceptance, and writes:
 
 ```text
-release/cyclo-agent-0.2.1/
-  cyclo_agent-0.2.1-py3-none-any.whl
-  cyclo_agent-0.2.1.tar.gz
+release/cyclo-agent-0.2.3/
+  cyclo_agent-0.2.3-py3-none-any.whl
+  cyclo_agent-0.2.3.tar.gz
   SHA256SUMS
   release-manifest.json
-  cyclo-agent-0.2.1.spdx.json
+  cyclo-agent-0.2.3.spdx.json
 ```
 
 The wheel and source archive are normalized before checksums and the SBOM are
@@ -171,11 +174,11 @@ Copy the complete release bundle and a separately obtained DComp executable to
 a disposable Linux host:
 
 ```sh
-cd ./cyclo-agent-0.2.1
+cd ./cyclo-agent-0.2.3
 sha256sum --check SHA256SUMS
 python3 -m venv /tmp/cyclo-release
 . /tmp/cyclo-release/bin/activate
-python -m pip install ./cyclo_agent-0.2.1-py3-none-any.whl
+python -m pip install ./cyclo_agent-0.2.3-py3-none-any.whl
 export CYCLO_DCOMP=/absolute/path/to/dcomp
 "$CYCLO_DCOMP" version --json
 cyclo --version

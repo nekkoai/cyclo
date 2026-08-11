@@ -77,8 +77,9 @@ where `installation-id` is a stable digest of the canonical state-root path.
 The complete desired system MUST contain:
 
 1. the gateway;
-2. every Provider component declared by the selected `host.conf`; and
-3. every persisted team instance with `running` intent.
+2. every Provider component declared by the selected `host.conf`;
+3. every standalone component declared by the selected `host.conf`; and
+4. every persisted team instance with `running` intent.
 
 Cyclo MUST compile and apply this complete set as one system. It MUST NOT start
 each Provider or team through an independent lifecycle implementation.
@@ -217,22 +218,26 @@ MUST be fully qualified protobuf service identities.
 Cyclo MUST require exactly one output whose service is
 `cyclo.provider.v1.Provider`. Other inputs and outputs MAY be declared.
 
-### 5.2 Host provider configuration
+### 5.2 Host component configuration
 
-Each non-comment `host.conf` line has this grammar:
+Each non-comment `host.conf` line has one of these grammars:
 
 ```text
 provider NAME SOURCE [context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...]
+component openai [bind=IPV4] [port=PORT]
 ```
 
 Cyclo MUST:
 
 - reserve the name `gateway`;
+- recognize `pooler` as the packaged pooler Provider source;
 - resolve relative `SOURCE` paths beside `host.conf`;
 - reject `~` expansion and whitespace-containing component paths;
 - require `SOURCE` to be a canonical directory;
 - resolve `context=PATH` relative to `SOURCE` when it is not absolute;
 - require `SOURCE` to be inside the selected build context;
+- use the installed components directory as the fixed build context for
+  `pooler` and reject `context=PATH` for that source;
 - bind every declared input exactly once;
 - reject unknown inputs, outputs, components, and nominal service mismatches;
   and
@@ -245,6 +250,24 @@ bindings, not startup dependencies.
 
 The outer Provider MUST be the final declared Provider's unique Provider
 output. If none is declared, it MUST be `gateway.provider`.
+
+`component openai` MUST enable exactly one bundled terminal OpenAI HTTP edge.
+It MUST NOT be included in the Provider list or change the outer Provider.
+Cyclo MUST link its Provider input to the outer Provider and publish container
+port 8080 on `127.0.0.1` by default. An explicit `bind` MUST be a literal IPv4
+address. The default host port MUST be 8080; an explicit `port` MUST be an
+integer from 1 through 65535. Duplicate settings and duplicate or unknown
+standalone component declarations MUST fail validation.
+
+The bundled pooler MUST require exactly one upstream Provider input and expose
+one Provider output. Provider-wide arguments MUST contain at least two distinct
+provider prefixes and create a virtual model for every provider-local model ID
+shared by at least two selected providers. Exact-model arguments MUST contain
+at least two distinct public model IDs followed by `model=OUTPUT_MODEL`.
+Virtual models MUST report compatible shared metadata and conservative token
+limits. The pooler MUST move a request to another member only for typed
+pre-response resource exhaustion, MUST NOT replay after emitting a response,
+and MUST treat inference payloads as opaque.
 
 ### 5.3 Team repository
 
@@ -426,7 +449,8 @@ validated base-identity label.
 Cyclo MUST emit:
 
 - one `gateway` component;
-- one component for each `host.conf` Provider; and
+- one component for each `host.conf` Provider;
+- one component for each standalone `host.conf` component; and
 - one stable generated component name for each running instance.
 
 The gateway MUST expose `cyclo.provider.v1.Provider` as `provider` and mount one
@@ -434,6 +458,11 @@ DComp named volume at `/var/lib/cyclo-gateway`.
 
 Every team MUST declare one Provider input named `provider` and link it to the
 outer Provider.
+
+The OpenAI edge MUST declare one Provider input named `provider`, expose no
+Provider output, and link that input to the outer Provider. It MUST have an
+explicit publication on its configured host IPv4 address and no persistent
+mount.
 
 ### 7.2 Generated policy
 
@@ -482,13 +511,12 @@ The apply sequence is:
 3. run the required host Docker builds;
 4. compile and atomically publish the complete DComp system;
 5. run `dcomp check`;
-6. inspect `dcomp status --json`;
-7. if DComp reports an unfinished operation, run `dcomp resume`;
-8. run `dcomp up`; and
-9. wait only for Docker health transitions to settle for a bounded interval.
+6. run `dcomp up`; and
+7. wait only for Docker health transitions to settle for a bounded interval.
 
 Cyclo MUST NOT speculate about Docker effects or implement a parallel rollback.
-DComp owns resumption and exact-object reconciliation.
+DComp owns resumption, supersession of an interrupted target when the newly
+resolved system differs, and exact-object reconciliation.
 
 If the wait expires while a component is still starting, Cyclo MUST report the
 observed state. It MUST NOT destroy the component merely because the wait
@@ -517,6 +545,8 @@ Cyclo MUST grant:
 
 - gateway egress;
 - outer-Provider egress plus a dynamic `127.0.0.1:0 -> 50051` publication;
+- configured OpenAI-edge egress plus its fixed
+  `IPV4:PORT -> 8080` publication, defaulting to `127.0.0.1:8080 -> 8080`;
 - normal-team egress plus a configured host publication to container port
   4137; and
 - no team egress or publication when `--offline` is selected.
@@ -814,7 +844,7 @@ Refresh MUST:
 1. reparse the recorded project file for every running instance;
 2. locate the same logical team selection;
 3. validate current mounts and build every replacement team image;
-4. apply only the current gateway and configured Provider components;
+4. apply the current gateway and configured host components without teams;
 5. obtain the outer Provider catalogue and validate every replacement model;
 6. atomically publish the complete running-instance replacement cohort;
 7. apply the complete system; and
@@ -825,8 +855,9 @@ Stopped instances MUST retain their prior persisted configuration and intent.
 
 ### 14.5 Repair
 
-Repair MUST run the required host Docker builds, apply current `host.conf` plus
-persisted instance intent, and resume incomplete DComp operations.
+Repair MUST run the required host Docker builds and apply current `host.conf`
+plus persisted instance intent. DComp `up` MUST resume an incomplete matching
+target or safely supersede it when current intent resolves differently.
 
 Repair MUST NOT reparse mutable team/project definitions to rewrite persisted
 instances. Refresh owns that adoption boundary.
@@ -897,7 +928,7 @@ provider-specific inspection remain fail-closed on invalid `host.conf`.
 - DComp executable and machine API compatibility;
 - applied-system presence;
 - every applied component, plus expected gateway and running-team components;
-- every configured Provider component when `host.conf` is valid;
+- every configured Provider and standalone component when `host.conf` is valid;
 - absence of stopped-team components; and
 - outer model catalogue reachability when the system is operational and
   provider configuration is available.
@@ -935,8 +966,8 @@ followed by apply or repair.
 ### 16.3 Host interruption
 
 DComp MUST record operation intent before Docker mutation and address verified
-immutable objects. Cyclo MUST resume an incomplete operation before applying a
-new target.
+immutable objects. DComp `up` MUST resume an incomplete matching operation or
+safely supersede it before applying a new target.
 
 Cyclo MUST NOT infer success or failure from a timeout alone, and MUST NOT
 implement speculative rollback around DComp.
@@ -982,12 +1013,16 @@ A release implementation SHOULD demonstrate:
 - an API version other than 1 fails before mutation;
 - a bound Docker endpoint is passed consistently;
 - malformed or exit-inconsistent status JSON fails closed; and
-- interrupted operations resume through DComp.
+- interrupted operations resume or are safely superseded through DComp.
 
 ### 18.2 Composition
 
 - an empty `host.conf` links a team directly to `gateway.provider`;
 - a multi-Provider configuration compiles exact endpoint links;
+- `pooler` resolves from the installed component root and compiles as
+  an ordinary intermediate Provider;
+- `component openai` compiles a separate terminal component linked to the final
+  Provider and published on the configured IPv4 address and port;
 - forward references and cycles validate nominally;
 - every missing or duplicate input binding fails;
 - the last provider is the host/team outer route; and
@@ -1039,5 +1074,7 @@ A release implementation SHOULD demonstrate:
 - no component has the Docker socket;
 - link networks contain only their declared endpoints;
 - host Provider publication is loopback-only;
+- OpenAI-edge HTTP publication defaults to loopback and any wider bind requires
+  explicit host configuration;
 - normal and offline network policies differ as specified; and
 - status/dashboard operations do not mutate composition.

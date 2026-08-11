@@ -22,6 +22,8 @@ COMPONENT_SOURCES = (
     "protocol/provider",
     "gateway",
     "passthrough",
+    "pooler",
+    "openai",
     "team",
 )
 
@@ -33,6 +35,8 @@ def test_release_manifest_scans_every_owned_node_lockfile(tmp_path: Path) -> Non
         "src/cyclo/components/protocol/component/package-lock.json",
         "src/cyclo/components/gateway/package-lock.json",
         "src/cyclo/components/passthrough/package-lock.json",
+        "src/cyclo/components/pooler/package-lock.json",
+        "src/cyclo/components/openai/package-lock.json",
         "src/cyclo/components/team/pi/package-lock.json",
         "src/cyclo/components/protocol/provider/package-lock.json",
         "src/cyclo/components/team/package-lock.json",
@@ -224,7 +228,7 @@ def test_release_manifest_for_built_distributions(
 
     manifest = json.loads((tmp_path / "release-manifest.json").read_text())
     assert manifest["distribution"] == "cyclo-agent"
-    assert manifest["version"] == "0.2.1"
+    assert manifest["version"] == "0.2.3"
     assert manifest["source_date_epoch"] == 1700000000
     assert [artifact["name"] for artifact in manifest["artifacts"]] == sorted(
         artifact["name"] for artifact in manifest["artifacts"]
@@ -232,7 +236,7 @@ def test_release_manifest_for_built_distributions(
     checksums = (tmp_path / "SHA256SUMS").read_text()
     assert all(artifact["sha256"] in checksums for artifact in manifest["artifacts"])
 
-    sbom = json.loads((tmp_path / "cyclo-agent-0.2.1.spdx.json").read_text())
+    sbom = json.loads((tmp_path / "cyclo-agent-0.2.3.spdx.json").read_text())
     assert sbom["spdxVersion"] == "SPDX-2.3"
     assert sbom["documentDescribes"] == ["SPDXRef-Package-cyclo-agent"]
     root_package = next(
@@ -240,7 +244,7 @@ def test_release_manifest_for_built_distributions(
     )
     assert root_package["downloadLocation"] == "NOASSERTION"
     assert any(
-        reference["referenceLocator"] == "pkg:pypi/cyclo-agent@0.2.1"
+        reference["referenceLocator"] == "pkg:pypi/cyclo-agent@0.2.3"
         for reference in root_package["externalRefs"]
     )
     assert sbom["dataLicense"] == "CC0-1.0"
@@ -304,7 +308,7 @@ def test_release_manifest_cross_checks_sdist_metadata(
         b"Requires-Python: >=3.10\n\n"
     )
     with tarfile.open(sdist, mode="w:gz") as archive:
-        member = tarfile.TarInfo("cyclo_agent-0.2.1/PKG-INFO")
+        member = tarfile.TarInfo("cyclo_agent-0.2.3/PKG-INFO")
         member.size = len(metadata)
         archive.addfile(member, io.BytesIO(metadata))
 

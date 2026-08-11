@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import re
 import stat
@@ -9,9 +10,15 @@ from pathlib import Path
 
 from .dcomp_system import Endpoint, PROVIDER_SERVICE
 from .errors import CycloError
+from .resources import components_root
 
 
 MAX_HOST_CONFIG_BYTES = 1024 * 1024
+OPENAI_COMPONENT_NAME = "openai"
+OPENAI_DEFAULT_BIND = "127.0.0.1"
+OPENAI_DEFAULT_PORT = 8080
+OPENAI_COMPONENT_SYNTAX = "component openai [bind=IPV4] [port=PORT]"
+BUNDLED_PROVIDER_SOURCES = frozenset({"pooler"})
 _NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 _SERVICE_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$"
@@ -58,10 +65,21 @@ class Provider:
 
 
 @dataclass(frozen=True)
+class HostComponent:
+    """A bundled terminal component enabled by host configuration."""
+
+    name: str
+    bind: str
+    port: int
+    line: int
+
+
+@dataclass(frozen=True)
 class Host:
     path: Path
     providers: tuple[Provider, ...]
     generation: str
+    components: tuple[HostComponent, ...] = ()
 
     @property
     def outer_component(self) -> str:
@@ -221,6 +239,88 @@ class _UnboundProvider:
     line: int
 
 
+def _provider_source(
+    selected: Path,
+    line_number: int,
+    source_token: str,
+) -> tuple[Path, Path, bool]:
+    if source_token in BUNDLED_PROVIDER_SOURCES:
+        context = _canonical_directory(
+            components_root(),
+            source=selected,
+            line=line_number,
+        )
+        source = _canonical_directory(
+            context / source_token,
+            source=selected,
+            line=line_number,
+        )
+        return source, context, True
+
+    if source_token == "~" or source_token.startswith("~/"):
+        raise CycloError(
+            f"{selected}:{line_number}: component paths do not expand '~'"
+        )
+    source_path = Path(source_token)
+    if not source_path.is_absolute():
+        source_path = selected.parent / source_path
+    source = _canonical_directory(
+        source_path,
+        source=selected,
+        line=line_number,
+    )
+    return source, source, False
+
+
+def _host_component(
+    selected: Path,
+    line_number: int,
+    fields: list[str],
+) -> HostComponent:
+    if len(fields) < 2 or fields[1] != OPENAI_COMPONENT_NAME:
+        raise CycloError(
+            f"{selected}:{line_number}: expected {OPENAI_COMPONENT_SYNTAX}"
+        )
+    bind = OPENAI_DEFAULT_BIND
+    port = OPENAI_DEFAULT_PORT
+    seen: set[str] = set()
+    for setting in fields[2:]:
+        key, separator, value = setting.partition("=")
+        if key not in {"bind", "port"} or not separator or key in seen:
+            raise CycloError(
+                f"{selected}:{line_number}: invalid or duplicate component "
+                f"setting {setting!r}; expected bind=IPV4 or port=PORT"
+            )
+        seen.add(key)
+        if key == "bind":
+            try:
+                bind = str(ipaddress.IPv4Address(value))
+            except ValueError as exc:
+                raise CycloError(
+                    f"{selected}:{line_number}: component bind must be a "
+                    "literal IPv4 address"
+                ) from exc
+            continue
+        try:
+            port = int(value, 10)
+        except ValueError as exc:
+            raise CycloError(
+                f"{selected}:{line_number}: component port must be an integer "
+                "between 1 and 65535"
+            ) from exc
+        if not 1 <= port <= 65535:
+            raise CycloError(
+                f"{selected}:{line_number}: component port must be an integer "
+                "between 1 and 65535"
+            )
+    return HostComponent(
+        OPENAI_COMPONENT_NAME,
+        bind,
+        port,
+        line_number,
+    )
+
+
 def load_host(path: Path) -> Host:
     selected = Path(os.path.abspath(path.expanduser()))
     raw = _read_regular_file(
@@ -231,16 +331,28 @@ def load_host(path: Path) -> Host:
     text = _decode(raw, selected, "host configuration")
 
     declarations: list[_UnboundProvider] = []
+    components: list[HostComponent] = []
     names = {"gateway"}
     for line_number, raw_line in enumerate(text.splitlines(), 1):
         content = _content(raw_line)
         if not content:
             continue
         fields = content.split()
+        if fields[0] == "component":
+            component = _host_component(selected, line_number, fields)
+            if component.name in names:
+                raise CycloError(
+                    f"{selected}:{line_number}: duplicate component name "
+                    f"{component.name!r}"
+                )
+            names.add(component.name)
+            components.append(component)
+            continue
         if fields[0] != "provider" or len(fields) < 3:
             raise CycloError(
                 f"{selected}:{line_number}: expected provider NAME SOURCE "
-                f"[context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...]"
+                f"[context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...] "
+                f"or {OPENAI_COMPONENT_SYNTAX}"
             )
         name = fields[1]
         if not _NAME_RE.fullmatch(name) or name in names:
@@ -249,18 +361,10 @@ def load_host(path: Path) -> Host:
                 f"name {name!r}"
             )
         names.add(name)
-        source_token = fields[2]
-        if source_token == "~" or source_token.startswith("~/"):
-            raise CycloError(
-                f"{selected}:{line_number}: component paths do not expand '~'"
-            )
-        source_path = Path(source_token)
-        if not source_path.is_absolute():
-            source_path = selected.parent / source_path
-        source = _canonical_directory(
-            source_path,
-            source=selected,
-            line=line_number,
+        source, context, bundled = _provider_source(
+            selected,
+            line_number,
+            fields[2],
         )
         contract = load_component(source)
 
@@ -274,7 +378,6 @@ def load_host(path: Path) -> Host:
         boundary = separators[0] if separators else len(fields)
         settings = list(fields[3:boundary])
         arguments = tuple(fields[boundary + 1 :]) if separators else ()
-        context = source
         context_settings = [
             setting for setting in settings if setting.startswith("context=")
         ]
@@ -283,6 +386,11 @@ def load_host(path: Path) -> Host:
                 f"{selected}:{line_number}: duplicate context setting"
             )
         if context_settings:
+            if bundled:
+                raise CycloError(
+                    f"{selected}:{line_number}: bundled provider sources "
+                    "do not accept context=PATH"
+                )
             context_value = context_settings[0].partition("=")[2]
             if not context_value:
                 raise CycloError(
@@ -380,7 +488,8 @@ def load_host(path: Path) -> Host:
         )
 
     return Host(
-        selected,
-        tuple(providers),
-        hashlib.sha256(raw).hexdigest(),
+        path=selected,
+        providers=tuple(providers),
+        generation=hashlib.sha256(raw).hexdigest(),
+        components=tuple(components),
     )

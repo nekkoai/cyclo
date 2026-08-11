@@ -1,0 +1,3 @@
+docker cyclo-pooler:dev
+input cyclo.provider.v1.Provider upstream
+output cyclo.provider.v1.Provider provider

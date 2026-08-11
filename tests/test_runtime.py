@@ -174,17 +174,44 @@ def test_gateway_only_runtime_does_not_parse_malformed_host_configuration(
         dcomp=dcomp,  # type: ignore[arg-type]
         images=NoImages(),  # type: ignore[arg-type]
     )
-    selected.build_gateway = lambda **_options: image("a")  # type: ignore[method-assign]
+    selected.build_gateway = (  # type: ignore[method-assign]
+        lambda **_options: image("a")
+    )
 
     assert selected.status() is observed
     assert selected.apply_gateway().status is observed
-    assert dcomp.calls == ["status", "check", "status", "up", "status"]
+    assert dcomp.calls == ["status", "check", "up", "status"]
 
     with pytest.raises(CycloError, match="expected provider"):
         selected.host
 
 
-def test_provider_graph_compiles_direct_interface_links(tmp_path: Path) -> None:
+def test_apply_delegates_pending_operation_recovery_to_dcomp_up(
+    tmp_path: Path,
+) -> None:
+    observed = status(
+        component_status("gateway", status="created", health="none"),
+        operation="apply",
+        phase="start",
+    )
+    dcomp = AppliedDComp(observed)
+    selected = CycloRuntime(
+        StateStore(tmp_path / "state"),
+        tmp_path / "host.conf",
+        dcomp=dcomp,  # type: ignore[arg-type]
+        images=NoImages(),  # type: ignore[arg-type]
+    )
+    selected.build_gateway = (  # type: ignore[method-assign]
+        lambda **_options: image("a")
+    )
+
+    assert selected.apply_gateway().status is observed
+    assert dcomp.calls == ["check", "up", "status"]
+
+
+def test_provider_graph_and_openai_edge_compile_direct_interface_links(
+    tmp_path: Path,
+) -> None:
     for name in ("first", "second"):
         source = tmp_path / name
         source.mkdir()
@@ -205,6 +232,7 @@ def test_provider_graph_compiles_direct_interface_links(tmp_path: Path) -> None:
             (
                 f"provider first {tmp_path / 'first'} upstream=gateway.provider",
                 f"provider second {tmp_path / 'second'} upstream=first.provider",
+                "component openai bind=0.0.0.0 port=18080",
                 "",
             )
         ),
@@ -214,6 +242,7 @@ def test_provider_graph_compiles_direct_interface_links(tmp_path: Path) -> None:
         SimpleNamespace(
             gateway=image("a"),
             providers={"first": image("b"), "second": image("c")},
+            components={"openai": image("d")},
         ),
         (),
     )
@@ -221,6 +250,7 @@ def test_provider_graph_compiles_direct_interface_links(tmp_path: Path) -> None:
     assert [(link.consumer, link.provider) for link in system.links] == [
         ("first", "gateway"),
         ("second", "first"),
+        ("openai", "second"),
     ]
     first = next(item for item in system.components if item.name == "first")
     second = next(item for item in system.components if item.name == "second")
@@ -228,6 +258,102 @@ def test_provider_graph_compiles_direct_interface_links(tmp_path: Path) -> None:
     assert first.ports == ()
     assert second.egress
     assert second.ports[0].container_port == 50051
+    openai = next(item for item in system.components if item.name == "openai")
+    assert openai.inputs[0].name == "provider"
+    assert openai.outputs == ()
+    assert openai.egress
+    assert openai.ports[0].host_ip == "0.0.0.0"
+    assert openai.ports[0].host_port == 18080
+    assert openai.ports[0].container_port == 8080
+    system.validate()
+
+
+def test_build_host_includes_and_caches_declared_openai_image(
+    tmp_path: Path,
+) -> None:
+    selected = runtime(tmp_path, "component openai\n")
+    calls: list[str] = []
+    selected._bind_docker = lambda: None  # type: ignore[method-assign]
+    selected.prepare = lambda: None  # type: ignore[method-assign]
+    selected.build_gateway = lambda **_options: image("a")  # type: ignore[method-assign]
+    selected._host_component_image = (  # type: ignore[method-assign]
+        lambda configured: calls.append(configured.name) or image("b")
+    )
+
+    first = selected.build_host()
+    second = selected.build_host()
+    rebuilt = selected.build_host(rebuild=True)
+
+    assert set(first.components) == {"openai"}
+    assert second.components["openai"] is first.components["openai"]
+    assert rebuilt.components["openai"].id == image("b").id
+    assert calls == ["openai", "openai"]
+
+
+def test_bundled_pooler_compiles_as_an_intermediate_provider(
+    tmp_path: Path,
+) -> None:
+    selected = runtime(
+        tmp_path,
+        "provider pool pooler upstream=gateway.provider "
+        "-- account-a account-b\n",
+    )
+
+    system = selected.system(
+        SimpleNamespace(
+            gateway=image("a"),
+            providers={"pool": image("b")},
+            components={},
+        ),
+        (),
+    )
+
+    pool = next(item for item in system.components if item.name == "pool")
+    assert pool.arguments == ("account-a", "account-b")
+    assert pool.inputs[0].name == "upstream"
+    assert pool.outputs[0].name == "provider"
+    assert pool.egress
+    assert [(link.consumer, link.provider) for link in system.links] == [
+        ("pool", "gateway")
+    ]
+    system.validate()
+
+
+def test_host_component_and_persisted_team_are_merged_separately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = runtime(tmp_path, "component openai\n")
+    selected.dcomp.executable = str(tmp_path / "dcomp")
+    monkeypatch.setattr("cyclo.runtime.require_non_root_team_host", lambda: None)
+    monkeypatch.setattr(
+        "cyclo.state.local_docker_endpoint",
+        lambda: f"unix://{tmp_path / 'docker.sock'}",
+    )
+    persisted = instance(tmp_path)
+
+    system = selected.system(
+        SimpleNamespace(
+            gateway=image("a"),
+            providers={},
+            components={"openai": image("b")},
+        ),
+        (persisted,),
+    )
+
+    team = selected.component_for_instance(persisted.id)
+    assert [item.name for item in selected.host.components] == ["openai"]
+    assert selected.host.providers == ()
+    assert {item.name for item in system.components} == {
+        "gateway",
+        "openai",
+        team,
+    }
+    assert {(link.consumer, link.provider) for link in system.links} == {
+        ("openai", "gateway"),
+        (team, "gateway"),
+    }
+    system.validate()
 
 
 def test_host_root_cannot_become_team_container_root(

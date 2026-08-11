@@ -5,7 +5,7 @@
 Cyclo turns four kinds of operator-owned input into a running agentic system:
 
 - gateway credentials;
-- a host provider configuration;
+- a host component configuration;
 - Git-defined teams; and
 - project definitions with explicit filesystem authority.
 
@@ -25,7 +25,13 @@ One Cyclo installation contains these runtime component classes:
 | --- | --- | --- |
 | Gateway | Provider login, credential refresh, native upstream calls, model catalogue, usage ledger | Gateway credential volume |
 | Intermediate Provider | Transform, route, filter, pool, or observe Provider traffic | Only its declared volumes, if any |
+| OpenAI edge | Standalone OpenAI Responses HTTP endpoint consuming one Provider | None |
 | Team | AgentWS workers, Pi, project tools, read-only AgentWS viewer | Its queue and Pi directories |
+
+The OpenAI edge is independently deployable and is not embedded in a team. It
+is added only when `host.conf` contains `component openai`. Cyclo then links
+its Provider input to the outer Provider and explicitly publishes its HTTP port
+on the configured host IPv4 address, which defaults to loopback.
 
 The host also runs two short-lived programs:
 
@@ -47,8 +53,9 @@ The canonical Cyclo state root produces a stable installation identifier and a
 single DComp system named `cyclo-<installation-id>`. Every apply compiles:
 
 1. the fixed gateway;
-2. every Provider component declared by the selected `host.conf`; and
-3. every persisted team instance whose intent is `running`.
+2. every Provider component declared by the selected `host.conf`;
+3. every standalone component declared by `host.conf`; and
+4. every persisted team instance whose intent is `running`.
 
 All active teams therefore share one declared provider stack but retain
 independent component containers, queues, Pi state, project mounts, and
@@ -65,12 +72,16 @@ dashboard ports.
 │ credentials │    link     │    A     │    link     │ outer    │
 └─────────────┘              └──────────┘              └────┬─────┘
                                                            │
-                                    one private link/team   │
-                                  ┌─────────────────────────┼─────┐
-                                  v                         v     v
-                              ┌────────┐                ┌────────┐
-                              │ team 1 │                │ team 2 │
-                              └────────┘                └────────┘
+                          ┌────────────────────────────────┼──────────────┐
+                          │ one private link/team           │              │
+                          v                                 v              v
+                     ┌────────┐                        ┌────────┐    ┌──────────┐
+                     │ team 1 │                        │ team 2 │    │ OpenAI   │
+                     └────────┘                        └────────┘    │ HTTP edge│
+                                                                  └────┬─────┘
+                                                                       │
+                                                    configured IPv4:port
+                                                   (127.0.0.1:8080 default)
 ```
 
 Arrows represent interface address bindings, not lifecycle dependencies.
@@ -83,10 +94,12 @@ No file is a universal configuration database.
 
 ### Host configuration
 
-`host.conf` installs intermediate Provider components:
+`host.conf` installs intermediate Provider components and enables bundled
+terminal host components:
 
 ```text
 provider NAME SOURCE [context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...]
+component openai [bind=IPV4] [port=PORT]
 ```
 
 The implicit installation reads `/etc/cyclo/host.conf`; an explicit
@@ -98,6 +111,19 @@ The gateway is implicit and always exposes `gateway.provider`. An empty file
 uses it directly. Every provider input must be bound exactly once. All
 declarations are collected before bindings are resolved, so a target may be
 declared earlier or later. The last provider declaration is the outer Provider.
+
+`pooler` is the packaged Provider source token. Cyclo resolves it
+inside the installed components build root; provider-wide arguments create one
+virtual model for each local ID shared by selected account prefixes, while
+exact-model arguments create one named virtual model. The component remains in
+the ordinary Provider chain and receives no credentials.
+
+`component openai` does not add another Provider to that chain. It adds one
+terminal HTTP component, links its `provider` input to the outer Provider, and
+publishes container port 8080 as `127.0.0.1:8080` by default. The optional
+`bind` setting selects a literal host IPv4 address, and `port` selects the host
+port. Setting `bind=0.0.0.0` makes the API reachable on every host IPv4
+interface and therefore requires an appropriate trusted network boundary.
 
 ### Component descriptor
 
@@ -173,8 +199,9 @@ Cyclo writes the current components as content-addressed descriptor directories
 below `STATE_ROOT/system/descriptors/`, atomically replaces
 `STATE_ROOT/system/system.dcomp`, and removes descriptors that the selected
 file no longer references. It keeps no history of generated systems. Cyclo
-validates the selected file with `dcomp check`, resumes an unfinished DComp
-operation when necessary, and invokes `dcomp up`.
+validates the selected file with `dcomp check` and invokes `dcomp up`. DComp
+resumes an unfinished matching target or safely supersedes it when the newly
+resolved target differs.
 
 DComp retains unchanged component instances and replaces only components whose
 resolved definition changed.
@@ -300,6 +327,9 @@ does not parse Cyclo instance records or project/team definitions.
 
 Cyclo instance records contain domain intent and immutable image IDs. They do
 not contain container IDs, network IDs, or a second lifecycle state machine.
+They are created by `cyclo run` under
+`STATE_ROOT/instances/INSTANCE/run.json`; team instances are not host
+configuration entries.
 
 ## Operations
 
@@ -348,7 +378,9 @@ Cyclo enforces these boundaries before emitting DComp binds:
 - initial launch rechecks bind-source device/inode identity after validation;
 - every later apply revalidates persisted mount authority;
 - team containers receive no Docker socket or gateway volume;
-- provider links are private networks with only their two endpoints; and
+- provider links are private networks with only their two endpoints;
+- the bundled OpenAI edge defaults to host loopback and requires an explicit
+  `host.conf` setting for a wider bind; and
 - credentials remain in the gateway volume.
 
 Team Dockerfiles and provider Dockerfiles execute through the trusted Docker

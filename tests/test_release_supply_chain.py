@@ -23,6 +23,8 @@ SHIPPED_NODE_PACKAGES = (
     "protocol/provider",
     "gateway",
     "passthrough",
+    "pooler",
+    "openai",
     "team/pi",
     "team",
 )
@@ -159,9 +161,9 @@ def test_every_shipped_component_has_a_pinned_lock_and_declaration() -> None:
         assert lock["lockfileVersion"] == 3
         assert (package / "package.json").is_file()
         assert_registry_artifacts_are_integrity_pinned(lock_path, lock)
-        if name in {"gateway", "passthrough", "team"}:
+        if name in {"gateway", "passthrough", "pooler", "openai", "team"}:
             assert (package / "Dockerfile").is_file()
-        if name in {"gateway", "passthrough"}:
+        if name in {"gateway", "passthrough", "pooler", "openai"}:
             assert (package / "component.conf").is_file()
 
 
@@ -170,7 +172,7 @@ def test_local_protocol_dependencies_match_source_and_image_layouts() -> None:
         "@cyclo/component": "file:../protocol/component",
         "@cyclo/provider": "file:../protocol/provider",
     }
-    for name in ("gateway", "passthrough"):
+    for name in ("gateway", "passthrough", "pooler", "openai"):
         package = json.loads(
             (COMPONENTS / name / "package.json").read_text(encoding="utf-8")
         )
@@ -187,7 +189,7 @@ def test_local_protocol_dependencies_match_source_and_image_layouts() -> None:
         "@cyclo/provider": "file:../../protocol/provider",
     }
 
-    for name in ("gateway", "passthrough", "team"):
+    for name in ("gateway", "passthrough", "pooler", "openai", "team"):
         dockerfile = (COMPONENTS / name / "Dockerfile").read_text(encoding="utf-8")
         assert "protocol/component/package.json" in dockerfile
         assert "./protocol/component/" in dockerfile
@@ -227,14 +229,15 @@ def test_ci_uses_and_tests_the_current_component_layout() -> None:
     assert "src/cyclo/_bundle" not in ci
     assert (
         "for package in components/protocol/component components/protocol/provider "
-        "components/gateway components/passthrough components/team/pi; do"
+        "components/gateway components/passthrough components/pooler "
+        "components/openai components/team/pi; do"
     ) in ci
     assert 'npm test --prefix "src/cyclo/$package"' in ci
     assert "python3 tools/dependency-audit" in ci
     assert '"$source_tree/tools/dependency-audit"' in release
     assert "npm audit" not in ci
     assert "npm audit" not in release
-    for component in ("team", "gateway", "passthrough"):
+    for component in ("team", "gateway", "passthrough", "pooler", "openai"):
         assert f"src/cyclo/components/{component}/Dockerfile" in ci
     assert re.search(
         r"--file src/cyclo/components/team/Dockerfile \\\n\s+src/cyclo/components\n",

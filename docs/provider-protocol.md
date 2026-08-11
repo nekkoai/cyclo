@@ -7,7 +7,8 @@ Cyclo separates component wiring from application semantics:
 - DComp declares component inputs and outputs, creates direct link networks,
   injects endpoint addresses, and owns Docker lifecycle.
 - Cyclo defines the `cyclo.provider.v1.Provider` application interface and
-  compiles gateway, provider, and team components into one DComp system.
+  compiles gateway, provider, terminal edge, and team components into one
+  DComp system.
 - Provider implementations decide what transformation or policy to apply.
 
 DComp does not inspect Provider messages. Cyclo does not proxy inference
@@ -23,7 +24,7 @@ input cyclo.provider.v1.Provider upstream
 output cyclo.provider.v1.Provider provider
 ```
 
-The grammar is:
+The Provider-declaration grammar is:
 
 ```text
 docker IMAGE
@@ -44,6 +45,11 @@ must already be present in the selected local Docker Engine. The image must
 define an OCI health check and listen for its declared interfaces on TCP port
 50051.
 
+Cyclo also recognizes the source token `pooler`. It resolves to Cyclo's
+installed pooler source and uses the installed components directory as its
+fixed Docker build context. A `context=PATH` override on that bundled source is
+rejected.
+
 ## Host installation
 
 Install component instances in `host.conf`:
@@ -61,6 +67,7 @@ provider NAME SOURCE [context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...]
 
 - `gateway.provider` is the fixed root output.
 - Relative source paths resolve beside `host.conf`; `~` is not expanded.
+- `pooler` selects the packaged pooler source.
 - `context=PATH` selects a Docker build context containing `SOURCE`.
 - Each `INPUT` must name an input from the source descriptor.
 - Each target must name a declared output with the same service identity.
@@ -74,6 +81,32 @@ provider NAME SOURCE [context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...]
 
 Declaration order selects the outer endpoint; it does not define startup order.
 DComp links are address bindings, not dependency edges.
+Standalone `component` directives may coexist in `host.conf`; they are not
+Provider declarations and do not participate in outer-Provider selection.
+
+### Bundled pooler
+
+Provider-wide mode takes at least two gateway provider prefixes:
+
+```text
+provider pool pooler upstream=gateway.provider -- account-a account-b
+```
+
+It preserves the upstream catalogue and adds `pool/LOCAL_MODEL` for each local
+model ID advertised by at least two selected providers. Exact-model mode takes
+at least two public model IDs and a final output name:
+
+```text
+provider pool pooler upstream=gateway.provider -- account-a/model account-b/model model=balanced
+```
+
+Members of a virtual model must have compatible inference format,
+capabilities, and extensions. The virtual limits are the conservative minima.
+The pooler may move an inference request only after typed
+`RESOURCE_EXHAUSTED(retry_at)` arrives before the first response. Once any
+response has been emitted, and for malformed or ambiguous failures, it
+propagates the result without replay. It holds no credentials and treats
+payload strings as opaque.
 
 ## Runtime links
 
