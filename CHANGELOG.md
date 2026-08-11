@@ -2,6 +2,20 @@
 
 All notable changes to Cyclo are documented in this file.
 
+## [0.2.4] - 2026-08-11
+
+Cyclo 0.2.4 restores interactive OAuth login compatibility with the pinned Pi
+authentication contract.
+
+### Gateway authentication
+
+- Always supply a concrete cancellation signal when the gateway invokes a
+  provider-level OAuth login directly. This prevents OpenAI Codex device-code
+  polling from dereferencing an absent signal after displaying the one-time
+  code and covers other OAuth providers that require the normalized contract.
+- Add a regression test at the gateway-to-provider login boundary so future Pi
+  upgrades cannot silently reintroduce an interaction without cancellation.
+
 ## [0.2.3] - 2026-08-11
 
 Cyclo 0.2.3 adds composable account pooling and a standalone OpenAI Responses

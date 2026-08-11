@@ -4,8 +4,13 @@ export function createAuthInteraction({ ask, askSecret = ask, write = console.lo
   if (typeof ask !== "function" || typeof askSecret !== "function" || typeof write !== "function") {
     throw new TypeError("OAuth interaction requires ask, askSecret, and write functions");
   }
+  // Pi's public AuthInteraction accepts an optional signal, but provider login
+  // implementations receive its normalized ProviderAuthInteraction where the
+  // signal is required.  The gateway dispatches to provider login directly, so
+  // it owns that normalization instead of relying on Pi's Models.login wrapper.
+  const operationSignal = signal ?? new AbortController().signal;
   return Object.freeze({
-    ...(signal === undefined ? {} : { signal }),
+    signal: operationSignal,
     async prompt(prompt) {
       if (!prompt || typeof prompt !== "object") {
         throw new Error("OAuth provider emitted an invalid prompt");

@@ -192,6 +192,7 @@ test("OAuth interaction implements the pi-ai selection prompt", async () => {
     ask: async () => "2",
     write() {},
   });
+  assert.equal(interaction.signal.aborted, false);
   assert.equal(typeof interaction.prompt, "function");
   assert.equal(await interaction.prompt({
     type: "select",
@@ -201,6 +202,45 @@ test("OAuth interaction implements the pi-ai selection prompt", async () => {
       { id: "two", label: "Two" },
     ],
   }), "two");
+});
+
+test("OAuth login supplies the provider-level cancellation signal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "cyclo-gateway-oauth-signal-"));
+  const path = join(directory, "auth.json");
+  const provider = {
+    ...fakeProvider("openai-codex"),
+    auth: {
+      oauth: {
+        async login(interaction) {
+          // OpenAI device-code polling reads this immediately after displaying
+          // the one-time code.  This reproduces the real provider contract.
+          assert.equal(interaction.signal.aborted, false);
+          interaction.notify({
+            type: "device_code",
+            verificationUri: "https://auth.openai.com/codex/device",
+            userCode: "TEST-CODE",
+          });
+          return {
+            access: "oauth-access",
+            refresh: "oauth-refresh",
+            expires: Date.now() + 3_600_000,
+          };
+        },
+      },
+    },
+  };
+  try {
+    await login(["openai-codex", "--as", "work"], {
+      env: { CYCLO_GATEWAY_AUTH_JSON: path },
+      output: new PassThrough(),
+      providers: [provider],
+      getProvider: (id) => id === provider.id ? provider : undefined,
+      getApiProvider: apiProvider,
+    });
+    assert.equal(JSON.parse(await readFile(path, "utf8")).work.type, "oauth");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("OAuth interaction stops before Pi dispatch when selection is cancelled", async () => {

@@ -1,4 +1,4 @@
-<img src="docs/assets/banner.svg" alt="cyclo — Agentic systems, in a Git loop. A local-first agent runtime. V0.2.3, MIT, Linux, Python 3.10+, DComp." width="100%">
+<img src="docs/assets/banner.svg" alt="cyclo — Agentic systems, in a Git loop. A local-first agent runtime. V0.2.4, MIT, Linux, Python 3.10+, DComp." width="100%">
 
 Cyclo runs Git-defined agent teams against explicitly mounted projects. A
 credential gateway owns provider logins, optional provider components transform
