@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,20 @@ def test_materializes_one_deterministic_dcomp_system(tmp_path: Path) -> None:
     assert "link team-core-et.provider gateway.provider" in text
     assert str(project) in text
     assert len(tuple((state / "dcomp" / "descriptors").iterdir())) == 2
+
+
+def test_materialization_does_not_rewrite_existing_access_mode(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "generated"
+    root.mkdir()
+    root.chmod(0o731)
+    materializer = Materializer(root)
+    system = System("demo", (Component("gateway", "gateway:1"),), ())
+
+    materializer.materialize(system)
+
+    assert stat.S_IMODE(root.stat().st_mode) == 0o731
 
 
 def test_materializer_keeps_only_the_selected_component_descriptors(

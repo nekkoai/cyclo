@@ -166,6 +166,56 @@ def test_api_key_environment_is_passed_only_on_stdin() -> None:
     assert "private" not in repr(calls[0][0])
 
 
+@pytest.mark.parametrize(
+    ("method", "arguments", "command"),
+    (
+        ("logout", ("work",), ("logout", "work")),
+        ("rename", ("work", "personal"), ("rename", "work", "personal")),
+    ),
+)
+def test_account_mutation_uses_private_store_and_restarts_only_gateway(
+    method: str,
+    arguments: tuple[str, ...],
+    command: tuple[str, ...],
+) -> None:
+    runtime = FakeRuntime(status(component()))
+    admin = GatewayAdmin(runtime)  # type: ignore[arg-type]
+
+    getattr(admin, method)(*arguments)
+
+    run = next(call for call in runtime.images.calls if call[0][0] == "run")
+    docker_arguments, options = run
+    assert docker_arguments[docker_arguments.index("--network") + 1] == "none"
+    assert docker_arguments[docker_arguments.index("--mount") + 1] == (
+        f"type=volume,src={VOLUME_NAME},dst=/var/lib/cyclo-gateway"
+    )
+    assert docker_arguments[-len(command) :] == list(command)
+    assert "--interactive" not in docker_arguments
+    assert options["capture"] is False
+    assert runtime.dcomp.calls == [
+        ("volume", "cyclo-test", "gateway", "credentials"),
+        ("restart", "cyclo-test", "gateway"),
+    ]
+    assert runtime.apply_gateway_calls == 0
+
+
+def test_failed_account_mutation_does_not_restart_gateway() -> None:
+    runtime = FakeRuntime(status(component()))
+    admin = GatewayAdmin(runtime)  # type: ignore[arg-type]
+
+    def fail(*_args, **_options):
+        raise CycloError("gateway logout failed with status 1")
+
+    admin._tool = fail  # type: ignore[method-assign]
+
+    with pytest.raises(CycloError, match="gateway logout failed"):
+        admin.logout("work")
+
+    assert runtime.dcomp.calls == [
+        ("volume", "cyclo-test", "gateway", "credentials")
+    ]
+
+
 def test_prepare_store_applies_only_gateway_for_fresh_installation() -> None:
     runtime = FakeRuntime(status(desired=False))
     admin = GatewayAdmin(runtime)  # type: ignore[arg-type]
@@ -392,8 +442,14 @@ def test_gateway_administration_ignores_malformed_provider_configuration(
     assert admin.usage() == {}
     admin.restart()
     admin.login(("openai", "--api-key-stdin"))
+    admin.logout("openai")
+    admin.rename("work", "personal")
     assert dcomp.calls == [
         ("volume", runtime.name, "gateway", "credentials"),
+        ("volume", runtime.name, "gateway", "credentials"),
+        ("restart", runtime.name, "gateway"),
+        ("volume", runtime.name, "gateway", "credentials"),
+        ("restart", runtime.name, "gateway"),
         ("volume", runtime.name, "gateway", "credentials"),
         ("restart", runtime.name, "gateway"),
         ("volume", runtime.name, "gateway", "credentials"),

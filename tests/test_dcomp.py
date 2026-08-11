@@ -519,6 +519,77 @@ def test_status_command_error_does_not_masquerade_as_degraded_state(
         client.status("cyclo-test")
 
 
+def test_failed_operation_surfaces_terminal_error_without_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_discovery(monkeypatch)
+    calls = 0
+
+    def run(command: list[str], **_options: object):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(command, 0, VERSION, "")
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            "",
+            "created network component/service\n"
+            "started component gateway\n"
+            "error: start service: runtime rejected request\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    client = DCompClient(
+        StateStore(tmp_path / "state"),
+        environment={"PATH": "/bin"},
+    )
+
+    with pytest.raises(CycloError) as failure:
+        client.up(tmp_path / "system.dcomp")
+
+    assert str(failure.value) == (
+        "dcomp up failed with status 1:\n"
+        "  start service: runtime rejected request"
+    )
+
+
+def test_failed_operation_preserves_unmarked_multiline_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_discovery(monkeypatch)
+    calls = 0
+
+    def run(command: list[str], **_options: object):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(command, 0, VERSION, "")
+        return subprocess.CompletedProcess(
+            command,
+            2,
+            "",
+            "bad configuration\nwith context\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    client = DCompClient(
+        StateStore(tmp_path / "state"),
+        environment={"PATH": "/bin"},
+    )
+
+    with pytest.raises(CycloError) as failure:
+        client.check(tmp_path / "system.dcomp")
+
+    assert str(failure.value) == (
+        "dcomp check failed with status 2:\n"
+        "  bad configuration\n"
+        "  with context"
+    )
+
+
 @pytest.mark.parametrize("failure", ("exit", "missing", "os-error", "invalid"))
 def test_subprocess_failures_are_cyclo_errors(
     failure: str,

@@ -4,6 +4,7 @@ import fcntl
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import time
 from pathlib import Path

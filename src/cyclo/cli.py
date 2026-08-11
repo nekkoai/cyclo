@@ -17,6 +17,7 @@ from .dcomp import DCompComponentStatus, DCompStatus
 from .errors import CycloError
 from .gateway_admin import GatewayAdmin
 from .host import load_host
+from .installation import SYSTEM_HOST_CONFIG, local_state_root
 from .project import (
     ProjectDefinition,
     ProjectTeam,
@@ -52,7 +53,7 @@ from .team.resources import packaged_agentws_runtime
 from .team.templates import bundled_team_template_names
 
 
-DEFAULT_HOST_CONFIG = Path("/etc/cyclo/host.conf")
+DEFAULT_HOST_CONFIG = SYSTEM_HOST_CONFIG
 DEFAULT_AGENTWS_HOST = "127.0.0.1"
 DEFAULT_DASHBOARD_HOST = "127.0.0.1"
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -79,11 +80,24 @@ class _Progress:
 
 
 def state_store(args: argparse.Namespace) -> StateStore:
-    selected = args.state_root
+    selected = getattr(args, "state_root", None)
+    local = bool(getattr(args, "local", False))
+    if local and selected:
+        raise CycloError(
+            "--local cannot be combined with --state-root or CYCLO_STATE_ROOT"
+        )
+    if local:
+        return StateStore(
+            local_state_root(),
+            requested_host_config_scope="local",
+            shared=False,
+            allow_legacy_scope_migration=True,
+        )
     root = Path(selected).expanduser().resolve() if selected else None
     return StateStore(
         root,
         requested_host_config_scope="local" if selected else "system",
+        shared=False if selected else True,
     )
 
 
@@ -92,7 +106,7 @@ def host_config(store: StateStore) -> Path:
         return DEFAULT_HOST_CONFIG
     if store.host_config_scope == "local":
         return store.root / "host.conf"
-    raise CycloError("Cyclo installation has no host configuration scope")
+    raise CycloError("Cyclo realm has no host configuration scope")
 
 
 def cyclo_runtime(
@@ -1077,6 +1091,14 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         with store.locked():
             admin.login(_gateway_login_arguments(args))
         return 0
+    if action == "logout":
+        with store.locked():
+            admin.logout(args.account)
+        return 0
+    if action == "rename":
+        with store.locked():
+            admin.rename(args.account, args.new_account)
+        return 0
     if action == "status":
         status = runtime.status()
         _print_table(
@@ -1237,12 +1259,20 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
 
 def add_common_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
         "--state-root",
         default=os.environ.get("CYCLO_STATE_ROOT"),
         help=(
-            "Cyclo installation directory; explicit roots use "
-            "STATE_ROOT/host.conf, otherwise /etc/cyclo/host.conf"
+            "private Cyclo realm directory using STATE_ROOT/host.conf"
+        ),
+    )
+    selection.add_argument(
+        "--local",
+        action="store_true",
+        help=(
+            "use the current user's private XDG realm and its host.conf "
+            "instead of the shared host realm"
         ),
     )
 
@@ -1254,7 +1284,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Everyday:  validate, run, start, stop, ps, inspect, logs, task\n"
             "Authoring: team, project\n"
-            "Host:      models, usage, component, gateway, providers, doctor"
+            "System:    models, usage, component, gateway, providers, doctor"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1512,6 +1542,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="read API key from standard input",
     )
     login.set_defaults(func=cmd_gateway)
+    logout = gateway_commands.add_parser(
+        "logout",
+        help="remove one locally stored gateway account",
+    )
+    logout.add_argument("account")
+    logout.set_defaults(func=cmd_gateway)
+    rename = gateway_commands.add_parser(
+        "rename",
+        help="change the public name of a stored gateway account",
+    )
+    rename.add_argument("account", metavar="OLD_ACCOUNT")
+    rename.add_argument("new_account", metavar="NEW_ACCOUNT")
+    rename.set_defaults(func=cmd_gateway)
     for action, help_text in (
         ("status", "show gateway status"),
         ("restart", "restart the gateway component"),
@@ -1555,6 +1598,8 @@ def _normalize_global_options(argv: list[str]) -> list[str]:
                 break
             global_options.append(argv[index])
         elif argument.startswith("--state-root="):
+            global_options.append(argument)
+        elif argument == "--local":
             global_options.append(argument)
         else:
             remaining.append(argument)

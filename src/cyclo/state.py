@@ -15,7 +15,7 @@ from typing import Iterable, Iterator
 
 from .docker_endpoint import local_docker_endpoint
 from .errors import CycloError
-from .installation import installation_id
+from .installation import SYSTEM_STATE_ROOT, local_state_root, realm_id
 
 
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -29,8 +29,15 @@ def utc_now() -> str:
 
 
 def default_state_root() -> Path:
-    base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return (base / "cyclo").resolve()
+    """Return the state root of the default shared host realm."""
+
+    return SYSTEM_STATE_ROOT
+
+
+def default_local_state_root() -> Path:
+    """Return the state root selected explicitly by ``cyclo --local``."""
+
+    return local_state_root()
 
 
 def slug(value: str, limit: int = 28) -> str:
@@ -192,7 +199,7 @@ class Instance:
 
 
 class StateStore:
-    """Private, durable Cyclo intent and AgentWS state.
+    """Durable Cyclo intent and AgentWS state for one host realm.
 
     DComp owns all container, network, and volume lifecycle state separately.
     """
@@ -202,19 +209,30 @@ class StateStore:
         root: Path | None = None,
         *,
         requested_host_config_scope: str | None = None,
+        shared: bool | None = None,
+        allow_legacy_scope_migration: bool = False,
     ) -> None:
+        implicit_root = root is None
         scope = requested_host_config_scope
         if scope is None:
-            scope = "local" if root is not None else "system"
+            scope = "local" if not implicit_root else "system"
         if scope not in HOST_CONFIG_SCOPES:
             raise CycloError("host configuration scope must be 'system' or 'local'")
         self.root = (root or default_state_root()).expanduser().resolve()
+        self.shared = implicit_root if shared is None else shared
+        if self.root == SYSTEM_STATE_ROOT.resolve() and not self.shared:
+            raise CycloError(
+                "/var/lib/cyclo is the shared host realm; do not select it "
+                "with --local or --state-root"
+            )
         self.instances_dir = self.root / "instances"
+        self.dcomp_root = self.root / "dcomp"
         self.lock_path = self.root / "control.lock"
         self.pending_batch_path = self.root / "pending-instance-batch.json"
         self.host_config_scope_path = self.root / "host-config.scope"
         self.docker_endpoint_path = self.root / "docker-endpoint"
         self._requested_host_config_scope = scope
+        self._allow_legacy_scope_migration = allow_legacy_scope_migration
         self._selected_host_config_scope: str | None = None
         self._docker_endpoint: str | None = None
         self._ensured = False
@@ -222,7 +240,7 @@ class StateStore:
 
     @property
     def system(self) -> str:
-        return installation_id(self.root)
+        return realm_id(self.root)
 
     @property
     def host_config_scope(self) -> str:
@@ -236,10 +254,13 @@ class StateStore:
                 persisted is not None
                 and persisted != self._requested_host_config_scope
             ):
-                raise CycloError(
-                    "Cyclo installation was initialized with another host "
-                    "configuration scope"
-                )
+                if self._can_migrate_host_config_scope(persisted):
+                    persisted = self._requested_host_config_scope
+                else:
+                    raise CycloError(
+                        "Cyclo realm was initialized with another host "
+                        "configuration scope"
+                    )
             self._selected_host_config_scope = (
                 persisted or self._requested_host_config_scope
             )
@@ -266,12 +287,12 @@ class StateStore:
         if persisted is not None:
             if persisted != selected:
                 raise CycloError(
-                    "Cyclo installation is bound to another Docker daemon: "
+                    "Cyclo realm is bound to another Docker daemon: "
                     f"{persisted}"
                 )
             return persisted
         self.ensure()
-        self._write_once(self.docker_endpoint_path, selected + "\n", mode=0o600)
+        self._write_once(self.docker_endpoint_path, selected + "\n")
         persisted = self._read_one_line(
             self.docker_endpoint_path,
             allowed=None,
@@ -279,7 +300,7 @@ class StateStore:
         )
         if persisted != selected:
             raise CycloError(
-                "Cyclo installation was concurrently bound to another Docker daemon"
+                "Cyclo realm was concurrently bound to another Docker daemon"
             )
         self._docker_endpoint = selected
         return selected
@@ -288,24 +309,25 @@ class StateStore:
         if self._ensured:
             return
         try:
-            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(self.root, 0o700)
-            for path in (self.instances_dir,):
-                if path.is_symlink():
-                    raise CycloError(
-                        f"refusing symlinked Cyclo state directory: {path}"
-                    )
-                path.mkdir(mode=0o700, exist_ok=True)
-                os.chmod(path, 0o700)
+            for path in (self.root, self.instances_dir, self.dcomp_root):
+                self.prepare_directory(path, "Cyclo state directory")
             self._sync_directory(self.instances_dir)
             self._sync_directory(self.root)
         except CycloError:
             raise
         except OSError as exc:
-            raise CycloError(
-                f"cannot prepare Cyclo state directory {self.root}: {exc}"
-            ) from exc
+            raise CycloError(f"cannot prepare Cyclo state {self.root}: {exc}") from exc
         self._ensured = True
+
+    def prepare_directory(self, path: Path, label: str) -> None:
+        """Create one state directory or use it exactly as the filesystem allows."""
+
+        if path.is_symlink():
+            raise CycloError(f"refusing symlinked {label}: {path}")
+        path.mkdir(parents=True, exist_ok=True)
+        metadata = path.stat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise CycloError(f"{label} is not a directory: {path}")
 
     @contextmanager
     def locked(
@@ -315,15 +337,32 @@ class StateStore:
         bind_host_config: bool = True,
     ) -> Iterator[None]:
         self.ensure()
+        descriptor = -1
+        stream = None
         try:
-            stream = self.lock_path.open("a+", encoding="utf-8")
-            os.chmod(self.lock_path, 0o600)
+            descriptor = os.open(
+                self.lock_path,
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o666,
+            )
+            stream = os.fdopen(descriptor, "a+", encoding="utf-8")
+            descriptor = -1
             flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
             fcntl.flock(stream.fileno(), flags)
         except BlockingIOError as exc:
+            if stream is not None:
+                stream.close()
             raise CycloError("Cyclo state is busy") from exc
         except OSError as exc:
+            if stream is not None:
+                stream.close()
             raise CycloError(f"cannot lock Cyclo state {self.lock_path}: {exc}") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         try:
             if bind_host_config:
                 self._bind_host_config_scope()
@@ -464,7 +503,7 @@ class StateStore:
             + "\n"
         ).encode("utf-8")
         try:
-            self._replace_file(self.pending_batch_path, content, mode=0o600)
+            self._replace_file(self.pending_batch_path, content)
             self._publish_instance_batch(documents)
             self.pending_batch_path.unlink()
             self._sync_directory(self.root)
@@ -523,8 +562,7 @@ class StateStore:
                         f"uncommitted Cyclo instance directory is not empty: "
                         f"{directory}"
                     )
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(directory, 0o700)
+            self.prepare_directory(directory, "Cyclo instance directory")
             content = (
                 json.dumps(
                     document,
@@ -534,7 +572,7 @@ class StateStore:
                 )
                 + "\n"
             ).encode("utf-8")
-            self._replace_file(metadata_path, content, mode=0o600)
+            self._replace_file(metadata_path, content)
             self._sync_directory(directory)
             self._sync_directory(self.instances_dir)
         except CycloError:
@@ -652,21 +690,36 @@ class StateStore:
             label="host configuration scope",
         )
         if persisted is None:
-            self._write_once(
-                self.host_config_scope_path,
-                selected + "\n",
-                mode=0o600,
-            )
+            self._write_once(self.host_config_scope_path, selected + "\n")
             persisted = self._read_one_line(
                 self.host_config_scope_path,
                 allowed={"system", "local"},
                 label="host configuration scope",
             )
         if persisted != selected:
-            raise CycloError(
-                "Cyclo installation was initialized with another host "
-                "configuration scope"
-            )
+            if self._can_migrate_host_config_scope(persisted):
+                self._replace_file(
+                    self.host_config_scope_path,
+                    (selected + "\n").encode("utf-8"),
+                )
+                persisted = self._read_one_line(
+                    self.host_config_scope_path,
+                    allowed={"system", "local"},
+                    label="host configuration scope",
+                )
+            if persisted != selected:
+                raise CycloError(
+                    "Cyclo realm was initialized with another host "
+                    "configuration scope"
+                )
+
+    def _can_migrate_host_config_scope(self, persisted: str) -> bool:
+        return (
+            self._allow_legacy_scope_migration
+            and not self.shared
+            and persisted == "system"
+            and self._requested_host_config_scope == "local"
+        )
 
     def _read_one_line(
         self,
@@ -687,7 +740,6 @@ class StateStore:
             metadata = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(metadata.st_mode)
-                or stat.S_IMODE(metadata.st_mode) & 0o077
                 or metadata.st_size > 4096
             ):
                 raise CycloError(f"invalid {label}: {path}")
@@ -710,13 +762,12 @@ class StateStore:
             raise CycloError(f"invalid {label}: {path}")
         return value
 
-    def _write_once(self, path: Path, text: str, *, mode: int) -> None:
+    def _write_once(self, path: Path, text: str) -> None:
         temporary = path.with_name(
             f".{path.name}.tmp.{os.getpid()}.{os.urandom(6).hex()}"
         )
         try:
             with temporary.open("x", encoding="utf-8") as stream:
-                os.chmod(temporary, mode)
                 stream.write(text)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -726,7 +777,7 @@ class StateStore:
                 return
             self._sync_directory(path.parent)
         except OSError as exc:
-            raise CycloError(f"cannot publish private state file {path}: {exc}") from exc
+            raise CycloError(f"cannot publish state file {path}: {exc}") from exc
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -752,7 +803,7 @@ class StateStore:
             raise CycloError("metadata is not a JSON object")
         return data
 
-    def _replace_file(self, path: Path, content: bytes, *, mode: int) -> None:
+    def _replace_file(self, path: Path, content: bytes) -> None:
         # Keep the temporary beside the instance directories, not inside a new
         # instance directory. If the host dies before the rename, inventory
         # still sees the instance directory as an unpublished empty entry.
@@ -762,7 +813,6 @@ class StateStore:
         )
         try:
             with temporary.open("xb") as stream:
-                os.chmod(temporary, mode)
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())

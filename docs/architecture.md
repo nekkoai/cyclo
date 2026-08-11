@@ -19,7 +19,7 @@ CLI nor DComp is in that data path.
 
 ## Components
 
-One Cyclo installation contains these runtime component classes:
+One Cyclo realm contains these runtime component classes:
 
 | Component | Responsibility | Persistent authority |
 | --- | --- | --- |
@@ -42,15 +42,15 @@ The host also runs two short-lived programs:
 
 DComp is an external executable. Cyclo discovers it through `CYCLO_DCOMP` or
 `PATH`, requires machine API version 1, and gives it
-`STATE_ROOT/dcomp` as its private state directory.
+`STATE_ROOT/dcomp` as its realm-scoped state directory.
 Docker resource names owned by DComp are opaque to Cyclo. Administrative code
 resolves the gateway's declared `credentials` volume through
 `dcomp volume --json`; it does not reproduce DComp's naming rules.
 
-## One installation-wide system
+## One realm-wide system
 
-The canonical Cyclo state root produces a stable installation identifier and a
-single DComp system named `cyclo-<installation-id>`. Every apply compiles:
+The canonical Cyclo state root produces a stable realm identifier and a single
+DComp system named `cyclo-<realm-id>`. Every apply compiles:
 
 1. the fixed gateway;
 2. every Provider component declared by the selected `host.conf`;
@@ -102,10 +102,17 @@ provider NAME SOURCE [context=PATH] INPUT=COMPONENT.OUTPUT ... [-- ARGUMENT ...]
 component openai [bind=IPV4] [port=PORT]
 ```
 
-The implicit installation reads `/etc/cyclo/host.conf`; an explicit
-`--state-root` or `CYCLO_STATE_ROOT` reads `STATE_ROOT/host.conf`. This scope is
-recorded when the installation is initialized and cannot later be changed for
-the same state root.
+The default realm combines `/etc/cyclo/host.conf` with state in
+`/var/lib/cyclo`. `--local` selects a self-contained private XDG realm for the
+current user. It, an explicit `--state-root`, and `CYCLO_STATE_ROOT` all read
+`STATE_ROOT/host.conf`; therefore configuration, gateway logins, teams, and
+runtime state stay in one realm.
+
+Host configuration selects the Provider and standalone-component plane. Team
+definitions and running/stopped intent are stored under the same realm's
+`instances/` tree, not in `host.conf`. Gateway accounts and usage live in that
+realm's gateway volume. Thus changing to a different `host.conf` necessarily
+changes the state root, gateway logins, teams, and DComp system.
 
 The gateway is implicit and always exposes `gateway.provider`. An empty file
 uses it directly. Every provider input must be bound exactly once. All
@@ -173,7 +180,7 @@ context describing the mounted projects.
 ## Builds and image identity
 
 Cyclo owns image construction; DComp deliberately does not build or pull
-images. Cyclo uses stable tags scoped by installation, component kind, Cyclo
+images. Cyclo uses stable tags scoped by realm, component kind, Cyclo
 version, and—where necessary—Provider or team identity.
 
 Whenever an operation needs a built host or team image, Cyclo invokes
@@ -288,7 +295,7 @@ AgentWS code is image content, not a host bind mount. A running team receives:
 /agentws/agents            durable writable agent state
 /agentws/project.cyclo     generated read-only project view
 /opt/cyclo/pi-settings.json generated read-only Pi settings template
-/home/cyclo/.pi            private writable Pi state
+/home/cyclo/.pi            realm-scoped writable Pi state
 /team                      team repository, ro or rw
 /workspace/<name>          each rw project mount
 /readonly/<name>           each ro supporting mount
@@ -306,9 +313,10 @@ mapped non-root identity. Task and explicit job creation mount a bounded,
 link-resistant snapshot staged under Cyclo state, never the live project path.
 
 The host must not be root. The base image is built for the invoking user's
-UID/GID; the entrypoint starts with image root only to select that identity.
+UID/GID. The entrypoint starts with image root only to select that identity.
 After dropping privilege it copies the immutable Pi settings template into the
-team's writable Pi state and executes the runtime.
+team's writable Pi state and executes the runtime. Filesystem access to mounted
+state is decided by the host rather than a Cyclo ownership or mode policy.
 
 ## State ownership
 
@@ -333,7 +341,7 @@ configuration entries.
 
 ## Operations
 
-Mutating Cyclo commands serialize through one installation lock. The important
+Mutating Cyclo commands serialize through one realm lock. The important
 operations are:
 
 - `run`: validate current project/team sources, ensure the provider system,
@@ -349,9 +357,10 @@ operations are:
 - `repair`: apply the current host configuration and persisted instance intent,
   running the required host Docker builds and resuming interrupted DComp work;
 - `models`: apply the system and query the outer Provider catalogue; and
-- `gateway login`: prepare only the fixed gateway/store boundary, update the
-  private store, and restart the gateway. It does not reconcile unrelated
-  Provider or team components.
+- `gateway login/logout/rename`: prepare only the fixed gateway/store boundary,
+  atomically update the private credential store, and restart the gateway. They
+  do not reconcile unrelated Provider or team components; logout is local
+  removal rather than provider-side revocation.
 
 `ps`, `inspect`, `logs`, generic component inspection/restart,
 `providers status`, `gateway status`, `doctor`, and the fleet dashboard inspect
@@ -366,8 +375,11 @@ non-operational until the configuration or component is fixed.
 ## Security architecture
 
 The trusted administrative domain is the host OS, Cyclo CLI, DComp executable
-and state, Docker daemon, operator-approved configuration, and image build
-inputs. The primary hostile workload is arbitrary code inside a team container.
+and state, Docker daemon, operator-approved configuration, image build inputs,
+and every host account granted access to the default realm's state. Such
+accounts can administer the same gateway accounts, Providers, teams, queues,
+and lifecycle.
+The primary hostile workload is arbitrary code inside a team container.
 
 Cyclo enforces these boundaries before emitting DComp binds:
 
@@ -398,5 +410,6 @@ loopback. A non-loopback deployment must use a trusted network boundary or
 authenticated reverse proxy.
 
 Separate state roots prevent accidental resource adoption and name collisions;
-they are not a security boundary against the trusted host or Docker
-administrator. Stronger tenant isolation requires separate OS or VM domains.
+they are not a security boundary against the trusted host, other accounts with
+realm access, or the Docker administrator. Stronger tenant isolation requires
+separate OS or VM domains.

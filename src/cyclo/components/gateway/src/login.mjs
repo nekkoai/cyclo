@@ -4,11 +4,11 @@ import { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
 import { getApiProvider } from "@earendil-works/pi-ai/compat";
-import { isProviderPrefix } from "@cyclo/provider/protocol";
 
 import { buildCatalogueForCredentials } from "./catalogue.mjs";
 import { createAuthInteraction } from "./oauth-ui.mjs";
 import { getPiProvider, getPiProviders } from "./pi-registry.mjs";
+import { routeName } from "./route-name.mjs";
 import { readJson, withFileLock, writeJsonAtomic } from "./store.mjs";
 
 export async function login(argv, options = {}) {
@@ -146,16 +146,6 @@ async function hiddenQuestion(input, output, prompt) {
     terminal.close();
     output.write("\n");
   }
-}
-
-function routeName(value, label) {
-  if (!isProviderPrefix(value)) {
-    throw new Error(
-      `${label} must start with a lowercase letter or number and use at most `
-      + "64 lowercase letters, numbers, underscores, or hyphens",
-    );
-  }
-  return value;
 }
 
 function requireValue(argv, index, flag) {

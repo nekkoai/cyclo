@@ -8,7 +8,7 @@ and lifecycle.
 
 ```text
 Dockerfile             common image
-entrypoint.sh          privilege drop and private Pi settings setup
+entrypoint.sh          privilege drop and realm-scoped Pi settings setup
 runtime.py             AgentWS supervisor and bounded shutdown
 agentws/               job loop, generic protocol, tools, roles, and viewer
 pi/                    in-process Pi-to-Provider adapter

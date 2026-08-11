@@ -78,6 +78,18 @@ export async function main(argv = process.argv.slice(2), options = {}) {
     await loginCommand(argv.slice(1), { env, input, output });
     return;
   }
+  if (command === "logout" && argv.length === 2) {
+    const logoutCommand = options.logout
+      ?? (await import("./accounts.mjs")).logout;
+    await logoutCommand(argv.slice(1), { env, output });
+    return;
+  }
+  if (command === "rename" && argv.length === 3) {
+    const renameCommand = options.rename
+      ?? (await import("./accounts.mjs")).rename;
+    await renameCommand(argv.slice(1), { env, output });
+    return;
+  }
   if (command === "providers" && argv.length === 1) {
     output.write(`${(options.formatProviders ?? formatSupportedProviders)()}\n`);
     return;
@@ -89,7 +101,8 @@ export async function main(argv = process.argv.slice(2), options = {}) {
     return;
   }
   throw new Error(
-    "usage: cyclo-gateway-component [providers | usage | login PROVIDER [OPTIONS]]",
+    "usage: cyclo-gateway-component [providers | usage | login PROVIDER [OPTIONS]"
+    + " | logout ACCOUNT | rename OLD_ACCOUNT NEW_ACCOUNT]",
   );
 }
 

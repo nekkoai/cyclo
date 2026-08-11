@@ -66,9 +66,35 @@ test("usage prints only the global audit report", async (t) => {
   assert.equal(Object.hasOwn(report, "by_team"), false);
 });
 
+test("account commands delegate only their exact account arguments", async () => {
+  const calls = [];
+  const output = capture();
+  const env = { CYCLO_GATEWAY_AUTH_JSON: "/private/auth.json" };
+
+  await main(["logout", "work"], {
+    env,
+    output,
+    logout: async (argv, options) => calls.push(["logout", argv, options]),
+  });
+  await main(["rename", "work", "personal"], {
+    env,
+    output,
+    rename: async (argv, options) => calls.push(["rename", argv, options]),
+  });
+
+  assert.deepEqual(calls, [
+    ["logout", ["work"], { env, output }],
+    ["rename", ["work", "personal"], { env, output }],
+  ]);
+});
+
 test("gateway informational commands reject trailing arguments", async () => {
   await assert.rejects(main(["providers", "extra"]), /usage:/u);
   await assert.rejects(main(["usage", "extra"]), /usage:/u);
+  await assert.rejects(main(["logout"]), /usage:/u);
+  await assert.rejects(main(["logout", "work", "extra"]), /usage:/u);
+  await assert.rejects(main(["rename", "work"]), /usage:/u);
+  await assert.rejects(main(["rename", "work", "new", "extra"]), /usage:/u);
   await assert.rejects(main(["serve"]), /usage:/u);
 });
 

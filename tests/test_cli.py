@@ -21,6 +21,7 @@ from cyclo.cli import (
     cmd_stop,
     cmd_task_add_job,
     cmd_task_run,
+    host_config,
     main,
     state_store,
 )
@@ -29,7 +30,7 @@ from cyclo.errors import CycloError
 
 
 def namespace(**values):
-    defaults = {"state_root": None}
+    defaults = {"state_root": None, "local": False}
     defaults.update(values)
     return SimpleNamespace(**defaults)
 
@@ -166,11 +167,20 @@ def test_cli_surface_has_declarative_provider_and_component_commands() -> None:
     )
     assert add_job.task_action == "add-job"
     assert add_job.role == "rtl"
+    logout = parser.parse_args(["gateway", "logout", "work"])
+    assert logout.gateway_action == "logout"
+    assert logout.account == "work"
+    rename = parser.parse_args(["gateway", "rename", "work", "personal"])
+    assert rename.gateway_action == "rename"
+    assert rename.account == "work"
+    assert rename.new_account == "personal"
 
     with pytest.raises(SystemExit):
         parser.parse_args(["providers", "start"])
     with pytest.raises(SystemExit):
         parser.parse_args(["component", "stop", "gateway"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["host", "init"])
 
 
 def test_global_state_root_is_accepted_after_subcommands(tmp_path: Path) -> None:
@@ -182,6 +192,18 @@ def test_global_state_root_is_accepted_after_subcommands(tmp_path: Path) -> None
     assert arguments[2:] == ["task", "list", "demo"]
 
 
+def test_global_local_mode_is_accepted_after_subcommands() -> None:
+    assert _normalize_global_options(["ps", "--local"]) == ["--local", "ps"]
+
+
+def test_default_cli_realm_is_shared_and_uses_system_configuration() -> None:
+    store = state_store(namespace())
+
+    assert store.root == Path("/var/lib/cyclo")
+    assert store.shared is True
+    assert store.host_config_scope == "system"
+
+
 def test_explicit_state_root_selects_local_host_configuration(
     tmp_path: Path,
 ) -> None:
@@ -189,6 +211,46 @@ def test_explicit_state_root_selects_local_host_configuration(
 
     assert store.root == tmp_path
     assert store.host_config_scope == "local"
+    assert store.shared is False
+
+
+def test_local_mode_selects_a_self_contained_private_xdg_realm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+
+    store = state_store(namespace(local=True))
+
+    assert store.root == (tmp_path / "cyclo").resolve()
+    assert store.host_config_scope == "local"
+    assert host_config(store) == store.root / "host.conf"
+    assert store.shared is False
+
+
+def test_local_mode_migrates_the_legacy_system_configuration_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    root = tmp_path / "cyclo"
+    root.mkdir(mode=0o700)
+    scope = root / "host-config.scope"
+    scope.write_text("system\n", encoding="utf-8")
+    scope.chmod(0o600)
+
+    store = state_store(namespace(local=True))
+
+    assert store.host_config_scope == "local"
+    assert host_config(store) == root / "host.conf"
+    with store.locked():
+        pass
+    assert scope.read_text(encoding="utf-8") == "local\n"
+
+
+def test_local_mode_rejects_an_environment_selected_state_root() -> None:
+    with pytest.raises(CycloError, match="--local cannot be combined"):
+        state_store(namespace(local=True, state_root="/tmp/another-realm"))
 
 
 def test_run_persists_intent_before_final_dcomp_apply(
@@ -723,6 +785,55 @@ def test_gateway_login_arguments_do_not_expand_secret_environment() -> None:
         "work",
         "--api-key-env",
         "OPENAI_SECRET",
+    ]
+
+
+def test_gateway_account_commands_dispatch_under_the_installation_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class Store(MemoryStore):
+        def locked(self, **_options):
+            class Lock:
+                def __enter__(self):
+                    calls.append(("lock",))
+
+                def __exit__(self, *_args):
+                    calls.append(("unlock",))
+
+            return Lock()
+
+    class Admin:
+        def __init__(self, _runtime):
+            pass
+
+        @staticmethod
+        def logout(account: str) -> None:
+            calls.append(("logout", account))
+
+        @staticmethod
+        def rename(account: str, new_account: str) -> None:
+            calls.append(("rename", account, new_account))
+
+    store = Store()
+    monkeypatch.setattr("cyclo.cli.state_store", lambda _args: store)
+    monkeypatch.setattr("cyclo.cli.cyclo_runtime", lambda _args, _store: object())
+    monkeypatch.setattr("cyclo.cli.GatewayAdmin", Admin)
+
+    assert cmd_gateway(namespace(gateway_action="logout", account="work")) == 0
+    assert cmd_gateway(namespace(
+        gateway_action="rename",
+        account="work",
+        new_account="personal",
+    )) == 0
+    assert calls == [
+        ("lock",),
+        ("logout", "work"),
+        ("unlock",),
+        ("lock",),
+        ("rename", "work", "personal"),
+        ("unlock",),
     ]
 
 

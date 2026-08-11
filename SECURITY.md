@@ -8,9 +8,10 @@ releases may be asked to upgrade instead of receiving a backport.
 
 ## Trust model
 
-A Cyclo installation treats these as one trusted administrative domain:
+A Cyclo realm treats these as one trusted administrative domain:
 
 - the host operating system and account running Cyclo;
+- every host account granted access to the default realm's state root;
 - the Cyclo package and state root;
 - the DComp executable and its state;
 - the selected local Docker daemon;
@@ -69,7 +70,7 @@ explicitly routed through it. It does not receive gateway credentials or
 unrelated link networks. Cyclo's transparent Provider transport does not
 provide semantic filtering, per-team quotas, or confidentiality from
 components on the selected path. Add an explicit policy component or use a
-separate installation when those controls are required.
+separate realm when those controls are required.
 
 The external model service necessarily receives data sent for inference.
 `--offline` prevents direct team egress; it does not make inference local.
@@ -105,7 +106,10 @@ self-modification.
 
 AgentWS code is baked into the image. Only task, job, and agent state
 directories are writable binds below `/agentws`; the generated
-`/agentws/project.cyclo` is read-only. Pi state is private to one instance.
+`/agentws/project.cyclo` is read-only. Pi state is scoped to one instance. In
+the default realm those mutable paths are available to the trusted operator
+group; private realms keep them owner-only. No team container receives another
+team's state binds.
 
 `cyclo task` uses allowlisted, one-shot AgentWS tools in the immutable team
 image. These containers have no network, project/team mounts, Pi state,
@@ -123,7 +127,7 @@ Provider and team Dockerfiles are trusted host programs. Running Cyclo may
 execute them through the Docker daemon before any runtime isolation exists.
 Review their source, base images, package installation, and build context.
 
-Cyclo runs Docker builds under stable installation/version tags, validates the
+Cyclo runs Docker builds under stable realm/version tags, validates the
 completed images, and gives DComp immutable image IDs. Docker owns context
 filtering and cache reuse. The immutable ID protects an applied runtime from a
 later tag change; it does not make an untrusted build recipe safe or prove
@@ -133,20 +137,26 @@ Cyclo refuses to build or run team workloads as host root. Its common team image
 maps the invoking UID/GID, starts through a fixed root entrypoint, and drops
 privileges before AgentWS starts.
 
-## State and installation boundaries
+## State and realm boundaries
 
 Cyclo owns domain intent, AgentWS queues, Pi state, and generated system files.
 DComp owns lifecycle state below `STATE_ROOT/dcomp` and Docker object
 reconciliation. Cyclo communicates with DComp only through machine API version
-1 and never parses DComp's private files.
+1 and never parses DComp-owned files.
 
-The first operation that needs Docker binds an installation to one canonical
+The first operation that needs Docker binds a realm to one canonical
 local Unix socket. Later attempts to select another endpoint fail. Remote
 Docker endpoints are unsupported.
 
 Different canonical state roots produce different DComp system and Docker
-resource names. This prevents accidental cross-installation adoption and name
-collision. It is not isolation from the shared host or Docker administrator.
+resource names. This prevents accidental cross-realm adoption and name
+collision. It is not isolation from the shared host, other authorized users, or
+Docker administrator.
+
+The default realm combines `/etc/cyclo/host.conf` with state in
+`/var/lib/cyclo`. Cyclo does not require or normalize an ownership, group, mode,
+or ACL policy for the realm root. Any account the host permits to use a realm
+is a full realm administrator, not a read-only observer.
 
 ## User interfaces
 
@@ -174,7 +184,7 @@ or Docker authority into teams:
 
 An extension receives exactly the Provider traffic and links assigned to it.
 Its existence is not itself a security guarantee; its implementation and
-configuration remain trusted installation inputs.
+configuration remain trusted realm inputs.
 
 ## Dependency audit policy
 

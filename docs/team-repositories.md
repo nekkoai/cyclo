@@ -108,7 +108,7 @@ A team component sees:
   agents/                durable writable bind
   project.cyclo          generated read-only bind
 /opt/cyclo/pi-settings.json generated read-only Pi settings template
-/home/cyclo/.pi          private writable Pi state
+/home/cyclo/.pi          instance-scoped writable Pi state
 /team                    selected team repository
 /workspace/NAME          each project `rw` mount
 /readonly/NAME           each project `ro` mount
@@ -136,7 +136,8 @@ state, host Pi configuration, or undeclared filesystem mount.
 AgentWS tasks, jobs, comments, results, retry state, and agent transcripts live
 under the Cyclo state root, not in the team repository or container writable
 layer. Replacing or stopping a DComp team component therefore does not discard
-work.
+work. Which host accounts can access any realm is determined by that realm's
+filesystem permissions and ACLs, not by Cyclo.
 
 Task operations are available from the host:
 
@@ -218,7 +219,7 @@ host-mapped `cyclo` UID/GID. It immediately drops privileges before executing
 the AgentWS runtime. Cyclo refuses team operations when the invoking host UID is
 zero.
 
-Cyclo gives the derived image a stable tag scoped by the installation, Cyclo
+Cyclo gives the derived image a stable tag scoped by the realm, Cyclo
 version, team name, and canonical team-repository identity. It invokes
 `docker build` with the repository as the real context and passes the common
 team tag as `CYCLO_TEAM_BASE`. Docker applies `.dockerignore` and decides

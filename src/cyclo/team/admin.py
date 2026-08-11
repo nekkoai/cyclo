@@ -115,12 +115,7 @@ class TaskAdmin:
         )
         try:
             for path in paths:
-                if path.is_symlink():
-                    raise CycloError(
-                        f"refusing symlinked AgentWS state directory: {path}"
-                    )
-                path.mkdir(mode=0o700, parents=True, exist_ok=True)
-                os.chmod(path, 0o700)
+                self.store.prepare_directory(path, "AgentWS state directory")
         except CycloError:
             raise
         except OSError as exc:

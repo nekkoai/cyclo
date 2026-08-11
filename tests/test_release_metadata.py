@@ -25,7 +25,7 @@ def test_distribution_keeps_the_cyclo_runtime_identity() -> None:
     project = project_metadata()
 
     assert project["name"] == "cyclo-agent"
-    assert project["version"] == cyclo.__version__ == "0.2.4"
+    assert project["version"] == cyclo.__version__ == "0.2.5"
     assert cyclo.__name__ == "cyclo"
     assert project["scripts"] == {"cyclo": "cyclo.cli:main"}
 
@@ -36,7 +36,7 @@ def test_distribution_keeps_the_cyclo_runtime_identity() -> None:
         text=True,
         env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
     )
-    assert result.stdout.strip() == "cyclo 0.2.4"
+    assert result.stdout.strip() == "cyclo 0.2.5"
 
 
 def test_release_metadata_is_stable() -> None:

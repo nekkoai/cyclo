@@ -39,7 +39,7 @@ cyclo project init /path/to/project.cyclo --context /path/to/context.md --team /
 ## Container view
 
 Each `team` line creates one durable Cyclo instance and one team component in
-the installation-wide DComp system. The example produces
+the realm-wide DComp system. The example produces
 `core-et-uart-jon-rtl` and `core-et-uart-rtl-auditor`.
 
 Each component has its own AgentWS queue, Pi state, team mount, Provider link,

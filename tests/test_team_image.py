@@ -92,7 +92,7 @@ def test_common_image_uses_the_team_component_context_once_per_builder(
     builder.build(selected)
 
     assert images.builds[0] == {
-        "reference": "cyclo-installation-team:0.2.4",
+        "reference": "cyclo-installation-team:0.2.5",
         "dockerfile": components / "team" / "Dockerfile",
         "context": components,
         "build_args": (("CYCLO_HOST_UID", "1234"), ("CYCLO_HOST_GID", "5678")),

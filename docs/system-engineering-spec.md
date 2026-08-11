@@ -63,16 +63,16 @@ installed as a service registry, proxy, sidecar, or data-plane daemon.
 After a successful apply, component traffic MUST travel directly between
 component containers. Cyclo and DComp MUST NOT be in the inference data path.
 
-### 2.3 One global composition
+### 2.3 One realm-wide composition
 
-One canonical Cyclo state root MUST correspond to exactly one installation-wide
+One canonical Cyclo state root MUST correspond to exactly one realm-wide
 DComp system. Its logical name is:
 
 ```text
-cyclo-<installation-id>
+cyclo-<realm-id>
 ```
 
-where `installation-id` is a stable digest of the canonical state-root path.
+where `realm-id` is a stable digest of the canonical state-root path.
 
 The complete desired system MUST contain:
 
@@ -91,6 +91,7 @@ each Provider or team through an independent lifecycle implementation.
 Cyclo assumes these are trusted together:
 
 - the host OS and account running Cyclo;
+- every host account granted access to the default realm's state root;
 - the Cyclo package and state root;
 - the DComp executable and its state;
 - the selected local Docker daemon;
@@ -107,42 +108,63 @@ they are the gateway itself.
 
 ### 3.2 Out-of-scope authority
 
-Cyclo does not defend against a compromised host account, root user, Docker
-administrator, DComp binary, or operator-approved Dockerfile. Stronger
-administrative isolation requires a separate OS or VM.
+Cyclo does not defend against a compromised host account with realm access,
+root user, Docker administrator, DComp binary, or operator-approved Dockerfile.
+Stronger administrative isolation requires a separate OS or VM.
 
 Separate Cyclo state roots prevent accidental resource collision and adoption.
 They are not a kernel or Docker-administrator security boundary.
 
-## 4. Installation selection
+## 4. Realm selection
 
 ### 4.1 State root
 
-Without `--state-root` or `CYCLO_STATE_ROOT`, Cyclo MUST use:
+Without `--local`, `--state-root`, or `CYCLO_STATE_ROOT`, Cyclo MUST use the
+shared host state root:
+
+```text
+/var/lib/cyclo
+```
+
+With `--local`, Cyclo MUST use the current user's private state root:
 
 ```text
 ${XDG_STATE_HOME:-$HOME/.local/state}/cyclo
 ```
 
+`--local` MUST be mutually exclusive with `--state-root` and
+`CYCLO_STATE_ROOT`.
+
 An explicitly selected state root MUST be made canonical before use.
 
 ### 4.2 Host configuration scope
 
-The implicit state root MUST read:
+The default shared realm MUST read:
 
 ```text
 /etc/cyclo/host.conf
 ```
 
-An explicit state root MUST read:
+The `--local` realm and an explicit state root MUST read:
 
 ```text
 STATE_ROOT/host.conf
 ```
 
-Cyclo MUST record whether an installation uses system or local host
-configuration. A later invocation requesting the other scope for the same state
-root MUST fail.
+The host configuration, gateway credential store, team inventory, and DComp
+state MUST therefore always be selected by the same canonical realm root.
+
+Cyclo MUST record whether a realm uses system or local host configuration. A
+later invocation requesting the other scope for the same state root MUST fail,
+except that `--local` MAY atomically migrate the conventional XDG root from a
+legacy `system` binding to `local`. That migration MUST NOT copy or continue to
+read `/etc/cyclo/host.conf`.
+
+The default realm MUST use `/etc/cyclo/host.conf` and `/var/lib/cyclo` without
+imposing an ownership, group, numeric-mode, or ACL policy. Cyclo MUST attempt
+the required filesystem operations and proceed when they succeed. An actual
+filesystem denial MUST be reported as an error. Cyclo MUST NOT reject a usable
+path merely because its metadata differs from a preferred access policy.
 
 A missing host configuration is equivalent to an empty file.
 
@@ -151,7 +173,7 @@ A missing host configuration is equivalent to an empty file.
 On the first operation requiring a Docker endpoint, Cyclo MUST resolve Docker's
 selected context to a canonical local Unix socket and persist that endpoint.
 
-All later Docker and DComp mutations for the installation MUST use the persisted
+All later Docker and DComp mutations for the realm MUST use the persisted
 endpoint. If the currently selected endpoint differs, Cyclo MUST fail.
 
 Cyclo MUST reject remote Docker schemes. It MUST NOT mount the Docker socket
@@ -194,7 +216,7 @@ logical identifiers to match the request, and treat the returned nonempty
 `name` as opaque. A nonzero exit or malformed response MUST fail the operation.
 Cyclo MUST NOT reproduce DComp's physical resource-naming rules.
 
-When the installation is bound to Docker, Cyclo MUST pass that endpoint through
+When the realm is bound to Docker, Cyclo MUST pass that endpoint through
 `DOCKER_HOST` and remove `DOCKER_CONTEXT` from the DComp environment.
 
 ## 5. Configuration formats
@@ -344,7 +366,7 @@ contexts.
 
 ### 6.2 Stable tags and native Docker builds
 
-Cyclo MUST use stable, installation-scoped tags for built images:
+Cyclo MUST use stable, realm-scoped tags for built images:
 
 ```text
 cyclo-INSTALLATION-gateway:VERSION
@@ -406,10 +428,11 @@ completed image MUST preserve:
 - the exact common-base identity label; and
 - a final configured user of root, `0`, or empty.
 
-The entrypoint MUST drop to the mapped non-root host UID/GID before writing any
+The entrypoint MUST drop to the mapped invoking UID/GID before writing any
 team-controlled path. Under that identity it MUST copy Cyclo's read-only Pi
-settings template into the team's private Pi state and then execute the team
-runtime. Cyclo MUST refuse team build or execution when the host UID is zero.
+settings template into the team's realm-scoped Pi state and then execute the
+team runtime. Cyclo MUST refuse team build or execution when the host UID is
+zero.
 A queue-only one-shot administration mode MAY skip Pi initialization, but only
 when Docker starts it directly as the mapped non-root identity and without
 receiving a Pi mount. Host UID zero MUST be rejected.
@@ -433,11 +456,11 @@ Before staging that snapshot, Cyclo MUST walk and open the host path without
 following any symlink, require a regular file, and enforce a fixed size bound.
 The one-shot container MUST NOT receive the original project path.
 
-The one-shot container MUST carry an installation ownership label so a later
+The one-shot container MUST carry a realm ownership label so a later
 serialized queue operation can remove an abandoned predecessor.
 
-Cyclo MUST build the common team image under its stable tag with the invoking
-host UID/GID as build arguments. A derived team image MUST use a stable tag
+Cyclo MUST build the common team image under its stable tag with the mapped host
+UID/GID as build arguments. A derived team image MUST use a stable tag
 that includes the canonical team-path identity, receive the common stable tag
 as `CYCLO_TEAM_BASE`, and record the exact common immutable image ID in its
 validated base-identity label.
@@ -506,7 +529,7 @@ MUST be flushed so a successful publication survives host failure.
 
 The apply sequence is:
 
-1. acquire the Cyclo installation lock;
+1. acquire the Cyclo realm lock;
 2. validate persisted running-instance mount authority;
 3. run the required host Docker builds;
 4. compile and atomically publish the complete DComp system;
@@ -622,19 +645,19 @@ replace, restart, or remove that service container.
 
 ### 10.2 One-shot tools
 
-Login, provider enumeration, and usage inspection MAY run the gateway image as
-one-shot Docker containers. These are administrative tools, not
-components.
+Login, per-account logout and rename, provider enumeration, and usage
+inspection MAY run the gateway image as one-shot Docker containers. These are
+administrative tools, not components.
 
 Cyclo MUST:
 
-- give every tool an installation-scoped ownership label and unique name;
+- give every tool a realm-scoped ownership label and unique name;
 - remove abandoned labeled tool containers before starting another;
 - use `--rm`;
 - mount the credential volume only when required;
 - obtain its physical Docker name from DComp's verified volume lookup;
 - mount it read-only for usage inspection;
-- use no network for API-key login and provider enumeration;
+- use no network for API-key login, logout, rename, and provider enumeration;
 - grant ordinary bridge access only to interactive login flows; and
 - never print an API key supplied through an environment variable.
 
@@ -656,7 +679,16 @@ Provider or team components.
 If the host fails after credential commit, the committed store remains valid.
 A later `models`, `repair`, or other apply operation MUST recover service state.
 
-Destroying the store MUST resolve the existing installation gateway volume
+Per-account logout and rename MUST follow the same store preparation,
+credential commit, gateway-only restart, and readiness ordering. They MUST
+serialize with login and OAuth refresh, atomically replace only `auth.json`, and
+leave unrelated credentials and `usage.jsonl` unchanged. Rename MUST preserve
+the credential's concrete provider and MUST NOT overwrite an existing target
+account. Logout removes only Cyclo's local credential and MUST NOT claim to
+revoke a provider-side token or session. A failed validation or mutation MUST
+leave the prior credential document unchanged and MUST NOT restart the gateway.
+
+Destroying the store MUST resolve the existing realm gateway volume
 through DComp, require exact confirmation of the returned name, stop the
 complete DComp system, and then delete that volume. It MUST NOT reapply a
 stopped gateway merely to destroy a surviving credential volume. Ordinary
@@ -733,7 +765,7 @@ persisted running-instance mount sources.
 
 ### 13.1 Cyclo state
 
-Cyclo state MUST use private directories and atomic regular files:
+Cyclo state MUST use atomic regular files under one realm root:
 
 ```text
 STATE_ROOT/
@@ -752,6 +784,13 @@ STATE_ROOT/
     descriptors/
   dcomp/
 ```
+
+For every realm, root ownership, groups, numeric modes, ACLs, and effective
+access MUST remain filesystem policy. Cyclo MUST NOT normalize or preflight the
+root against a preferred policy. Directory creation, file creation, locking,
+replacement, and synchronization MUST report their real operating-system
+errors. Generated immutable inputs MAY be made read-only where immutability is
+part of their data contract.
 
 `run.json` MUST contain domain facts only:
 
@@ -786,17 +825,22 @@ Cyclo MUST NOT import or parse those files. It MUST use `version --json`,
 `status --json`, `volume --json`, and the documented DComp command exit
 contracts.
 
+DComp MUST use `STATE_ROOT/dcomp` according to the filesystem access available
+to its process. Cyclo MUST NOT infer or impose a DComp permission policy from
+that path's metadata.
+
 ### 13.3 Gateway state
 
-Credentials and usage MUST live in the installation-scoped named Docker volume.
-DComp down/replacement MUST preserve declared volumes. Only the explicit
-destroy-store operation may delete it.
+Credentials and usage MUST live in the realm-scoped named Docker volume.
+DComp down/replacement MUST preserve declared volumes. Per-account logout may
+delete one credential from `auth.json`; only the explicit destroy-store
+operation may delete the volume or usage history.
 
 ## 14. Lifecycle operations
 
 ### 14.1 Serialization
 
-All Cyclo mutations of installation state or runtime composition MUST hold one
+All Cyclo mutations of realm state or runtime composition MUST hold one
 exclusive host file lock. Read-only status operations SHOULD avoid that lock.
 
 ### 14.2 Run
@@ -917,7 +961,8 @@ able to complete its assigned task.
 domain state and DComp/Docker facts. They MUST NOT synthesize alternate routes.
 
 Runtime construction, generic component inspection/restart, and gateway
-providers/login/status/restart/usage MUST NOT require `host.conf` to parse.
+providers/login/logout/rename/status/restart/usage MUST NOT require `host.conf`
+to parse.
 When provider context is unavailable, `ps`, `inspect`, `doctor`, and the
 dashboard MUST preserve the applied DComp diagnostics and report the
 configuration error separately. Provider compilation, reconciliation, and
@@ -974,7 +1019,7 @@ implement speculative rollback around DComp.
 
 ### 16.4 One-shot gateway interruption
 
-Every one-shot gateway tool container MUST carry an installation ownership
+Every one-shot gateway tool container MUST carry a realm ownership
 label. Before the next tool operation, Cyclo MUST enumerate and forcibly remove
 abandoned containers with that exact label.
 
@@ -982,14 +1027,15 @@ Credential-volume deletion MUST never be part of abandoned-tool cleanup.
 
 ## 17. Required security invariants
 
-A conforming Cyclo 0.2 installation MUST preserve all of these:
+A conforming Cyclo 0.2 realm MUST preserve all of these:
 
 1. Only the gateway service and bounded gateway administration tools can mount
    the credential volume.
 2. No runtime component receives the Docker socket.
 3. No runtime component receives Cyclo or DComp host state.
-4. A team receives only its team repository, declared project mounts, private
-   queue/Pi state, generated project file, and outer Provider link.
+4. A team receives only its team repository, declared project mounts,
+   realm-scoped queue/Pi state, generated project file, and outer Provider
+   link.
 5. A Provider receives only its image policy, declared volumes, egress policy,
    and declared links.
 6. Host-side Provider RPC is loopback-only.
@@ -1002,6 +1048,8 @@ A conforming Cyclo 0.2 installation MUST preserve all of these:
     unauthenticated.
 12. Separate state roots never authorize adoption of each other's DComp-owned
     resources.
+13. The default realm grants state access only to root and its explicit trusted
+    Unix group; private realms remain owner-only.
 
 ## 18. Acceptance criteria
 
@@ -1054,6 +1102,10 @@ A release implementation SHOULD demonstrate:
 
 ### 18.5 Persistence and failure
 
+- the default realm, `--local`, and explicit-root selections bind the specified
+  state and `host.conf` pairs;
+- usable state paths succeed regardless of ownership, group, mode, or ACL
+  representation, while real filesystem denials are reported;
 - run/start/stop persist intent before final apply;
 - failed apply leaves intent inspectable and repairable;
 - refresh adopts current running project/team sources;

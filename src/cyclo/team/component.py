@@ -41,20 +41,15 @@ def materialize_instance(store: StateStore, instance: Instance) -> InstanceFiles
     store.ensure()
     instance_root = store.instance_dir(instance.id)
     try:
-        instance_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(instance_root, 0o700)
+        store.prepare_directory(instance_root, "Cyclo instance directory")
         for path in (
+            store.queue_root(instance.id),
             store.tasks_dir(instance.id),
             store.jobs_dir(instance.id),
             store.agents_dir(instance.id),
             store.pi_root(instance.id),
         ):
-            if path.is_symlink():
-                raise CycloError(
-                    f"refusing symlinked AgentWS state directory: {path}"
-                )
-            path.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(path, 0o700)
+            store.prepare_directory(path, "AgentWS state directory")
     except OSError as exc:
         raise CycloError(
             f"cannot prepare team state for {instance.id}: {exc}"
@@ -66,6 +61,8 @@ def materialize_instance(store: StateStore, instance: Instance) -> InstanceFiles
         / instance.project_generation
         / "project.cyclo"
     )
+    store.prepare_directory(config.parent.parent, "project configuration directory")
+    store.prepare_directory(config.parent, "project generation directory")
     _immutable_file(
         config,
         instance.project_config.rstrip().encode("utf-8") + b"\n",
@@ -170,6 +167,8 @@ def _materialize_pi_settings(store: StateStore, instance: Instance) -> Path:
         / digest
         / "pi-settings.json"
     )
+    store.prepare_directory(path.parent.parent, "team runtime configuration directory")
+    store.prepare_directory(path.parent, "team runtime generation directory")
     _immutable_file(path, content, mode=0o444)
     return path
 
@@ -184,7 +183,6 @@ def _immutable_file(path: Path, content: bytes, *, mode: int) -> None:
                     f"immutable runtime file has unexpected content: {path}"
                 )
             return
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = path.with_name(
             f".{path.name}.tmp.{os.getpid()}.{os.urandom(6).hex()}"
         )

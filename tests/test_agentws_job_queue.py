@@ -6,6 +6,7 @@ import re
 import runpy
 import shutil
 import signal
+import stat
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor

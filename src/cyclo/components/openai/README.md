@@ -52,7 +52,7 @@ IDs are the Provider catalogue's public `PROVIDER/MODEL` IDs.
 
 This is an HTTP edge, not another Provider in the host's Provider chain, so it
 does not declare a Provider output or live in a provider-source
-`component.dcomp`. Enable it for a Cyclo installation in `host.conf`:
+`component.dcomp`. Enable it for a Cyclo realm in `host.conf`:
 
 ```text
 component openai

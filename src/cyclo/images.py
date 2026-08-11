@@ -170,7 +170,7 @@ class Images:
         input_data: str | None = None,
         capture: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        """Run a Docker command using this installation's endpoint."""
+        """Run a Docker command using this realm's endpoint."""
 
         try:
             result = subprocess.run(

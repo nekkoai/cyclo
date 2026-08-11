@@ -78,7 +78,6 @@ def test_state_round_trip_contains_domain_intent_only(tmp_path: Path) -> None:
         "provider_generation",
     ):
         assert legacy not in document
-    assert stat.S_IMODE(store.metadata_path(instance.id).stat().st_mode) == 0o600
 
 
 def test_legacy_lifecycle_fields_are_rejected(tmp_path: Path) -> None:
@@ -409,7 +408,7 @@ def test_forget_requires_stopped_intent_and_removes_all_instance_state(
     assert not store.instance_dir(running.id).exists()
 
 
-def test_state_and_binding_permissions_are_private(
+def test_state_creation_respects_the_process_umask(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -417,10 +416,67 @@ def test_state_and_binding_permissions_are_private(
     monkeypatch.setattr("cyclo.state.local_docker_endpoint", lambda: endpoint)
     store = StateStore(tmp_path / "state")
 
-    assert store.docker_endpoint == endpoint
+    previous = os.umask(0o027)
+    try:
+        assert store.docker_endpoint == endpoint
+    finally:
+        os.umask(previous)
 
-    assert stat.S_IMODE(store.root.stat().st_mode) == 0o700
-    assert stat.S_IMODE(store.docker_endpoint_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(store.root.stat().st_mode) == 0o750
+    assert stat.S_IMODE(store.docker_endpoint_path.stat().st_mode) == 0o640
+
+
+def test_host_realm_uses_a_writable_root_without_changing_its_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint = "unix:///var/run/docker.sock"
+    monkeypatch.setattr("cyclo.state.local_docker_endpoint", lambda: endpoint)
+    shared_root = tmp_path / "shared"
+    shared_root.mkdir()
+    shared_root.chmod(0o731)
+    store = StateStore(
+        shared_root,
+        requested_host_config_scope="system",
+        shared=True,
+    )
+
+    with store.locked():
+        store.save(make_instance(tmp_path))
+        assert store.docker_endpoint == endpoint
+
+    assert stat.S_IMODE(store.root.stat().st_mode) == 0o731
+    assert store.instances_dir.is_dir()
+    assert store.dcomp_root.is_dir()
+    assert store.metadata_path("alpha").is_file()
+
+    reopened = StateStore(
+        store.root,
+        requested_host_config_scope="system",
+        shared=True,
+    )
+    assert [item.id for item in reopened.list()] == ["alpha"]
+
+
+def test_host_realm_attempts_to_create_a_missing_root(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(
+        tmp_path / "missing",
+        requested_host_config_scope="system",
+        shared=True,
+    )
+
+    store.ensure()
+
+    assert store.root.is_dir()
+    assert store.instances_dir.is_dir()
+    assert store.dcomp_root.is_dir()
+
+
+def test_system_state_root_cannot_be_reinterpreted_as_private() -> None:
+    with pytest.raises(CycloError, match="shared host realm"):
+        StateStore(Path("/var/lib/cyclo"), shared=False)
 
 
 def test_docker_binding_is_stable_and_rejects_daemon_changes(
@@ -469,7 +525,7 @@ def test_interrupted_write_once_never_publishes_partial_binding(
 
     monkeypatch.setattr(os, "link", fail_link)
     with pytest.raises(CycloError, match="publication failure"):
-        store._write_once(store.docker_endpoint_path, "unix:///socket\n", mode=0o600)
+        store._write_once(store.docker_endpoint_path, "unix:///socket\n")
 
     assert not store.docker_endpoint_path.exists()
     assert list(store.root.glob(".docker-endpoint.tmp.*")) == []

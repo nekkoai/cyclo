@@ -29,29 +29,64 @@ root inside its container.
 
 Cyclo supports only a local Docker Unix socket. The first operation that needs
 the Docker endpoint records the selected canonical value in the state root.
-Later commands reject a different context or endpoint for that installation.
+Later commands reject a different context or endpoint for that realm.
 
-## 2. Select an installation
+## 2. Select a realm
 
-Without an explicit root, Cyclo stores state under
-`${XDG_STATE_HOME:-$HOME/.local/state}/cyclo` and reads
-`/etc/cyclo/host.conf`.
+Without a selection option, Cyclo uses the shared host realm:
 
-For a user-owned installation, set an explicit root:
+```text
+host configuration  /etc/cyclo/host.conf
+state               /var/lib/cyclo
+```
+
+There is no Cyclo initialization command or permission policy. Cyclo attempts
+to create and write `/var/lib/cyclo`; the filesystem either permits the
+operation or returns the error. Since `/var/lib` is normally
+administrator-controlled, create the directory or grant access with the host's
+ordinary ownership, group, or ACL tools when necessary:
+
+```sh
+unset CYCLO_STATE_ROOT
+```
+
+Cyclo creates its state children automatically. Every account allowed by the
+filesystem to use that root shares gateway logins and usage, Provider
+configuration, persisted teams, AgentWS queues, Pi state, and the single DComp
+system. Configure host components with `sudoedit /etc/cyclo/host.conf`.
+
+Use `--local` for a self-contained private per-user realm:
+
+```sh
+cyclo --local doctor
+```
+
+Its state root is `${XDG_STATE_HOME:-$HOME/.local/state}/cyclo`, and it reads
+`host.conf` inside that directory. Its gateway logins, Provider graph, teams,
+queues, and DComp system are independent of the shared realm. Unset
+`CYCLO_STATE_ROOT` before using `--local`.
+
+If that XDG state predates the shared default, create or copy the desired
+configuration into its `host.conf` before applying it. Cyclo safely rebinds the
+legacy scope marker to the local file; it does not copy
+`/etc/cyclo/host.conf` implicitly.
+
+Use an explicit root for a private, self-contained realm:
 
 ```sh
 export CYCLO_STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cyclo-work"
 mkdir -p "$CYCLO_STATE_ROOT"
 ```
 
-That installation reads `$CYCLO_STATE_ROOT/host.conf`. The selected
-system/local configuration scope is recorded on first mutation. Do not alternate
-between an explicit and implicit spelling for the same state directory.
+That realm reads `$CYCLO_STATE_ROOT/host.conf`. `--state-root PATH` is the
+command-line equivalent. `--local` is shorthand for the conventional XDG path;
+selecting that same canonical path explicitly reaches the same realm.
 
-The canonical state-root path determines the installation ID, DComp system
+The canonical state-root path determines the realm ID, DComp system
 name, Docker resource names, gateway credential volume, generated image names,
-and queue locations. Several installations may share one trusted Docker host
-when each uses a different state root.
+teams, and queue locations. A different explicit `host.conf` therefore implies
+a different state root, gateway credential volume, and set of logins. Several
+realms may share one trusted Docker host when each uses a different state root.
 
 Cyclo 0.2 does not migrate Cyclo 0.1 state. Start with a fresh state root.
 
@@ -83,10 +118,24 @@ cyclo gateway login openai --as openai-work --api-key-env OPENAI_API_KEY
 
 `--as` chooses the public account/provider prefix used in model IDs. A
 successful login writes the gateway's private Docker volume and restarts the
-gateway. On a fresh installation Cyclo first creates only that fixed
+gateway. In a fresh realm Cyclo first creates only that fixed
 gateway/store boundary; unrelated host-component or team failures do not block
 login.
 A separate build or restart command is not required.
+
+Change the public account prefix, or remove just one stored account:
+
+```sh
+cyclo gateway rename codex-work codex-personal
+cyclo gateway logout openai-work
+```
+
+These commands atomically update only `auth.json`, preserve every other
+account and all usage history, and restart only the gateway. Rename preserves
+the underlying provider; existing usage records retain the old model prefix.
+Logout is local credential removal, not remote token or OAuth-session
+revocation. Use the provider's own security controls when remote revocation is
+required.
 
 Inspect the result:
 
@@ -218,7 +267,7 @@ component openai bind=0.0.0.0 port=18080
 only when the surrounding container or host network provides the intended
 access boundary.
 
-Only one bundled OpenAI edge may be declared per installation. Run
+Only one bundled OpenAI edge may be declared per realm. Run
 `cyclo repair` after changing `host.conf`.
 
 ## 5. Create a team
@@ -469,7 +518,7 @@ cyclo refresh
 
 `refresh` reparses each running instance's recorded project file, validates its
 current team, runs host and team Docker builds, updates the persisted instance,
-and applies the installation-wide DComp system. Stopped instances remain
+and applies the realm-wide DComp system. Stopped instances remain
 stopped and retain their previous persisted configuration.
 
 Reapply current `host.conf` and persisted instance intent:
@@ -495,11 +544,10 @@ removed by ordinary stop, refresh, repair, or forget operations.
 
 ## 11. State and ownership
 
-A typical explicit installation contains:
+A default shared realm contains `/etc/cyclo/host.conf` plus:
 
 ```text
-STATE_ROOT/
-  host.conf
+/var/lib/cyclo/
   host-config.scope
   docker-endpoint
   control.lock
@@ -520,18 +568,24 @@ STATE_ROOT/
   dcomp/
 ```
 
+Realm-root ownership, modes, groups, ACLs, and resulting access are controlled
+by the host filesystem. Cyclo does not require or normalize that root metadata;
+it performs the operation and reports an actual failure. `--local` and explicit
+state roots each contain their own `host.conf`; only the default realm reads
+`/etc/cyclo/host.conf`. Generated immutable runtime inputs may be read-only.
+
 Cyclo owns instance intent, queue state, Pi state, image construction, and the
 generated system definition. DComp owns the contents of `dcomp/` and all
-container/network/volume lifecycle state. Cyclo never reads DComp's private
+container/network/volume lifecycle state. Cyclo never reads DComp-owned
 files; it uses machine API version 1. The gateway owns credentials and usage in
 its named Docker volume.
 
 When one command changes several instances, Cyclo journals the complete cohort
 in `pending-instance-batch.json` before replacing any `run.json`. Readers hold
-the same installation lock and finish an interrupted publication before
+the same realm lock and finish an interrupted publication before
 returning an inventory snapshot.
 
-Do not copy one state root over another running installation. Back up state only
+Do not copy one state root over another running realm. Back up state only
 with the corresponding system stopped and include the gateway volume separately
 when credential recovery is required.
 
@@ -543,14 +597,14 @@ Cyclo rejects:
 - overlapping team and project trees;
 - mounts overlapping Cyclo state, installed Cyclo code, `host.conf`, DComp,
   the host Pi directory, `/proc`, `/sys`, `/dev`, `/run`, or a Docker socket;
-- a selected Docker endpoint that is remote or changes after installation
+- a selected Docker endpoint that is remote or changes after realm
   binding; and
 - team image execution as host root.
 
 Team containers never receive the Docker socket or gateway credential volume.
 Provider links are private DComp networks. This isolation does not make
 readable project data confidential from a normal network-enabled team or from
-the external model service. Use `--offline`, separate projects/installations,
+the external model service. Use `--offline`, separate projects/realms,
 or explicit policy components according to the deployment threat model.
 
 ## 13. Troubleshooting

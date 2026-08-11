@@ -2,6 +2,34 @@
 
 All notable changes to Cyclo are documented in this file.
 
+## [0.2.5] - 2026-08-11
+
+Cyclo 0.2.5 makes the system host configuration and shared runtime state one
+coherent realm, and adds explicit gateway account administration.
+
+### Shared host realms
+
+- Make `/etc/cyclo/host.conf` and `/var/lib/cyclo` the coherent
+  default realm, containing one gateway/login store, Provider graph, team
+  inventory, AgentWS/Pi state, and DComp system.
+- Document `/etc/cyclo/host.conf` and `/var/lib/cyclo` as the default realm
+  paths while leaving ownership, groups, modes, ACLs, and write authority to the
+  host filesystem.
+- Add `--local` as shorthand for a self-contained per-user XDG realm;
+  both it and explicit state roots use their own `STATE_ROOT/host.conf`.
+- Rebind the legacy XDG realm's recorded system-configuration scope to its
+  local `host.conf` under the realm lock without copying configuration content.
+
+### Gateway account administration
+
+- Add `cyclo gateway logout ACCOUNT` for atomic, local removal of one stored
+  credential without deleting other accounts or usage history.
+- Add `cyclo gateway rename OLD_ACCOUNT NEW_ACCOUNT` to change an account's
+  public model prefix while preserving its concrete provider, including legacy
+  credentials that inferred the provider from their former account name.
+- Run both operations in a network-isolated one-shot gateway container and
+  restart only the gateway after a successful credential-store mutation.
+
 ## [0.2.4] - 2026-08-11
 
 Cyclo 0.2.4 restores interactive OAuth login compatibility with the pinned Pi

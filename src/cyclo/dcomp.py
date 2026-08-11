@@ -86,7 +86,7 @@ class DCompClient:
         bound_endpoint = store.bound_docker_endpoint
         if bound_endpoint is not None:
             self._environment["DOCKER_HOST"] = bound_endpoint
-            # A selected Docker context must not override the installation's
+            # A selected Docker context must not override the realm's
             # durable daemon binding.
             self._environment.pop("DOCKER_CONTEXT", None)
         self._compatible = False
@@ -136,8 +136,7 @@ class DCompClient:
             if process.stderr:
                 detail = _command_detail(process)
                 raise CycloError(
-                    "dcomp status failed with status "
-                    f"{process.returncode}: {detail}"
+                    _command_failure("status", process.returncode, detail)
                 ) from exc
             raise
         if status.name != name:
@@ -291,10 +290,9 @@ class DCompClient:
             raise CycloError(f"cannot run dcomp {action}: {exc}") from exc
         if process.returncode not in accepted_returncodes:
             detail = _command_detail(process)
-            message = f"dcomp {action} failed with status {process.returncode}"
-            if detail:
-                message += f": {detail}"
-            raise CycloError(message)
+            raise CycloError(
+                _command_failure(action, process.returncode, detail)
+            )
         return process
 
 
@@ -319,7 +317,21 @@ def _find_executable(environment: Mapping[str, str]) -> str:
 
 def _command_detail(process: subprocess.CompletedProcess[str]) -> str:
     raw = process.stderr or process.stdout or ""
-    return " ".join(raw.split())[:2048]
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].startswith("error:"):
+            lines = lines[index:]
+            lines[0] = lines[0].removeprefix("error:").lstrip()
+            break
+    return "\n".join(line for line in lines if line)[:2048]
+
+
+def _command_failure(action: str, status: int, detail: str) -> str:
+    message = f"dcomp {action} failed with status {status}"
+    if not detail:
+        return message
+    indented = "\n".join(f"  {line}" for line in detail.splitlines())
+    return f"{message}:\n{indented}"
 
 
 def _json_object(raw: str | None, source: str) -> dict[str, object]:

@@ -1,4 +1,4 @@
-<img src="docs/assets/banner.svg" alt="cyclo — Agentic systems, in a Git loop. A local-first agent runtime. V0.2.4, MIT, Linux, Python 3.10+, DComp." width="100%">
+<img src="docs/assets/banner.svg" alt="cyclo — Agentic systems, in a Git loop. A local-first agent runtime. V0.2.5, MIT, Linux, Python 3.10+, DComp." width="100%">
 
 Cyclo runs Git-defined agent teams against explicitly mounted projects. A
 credential gateway owns provider logins, optional provider components transform
@@ -6,9 +6,9 @@ or route model traffic, optional host edge components expose terminal APIs, and
 each team runs as an isolated component with its own durable AgentWS queue.
 
 Cyclo uses [DComp](https://github.com/glguida/dcomp) for Docker lifecycle and
-component links. Cyclo builds images and compiles one installation-wide DComp
-system; DComp reconciles its containers, networks, volumes, and crash-recovery
-state. Neither program is in the inference data path after startup.
+component links. Cyclo builds images and compiles one realm-wide DComp system;
+DComp reconciles its containers, networks, volumes, and crash-recovery state.
+Neither program is in the inference data path after startup.
 
 ## 01 · Requirements
 
@@ -31,19 +31,37 @@ who owns the project files and may access Docker.
 Cyclo 0.2 is a fresh-install boundary. It does not import Cyclo 0.1 state or
 Docker resources.
 
-## 02 · First installation
+## 02 · First shared realm
 
-Install the Python package on the host and select a state root:
+Install the Python package. The default realm uses exactly these paths:
+
+| Path | Purpose |
+|---|---|
+| `/etc/cyclo/host.conf` | Provider and host-component configuration |
+| `/var/lib/cyclo/` | Realm state |
+
+Cyclo does not prescribe, inspect, or rewrite their ownership, group, numeric
+mode, or ACLs. It attempts to create and write the selected state path. If the
+host filesystem allows the operation, Cyclo proceeds; otherwise it reports the
+filesystem error. Because `/var/lib` is normally administrator-controlled, a
+host administrator or package commonly creates that directory and grants the
+intended operator access using the host's normal policy.
 
 ```sh
 python3 -m pip install .
-export CYCLO_STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cyclo-work"
-mkdir -p "$CYCLO_STATE_ROOT"
+unset CYCLO_STATE_ROOT
 ```
 
-An explicit state root uses `$CYCLO_STATE_ROOT/host.conf`. An implicit default
-state root uses `/etc/cyclo/host.conf`. The file may be absent or empty, which
-routes teams directly to the gateway.
+Every account that the filesystem allows to use the same state root sees the
+same gateway accounts, Provider graph, usage, teams, queues, and DComp system.
+Edit the host configuration with `sudoedit`:
+
+```sh
+sudoedit /etc/cyclo/host.conf
+```
+
+The file may be empty, which routes teams directly to the gateway. Teams are
+not entries in `host.conf`; `cyclo run` records them in the selected realm.
 
 Inspect login providers, authenticate, and list the resulting models:
 
@@ -55,10 +73,20 @@ cyclo doctor
 ```
 
 Login stores credentials in the gateway's private Docker volume and restarts
-the gateway so the new catalogue is visible. On a fresh installation Cyclo
+the gateway so the new catalogue is visible. In a fresh realm Cyclo
 creates only that fixed gateway/store boundary first; unrelated host-component
 or team failures cannot block login. API keys and OAuth sessions are never
 mounted into provider or team components.
+
+Rename or remove one stored account without touching the others:
+
+```sh
+cyclo gateway rename codex-work codex-personal
+cyclo gateway logout codex-personal
+```
+
+Both operations restart only the gateway. Logout deletes Cyclo's local stored
+credential; it does not revoke the token or session at the upstream provider.
 
 ## 03 · Provider composition
 
@@ -111,7 +139,7 @@ provider pool pooler upstream=gateway.provider -- account-a/model account-b/mode
 The latter adds `pool/balanced`. Failover occurs only for typed pre-stream
 resource exhaustion; the pooler never replays after emitting a response.
 
-Cyclo uses stable installation/version tags for built gateway, Provider, and
+Cyclo uses stable realm/version tags for built gateway, Provider, and
 team images. Whenever an operation needs one, Cyclo invokes `docker build` with
 the real source context and lets Docker apply `.dockerignore` and its native
 layer cache. Cyclo captures the build output, inspects the resulting immutable
@@ -209,7 +237,7 @@ may claim and its `roles/ROLE.md` instructions. Several agents may share a role.
 Task coordination authority belongs to role `planner`.
 
 Use `cyclo refresh` to re-read running projects and teams, rebuild their images,
-and apply the resulting installation-wide DComp system. Use `cyclo stop`,
+and apply the resulting realm-wide DComp system. Use `cyclo stop`,
 `cyclo start`, and `cyclo forget` for durable instance intent. `cyclo repair`
 runs the required host Docker builds and reapplies current host configuration
 plus persisted instance intent. DComp resumes an interrupted matching target
@@ -217,7 +245,7 @@ or safely supersedes a stale target as part of `up`.
 
 ## 05 · Runtime model
 
-One canonical state root defines one Cyclo installation and one DComp system:
+One canonical state root defines one Cyclo realm and one DComp system:
 
 ```text
 Cyclo CLI
@@ -240,20 +268,33 @@ The configured outer Provider is the only route. A failed component remains
 inspectable through `cyclo component status` and makes the system
 non-operational until it is fixed or removed from `host.conf`.
 
-## 06 · Multiple installations
+## 06 · Local and alternate realms
 
-Use a different state root for each installation:
+`--local` selects a self-contained private realm at
+`${XDG_STATE_HOME:-$HOME/.local/state}/cyclo`. Its configuration is
+`${XDG_STATE_HOME:-$HOME/.local/state}/cyclo/host.conf`; its gateway logins,
+Provider graph, teams, queues, and DComp system are all independent of the
+shared host realm:
 
 ```sh
-CYCLO_STATE_ROOT="$HOME/.local/state/cyclo-work" cyclo doctor
-CYCLO_STATE_ROOT="$HOME/.local/state/cyclo-lab" cyclo doctor
+cyclo --local doctor
+# configuration: ${XDG_STATE_HOME:-$HOME/.local/state}/cyclo/host.conf
 ```
 
-The canonical state-root path determines the DComp system name, Docker resource
-namespace, image names, gateway volume, queues, and generated configuration.
-Each installation binds itself to the selected local Docker Unix socket on its
-first operation that needs a Docker endpoint and rejects later attempts to
-retarget it.
+For a self-contained private realm with its own host configuration, select an
+explicit root:
+
+```sh
+cyclo --state-root "$HOME/.local/state/cyclo-lab" doctor
+# configuration: $HOME/.local/state/cyclo-lab/host.conf
+```
+
+`CYCLO_STATE_ROOT` is the environment equivalent. The canonical state-root path
+determines the DComp system name, Docker resource namespace, image names,
+gateway volume, teams, queues, and generated configuration. Consequently a
+different explicit `host.conf` belongs to a different gateway/login realm.
+Each realm binds itself to the selected local Docker Unix socket on its first
+operation that needs one and rejects later attempts to retarget it.
 
 ## 07 · Documentation
 

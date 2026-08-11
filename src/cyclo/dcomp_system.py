@@ -305,11 +305,9 @@ class Materializer:
 
     def _prepare_root(self) -> None:
         try:
-            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(self.root, 0o700)
+            self.root.mkdir(parents=True, exist_ok=True)
             descriptors = self.root / "descriptors"
-            descriptors.mkdir(mode=0o700, exist_ok=True)
-            os.chmod(descriptors, 0o700)
+            descriptors.mkdir(exist_ok=True)
             self._sync_directory(descriptors)
             self._sync_directory(self.root)
         except OSError as exc:
@@ -400,7 +398,7 @@ class Materializer:
                 f".{directory.name}.tmp.{os.getpid()}.{os.urandom(6).hex()}"
             )
             try:
-                temporary.mkdir(mode=0o700)
+                temporary.mkdir()
                 self._write_file(temporary / "component.dcomp", content)
                 self._sync_directory(temporary)
                 os.replace(temporary, directory)
@@ -481,10 +479,8 @@ class Materializer:
         finally:
             temporary.unlink(missing_ok=True)
 
-    @staticmethod
-    def _write_file(path: Path, content: bytes) -> None:
+    def _write_file(self, path: Path, content: bytes) -> None:
         with path.open("xb") as stream:
-            os.chmod(path, 0o600)
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())

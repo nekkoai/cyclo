@@ -50,7 +50,7 @@ class GatewayAdmin:
 
     def restart(self) -> None:
         self._prepare_store()
-        self._restart_gateway()
+        self._restart_gateway("login")
 
     def login(
         self,
@@ -93,7 +93,28 @@ class GatewayAdmin:
         )
         self._restart_gateway()
 
-    def _restart_gateway(self) -> None:
+    def logout(self, account: str) -> None:
+        if not account:
+            raise CycloError("gateway logout requires an account")
+        self._update_credentials(("logout", account))
+
+    def rename(self, account: str, new_account: str) -> None:
+        if not account or not new_account:
+            raise CycloError("gateway rename requires two account names")
+        self._update_credentials(("rename", account, new_account))
+
+    def _update_credentials(self, command: Sequence[str]) -> None:
+        volume = self._prepare_store()
+        image = self.runtime.build_gateway()
+        self._tool(
+            image,
+            command,
+            volume=volume,
+            capture=False,
+        )
+        self._restart_gateway(command[0])
+
+    def _restart_gateway(self, operation: str = "restart") -> None:
         self.runtime.dcomp.restart(self.runtime.name, _GATEWAY_COMPONENT)
         observed = self.runtime.wait_status()
         gateway = observed.component(_GATEWAY_COMPONENT)
@@ -104,7 +125,7 @@ class GatewayAdmin:
         ):
             detail = gateway.problem if gateway is not None else "component is absent"
             raise CycloError(
-                "gateway did not become ready after login"
+                f"gateway did not become ready after {operation}"
                 + (f": {detail}" if detail else "")
             )
 

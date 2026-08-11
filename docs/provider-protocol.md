@@ -50,7 +50,7 @@ installed pooler source and uses the installed components directory as its
 fixed Docker build context. A `context=PATH` override on that bundled source is
 rejected.
 
-## Host installation
+## Host realm configuration
 
 Install component instances in `host.conf`:
 
@@ -247,11 +247,11 @@ visible and makes the system non-operational.
 - Team and provider components receive no Docker socket or DComp/Cyclo state.
 - Link networks are private to their two endpoints.
 - Host-side Provider calls are restricted to the DComp-reported loopback port.
-- Provider source and Dockerfiles are trusted installation inputs.
+- Provider source and Dockerfiles are trusted realm inputs.
 
 This protocol does not provide per-team quotas, semantic filtering, or
 confidentiality from a provider in the selected path. Those policies belong in
-explicit Provider components or separate installations.
+explicit Provider components or separate realms.
 
 ## Implementing a provider
 

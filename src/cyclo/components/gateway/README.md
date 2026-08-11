@@ -40,15 +40,18 @@ allowlist. ConnectRPC carries cancellation out of band.
 
 Incoming RPC headers are never forwarded. Provider credentials never appear in
 the model catalogue, request payload, Docker arguments, logs, or downstream
-containers. The public catalogue is a startup snapshot; login or model changes
-therefore require a gateway restart, which `cyclo gateway login` performs
-automatically. Health detects when the committed non-secret catalogue differs
-from that snapshot, so an interrupted post-login restart is repaired by the
-next ordinary start or model operation. Login builds the candidate catalogue in
-memory before atomically replacing `auth.json`; an unknown provider or unusable
-custom catalogue leaves the previous credential store and running gateway
-untouched. Credential values and OAuth refreshes are read dynamically and
-written with kernel locking plus atomic replacement.
+containers. The public catalogue is a startup snapshot; credential or model
+changes therefore require a gateway restart, which the host-side gateway
+credential commands perform automatically. Health detects when the committed
+non-secret catalogue differs from that snapshot, so an interrupted
+post-mutation restart is repaired by the next ordinary start or model
+operation. Login builds the candidate catalogue in memory before atomically
+replacing `auth.json`; an unknown provider or unusable custom catalogue leaves
+the previous credential store and running gateway untouched. Per-account
+logout and rename use the same kernel lock and atomic replacement as login and
+OAuth refresh, and never rewrite `usage.jsonl`. Rename preserves the concrete
+provider when upgrading a legacy credential that inferred it from its old
+account name.
 
 Models using the Pi inference format must publish positive context-window and
 output-token limits. The gateway excludes an unusable model without hiding
@@ -95,9 +98,11 @@ npm --prefix gateway test
 docker build -f gateway/Dockerfile -t cyclo-gateway-component .
 ```
 
-The image also performs one-shot login and usage commands against its private
-state volume. `providers` needs no credential store; `login` writes it; `usage`
-requires the existing store and reads the audit without exposing credentials.
-The host labels these command containers and removes a verified abandoned
-command after controller or host failure; the named credential volume is never
-created or removed by usage cleanup.
+The image also performs one-shot login, logout, rename, and usage commands
+against its private state volume. `providers` needs no credential store;
+`login`, `logout`, and `rename` write only `auth.json`; `usage` requires the
+existing store and reads the audit without exposing credentials. Logout is
+local removal and does not attempt provider-side token revocation. The host
+labels these command containers and removes a verified abandoned command after
+controller or host failure; the named credential volume is never created or
+removed by usage cleanup.
